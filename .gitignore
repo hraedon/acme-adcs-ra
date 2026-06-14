@@ -1,0 +1,29 @@
+# Python / build
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+# uv lock is committed once it exists; ignore until then
+# uv.lock
+
+# Runtime data — never commit
+*.db
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Secrets & local config — NEVER commit (EAB keys, real CA topology, gMSA details)
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+config/local*
+samples/
+secrets/
+
+# Harness
+.claude/
