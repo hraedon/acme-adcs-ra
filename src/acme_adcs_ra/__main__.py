@@ -28,7 +28,7 @@ def _build_policy(config: RAConfig) -> IssuancePolicy:
 
 def main() -> int:
     config = RAConfig()
-    store = Store(config.db_path)
+    store = Store(config.db_path, order_expiry_seconds=config.order_expiry_seconds)
     policy = _build_policy(config)
     # Use the real ADCS legs on Windows if the spike is implemented, otherwise
     # the fake legs.  For dev/CI on Linux this always selects Fake*Leg.

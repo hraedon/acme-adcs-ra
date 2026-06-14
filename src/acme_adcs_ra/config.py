@@ -56,6 +56,9 @@ class RAConfig(BaseSettings):
 
     # --- Storage -------------------------------------------------------------
     db_path: Path = Path("acme_ra.db")
+    # ACME order/authz lifetime (RFC 8555 §7.1.4). Orders must not be born
+    # expired or well-behaved clients reject them immediately.
+    order_expiry_seconds: int = 3600
 
     # --- SIEM / audit emission -----------------------------------------------
     # Auditing every issuance is mandatory (hard rule). There is no toggle.

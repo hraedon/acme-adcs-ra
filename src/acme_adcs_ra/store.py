@@ -29,6 +29,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _now_iso_plus(seconds: int) -> str:
+    """Return a UTC RFC 3339 timestamp ``seconds`` in the future."""
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
 def _dump_json(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
@@ -208,8 +215,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 class Store:
     """SQLite-backed RA store."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, order_expiry_seconds: int = 3600) -> None:
         self._db_path = db_path
+        self._order_expiry_seconds = order_expiry_seconds
         # Ensure parent directory exists so SQLite can create the file.
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
@@ -365,7 +373,7 @@ class Store:
         order_id = uuid.uuid4().hex
         created_at = _now_iso()
         if expires is None:
-            expires = _now_iso()  # MVP: no clock skew handling
+            expires = _now_iso_plus(self._order_expiry_seconds)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -482,7 +490,7 @@ class Store:
         """
         order_id = uuid.uuid4().hex
         created_at = _now_iso()
-        expires = created_at  # MVP: no clock skew handling
+        expires = _now_iso_plus(self._order_expiry_seconds)
         authz_urls: list[str] = []
 
         with self._connect() as conn:

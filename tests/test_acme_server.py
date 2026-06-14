@@ -362,6 +362,23 @@ class TestPolicyViaFinalize:
 # ---------------------------------------------------------------------------
 
 
+class TestOrderExpiry:
+    def test_order_expires_in_the_future(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """Orders must not be born expired (RFC 8555 §7.1.4) — a well-behaved
+        client rejects an already-expired order."""
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        resp = acme_client.new_order(["web.WORK-DOMAIN.local"])
+        expires_str = resp.json()["expires"]
+        expires = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+        assert expires > datetime.now(timezone.utc)
+        # Default lifetime is 1h; allow slack for test runtime.
+        assert (expires - datetime.now(timezone.utc)).total_seconds() > 3000
+
+
 class TestFullRoundTrip:
     def test_certify_the_web_like_flow(
         self,
