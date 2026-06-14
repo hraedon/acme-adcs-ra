@@ -31,18 +31,18 @@ class IssuancePolicy:
     def __init__(
         self,
         *,
-        allowed_accounts: set[str],
+        allowed_kids: set[str],
         san_scopes: dict[str, list[str]],
         template: str = "ACME-ServerAuth",
     ) -> None:
-        self._allowed_accounts = allowed_accounts
+        self._allowed_kids = allowed_kids
         self._san_scopes = san_scopes
         self._template = template
 
     def evaluate(
         self,
         *,
-        account_id: str,
+        eab_kid: str,
         csr_subject: str,
         requested_sans: Sequence[str],
     ) -> PolicyDecision:
@@ -52,11 +52,11 @@ class IssuancePolicy:
         # but is not currently used in the allow/deny decision.
 
         # 1. Account must be known
-        if account_id not in self._allowed_accounts:
+        if eab_kid not in self._allowed_kids:
             return PolicyDecision(
                 allowed=False,
                 template=None,
-                reason=f"unknown account: {account_id}",
+                reason=f"unknown kid: {eab_kid}",
             )
 
         # 2. Server-auth certs must request at least one SAN.
@@ -71,7 +71,7 @@ class IssuancePolicy:
 
         # 3. Every SAN must match at least one allowed pattern for this account.
         # DNS names are case-insensitive (RFC 4343), so fold case before matching.
-        allowed_patterns = self._san_scopes.get(account_id, [])
+        allowed_patterns = self._san_scopes.get(eab_kid, [])
         for san in requested_sans:
             san_lower = san.lower()
             if not any(
@@ -80,7 +80,7 @@ class IssuancePolicy:
                 return PolicyDecision(
                     allowed=False,
                     template=None,
-                    reason=f"SAN out of scope for account {account_id}: {san}",
+                    reason=f"SAN out of scope for kid {eab_kid}: {san}",
                 )
 
         # 4. All checks pass

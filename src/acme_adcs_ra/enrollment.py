@@ -34,6 +34,20 @@ class EnrollmentResult:
 
 
 # ---------------------------------------------------------------------------
+# Enrollment error types (M2 — distinct so the real leg + audit can
+# distinguish ADCS policy denial from transport error)
+# ---------------------------------------------------------------------------
+
+
+class EnrollmentDenied(Exception):
+    """The ADCS CA explicitly denied the request (policy violation)."""
+
+
+class EnrollmentTransportError(Exception):
+    """A transport / connectivity error when contacting the ADCS CA."""
+
+
+# ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
 

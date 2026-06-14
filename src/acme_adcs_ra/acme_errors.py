@@ -1,0 +1,104 @@
+"""ACME problem+json errors (RFC 8555 §6.7).
+
+No signing primitives live here — just structured exception types that the
+FastAPI exception handler converts to problem documents.
+"""
+
+from __future__ import annotations
+
+
+class AcmeError(Exception):
+    """Base for ACME protocol errors."""
+
+    def __init__(
+        self,
+        typ: str,
+        detail: str,
+        status: int = 400,
+        title: str | None = None,
+    ) -> None:
+        self.typ = typ
+        self.detail = detail
+        self.status = status
+        self.title = title or typ.rsplit(":", 1)[-1]
+        super().__init__(detail)
+
+    def to_problem(self) -> dict[str, str | int]:
+        return {
+            "type": self.typ,
+            "title": self.title,
+            "detail": self.detail,
+            "status": self.status,
+        }
+
+
+def bad_nonce(detail: str = "invalid or missing nonce") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:badNonce",
+        detail,
+        status=400,
+    )
+
+
+def unauthorized(detail: str = "unauthorized") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:unauthorized",
+        detail,
+        status=401,
+    )
+
+
+def malformed(detail: str = "malformed request") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:malformed",
+        detail,
+        status=400,
+    )
+
+
+def bad_public_key(detail: str = "invalid account key") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:badPublicKey",
+        detail,
+        status=400,
+    )
+
+
+def bad_csr(detail: str = "invalid CSR") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:badCSR",
+        detail,
+        status=400,
+    )
+
+
+def rejected_identifier(detail: str = "identifier rejected by policy") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:rejectedIdentifier",
+        detail,
+        status=400,
+    )
+
+
+def bad_external_account_binding(detail: str = "invalid external account binding") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:badExternalAccountBinding",
+        detail,
+        status=400,
+    )
+
+
+def server_internal(detail: str = "internal server error") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:serverInternal",
+        detail,
+        status=500,
+    )
+
+
+def unsupported_identifier(detail: str = "unsupported identifier") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:unsupportedIdentifier",
+        detail,
+        status=400,
+    )

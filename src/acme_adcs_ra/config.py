@@ -6,6 +6,7 @@ All values use placeholders (CA01, WORK-DOMAIN.local, etc.).
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 from pydantic import BaseModel, SecretStr, model_validator
@@ -45,6 +46,10 @@ class RAConfig(BaseSettings):
     adcs_template: str = "ACME-ServerAuth"
     adcs_ca_name: str = "CONTOSO-CA01-CA"
 
+    # --- ACME server surface -------------------------------------------------
+    base_url: str = "http://localhost:8000"
+    terms_of_service: str = ""
+
     # --- SAN scope per account (kid → allowed DNS glob patterns) -------------
     san_scopes: dict[str, SANScope] = {}
 
@@ -65,5 +70,18 @@ class RAConfig(BaseSettings):
         return self
 
     def eab_keys_by_kid(self) -> dict[str, str]:
-        """Return {kid: mac_key} for fast EAB lookup."""
+        """Return {kid: mac_key} for fast EAB lookup.
+
+        The mac_key value is the base64url-encoded key as stored in config.
+        Use ``eab_key_bytes`` when the raw key bytes are needed (e.g. HMAC).
+        """
         return {e.kid: e.mac_key.get_secret_value() for e in self.eab_allowlist}
+
+    def eab_key_bytes(self, kid: str) -> bytes | None:
+        """Return the decoded EAB MAC key bytes for a kid, or None if unknown."""
+        mac_key_b64 = self.eab_keys_by_kid().get(kid)
+        if mac_key_b64 is None:
+            return None
+        # base64url decode, tolerating missing padding.
+        padding_needed = (-len(mac_key_b64)) % 4
+        return base64.urlsafe_b64decode(mac_key_b64 + ("=" * padding_needed))
