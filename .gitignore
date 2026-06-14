@@ -6,6 +6,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+dist/
+build/
 # uv lock is committed once it exists; ignore until then
 # uv.lock
 
@@ -24,6 +26,8 @@ __pycache__/
 config/local*
 samples/
 secrets/
+# ...except fixture PEMs used by dev/CI, which are pre-generated sample certs.
+!src/acme_adcs_ra/fixtures/*.pem
 
 # Harness
 .claude/

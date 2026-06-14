@@ -12,9 +12,9 @@ them into a proven round-trip, then a minimal server.
 
 - Charter (`README.md`), design spine (`docs/architecture.md`), and the
   enrollment runbook (`docs/certsrv-setup.md`, Modes A and C) exist. No code.
-- Lab: issuing CA **CA01** (`CA01`, OCSP working, IIS present; `/certsrv/` Web
+- Lab: issuing CA **CA01** (OCSP working, IIS present; `/certsrv/` Web
   Enrollment **not yet installed but installable**). Offline root is a separate
-  offline box. `mvmadmin01` is no longer a CA (now WAC).
+  offline box.
 - Production dependency, unproven: the work CA has Web Enrollment ("CertEnroll")
   installed but **possibly broken** — must be fixed/verified before prod.
 
