@@ -102,3 +102,27 @@ def unsupported_identifier(detail: str = "unsupported identifier") -> AcmeError:
         detail,
         status=400,
     )
+
+
+def bad_revocation_reason(detail: str = "invalid revocation reason") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:badRevocationReason",
+        detail,
+        status=400,
+    )
+
+
+def already_revoked(detail: str = "certificate already revoked") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:alreadyRevoked",
+        detail,
+        status=400,
+    )
+
+
+def not_found(detail: str = "resource not found") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:notFound",
+        detail,
+        status=404,
+    )

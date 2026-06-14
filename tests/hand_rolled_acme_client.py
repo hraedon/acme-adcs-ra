@@ -225,3 +225,14 @@ class HandRolledAcmeClient:
 
     def get_certificate(self, cert_url: str) -> Any:
         return self.http.get(cert_url)
+
+    def revoke_certificate(
+        self,
+        cert_der: bytes,
+        reason: int | None = None,
+    ) -> Any:
+        url = f"{self.base_url}/acme/revoke-cert"
+        payload: dict[str, Any] = {"cert": b64url_encode(cert_der)}
+        if reason is not None:
+            payload["reason"] = reason
+        return self._post_jws(url, payload)

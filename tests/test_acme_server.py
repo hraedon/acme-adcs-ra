@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from acme_adcs_ra.config import EABEntry, RAConfig
 from acme_adcs_ra.enrollment import FakeEnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
+from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import NONCE_TTL_SECONDS, Store
 
@@ -32,6 +34,7 @@ def _make_test_config(tmp_path: Path) -> RAConfig:
     return RAConfig(
         base_url="http://testserver",
         db_path=tmp_path / "test_ra.db",
+        siem_jsonl_path=tmp_path / "test_ra.siem.jsonl",
         eab_allowlist=[
             EABEntry(kid="kid-001", mac_key=mac_key_b64),
             EABEntry(kid="kid-002", mac_key="YW5vdGhlci0zMi1ieXRlLW1hYy1rZXktZm9yLXRlc3Rz"),
@@ -64,6 +67,7 @@ def app(test_config: RAConfig) -> Any:
         store=store,
         policy=policy,
         enrollment=FakeEnrollmentLeg(),
+        revocation=FakeRevocationLeg(),
     )
     return create_app(context)
 
@@ -211,6 +215,48 @@ class TestNewAccount:
         resp2 = acme_client.http.post(url, json=body)
         assert resp2.status_code == 400
         assert resp2.json()["type"] == "urn:ietf:params:acme:error:badNonce"
+
+
+# ---------------------------------------------------------------------------
+# M-2: Failed account-creation attempts are audited
+# ---------------------------------------------------------------------------
+
+
+class TestAccountCreationDeniedAudit:
+    def test_unknown_kid_produces_audit_row(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """M-2: An unknown-kid newAccount attempt produces an account-creation-denied audit row."""
+        store = Store(test_config.db_path)
+        before = store.list_audit_events(event_type="account-creation-denied")
+        resp = acme_client.new_account("kid-unknown", _eab_mac_key(test_config, "kid-001"))
+        assert resp.status_code == 400
+        after = store.list_audit_events(event_type="account-creation-denied")
+        assert len(after) == len(before) + 1
+        assert after[0]["outcome"] == "failed"
+        assert after[0]["details"]["reason"] == "unknown EAB kid"
+        assert after[0]["details"]["kid"] == "kid-unknown"
+
+    def test_wrong_mac_produces_audit_row(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """M-2: A bad-MAC newAccount attempt produces an account-creation-denied audit row."""
+        store = Store(test_config.db_path)
+        before = store.list_audit_events(event_type="account-creation-denied")
+        bad_key = b"wrong-key-32-bytes-long!!!!!!!!!"
+        resp = acme_client.new_account("kid-001", bad_key)
+        assert resp.status_code == 400
+        after = store.list_audit_events(event_type="account-creation-denied")
+        assert len(after) == len(before) + 1
+        assert after[0]["outcome"] == "failed"
+        assert "EAB MAC verification failed" in after[0]["details"]["reason"]
+        # The MAC key itself must NOT appear in the audit row.
+        details_str = json.dumps(after[0]["details"])
+        assert "wrong-key" not in details_str
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +440,7 @@ class TestAuditHook:
             store=store,
             policy=policy,
             enrollment=FakeEnrollmentLeg(),
+            revocation=FakeRevocationLeg(),
             audit_hook=hook,
         )
         client = TestClient(create_app(context))
@@ -401,18 +448,6 @@ class TestAuditHook:
         resp = ac.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
         assert resp.status_code == 201
         assert any(e["event_type"] == "account-created" and e["outcome"] == "success" for e in events)
-
-
-# ---------------------------------------------------------------------------
-# Revocation placeholder
-# ---------------------------------------------------------------------------
-
-
-class TestRevokeCertPlaceholder:
-    def test_returns_501(self, client: TestClient) -> None:
-        resp = client.post("/acme/revoke-cert", json={})
-        assert resp.status_code == 501
-        assert "not implemented" in resp.json()["detail"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +627,7 @@ class TestDoubleFinalizeGuard:
                 store=store,
                 policy=policy,
                 enrollment=FakeEnrollmentLeg(),
+                revocation=FakeRevocationLeg(),
             )
         )
         client = TestClient(app)

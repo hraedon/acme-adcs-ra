@@ -13,6 +13,7 @@ import uvicorn
 from acme_adcs_ra.config import RAConfig
 from acme_adcs_ra.enrollment import CertsrvEnrollmentLeg, FakeEnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
+from acme_adcs_ra.revocation import CertsrvRevocationLeg, FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import Store
 
@@ -29,16 +30,20 @@ def main() -> int:
     config = RAConfig()
     store = Store(config.db_path)
     policy = _build_policy(config)
-    # Use the real ADCS leg on Windows if the spike is implemented, otherwise
-    # the fake leg.  For dev/CI on Linux this always selects FakeEnrollmentLeg.
+    # Use the real ADCS legs on Windows if the spike is implemented, otherwise
+    # the fake legs.  For dev/CI on Linux this always selects Fake*Leg.
     enrollment: FakeEnrollmentLeg | CertsrvEnrollmentLeg = (
         CertsrvEnrollmentLeg() if sys.platform == "win32" else FakeEnrollmentLeg()
+    )
+    revocation: FakeRevocationLeg | CertsrvRevocationLeg = (
+        CertsrvRevocationLeg() if sys.platform == "win32" else FakeRevocationLeg()
     )
     context = ServerContext(
         config=config,
         store=store,
         policy=policy,
         enrollment=enrollment,
+        revocation=revocation,
     )
     app = create_app(context)
     # Extract host/port from base_url if present; default to localhost:8000.

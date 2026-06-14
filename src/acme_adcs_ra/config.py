@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,8 +57,19 @@ class RAConfig(BaseSettings):
     # --- Storage -------------------------------------------------------------
     db_path: Path = Path("acme_ra.db")
 
-    # --- Audit ---------------------------------------------------------------
+    # --- SIEM / audit emission -----------------------------------------------
     # Auditing every issuance is mandatory (hard rule). There is no toggle.
+    # The default sink is JSON-lines next to the database; syslog and Splunk
+    # HEC are optional operator-configured targets.
+    siem_sink: Literal["jsonl", "syslog", "hec"] = "jsonl"
+    siem_jsonl_path: Path | None = None
+    siem_syslog_host: str = ""
+    siem_syslog_port: int = 514
+    siem_syslog_proto: Literal["udp", "tcp"] = "udp"
+    siem_hec_url: str = ""
+    siem_hec_token: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    siem_hec_index: str = ""
+    siem_hec_sourcetype: str = "acme-adcs-ra"
 
     @model_validator(mode="after")
     def _no_duplicate_eab_kids(self) -> "RAConfig":

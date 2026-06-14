@@ -7,9 +7,10 @@ The enrollment leg (``EnrollmentLeg``) forwards accepted CSRs to ADCS.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, cast
 
 from fastapi import Depends, FastAPI, Request, Response
@@ -34,7 +35,9 @@ from acme_adcs_ra.acme_errors import (
     AcmeError,
     bad_csr,
     bad_external_account_binding,
+    bad_revocation_reason,
     malformed,
+    not_found,
     rejected_identifier,
     server_internal,
     unauthorized,
@@ -44,11 +47,15 @@ from acme_adcs_ra.config import RAConfig
 from acme_adcs_ra.enrollment import EnrollmentLeg
 from acme_adcs_ra.jws import JWSValidationError, verify_eab_jws, _base64url_decode
 from acme_adcs_ra.policy import IssuancePolicy
+from acme_adcs_ra.revocation import RevocationLeg
 from acme_adcs_ra.server_jws import (
     verify_existing_account_jws,
     verify_new_account_jws,
 )
-from acme_adcs_ra.store import Store
+from acme_adcs_ra.siem import SiemEmitter, SiemConfig, build_siem_config, default_jsonl_path
+from acme_adcs_ra.store import Store, _now_iso
+
+logger = logging.getLogger("acme_adcs_ra.server")
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +83,10 @@ class ServerContext:
     store: Store
     policy: IssuancePolicy
     enrollment: EnrollmentLeg
+    revocation: RevocationLeg
     # Optional extension hook for SIEM emission (Phase 3).  Called after the
     # audit row is persisted, unconditionally, for every issuance event.
+    # When None, create_app wires the default SIEM emitter from config.
     audit_hook: Callable[[dict[str, Any]], None] | None = None
 
 
@@ -85,7 +94,14 @@ def _audit(ctx: ServerContext, **kwargs: Any) -> None:
     """Persist an audit row and notify the optional SIEM hook."""
     event = ctx.store.record_audit(**kwargs)
     if ctx.audit_hook is not None:
-        ctx.audit_hook(event)
+        try:
+            ctx.audit_hook(event)
+        except Exception:
+            logger.warning(
+                "audit hook failed for event_type=%s; continuing",
+                event.get("event_type"),
+                exc_info=True,
+            )
 
 
 def _url(context: ServerContext, path: str) -> str:
@@ -116,10 +132,6 @@ def _finalize_url(context: ServerContext, order_id: str) -> str:
 
 def _certificate_url(context: ServerContext, cert_id: str) -> str:
     return _url(context, f"/acme/cert/{cert_id}")
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _reject_non_dns_sans(san_value: x509.SubjectAlternativeName) -> None:
@@ -182,9 +194,32 @@ def _validate_csr_key_strength(csr: x509.CertificateSigningRequest) -> None:
         )
 
 
+def _default_siem_emitter(config: RAConfig) -> SiemEmitter:
+    """Build the default SIEM emitter from RAConfig."""
+    siem_config = build_siem_config(config)
+    if siem_config.sink == "jsonl" and siem_config.jsonl_path is None:
+        siem_config = SiemConfig(
+            **{**siem_config.__dict__, "jsonl_path": default_jsonl_path(config.db_path)}
+        )
+    return SiemEmitter(siem_config)
+
+
 def create_app(context: ServerContext) -> FastAPI:
     """Build a FastAPI app wired to the supplied server context."""
-    app = FastAPI(title="acme-adcs-ra", version="0.1.0")
+    # Wire the default SIEM emitter when no test/operator hook is supplied.
+    _siem_emitter: SiemEmitter | None = None
+    if context.audit_hook is None:
+        _siem_emitter = _default_siem_emitter(context.config)
+        context.audit_hook = _siem_emitter.export
+
+    # H-3: shut down the SIEM emitter pool on app shutdown via lifespan.
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> Any:  # noqa: ARG001
+        yield
+        if _siem_emitter is not None:
+            _siem_emitter.close()
+
+    app = FastAPI(title="acme-adcs-ra", version="0.1.0", lifespan=_lifespan)
     app.state.context = context
 
     @app.exception_handler(AcmeError)
@@ -250,26 +285,51 @@ def create_app(context: ServerContext) -> FastAPI:
 
         eab_jws = payload.get("externalAccountBinding")
         if not isinstance(eab_jws, dict):
+            _audit(ctx,
+                event_type="account-creation-denied",
+                outcome="failed",
+                details={"reason": "missing externalAccountBinding"},
+            )
             raise bad_external_account_binding("externalAccountBinding is required")
 
         try:
             eab_header = json.loads(_base64url_decode(eab_jws["protected"]))
         except Exception as exc:
+            _audit(ctx,
+                event_type="account-creation-denied",
+                outcome="failed",
+                details={"reason": "invalid EAB protected header"},
+            )
             raise bad_external_account_binding(
                 f"invalid externalAccountBinding protected header: {exc}"
             ) from exc
         eab_kid = eab_header.get("kid")
         if not eab_kid:
+            _audit(ctx,
+                event_type="account-creation-denied",
+                outcome="failed",
+                details={"reason": "EAB protected header missing kid"},
+            )
             raise bad_external_account_binding(
                 "externalAccountBinding protected header missing kid"
             )
         mac_key = ctx.config.eab_key_bytes(eab_kid)
         if mac_key is None:
+            _audit(ctx,
+                event_type="account-creation-denied",
+                outcome="failed",
+                details={"reason": "unknown EAB kid", "kid": eab_kid},
+            )
             raise bad_external_account_binding("unknown external account kid")
 
         try:
             verified_kid = verify_eab_jws(eab_jws, account_jwk, mac_key)
         except JWSValidationError as exc:
+            _audit(ctx,
+                event_type="account-creation-denied",
+                outcome="failed",
+                details={"reason": "EAB MAC verification failed", "kid": eab_kid},
+            )
             raise bad_external_account_binding(f"EAB verification failed: {exc}") from exc
 
         contact = payload.get("contact", [])
@@ -626,6 +686,9 @@ def create_app(context: ServerContext) -> FastAPI:
         cert = ctx.store.get_certificate(cert_id)
         if cert is None:
             raise unauthorized("certificate not found")
+        # H-1: revoked certs must not be installable — return 410 Gone.
+        if cert.status == "revoked":
+            return Response(status_code=410)
         body = cert.cert_pem + "".join(cert.chain_pem)
         return Response(
             content=body,
@@ -633,7 +696,7 @@ def create_app(context: ServerContext) -> FastAPI:
         )
 
     # ------------------------------------------------------------------
-    # revokeCert (placeholder)
+    # revokeCert (RFC 8555 §7.6)
     # ------------------------------------------------------------------
 
     @app.post(_ACME_PATHS["revokeCert"])
@@ -641,15 +704,100 @@ def create_app(context: ServerContext) -> FastAPI:
         request: Request,
         ctx: ServerContext = Depends(_ctx),
     ) -> JSONResponse:
-        return JSONResponse(
-            status_code=501,
-            content={
-                "type": "urn:ietf:params:acme:error:serverInternal",
-                "title": "notImplemented",
-                "detail": "revokeCert is not implemented in this phase",
-                "status": 501,
+        header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+
+        cert_b64 = payload.get("cert")
+        if not isinstance(cert_b64, str) or not cert_b64:
+            raise malformed("missing or invalid cert field")
+
+        try:
+            cert_der = _base64url_decode(cert_b64)
+        except Exception as exc:
+            raise malformed(f"cert is not valid base64url: {exc}") from exc
+
+        try:
+            cert = x509.load_der_x509_certificate(cert_der)
+        except Exception as exc:
+            raise malformed(f"unable to parse certificate: {exc}") from exc
+
+        reason = payload.get("reason")
+        if reason is not None:
+            if not isinstance(reason, int) or reason < 0 or reason > 10:
+                raise bad_revocation_reason(
+                    "reason code must be an integer in the range 0-10"
+                )
+
+        serial_hex = format(cert.serial_number, "x").upper()
+
+        try:
+            san_ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+        except x509.ExtensionNotFound:
+            cert_sans: list[str] = []
+        else:
+            san_value = cast(x509.SubjectAlternativeName, san_ext.value)
+            cert_sans = [str(v) for v in san_value.get_values_for_type(DNSName)]
+
+        # C-1: scope the serial lookup to (serial, account_id) so that a
+        # serial collision cannot return another account's row.  Merging the
+        # not-found and unauthorised outcomes into a single 404 avoids
+        # information leakage about whether another account owns that serial.
+        cert_record = ctx.store.get_certificate_by_serial(serial_hex, account_id)
+        if cert_record is None:
+            raise not_found("certificate not found in RA store")
+
+        if cert_record.status == "revoked":
+            # H-4: RFC 8555 §7.6 says an already-revoked cert returns 200 OK
+            # (idempotent) rather than 400 alreadyRevoked.
+            return JSONResponse(status_code=200, content={})
+
+        try:
+            revocation_result = ctx.revocation.revoke(
+                cert_record.cert_pem,
+                reason,
+            )
+        except Exception as exc:
+            _audit(
+                ctx,
+                event_type="certificate-revoked",
+                account_id=account_id,
+                order_id=cert_record.order_id,
+                sans=cert_sans,
+                outcome="failed",
+                details={
+                    "certificate_id": cert_record.id,
+                    "serial": serial_hex,
+                    "error": str(exc),
+                },
+            )
+            raise server_internal(f"revocation failed: {exc}") from exc
+
+        revoked_at = revocation_result.revoked_at or _now_iso()
+        updated = ctx.store.revoke_certificate(
+            cert_record.id,
+            revocation_result.reason if revocation_result.reason is not None else reason,
+            revoked_at=revoked_at,
+        )
+        if updated is None:
+            raise server_internal("certificate disappeared during revocation")
+
+        # H-1: flip the order to a revoked state so order and cert are consistent.
+        ctx.store.update_order_status(cert_record.order_id, "revoked")
+
+        _audit(
+            ctx,
+            event_type="certificate-revoked",
+            account_id=account_id,
+            order_id=cert_record.order_id,
+            sans=cert_sans,
+            outcome="success",
+            details={
+                "certificate_id": cert_record.id,
+                "serial": serial_hex,
+                "reason": reason,
             },
         )
+
+        return JSONResponse(status_code=200, content={})
 
     return app
 

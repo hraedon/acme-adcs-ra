@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from cryptography import x509
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,6 +37,12 @@ def _load_json(text: str | None) -> Any:
     if text is None:
         return None
     return json.loads(text)
+
+
+def _serial_from_pem(cert_pem: str) -> str:
+    """Return the certificate serial number as uppercase hex."""
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    return format(cert.serial_number, "x").upper()
 
 
 NONCE_TTL_SECONDS: int = 1800  # 30 minutes
@@ -103,6 +111,10 @@ class CertificateRecord:
     requester: str
     issued_at: str
     metadata: dict[str, str]
+    serial_number: str | None = None
+    status: str = "valid"
+    revocation_reason: int | None = None
+    revoked_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +178,11 @@ CREATE TABLE IF NOT EXISTS certificates (
     template TEXT NOT NULL,
     requester TEXT NOT NULL,
     issued_at TEXT NOT NULL,
-    metadata TEXT NOT NULL  -- JSON object
+    metadata TEXT NOT NULL,  -- JSON object
+    serial_number TEXT,
+    status TEXT NOT NULL DEFAULT 'valid',
+    revocation_reason TEXT,
+    revoked_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -206,6 +222,44 @@ class Store:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate_certificates_table(conn)
+
+    def _migrate_certificates_table(self, conn: sqlite3.Connection) -> None:
+        """Add revocation columns to certificates if they are missing."""
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(certificates)"
+            ).fetchall()
+        }
+        for column, ddl in (
+            ("serial_number", "TEXT"),
+            ("status", "TEXT NOT NULL DEFAULT 'valid'"),
+            ("revocation_reason", "TEXT"),
+            ("revoked_at", "TEXT"),
+        ):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE certificates ADD COLUMN {column} {ddl}")
+
+    def _certificate_from_row(self, row: sqlite3.Row) -> CertificateRecord:
+        reason_raw = row["revocation_reason"]
+        revocation_reason = int(reason_raw) if reason_raw is not None else None
+        return CertificateRecord(
+            id=row["id"],
+            order_id=row["order_id"],
+            account_id=row["account_id"],
+            cert_pem=row["cert_pem"],
+            chain_pem=_load_json(row["chain_pem"]),
+            template=row["template"],
+            requester=row["requester"],
+            issued_at=row["issued_at"],
+            metadata=_load_json(row["metadata"]),
+            serial_number=row["serial_number"],
+            status=row["status"],
+            revocation_reason=revocation_reason,
+            revoked_at=row["revoked_at"],
+        )
+
 
     # ------------------------------------------------------------------
     # Accounts
@@ -683,17 +737,7 @@ class Store:
             ).fetchone()
         if row is None:
             return None
-        return CertificateRecord(
-            id=row["id"],
-            order_id=row["order_id"],
-            account_id=row["account_id"],
-            cert_pem=row["cert_pem"],
-            chain_pem=_load_json(row["chain_pem"]),
-            template=row["template"],
-            requester=row["requester"],
-            issued_at=row["issued_at"],
-            metadata=_load_json(row["metadata"]),
-        )
+        return self._certificate_from_row(row)
 
     def create_certificate(
         self,
@@ -708,13 +752,15 @@ class Store:
     ) -> CertificateRecord:
         cert_id = uuid.uuid4().hex
         issued_at = _now_iso()
+        serial_number = _serial_from_pem(cert_pem)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO certificates
                 (id, order_id, account_id, cert_pem, chain_pem, template,
-                 requester, issued_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 requester, issued_at, metadata, serial_number, status,
+                 revocation_reason, revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cert_id,
@@ -726,6 +772,10 @@ class Store:
                     requester,
                     issued_at,
                     _dump_json(metadata or {}),
+                    serial_number,
+                    "valid",
+                    None,
+                    None,
                 ),
             )
         return CertificateRecord(
@@ -738,6 +788,7 @@ class Store:
             requester=requester,
             issued_at=issued_at,
             metadata=metadata or {},
+            serial_number=serial_number,
         )
 
     def get_certificate(self, cert_id: str) -> CertificateRecord | None:
@@ -747,17 +798,58 @@ class Store:
             ).fetchone()
         if row is None:
             return None
-        return CertificateRecord(
-            id=row["id"],
-            order_id=row["order_id"],
-            account_id=row["account_id"],
-            cert_pem=row["cert_pem"],
-            chain_pem=_load_json(row["chain_pem"]),
-            template=row["template"],
-            requester=row["requester"],
-            issued_at=row["issued_at"],
-            metadata=_load_json(row["metadata"]),
-        )
+        return self._certificate_from_row(row)
+
+    def get_certificate_by_serial(
+        self,
+        serial_hex: str,
+        account_id: str | None = None,
+    ) -> CertificateRecord | None:
+        """Look up a certificate by its uppercase hex serial number.
+
+        When *account_id* is provided the lookup is scoped to
+        ``(serial_number, account_id)`` so that a serial collision
+        (possible in test with a static fixture cert) cannot return
+        another account's row.  When *account_id* is ``None`` the
+        legacy serial-only behaviour is preserved for callers that
+        do not have an account context.
+        """
+        with self._connect() as conn:
+            if account_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM certificates WHERE serial_number = ? AND account_id = ?",
+                    (serial_hex.upper(), account_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM certificates WHERE serial_number = ?",
+                    (serial_hex.upper(),),
+                ).fetchone()
+        if row is None:
+            return None
+        return self._certificate_from_row(row)
+
+    def revoke_certificate(
+        self,
+        cert_id: str,
+        reason: int | None,
+        *,
+        revoked_at: str | None = None,
+    ) -> CertificateRecord | None:
+        """Mark a certificate as revoked in the RA store."""
+        timestamp = revoked_at or _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE certificates
+                SET status = 'revoked',
+                    revocation_reason = ?,
+                    revoked_at = ?
+                WHERE id = ?
+                """,
+                (reason, timestamp, cert_id),
+            )
+        return self.get_certificate(cert_id)
 
     # ------------------------------------------------------------------
     # Audit
