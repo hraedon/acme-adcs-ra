@@ -74,6 +74,23 @@ def _raw_ecdsa_to_der(signature: bytes, coordinate_byte_length: int) -> bytes:
     return b"\x30" + _length_bytes(len(seq_body)) + seq_body
 
 
+def jwk_thumbprint(jwk: dict[str, Any]) -> str:
+    """Return the RFC 7638 SHA-256 thumbprint of a JWK (base64url, no padding).
+
+    This is the canonical, key-order-independent identity of an account key —
+    used to deduplicate accounts (RFC 8555 §7.3). Hashing only; never signs.
+    """
+    kty = jwk.get("kty")
+    if kty == "RSA":
+        members = {"e": jwk["e"], "kty": "RSA", "n": jwk["n"]}
+    elif kty == "EC":
+        members = {"crv": jwk["crv"], "kty": "EC", "x": jwk["x"], "y": jwk["y"]}
+    else:
+        raise UnsupportedAlgorithmError(f"cannot thumbprint JWK kty: {kty}")
+    canonical = json.dumps(members, separators=(",", ":"), sort_keys=True).encode("ascii")
+    return _base64url_encode(hashlib.sha256(canonical).digest())
+
+
 def _public_key_from_jwk(jwk: dict[str, Any]) -> rsa.RSAPublicKey | ec.EllipticCurvePublicKey:
     """Build a cryptography public key from a JWK dictionary."""
     kty = jwk.get("kty")

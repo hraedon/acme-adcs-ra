@@ -33,6 +33,7 @@ from cryptography.x509.oid import ExtensionOID
 
 from acme_adcs_ra.acme_errors import (
     AcmeError,
+    account_does_not_exist,
     bad_csr,
     bad_external_account_binding,
     bad_revocation_reason,
@@ -283,6 +284,19 @@ def create_app(context: ServerContext) -> FastAPI:
     ) -> JSONResponse:
         header, payload, account_jwk = await verify_new_account_jws(request, ctx.store)
 
+        # RFC 8555 §7.3: newAccount is idempotent on the account key. If an
+        # account already exists for this key, return it (200) rather than
+        # minting a duplicate; honor onlyReturnExisting (§7.3.1).
+        existing = ctx.store.get_account_by_jwk(account_jwk)
+        if existing is not None:
+            return JSONResponse(
+                status_code=200,
+                content=_account_to_json(ctx, existing),
+                headers={"Location": _account_url(ctx, existing.id)},
+            )
+        if payload.get("onlyReturnExisting") is True:
+            raise account_does_not_exist("no account exists for this key")
+
         eab_jws = payload.get("externalAccountBinding")
         if not isinstance(eab_jws, dict):
             _audit(ctx,
@@ -351,9 +365,7 @@ def create_app(context: ServerContext) -> FastAPI:
         )
 
         body: dict[str, Any] = {
-            "status": account.status,
-            "contact": account.contact,
-            "orders": _url(ctx, f"/acme/acct/{account.id}/orders"),
+            **_account_to_json(ctx, account),
             "externalAccountBinding": eab_jws,
         }
         if ctx.config.terms_of_service:
@@ -493,6 +505,12 @@ def create_app(context: ServerContext) -> FastAPI:
         order = ctx.store.get_order(order_id)
         if order is None:
             return
+        # Only a pending order advances to ready. Without this, re-POSTing a
+        # challenge on an already valid/processing order would regress it to
+        # ready (a state machine regression; finalize's guards prevent a double
+        # issue, but the regression is still wrong).
+        if order.status != "pending":
+            return
         for authz_url in order.authorizations:
             authz_id = authz_url.rsplit("/", 1)[-1]
             authz = ctx.store.get_authorization(authz_id)
@@ -544,21 +562,11 @@ def create_app(context: ServerContext) -> FastAPI:
                 f"order is not ready for finalization (status={order.status})"
             )
 
-        # M3: atomically transition ready -> processing to prevent a
-        # concurrent finalize from issuing a second certificate.
-        if not ctx.store.transition_order_to_processing(order_id):
-            # A concurrent finalize won the CAS; return the processing order.
-            refreshed = ctx.store.get_order(order_id)
-            if refreshed is not None and refreshed.status == "processing":
-                return JSONResponse(
-                    content=_order_to_json(refreshed),
-                    headers={"Retry-After": "3"},
-                )
-            raise malformed(
-                "order is no longer ready for finalization "
-                "(concurrent finalize detected)"
-            )
-
+        # NOTE: all CSR validation and policy evaluation below run while the
+        # order is still 'ready'. The transition to 'processing' (the
+        # point-of-no-return CAS) happens only after they pass, so a rejected
+        # CSR or policy denial leaves the order retryable instead of wedging it
+        # in 'processing' forever.
         csr_b64 = payload.get("csr")
         if not isinstance(csr_b64, str) or not csr_b64:
             raise bad_csr("missing or invalid csr field")
@@ -597,6 +605,34 @@ def create_app(context: ServerContext) -> FastAPI:
 
         requested_sans = san_values
 
+        # RFC 8555 §7.4: the CSR must not request identifiers beyond the order's.
+        # Without this, the order/authz machinery is decorative and the issued
+        # SANs are gated only by EAB policy — the authorized identifier set and
+        # the issued cert could diverge. Compare case-insensitively (RFC 4343).
+        order_dns = {
+            i["value"].lower()
+            for i in order.identifiers
+            if i.get("type") == "dns" and isinstance(i.get("value"), str)
+        }
+        out_of_order = sorted(s for s in requested_sans if s.lower() not in order_dns)
+        if out_of_order:
+            _audit(
+                ctx,
+                event_type="finalize-csr-mismatch",
+                account_id=account_id,
+                order_id=order_id,
+                sans=requested_sans,
+                outcome="denied",
+                details={
+                    "reason": "CSR SANs not in order identifiers",
+                    "out_of_order": out_of_order,
+                },
+            )
+            raise rejected_identifier(
+                "CSR contains identifiers not present in the order: "
+                + ", ".join(out_of_order)
+            )
+
         account = ctx.store.get_account(account_id)
         if account is None:
             raise unauthorized("account not found")
@@ -618,6 +654,23 @@ def create_app(context: ServerContext) -> FastAPI:
             if "out of scope" in decision.reason or "no SANs" in decision.reason:
                 raise rejected_identifier(decision.reason)
             raise bad_csr(decision.reason)
+
+        # Point of no return: atomically transition ready -> processing so a
+        # concurrent finalize cannot issue a second certificate. Done only now,
+        # after all validation has passed, so failed validation never wedges the
+        # order in 'processing'.
+        if not ctx.store.transition_order_to_processing(order_id):
+            refreshed = ctx.store.get_order(order_id)
+            if refreshed is not None and refreshed.status == "processing":
+                return JSONResponse(
+                    content=_order_to_json(refreshed),
+                    headers={"Retry-After": "3"},
+                )
+            # Lost the race to a finalize that already produced a cert, or the
+            # order otherwise moved on — return its current state.
+            if refreshed is not None:
+                return JSONResponse(content=_order_to_json(refreshed))
+            raise server_internal("order disappeared during finalization")
 
         csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("utf-8")
         try:
@@ -805,6 +858,14 @@ def create_app(context: ServerContext) -> FastAPI:
 # ---------------------------------------------------------------------------
 # JSON serializers
 # ---------------------------------------------------------------------------
+
+
+def _account_to_json(context: ServerContext, account: Any) -> dict[str, Any]:
+    return {
+        "status": account.status,
+        "contact": account.contact,
+        "orders": _url(context, f"/acme/acct/{account.id}/orders"),
+    }
 
 
 def _order_to_json(order: Any) -> dict[str, Any]:

@@ -126,3 +126,11 @@ def not_found(detail: str = "resource not found") -> AcmeError:
         detail,
         status=404,
     )
+
+
+def account_does_not_exist(detail: str = "account does not exist") -> AcmeError:
+    return AcmeError(
+        "urn:ietf:params:acme:error:accountDoesNotExist",
+        detail,
+        status=400,
+    )

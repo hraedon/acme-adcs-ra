@@ -18,6 +18,8 @@ from typing import Any, Callable, Sequence
 
 from cryptography import x509
 
+from acme_adcs_ra.jws import jwk_thumbprint
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -135,8 +137,11 @@ CREATE TABLE IF NOT EXISTS accounts (
     jwk_json TEXT NOT NULL,
     eab_kid TEXT NOT NULL,
     contact TEXT NOT NULL,  -- JSON array
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    jwk_thumbprint TEXT  -- RFC 7638 account-key identity, for dedup
 );
+CREATE INDEX IF NOT EXISTS idx_accounts_thumbprint
+    ON accounts (jwk_thumbprint);
 
 CREATE TABLE IF NOT EXISTS nonces (
     nonce TEXT PRIMARY KEY,
@@ -225,12 +230,31 @@ class Store:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path))
         conn.row_factory = sqlite3.Row
+        # FastAPI runs sync handlers in a threadpool, so issuance requests open
+        # concurrent connections. Without a busy timeout, a second writer hits
+        # "database is locked" immediately and surfaces as a 500 instead of the
+        # graceful CAS-loss path; WAL lets readers proceed alongside one writer.
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
             self._migrate_certificates_table(conn)
+            self._migrate_accounts_table(conn)
+
+    def _migrate_accounts_table(self, conn: sqlite3.Connection) -> None:
+        """Add the jwk_thumbprint column to accounts if missing (dedup support)."""
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+        }
+        if "jwk_thumbprint" not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN jwk_thumbprint TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_accounts_thumbprint "
+                "ON accounts (jwk_thumbprint)"
+            )
 
     def _migrate_certificates_table(self, conn: sqlite3.Connection) -> None:
         """Add revocation columns to certificates if they are missing."""
@@ -284,11 +308,13 @@ class Store:
         account_id = uuid.uuid4().hex
         created_at = _now_iso()
         contact_list = list(contact or [])
+        thumbprint = jwk_thumbprint(jwk)
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO accounts (id, status, jwk_json, eab_kid, contact, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO accounts
+                    (id, status, jwk_json, eab_kid, contact, created_at, jwk_thumbprint)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
@@ -297,6 +323,7 @@ class Store:
                     eab_kid,
                     _dump_json(contact_list),
                     created_at,
+                    thumbprint,
                 ),
             )
         return AccountRecord(
@@ -312,6 +339,28 @@ class Store:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return AccountRecord(
+            id=row["id"],
+            status=row["status"],
+            jwk_json=row["jwk_json"],
+            eab_kid=row["eab_kid"],
+            created_at=row["created_at"],
+            contact=_load_json(row["contact"]) or [],
+        )
+
+    def get_account_by_jwk(self, jwk: dict[str, Any]) -> AccountRecord | None:
+        """Return the account whose key matches this JWK (RFC 7638 thumbprint).
+
+        Used to make newAccount idempotent (RFC 8555 §7.3): the same account key
+        returns the existing account rather than creating a duplicate.
+        """
+        thumbprint = jwk_thumbprint(jwk)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE jwk_thumbprint = ?", (thumbprint,)
             ).fetchone()
         if row is None:
             return None

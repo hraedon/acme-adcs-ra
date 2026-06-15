@@ -263,3 +263,40 @@ def _der_to_raw(der_sig: bytes, coordinate_len: int) -> bytes:
     r = _parse_int()
     s = _parse_int()
     return r.to_bytes(coordinate_len, "big") + s.to_bytes(coordinate_len, "big")
+
+
+class TestJwkThumbprint:
+    def test_rfc7638_known_vector(self) -> None:
+        # The canonical example from RFC 7638 §3.1.
+        from acme_adcs_ra.jws import jwk_thumbprint
+
+        jwk = {
+            "kty": "RSA",
+            "n": (
+                "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86z"
+                "wu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY"
+                "4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
+            ),
+            "e": "AQAB",
+        }
+        assert jwk_thumbprint(jwk) == "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+
+    def test_key_order_independent(self) -> None:
+        from acme_adcs_ra.jws import jwk_thumbprint
+
+        a = {"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}
+        b = {"y": "def", "x": "abc", "kty": "EC", "crv": "P-256"}
+        assert jwk_thumbprint(a) == jwk_thumbprint(b)
+
+    def test_alg_member_ignored(self) -> None:
+        from acme_adcs_ra.jws import jwk_thumbprint
+
+        base = {"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}
+        with_alg = {**base, "alg": "ES256"}
+        assert jwk_thumbprint(base) == jwk_thumbprint(with_alg)
+
+    def test_unsupported_kty_raises(self) -> None:
+        from acme_adcs_ra.jws import UnsupportedAlgorithmError, jwk_thumbprint
+
+        with pytest.raises(UnsupportedAlgorithmError):
+            jwk_thumbprint({"kty": "oct", "k": "secret"})

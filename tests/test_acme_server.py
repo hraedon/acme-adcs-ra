@@ -814,3 +814,72 @@ class TestMinimumKeyStrength:
         csr_der = csr.public_bytes(serialization.Encoding.DER)
         finalize_resp = ec_client.finalize_order(order["finalize"], csr_der)
         assert finalize_resp.status_code == 200
+
+
+class TestReviewFixes:
+    """Regression tests for the post-review fixes (CSR<=order, idempotent
+    newAccount, validation-before-processing)."""
+
+    def _ready_order(
+        self, acme_client: HandRolledAcmeClient, identifiers: list[str]
+    ) -> Any:
+        order = acme_client.new_order(identifiers).json()
+        for authz_url in order["authorizations"]:
+            authz = acme_client.get_authorization(authz_url).json()
+            acme_client.validate_challenge(authz["challenges"][0]["url"])
+        return order
+
+    def test_finalize_rejects_csr_san_not_in_order(
+        self, acme_client: HandRolledAcmeClient, test_config: RAConfig
+    ) -> None:
+        # other.WORK-DOMAIN.local is within kid-001's EAB scope (*.WORK-DOMAIN.local)
+        # but was NOT in the order — it must still be rejected (RFC 8555 §7.4).
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = self._ready_order(acme_client, ["web.WORK-DOMAIN.local"])
+        csr_der = _make_csr(["other.WORK-DOMAIN.local"])
+        resp = acme_client.finalize_order(order["finalize"], csr_der)
+        assert resp.status_code == 400
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:rejectedIdentifier"
+        assert "not present in the order" in resp.json()["detail"]
+
+    def test_rejected_csr_leaves_order_retryable(
+        self, acme_client: HandRolledAcmeClient, test_config: RAConfig
+    ) -> None:
+        # A CSR rejected by validation must NOT wedge the order in 'processing';
+        # the client can retry the same order with a correct CSR.
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = self._ready_order(acme_client, ["web.WORK-DOMAIN.local"])
+        bad = acme_client.finalize_order(order["finalize"], _make_csr(["other.WORK-DOMAIN.local"]))
+        assert bad.status_code == 400
+        # Retry with the correct CSR succeeds.
+        good = acme_client.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        assert good.status_code == 200
+        assert good.json()["status"] == "valid"
+
+    def test_finalize_csr_san_case_insensitive_subset(
+        self, acme_client: HandRolledAcmeClient, test_config: RAConfig
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = self._ready_order(acme_client, ["web.WORK-DOMAIN.local"])
+        resp = acme_client.finalize_order(order["finalize"], _make_csr(["WEB.work-domain.local"]))
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "valid"
+
+    def test_new_account_is_idempotent(
+        self, acme_client: HandRolledAcmeClient, test_config: RAConfig
+    ) -> None:
+        first = acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        assert first.status_code == 201
+        second = acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        assert second.status_code == 200
+        assert second.headers["Location"] == first.headers["Location"]
+
+    def test_only_return_existing_unknown_key(
+        self, acme_client: HandRolledAcmeClient
+    ) -> None:
+        # No account for this key yet; onlyReturnExisting must 400 accountDoesNotExist
+        # without needing EAB.
+        url = f"{acme_client.base_url}/acme/new-acct"
+        resp = acme_client._post_jws(url, {"onlyReturnExisting": True}, is_new_account=True)
+        assert resp.status_code == 400
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:accountDoesNotExist"
