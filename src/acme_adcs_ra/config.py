@@ -46,10 +46,34 @@ class RAConfig(BaseSettings):
     adcs_host: str = "CA01.WORK-DOMAIN.local"
     adcs_template: str = "ACME-ServerAuth"
     adcs_ca_name: str = "CONTOSO-CA01-CA"
+    # Optional PEM bundle to verify the ADCS /certsrv/ TLS cert (private CA).
+    # None/blank -> OS trust store (the gMSA host's local roots).
+    adcs_ca_bundle: str | None = None
 
     # --- ACME server surface -------------------------------------------------
     base_url: str = "http://localhost:8000"
     terms_of_service: str = ""
+
+    # --- TLS termination (optional) ------------------------------------------
+    # When both are set, uvicorn terminates TLS directly. This is the
+    # scheduled-task / gMSA deployment shape, where there is no IIS reverse
+    # proxy in front. Leave both unset to serve plain HTTP (loopback-only lab
+    # use, e.g. the enrollment spike with a local client).
+    tls_certfile: Path | None = None
+    tls_keyfile: Path | None = None
+
+    # --- Bind address (decoupled from base_url for reverse-proxy hosting) -----
+    # Behind IIS/HttpPlatformHandler (or any reverse proxy) the app binds to a
+    # loopback port the proxy assigns, while base_url stays the PUBLIC URL used
+    # to construct ACME directory / JWS-bound URLs. Empty/None => derive from
+    # base_url (direct-serve / loopback lab use).
+    bind_host: str = ""
+    bind_port: int | None = None
+    # When fronted by a TLS-terminating reverse proxy, trust its forwarded
+    # headers so the JWS full-URL binding (threat-model §4.D) sees the public
+    # scheme/host. forwarded_allow_ips bounds which proxy IPs may set them.
+    trust_proxy: bool = False
+    forwarded_allow_ips: str = "127.0.0.1"
 
     # --- SAN scope per account (kid → allowed DNS glob patterns) -------------
     san_scopes: dict[str, SANScope] = {}
@@ -82,6 +106,14 @@ class RAConfig(BaseSettings):
             if entry.kid in seen:
                 raise ValueError(f"duplicate EAB kid: {entry.kid}")
             seen.add(entry.kid)
+        return self
+
+    @model_validator(mode="after")
+    def _tls_cert_key_paired(self) -> "RAConfig":
+        """TLS needs both halves or neither — a lone cert/key is a misconfig
+        that would silently fall back to plain HTTP."""
+        if bool(self.tls_certfile) != bool(self.tls_keyfile):
+            raise ValueError("tls_certfile and tls_keyfile must be set together")
         return self
 
     def eab_keys_by_kid(self) -> dict[str, str]:
