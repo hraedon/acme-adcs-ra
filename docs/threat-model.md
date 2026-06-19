@@ -9,16 +9,36 @@ and holds a standing enrollment identity. Worst case is *mis-issuance* or *leak
 of that identity* — not "wrong analysis." The read-only family conventions do
 not apply.
 
-> **⚠️ STUB GATE — the issuance HTTP path is unproven until WI-1 closes.**
-> `CertsrvEnrollmentLeg` and `CertsrvRevocationLeg` are **platform-gated stubs**
-> that raise `NotImplementedError`. The entire `/certsrv/` round-trip
-> (Negotiate/SSPI → `certfnsh.asp` / `certrev.asp` → ADCS CA database write with
-> **requester = `gMSA-acme-ra$`**) has **not been exercised against a live CA**.
-> Every control downstream of "ADCS issued/revoked a cert" (chain fetch, error
-> mapping, requester capture, audit fields) is *analyzed*, not *verified*. The
-> spike's acceptance criterion — **requester = `gMSA-acme-ra$` in the CA
-> database, cert chains to the existing root** — is the gate. Until it passes,
-> this document describes intent, not deployed behavior.
+> **⚠️ STUB GATE — the issuance HTTP path is implemented but unconfirmed until
+> WI-1 closes; revocation has no `/certsrv/` endpoint at all.**
+>
+> - **Enrollment (`CertsrvEnrollmentLeg`)** is now a **real implementation**
+>   (the proven `certfnsh.asp` / `certnew.cer` / `certnew.p7b` payload, with
+>   `raise_for_status`, content-type checks, and PKCS#7 chain parsing). It is
+>   unit-tested against a fake HTTP session on Linux; the live round-trip
+>   (Negotiate/SSPI as the gMSA → ADCS CA database write with **requester =
+>   `gMSA-acme-ra$`**, cert chaining to the existing root) has **not yet been
+>   exercised against a live CA**. The spike (`docs/spike-runbook.md`,
+>   `lab/spike_mode_a.py`) is the confirmation run. Until it passes, the
+>   enrollment path is *built, not deployed*.
+> - **Revocation (`CertsrvRevocationLeg`)** is an **honest `NotImplementedError`
+>   stub.** ADCS Web Enrollment exposes **no revocation endpoint** (Microsoft
+>   Learn enumerates only request-cert / retrieve-CA-cert / retrieve-CRL;
+>   `magnuswatn/certsrv` has no `revoke()`; `acme2certifier` returns "not
+>   supported"). A fictional `certrev.asp` form that appeared in one draft was
+>   removed. The real mechanism is `certutil -revoke` or `ICertAdmin2`
+>   `RevokeCertificate`, which requires granting the gMSA **CA-officer
+>   ("Manage CA") rights** — a blast-radius change that is an operator
+>   decision (see §E) and is **out of scope until then**. The server's
+>   `revokeCert` endpoint remains wired to this leg via `FakeRevocationLeg`
+>   (dev) so the mechanism drops in without an ACME-surface change.
+>
+> Every control downstream of "ADCS issued a cert" (chain fetch, error mapping,
+> requester capture, audit fields) is *analyzed and unit-tested*, not
+> *live-verified*. The enrollment spike's acceptance criterion — **requester =
+>   `gMSA-acme-ra$` in the CA database, cert chains to the existing root** — is
+>   the gate. Until it passes, this document describes intent, not deployed
+>   behavior.
 
 ## 1. System & trust model
 
@@ -176,6 +196,19 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   design, accepted here.
 - **Residual:** a compromised issuing account can revoke its own certs (denial
   of availability for that account's services). Bounded; audited.
+- **CA-side revocation is a documented gap (operator decision required).** The
+  controls above are all **RA-store-level** (the RA marks the cert revoked and
+  stops serving it). The passthrough to the ADCS CA database / CRL is **not
+  implemented**: ADCS Web Enrollment exposes no revocation endpoint, so
+  `CertsrvRevocationLeg` is an honest `NotImplementedError` stub. The real
+  mechanism (`certutil -revoke` or `ICertAdmin2` COM) requires granting the
+  gMSA **CA-officer ("Manage CA") rights** — which would let a compromised RA
+  host revoke *any* cert on the CA, not just its own. That blast-radius
+  increase is an **operator decision**: either accept it (separate, more-
+  privileged revoke identity preferred over widening the enrollment gMSA), or
+  treat revocation as an out-of-band CA-officer action and have the RA's
+  `revokeCert` decline/record-only. Until decided, a `revokeCert` that succeeds
+  flips the RA store only — **the cert is still valid against the CA's CRL.**
 
 ### F. Audit / SIEM
 - **Every** issuance, policy-denial, enrollment-failure, account creation
@@ -254,14 +287,21 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 
 ## 7. Known gaps & residuals (tracked, not resolved)
 
-- **Real enrollment/revocation HTTP path unproven** (the stub gate) — the spike
-  resolves it.
+- **Real enrollment HTTP path implemented, pending live confirmation** (the
+  stub gate): `CertsrvEnrollmentLeg` is real and unit-tested against a fake
+  session; the WI-1 spike (`docs/spike-runbook.md`) confirms requester, chain,
+  and EKU against the lab CA.
+- **Revocation has no `/certsrv/` endpoint** — `CertsrvRevocationLeg` is an
+  honest `NotImplementedError` stub. The mechanism (`certutil`/`ICertAdmin2`)
+  + its gMSA CA-officer privilege implication is an **operator decision**
+  (§4.E). Until then `revokeCert` flips the RA store only, not the CA CRL.
 - **Stuck-`processing` orders** have no auto-recovery; ops reconciles manually.
   Follow-up: add `processing_started_at` + an alert.
-- **`EnrollmentDenied` vs `EnrollmentTransportError`** are scaffolded but not yet
-  wired through the finalize handler (all enrollment failures are 500 today);
-  wire post-spike so transport errors map to 503+`Retry-After` and policy denials
-  to 400, with distinct audit categories.
+- **`EnrollmentDenied` vs `EnrollmentTransportError`** are scaffolded and now
+  **raised** by the real enrollment leg, but not yet **wired through the
+  finalize handler** (all enrollment failures still map to 500 today); wire so
+  transport errors map to 503+`Retry-After` and policy denials to 400, with
+  distinct audit categories.
 - **EAB kid-existence timing side-channel** (§4.B) — cheap dummy-HMAC follow-up.
 - **DoS caps not in code** (§4.G) — proxy + code follow-up before pilot.
 - **Enterprise-trust shortcut:** in-scope SANs issue without domain proof; the
@@ -273,4 +313,5 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 - Public-DV trust model.
 - CES/WSTEP (Mode C2) transport — documented only.
 - Auto-recovery of a stuck `processing` order (near-term follow-up, §7).
-- The real `/certsrv/` HTTP bodies — platform-gated stubs until the spike.
+- CA-side revocation (CRL write) — `revokeCert` is RA-store-only until the
+  mechanism decision (§4.E); the `/certsrv/` enrollment bodies are now real.

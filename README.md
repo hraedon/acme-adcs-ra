@@ -85,9 +85,19 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-Charter / pre-code, and **spike-gated** — see
-[`plans/001-spike-and-mvp.md`](plans/001-spike-and-mvp.md). The single
-feasibility gate is a lab spike proving FastAPI-as-gMSA → `/certsrv/` Negotiate →
-ADCS issuance → ACME cert back to Certify the Web. Start with
-[`docs/architecture.md`](docs/architecture.md) and
+Built and unit-tested; **live-spike-gated.** The ACME server (RFC 8555 subset:
+directory, EAB-gated accounts, orders, finalize, cert retrieval, revokeCert),
+deterministic issuance policy, SIEM audit emission, and the real ADCS
+**enrollment** leg (`/certsrv/` `certfnsh.asp` → issued cert + PKCS#7 chain,
+passwordless gMSA/Negotiate) are implemented — see
+[`docs/architecture.md`](docs/architecture.md),
+[`docs/threat-model.md`](docs/threat-model.md) (note the **STUB GATE**), and
 [`docs/certsrv-setup.md`](docs/certsrv-setup.md).
+
+The single **live feasibility gate** remaining is the WI-1 lab spike
+([`docs/spike-runbook.md`](docs/spike-runbook.md)): prove FastAPI-as-gMSA →
+`/certsrv/` Negotiate → ADCS issuance with **requester = `gMSA-acme-ra$`** in the
+CA database and the cert chaining to the existing root. **CA-side revocation is
+a documented gap** — ADCS Web Enrollment exposes no revocation endpoint; the
+mechanism + its gMSA privilege implication is an operator decision
+(threat-model §E).

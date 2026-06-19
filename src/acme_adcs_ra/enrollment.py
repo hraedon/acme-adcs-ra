@@ -10,11 +10,20 @@ certificate-minting primitive at runtime.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import importlib.resources
+import os
+import re
 import sys
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Protocol, Sequence, cast
+
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import pkcs7
 
 
 # ---------------------------------------------------------------------------
@@ -123,18 +132,107 @@ class FakeEnrollmentLeg:
 
 
 # ---------------------------------------------------------------------------
-# Real ADCS enrollment leg — platform-gated stub
+# HTTP session Protocols (enable dependency-injection for unit tests)
 # ---------------------------------------------------------------------------
 
 
-class CertsrvEnrollmentLeg:
-    """ADCS Web Enrollment leg via /certsrv/.
+class HttpResponse(Protocol):
+    """Minimal view of an HTTP response (satisfied by ``requests.Response``)."""
 
-    The real implementation requires Windows SSPI/Negotiate auth
-    (``requests-negotiate-sspi``) and will be filled by the
-    Mode A lab spike (WI-1).  On non-Windows platforms the class is
-    importable but ``submit_csr`` always raises ``NotImplementedError``.
+    status_code: int
+    text: str
+    content: bytes
+    headers: Mapping[str, str]
+
+    def raise_for_status(self) -> None: ...
+
+
+class HttpSession(Protocol):
+    """Minimal HTTP session (satisfied by ``requests.Session`` on win32).
+
+    Duck-typed so a test fake can stand in for ``requests.Session`` without
+    the win32-only ``requests``/``requests-negotiate-sspi`` deps being
+    installed.  ``requests`` is *only* imported inside ``_build_session``
+    (the win32 default-session path), never at module top level.
     """
+
+    def post(
+        self, url: str, *, data: Mapping[str, str], timeout: float
+    ) -> HttpResponse: ...
+
+    def get(
+        self, url: str, *, params: Mapping[str, str], timeout: float
+    ) -> HttpResponse: ...
+
+
+# ---------------------------------------------------------------------------
+# Real ADCS enrollment leg — /certsrv/ via Negotiate/SSPI (Mode A)
+# ---------------------------------------------------------------------------
+
+# certfnsh.asp payload borrowed from magnuswatn/certsrv (the proven reference
+# cited in docs/architecture.md) and mirrored in lab/spike_mode_a.py:
+#   https://github.com/magnuswatn/certsrv/blob/master/certsrv.py
+_CERTFNSH_USER_AGENT = "acme-adcs-ra/0.1-enroll (Mode A)"
+
+
+class CertsrvEnrollmentLeg:
+    """ADCS Web Enrollment leg via ``/certsrv/`` (Mode A).
+
+    The real implementation authenticates to the ADCS Web Enrollment surface
+    as the process's ambient **gMSA** identity using Negotiate/SSPI
+    (``requests-negotiate-sspi``) — no stored password.  It POSTs the CSR to
+    ``certfnsh.asp``, then fetches the issued certificate and the CA chain.
+
+    On non-Windows platforms the class is importable but ``submit_csr`` raises
+    ``NotImplementedError`` *unless* a ``session_factory`` is injected (which is
+    how the full logic is unit-tested on Linux without a live CA).
+
+    The RA holds **no signing key**; this leg only *forwards* the client's CSR
+    and *parses* the ADCS-issued certificate/chain.  It never builds or signs
+    a certificate (the pkcs7 *builder* is never used; only the loaders are).
+    """
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        template: str,
+        ca_name: str | None = None,
+        ca_bundle: str | None = None,
+        timeout: float = 30.0,
+        session_factory: Callable[[], HttpSession] | None = None,
+    ) -> None:
+        self._host = host
+        self._template = template
+        self._ca_name = ca_name
+        self._ca_bundle = ca_bundle
+        self._timeout = timeout
+        self._session_factory = session_factory
+
+    def _build_session(self) -> HttpSession:
+        """Build the win32 default session (lazy imports; never called on Linux).
+
+        ``requests`` and ``requests-negotiate-sspi`` are
+        ``sys_platform == 'win32'``-gated in pyproject; importing them here
+        keeps the Linux env clean.  The ambient process identity (the gMSA) is
+        used — no password is ever stored or read.
+        """
+        import requests  # type: ignore[import-untyped]
+        from requests_negotiate_sspi import (  # type: ignore[import-not-found]
+            HttpNegotiateAuth,
+        )
+
+        session = requests.Session()
+        session.auth = HttpNegotiateAuth()  # passwordless; ambient gMSA identity
+        session.headers.update({"User-agent": _CERTFNSH_USER_AGENT})
+        session.verify = self._ca_bundle if self._ca_bundle else True
+        return cast(HttpSession, session)
+
+    def _requester(self) -> str:
+        """Best-effort capture of the ambient enrollment identity (the gMSA)."""
+        domain = os.environ.get("USERDOMAIN", "")
+        user = os.environ.get("USERNAME", "?")
+        return f"{domain}\\{user}" if domain else user
 
     def submit_csr(
         self,
@@ -143,15 +241,135 @@ class CertsrvEnrollmentLeg:
         account_id: str,
         requested_sans: Sequence[str],
     ) -> EnrollmentResult:
-        if sys.platform != "win32":
+        # Linux guard preserved: without an injected session the live
+        # Negotiate/SSPI path is unavailable on non-Windows platforms.  When a
+        # session_factory is injected (tests) the full logic runs regardless of
+        # platform so it is unit-testable on Linux without a live CA.
+        if sys.platform != "win32" and self._session_factory is None:
             raise NotImplementedError(
                 "CertsrvEnrollmentLeg requires Windows (SSPI/Negotiate auth). "
                 "Use FakeEnrollmentLeg for dev/CI."
             )
-        # The live /certsrv/ implementation goes here (WI-1).
-        # It will import requests-negotiate-sspi inside this method
-        # so the import only happens on Windows at call time.
-        raise NotImplementedError(
-            "CertsrvEnrollmentLeg not yet implemented — "
-            "filled by the Mode A spike (WI-1)"
+
+        session = (
+            self._session_factory()
+            if self._session_factory is not None
+            else self._build_session()
         )
+        base = f"https://{self._host}/certsrv"
+        timeout = self._timeout
+
+        try:
+            # 1. Submit the CSR to certfnsh.asp (payload per magnuswatn/certsrv).
+            form = {
+                "Mode": "newreq",
+                "CertRequest": csr_pem,
+                "CertAttrib": f"CertificateTemplate:{self._template}\r\n",
+                "FriendlyType": "Saved-Request Certificate",
+                "TargetStoreFlags": "0",
+                "SaveCert": "yes",
+            }
+            resp = session.post(f"{base}/certfnsh.asp", data=form, timeout=timeout)
+            resp.raise_for_status()
+            body = resp.text
+            m = re.search(r"certnew\.cer\?ReqID=(\d+)&", body)
+            if not m:
+                if re.search(r"Certificate Pending", body, re.IGNORECASE):
+                    rid = re.search(r"Your Request Id is (\d+)", body)
+                    raise EnrollmentTransportError(
+                        "certificate pending CA-manager approval "
+                        f"(ReqID={rid.group(1) if rid else '?'}); "
+                        "turn off manager approval on the template — the RA is the gate"
+                    )
+                msg = re.search(r'The disposition message is "([^"]+)', body)
+                if msg:
+                    raise EnrollmentDenied(f"CA denied the request: {msg.group(1)}")
+                raise EnrollmentTransportError(
+                    f"unexpected certfnsh.asp response (HTTP {resp.status_code})"
+                )
+            req_id = m.group(1)
+
+            # 2. Fetch the issued certificate (base64 or PEM).
+            cert_resp = session.get(
+                f"{base}/certnew.cer",
+                params={"ReqID": req_id, "Enc": "b64"},
+                timeout=timeout,
+            )
+            cert_resp.raise_for_status()
+            ct = cert_resp.headers.get("Content-Type")
+            if ct != "application/pkix-cert":
+                raise EnrollmentTransportError(
+                    f"unexpected content-type from certnew.cer: {ct!r}"
+                )
+            cert_pem = _parse_cert_body(cert_resp.content)
+
+            # 3. Fetch the CA chain (PKCS#7).  First scrape nRenewals from
+            #    certcarc.asp, then GET certnew.p7b (mirrors spike_mode_a.py).
+            arc_resp = session.get(f"{base}/certcarc.asp", params={}, timeout=timeout)
+            arc_resp.raise_for_status()
+            nren = re.search(r"var nRenewals=(\d+);", arc_resp.text)
+            renewals = nren.group(1) if nren else "0"
+            chain_resp = session.get(
+                f"{base}/certnew.p7b",
+                params={"ReqID": "CACert", "Renewal": renewals, "Enc": "b64"},
+                timeout=timeout,
+            )
+            chain_resp.raise_for_status()
+            chain_pem = _parse_pkcs7_chain(chain_resp.content)
+        except EnrollmentDenied:
+            raise
+        except EnrollmentTransportError:
+            raise
+        except Exception as exc:
+            raise EnrollmentTransportError(
+                f"ADCS enrollment transport error: {exc}"
+            ) from exc
+
+        metadata: dict[str, str] = {
+            "req_id": req_id,
+            "host": self._host,
+            "source": "certsrv",
+        }
+        if self._ca_name:
+            metadata["ca_name"] = self._ca_name
+
+        return EnrollmentResult(
+            cert_pem=cert_pem,
+            chain_pem=chain_pem,
+            template=self._template,
+            requester=self._requester(),
+            metadata=metadata,
+        )
+
+
+def _parse_cert_body(body: bytes) -> str:
+    """Parse a ``certnew.cer`` response into a PEM string.
+
+    ADCS with ``Enc=b64`` may return either a PEM block or a raw base64-encoded
+    DER blob; handle both robustly.  This is a read/parse operation — no signing
+    primitive is involved.
+    """
+    if body.lstrip().startswith(b"-----BEGIN CERTIFICATE"):
+        return body.strip().decode("ascii")
+    cleaned = body.replace(b"\n", b"").replace(b"\r", b"").replace(b" ", b"")
+    der = base64.b64decode(cleaned, validate=True)
+    cert = x509.load_der_x509_certificate(der)
+    return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def _parse_pkcs7_chain(body: bytes) -> list[str]:
+    """Parse a ``certnew.p7b`` PKCS#7 response into a list of PEM cert strings.
+
+    Per spec: try ``load_der_pkcs7_certificates`` after base64-decoding, falling
+    back to ``load_pem_pkcs7_certificates``.  This is a read/parse operation —
+    no signing primitive is involved (the pkcs7 *builder* is never used).
+    """
+    try:
+        cleaned = body.replace(b"\n", b"").replace(b"\r", b"").replace(b" ", b"")
+        der = base64.b64decode(cleaned, validate=True)
+        certs = pkcs7.load_der_pkcs7_certificates(der)
+    except (binascii.Error, ValueError):
+        certs = pkcs7.load_pem_pkcs7_certificates(body)
+    if not certs:
+        raise EnrollmentTransportError("CA returned an empty PKCS#7 chain")
+    return [c.public_bytes(serialization.Encoding.PEM).decode("ascii") for c in certs]

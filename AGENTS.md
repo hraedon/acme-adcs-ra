@@ -71,5 +71,11 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-Charter / pre-code, spike-gated (`plans/001`). The lab spike is the feasibility
-gate before meaningful code.
+ACME server (RFC 8555 subset) + EAB/policy + SIEM audit + revokeCert are built
+and unit-tested; the real ADCS **enrollment** leg is implemented (real
+`certfnsh.asp` payload, pending the live WI-1 spike confirmation — see
+`docs/spike-runbook.md` and the STUB GATE in `docs/threat-model.md`). **CA-side
+revocation is a documented gap**: ADCS Web Enrollment exposes no revocation
+endpoint, so `CertsrvRevocationLeg` is an honest `NotImplementedError` stub
+pending the mechanism decision (threat-model §E). The live spike is still the
+feasibility gate before a production pilot.

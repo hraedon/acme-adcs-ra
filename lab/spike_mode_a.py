@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +47,7 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 log = logging.getLogger("spike")
@@ -85,6 +87,48 @@ def build_csr(san: str) -> tuple[str, bytes]:
         serialization.NoEncryption(),
     )
     return csr_pem, key_pem
+
+
+def _verify_requester(req_id: int) -> bool:
+    """Confirm Requester in the CA database is the gMSA (the gate's AC).
+
+    Runs ``certutil -view`` and checks the Requester column contains the
+    expected account.  Returns True if confirmed, False if it could not be
+    auto-confirmed (the caller then prints a manual-verification fallback).
+    Best-effort lab helper.
+    """
+    expected = os.environ.get("ACME_RA_SPIKE_EXPECTED_REQUESTER", "gMSA-acme-ra$")
+    try:
+        result = subprocess.run(
+            [
+                "certutil", "-view",
+                "-restrict", f"RequestID={req_id}",
+                "-out", "Requester",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - lab script
+        log.warning("certutil -view invocation failed: %s", exc)
+        return False
+    if result.returncode != 0:
+        log.warning("certutil -view exited %d: %s", result.returncode, result.stderr.strip())
+        return False
+    m = re.search(r"Requester\s*[:]?\s*(\S+)", result.stdout)
+    if not m:
+        log.warning("could not parse Requester from certutil output")
+        return False
+    requester = m.group(1)
+    if expected.lower() not in requester.lower():
+        log.error(
+            "Requester MISMATCH: CA DB has %r, expected to contain %r",
+            requester, expected,
+        )
+        return False
+    log.info("CA database confirms Requester = %s (matches the gMSA)", requester)
+    return True
 
 
 def main() -> int:
@@ -160,9 +204,8 @@ def main() -> int:
         # 3. Fetch the CA chain (PKCS#7) for chain verification.
         arc = session.get(f"https://{HOST}/certsrv/certcarc.asp", timeout=TIMEOUT)
         arc.raise_for_status()
-        renewals = (re.search(r"var nRenewals=(\d+);", arc.text) or re.match("0", "0")).group(
-            1
-        ) if re.search(r"var nRenewals=(\d+);", arc.text) else "0"
+        nren = re.search(r"var nRenewals=(\d+);", arc.text)
+        renewals = nren.group(1) if nren else "0"
         chain_r = session.get(
             f"https://{HOST}/certsrv/certnew.p7b",
             params={"ReqID": "CACert", "Renewal": renewals, "Enc": "b64"},
@@ -206,17 +249,45 @@ def main() -> int:
     if sans != [SAN]:
         log.warning("issued SANs != requested (%r) - template may be overriding", SAN)
 
+    # 5. Inspect the CA chain so the operator can confirm it is the EXISTING
+    #    chain (no new intermediate) - the other half of the WI-1 AC.
+    try:
+        chain_bytes = (OUT / "spike.chain.p7b").read_bytes()
+        try:
+            chain_certs = pkcs7.load_der_pkcs7_certificates(chain_bytes)
+        except Exception:
+            chain_certs = pkcs7.load_pem_pkcs7_certificates(chain_bytes)
+        log.info("CA chain (%d cert(s)) - confirm these are the EXISTING chain:", len(chain_certs))
+        for i, c in enumerate(chain_certs):
+            log.info("  [%d] subject=%s", i, c.subject.rfc4514_string())
+            log.info("      issuer =%s", c.issuer.rfc4514_string())
+    except Exception as exc:  # noqa: BLE001 - lab script
+        log.warning("could not parse chain for inspection: %s", exc)
+
+    # 6. Verify the requester in the CA database is the gMSA. This is the
+    #    load-bearing audit control and the project's feasibility gate.
+    requester_ok = _verify_requester(req_id)
+
     print("\nSUCCESS - enrollment round-trip complete.")
     print(f"Artifacts in: {OUT.resolve()}")
-    print("\nNow CONFIRM the requester in the CA database (the audit hook):")
+    if not requester_ok:
+        print(
+            "\nWARNING: could not auto-confirm Requester = gMSA-acme-ra$ in the CA"
+            " database. Run this manually and DO NOT proceed until it holds:"
+        )
+        print(
+            f'  certutil -view -restrict "RequestID={req_id}" '
+            "-out RequestID Requester CommonName CertificateTemplate RequestDisposition"
+        )
+        print("  Expected: Requester = WORK-DOMAIN\\gMSA-acme-ra$")
+        print(
+            "If Requester is anything else, Mode A is NOT behaving as local-enrollment"
+            " - stop and investigate before building the ACME server on this assumption."
+        )
     print(
-        f'  certutil -view -restrict "RequestID={req_id}" '
-        "-out RequestID Requester CommonName CertificateTemplate RequestDisposition"
-    )
-    print("  Expected: Requester = WORK-DOMAIN\\gMSA-acme-ra$")
-    print(
-        "\nIf Requester is anything else, Mode A is NOT behaving as local-enrollment"
-        " - stop and investigate before building the ACME server on this assumption."
+        "\nNOTE: this spike exercises ENROLLMENT only. ADCS Web Enrollment exposes"
+        " no revocation endpoint; revokeCert is a separate, documented gap"
+        " (see docs/threat-model.md §E)."
     )
     return 0
 

@@ -318,10 +318,24 @@ class TestRevocationLeg:
         assert result.reason == 1
         assert result.revoked_at is not None
 
-    def test_certsrv_stub_raises_not_implemented(self) -> None:
+    def test_certsrv_leg_is_importable(self) -> None:
+        assert CertsrvRevocationLeg is not None
+
+    def test_certsrv_leg_ctor_no_args(self) -> None:
         leg = CertsrvRevocationLeg()
-        with pytest.raises(NotImplementedError):
-            leg.revoke("pem", reason=0)
+        assert isinstance(leg, CertsrvRevocationLeg)
+
+    def test_certsrv_leg_revoke_is_not_implemented(self) -> None:
+        leg = CertsrvRevocationLeg()
+        with pytest.raises(NotImplementedError, match="no revocation endpoint"):
+            leg.revoke("no-matter", reason=0)
+
+    def test_certsrv_leg_error_cites_mechanism(self) -> None:
+        leg = CertsrvRevocationLeg()
+        with pytest.raises(NotImplementedError) as exc_info:
+            leg.revoke("no-matter", reason=0)
+        msg = str(exc_info.value)
+        assert "certutil" in msg or "ICertAdmin" in msg
 
 
 # ---------------------------------------------------------------------------

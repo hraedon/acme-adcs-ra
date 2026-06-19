@@ -1,15 +1,28 @@
 """Revocation leg — the interface between the RA and the certificate revoker.
 
-Defines the ``RevocationLeg`` protocol, a dev/CI fake, and a platform-gated
-stub for the real ADCS Web Enrollment revocation implementation.
+Defines the ``RevocationLeg`` protocol, a dev/CI fake, and an honest stub for
+a real ADCS revocation mechanism.
 
-The RA holds **no signing key**.  Revocation is a request to the ADCS CA to
-add the certificate to its CRL; the RA never signs a CRL itself.
+The RA holds **no signing key**.  ADCS Web Enrollment (``/certsrv/``) exposes
+no revocation endpoint: Microsoft Learn enumerates only request-cert /
+retrieve-CA-cert / retrieve-CRL, the proven ``magnuswatn/certsrv`` reference has
+no ``revoke()`` method, and ``acme2certifier`` returns "Revocation is not
+supported."  The fictional ``certrev.asp`` / ``certrv.asp`` payload that was
+present in an earlier draft has been removed.
+
+The real revocation mechanism is ``certutil -revoke <serial> <reason>`` or
+``ICertAdmin2::RevokeCertificate`` (COM).  Either path requires granting the
+gMSA CA-officer rights ("Manage CA"), which is a security-model decision for
+the operator and must be documented in ``docs/threat-model.md`` §E before it is
+wired in.
+
+The server's ``revokeCert`` endpoint remains connected to this leg, so once a
+mechanism is chosen and implemented it can drop in without changing the ACME
+surface.
 """
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -72,33 +85,39 @@ class FakeRevocationLeg:
 
 
 # ---------------------------------------------------------------------------
-# Real ADCS revocation leg — platform-gated stub
+# Real ADCS revocation leg — documented gap
 # ---------------------------------------------------------------------------
 
 
 class CertsrvRevocationLeg:
-    """ADCS Web Enrollment revocation leg via /certsrv/certrev.asp.
+    """Honest stub for ADCS certificate revocation.
 
-    The real implementation requires Windows SSPI/Negotiate auth
-    (``requests-negotiate-sspi``) and will be filled by the post-spike work.
-    On non-Windows platforms the class is importable but ``revoke`` always
-    raises ``NotImplementedError``.
+    ADCS Web Enrollment does **not** expose a revocation endpoint; the fictional
+    ``certrev.asp`` / ``certrv.asp`` form implementation was removed after
+    reviewers confirmed the endpoint does not exist.  The server still routes
+    ``revokeCert`` here so a real mechanism can be wired in later.
+
+    Possible mechanisms (operator choice, each with a privilege implication):
+
+    * ``certutil -revoke <serial> <reason>`` run by the gMSA.
+    * ``ICertAdmin2::RevokeCertificate`` over COM from Python.
+
+    Both require CA-officer ("Manage CA") rights for the gMSA — see
+    ``docs/threat-model.md`` §E.
     """
+
+    def __init__(self, *, host: str = "", ca_bundle: str | None = None, timeout: float = 30.0) -> None:
+        pass
 
     def revoke(
         self,
         cert_pem: str,
         reason: int | None,
     ) -> RevocationResult:
-        if sys.platform != "win32":
-            raise NotImplementedError(
-                "CertsrvRevocationLeg requires Windows (SSPI/Negotiate auth). "
-                "Use FakeRevocationLeg for dev/CI."
-            )
-        # Live /certsrv/certrev.asp implementation goes here (post-spike).
-        # It will import requests-negotiate-sspi inside this method so the
-        # import only happens on Windows at call time.
         raise NotImplementedError(
-            "CertsrvRevocationLeg not yet implemented — "
-            "filled post-spike (POST to /certsrv/certrev.asp)"
+            "ADCS Web Enrollment (/certsrv/) exposes no revocation endpoint. "
+            "The real mechanism is `certutil -revoke <serial> <reason>` or "
+            "ICertAdmin2::RevokeCertificate (COM), which requires granting the gMSA "
+            "CA-officer (Manage CA) rights — a security-model decision "
+            "(see docs/threat-model.md §E). Not yet implemented."
         )
