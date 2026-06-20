@@ -6,6 +6,8 @@ The enrollment leg (``EnrollmentLeg``) forwards accepted CSRs to ADCS.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 from collections.abc import Callable
@@ -45,7 +47,11 @@ from acme_adcs_ra.acme_errors import (
     unsupported_identifier,
 )
 from acme_adcs_ra.config import RAConfig
-from acme_adcs_ra.enrollment import EnrollmentLeg
+from acme_adcs_ra.enrollment import (
+    EnrollmentLeg,
+    EnrollmentDenied,
+    EnrollmentTransportError,
+)
 from acme_adcs_ra.jws import JWSValidationError, verify_eab_jws, _base64url_decode
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.revocation import RevocationLeg
@@ -57,6 +63,19 @@ from acme_adcs_ra.siem import SiemEmitter, SiemConfig, build_siem_config, defaul
 from acme_adcs_ra.store import Store, _now_iso
 
 logger = logging.getLogger("acme_adcs_ra.server")
+
+
+def _dummy_hmac(eab_jws: dict[str, Any]) -> None:
+    """Perform a dummy HMAC to equalize timing on unknown EAB kid path.
+
+    This mitigates the kid-existence timing side-channel (threat-model §4.B).
+    """
+    protected_b64 = eab_jws.get("protected", "")
+    payload_b64 = eab_jws.get("payload", "")
+    signing_input = f"{protected_b64}.{payload_b64}".encode("ascii")
+    # Use a fixed dummy key - the result is discarded, only the time matters.
+    dummy_key = b"dummy-timing-equalization-key-32-bytes!!"
+    hmac.new(dummy_key, signing_input, hashlib.sha256).digest()
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +292,34 @@ def create_app(context: ServerContext) -> FastAPI:
     async def new_nonce_get(ctx: ServerContext = Depends(_ctx)) -> Response:
         return _nonce_response(ctx)
 
+    def _require_admin_token(request: Request, ctx: ServerContext) -> None:
+        """Verify the Authorization: Bearer <admin_token> header."""
+        admin_token = ctx.config.admin_token.get_secret_value()
+        if not admin_token:
+            raise unauthorized("admin endpoint not configured")
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise unauthorized("missing Bearer token")
+        provided = auth_header.split(" ", 1)[1]
+        import hmac
+        if not hmac.compare_digest(provided, admin_token):
+            raise unauthorized("invalid admin token")
+
+    # Administrative: explicit nonce cleanup endpoint for cron (replaces
+    # probabilistic GC). Returns count of deleted nonces. Requires Bearer token.
+    @app.delete("/acme/admin/nonces")
+    async def cleanup_nonces(
+        request: Request, ctx: ServerContext = Depends(_ctx)
+    ) -> JSONResponse:
+        _require_admin_token(request, ctx)
+        deleted = ctx.store.cleanup_expired_nonces()
+        _audit(ctx,
+            event_type="admin-nonce-cleanup",
+            outcome="success",
+            details={"deleted": deleted},
+        )
+        return JSONResponse(content={"deleted": deleted})
+
     # ------------------------------------------------------------------
     # newAccount
     # ------------------------------------------------------------------
@@ -329,6 +376,10 @@ def create_app(context: ServerContext) -> FastAPI:
             )
         mac_key = ctx.config.eab_key_bytes(eab_kid)
         if mac_key is None:
+            # Timing equalization: perform a dummy HMAC with a random key so
+            # the unknown-kid path takes comparable time to the known-kid path.
+            # This mitigates the kid-existence timing side-channel (threat-model §4.B).
+            _dummy_hmac(eab_jws)
             _audit(ctx,
                 event_type="account-creation-denied",
                 outcome="failed",
@@ -391,6 +442,13 @@ def create_app(context: ServerContext) -> FastAPI:
         identifiers_raw = payload.get("identifiers")
         if not isinstance(identifiers_raw, list) or not identifiers_raw:
             raise malformed("newOrder payload must contain a non-empty identifiers list")
+
+        # DoS cap: max identifiers per order (threat-model §4.G)
+        max_idents = ctx.config.max_identifiers_per_order
+        if len(identifiers_raw) > max_idents:
+            raise malformed(
+                f"too many identifiers in order (max {max_idents}, got {len(identifiers_raw)})"
+            )
 
         identifiers: list[dict[str, str]] = []
         for item in identifiers_raw:
@@ -576,6 +634,12 @@ def create_app(context: ServerContext) -> FastAPI:
         except Exception as exc:
             raise bad_csr(f"csr is not valid base64url: {exc}") from exc
 
+        # DoS cap: max CSR size (threat-model §4.G)
+        if len(csr_der) > ctx.config.max_csr_size_bytes:
+            raise bad_csr(
+                f"CSR too large (max {ctx.config.max_csr_size_bytes} bytes, got {len(csr_der)})"
+            )
+
         try:
             csr = load_der_x509_csr(csr_der)
         except Exception:
@@ -679,8 +743,41 @@ def create_app(context: ServerContext) -> FastAPI:
                 account_id=account_id,
                 requested_sans=requested_sans,
             )
+        except EnrollmentDenied as exc:
+            # The CA definitively denied the request (policy violation) — no cert
+            # was issued, so there is no double-issuance risk from reverting the
+            # order back to 'ready'. This keeps the order retryable for the client.
+            ctx.store.update_order_status(order_id, "ready")
+            _audit(ctx,
+                event_type="finalize-enrollment-denied",
+                account_id=account_id,
+                order_id=order_id,
+                sans=requested_sans,
+                template=decision.template,
+                outcome="denied",
+                details={"error": str(exc)},
+            )
+            raise rejected_identifier(str(exc)) from exc
+        except EnrollmentTransportError as exc:
+            _audit(ctx,
+                event_type="finalize-enrollment-transport-failed",
+                account_id=account_id,
+                order_id=order_id,
+                sans=requested_sans,
+                template=decision.template,
+                outcome="failed",
+                details={"error": str(exc)},
+            )
+            order = ctx.store.get_order(order_id)
+            if order is None:
+                raise server_internal("order disappeared during enrollment transport error")
+            return JSONResponse(
+                status_code=503,
+                content=_order_to_json(order),
+                headers={"Retry-After": "30"},
+            )
         except Exception as exc:
-            _audit(ctx, 
+            _audit(ctx,
                 event_type="finalize-enrollment-failed",
                 account_id=account_id,
                 order_id=order_id,
@@ -876,6 +973,8 @@ def _order_to_json(order: Any) -> dict[str, Any]:
         "authorizations": order.authorizations,
         "finalize": order.finalize_url,
         **({"certificate": order.certificate_url} if order.certificate_url else {}),
+        **({"processing_started_at": order.processing_started_at}
+           if order.processing_started_at else {}),
     }
 
 

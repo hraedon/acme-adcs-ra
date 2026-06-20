@@ -8,7 +8,6 @@ carries no signing primitives.
 from __future__ import annotations
 
 import json
-import random
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -85,6 +84,7 @@ class OrderRecord:
     expires: str
     created_at: str
     updated_at: str
+    processing_started_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -158,7 +158,8 @@ CREATE TABLE IF NOT EXISTS orders (
     certificate_url TEXT,
     expires TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    processing_started_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS authorizations (
@@ -220,9 +221,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
 class Store:
     """SQLite-backed RA store."""
 
-    def __init__(self, db_path: Path, order_expiry_seconds: int = 3600) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        order_expiry_seconds: int = 3600,
+        max_authorizations_per_order: int = 50,
+    ) -> None:
         self._db_path = db_path
         self._order_expiry_seconds = order_expiry_seconds
+        self._max_authorizations_per_order = max_authorizations_per_order
         # Ensure parent directory exists so SQLite can create the file.
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
@@ -243,6 +250,7 @@ class Store:
             conn.executescript(_SCHEMA)
             self._migrate_certificates_table(conn)
             self._migrate_accounts_table(conn)
+            self._migrate_orders_table(conn)
 
     def _migrate_accounts_table(self, conn: sqlite3.Connection) -> None:
         """Add the jwk_thumbprint column to accounts if missing (dedup support)."""
@@ -272,6 +280,17 @@ class Store:
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE certificates ADD COLUMN {column} {ddl}")
+
+    def _migrate_orders_table(self, conn: sqlite3.Connection) -> None:
+        """Add processing_started_at column to orders if missing."""
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(orders)"
+            ).fetchall()
+        }
+        if "processing_started_at" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN processing_started_at TEXT")
 
     def _certificate_from_row(self, row: sqlite3.Row) -> CertificateRecord:
         reason_raw = row["revocation_reason"]
@@ -385,10 +404,6 @@ class Store:
                 "INSERT INTO nonces (nonce, created_at) VALUES (?, ?)",
                 (nonce, now.strftime("%Y-%m-%dT%H:%M:%SZ")),
             )
-            # Probabilistic GC: ~1% of nonce creations also purge expired nonces.
-            if random.random() < 0.01:
-                cutoff = (now - timedelta(seconds=NONCE_TTL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-                conn.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
         return nonce
 
     def consume_nonce(self, nonce: str) -> bool:
@@ -475,6 +490,7 @@ class Store:
             expires=row["expires"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            processing_started_at=row["processing_started_at"],
         )
 
     def update_order_status(
@@ -515,9 +531,9 @@ class Store:
         updated_at = _now_iso()
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE orders SET status = ?, updated_at = ? "
+                "UPDATE orders SET status = ?, updated_at = ?, processing_started_at = ? "
                 "WHERE id = ? AND status = 'ready'",
-                ("processing", updated_at, order_id),
+                ("processing", updated_at, updated_at, order_id),
             )
             return cursor.rowcount == 1
 

@@ -84,6 +84,13 @@ class RAConfig(BaseSettings):
     # expired or well-behaved clients reject them immediately.
     order_expiry_seconds: int = 3600
 
+    # --- DoS caps (threat-model §4.G) ----------------------------------------
+    # Maximum identifiers per order (bounds per-request work and DB growth)
+    # In this implementation, 1 identifier = 1 authorization, so this caps both.
+    max_identifiers_per_order: int = 50
+    # Maximum CSR body size in bytes (bounds memory + parsing work)
+    max_csr_size_bytes: int = 8192
+
     # --- SIEM / audit emission -----------------------------------------------
     # Auditing every issuance is mandatory (hard rule). There is no toggle.
     # The default sink is JSON-lines next to the database; syslog and Splunk
@@ -97,6 +104,9 @@ class RAConfig(BaseSettings):
     siem_hec_token: SecretStr = Field(default_factory=lambda: SecretStr(""))
     siem_hec_index: str = ""
     siem_hec_sourcetype: str = "acme-adcs-ra"
+
+    # Admin API token for maintenance endpoints (e.g., nonce cleanup)
+    admin_token: SecretStr = Field(default_factory=lambda: SecretStr(""))
 
     @model_validator(mode="after")
     def _no_duplicate_eab_kids(self) -> "RAConfig":

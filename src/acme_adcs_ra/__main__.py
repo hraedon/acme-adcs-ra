@@ -33,7 +33,11 @@ def main() -> int:
     dotenv = os.environ.get("ACME_RA_DOTENV")
     # _env_file is a pydantic-settings runtime init kwarg; its stubs don't expose it.
     config = RAConfig(_env_file=dotenv) if dotenv else RAConfig()  # type: ignore[call-arg]
-    store = Store(config.db_path, order_expiry_seconds=config.order_expiry_seconds)
+    store = Store(
+        config.db_path,
+        order_expiry_seconds=config.order_expiry_seconds,
+        max_authorizations_per_order=config.max_identifiers_per_order,
+    )
     policy = _build_policy(config)
     # Use the real ADCS legs on Windows (Negotiate/SSPI as the gMSA), otherwise
     # the fake legs.  For dev/CI on Linux this always selects Fake*Leg.
