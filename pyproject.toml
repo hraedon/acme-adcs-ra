@@ -10,16 +10,17 @@ dependencies = [
     "cryptography",       # CSR parsing, JWS verification
     "pydantic",
     "pydantic-settings",  # env-var / config-file loading
-    # Enrollment leg is Windows/SSPI-only; platform-gated so Linux CI is unaffected:
-    "requests; sys_platform == 'win32'",
-    "requests-negotiate-sspi; sys_platform == 'win32'",
+    "requests",           # ADCS /certsrv/ HTTP client + the Negotiate auth handler
+    # SPNEGO/Negotiate with channel binding (EPA=Require) as the ambient gMSA.
+    # Windows-only (SSPI via sspilib); platform-gated so Linux CI is unaffected.
+    "pyspnego; sys_platform == 'win32'",
 ]
 
 [project.scripts]
 acme-adcs-ra = "acme_adcs_ra.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "ruff", "mypy"]
+dev = ["pytest", "httpx", "ruff", "mypy", "types-requests"]
 
 [build-system]
 requires = ["hatchling"]

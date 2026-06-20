@@ -101,8 +101,10 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 - A **lockfile** (`uv.lock`) must be in use and committed for the pilot;
   dependencies reviewed for known vulns at pilot time.
 - `cryptography`, `fastapi`, `pydantic`, `uvicorn` are on the issuance path
-  (request parsing, settings); `requests-negotiate-sspi`/`winkerberos` are the
-  win32 enrollment client. **A CVE in any of these is a pilot-blocker.**
+  (request parsing, settings); `requests` + `pyspnego` (SSPI via `sspilib`) are
+  the win32 enrollment client — the in-tree `negotiate_auth.NegotiateAuth`
+  replaced the single-maintainer `requests-negotiate-sspi`, which also broke on
+  Python 3.14. **A CVE in any of these is a pilot-blocker.**
 - Binary/native deps (SSPI, Kerberos) are pinned to a known-good version.
 
 ## 4. Adversaries → controls → residual risk
@@ -249,8 +251,9 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 - **Template (`ACME-ServerAuth`):** Server Authentication EKU **only**; subject
   in request; no manager approval (the RA is the gate); minimum key size ≤ CSR.
 - **IIS `/certsrv/`:** HTTPS-only; Windows Auth enabled, Anonymous disabled;
-  Negotiate preferred, **NTLM removed** once Kerberos is proven; EPA=Accept;
-  IP-restricted to the RA host.
+  Negotiate preferred, **NTLM removed** once Kerberos is proven; **EPA=Require**
+  (the RA channel-binds via `pyspnego`, so the hardened setting is supported —
+  no need to weaken to Accept); IP-restricted to the RA host.
 - **Reverse proxy:** network allowlist enforced here (the RA endpoint is not
   public); `--proxy-headers` + `--forwarded-allow-ips` on uvicorn; per-account
   rate limit.
@@ -269,7 +272,8 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 3. **gMSA host hardened** to the §4.A bar (tier-0-adjacent, auditable).
 4. **Separation of duty** (§4.A insider): RA host admin ≠ CA host admin ≠ EAB
    custodian.
-5. **NTLM removed** from `/certsrv/` providers; EPA=Accept.
+5. **NTLM removed** from `/certsrv/` providers; **EPA=Require** (channel-bound
+   by the RA via `pyspnego`).
 6. **Network allowlist** at the reverse proxy; uvicorn `--proxy-headers` +
    `--forwarded-allow-ips` configured (§4.D).
 7. **Rate limiting + caps** (§4.G) in place at the proxy / code.

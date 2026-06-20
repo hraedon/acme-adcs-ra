@@ -27,7 +27,8 @@ no new intermediate. See `README.md` for the charter.
   security-critical.** This is not read-only software; there is no "it's just
   analysis" safety margin.
 - **Passwordless to ADCS.** Authenticate as a **gMSA** via Negotiate/SSPI
-  (`requests-negotiate-sspi` / `winkerberos`, ambient process identity). **No
+  (`pyspnego`, SPNEGO + RFC 5929 channel binding so EPA=Require is supported;
+  ambient process identity via in-tree `negotiate_auth.NegotiateAuth`). **No
   stored ADCS passwords.** EAB keys and any secrets are never committed.
 - **Deterministic issuance policy.** Which template, which SANs are permitted, who
   may request — explicit policy code. **No LLM in the issuance decision path.**

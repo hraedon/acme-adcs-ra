@@ -213,20 +213,19 @@ class CertsrvEnrollmentLeg:
         self._session_factory = session_factory
 
     def _build_session(self) -> HttpSession:
-        """Build the win32 default session (lazy imports; never called on Linux).
+        """Build the live ADCS session: SPNEGO/Negotiate as the ambient gMSA,
+        channel-bound to the CA's TLS cert (works with ``/certsrv/`` EPA=Require).
 
-        ``requests`` and ``requests-negotiate-sspi`` are
-        ``sys_platform == 'win32'``-gated in pyproject; importing them here
-        keeps the Linux env clean.  The ambient process identity (the gMSA) is
-        used — no password is ever stored or read.
+        ``pyspnego`` is ``sys_platform == 'win32'``-gated; ``NegotiateAuth``
+        imports it lazily so the Linux env stays clean. No password is ever
+        stored or read — the current Windows logon (the gMSA) is used.
         """
-        import requests  # type: ignore[import-untyped]
-        from requests_negotiate_sspi import (  # type: ignore[import-not-found]
-            HttpNegotiateAuth,
-        )
+        import requests
+
+        from acme_adcs_ra.negotiate_auth import NegotiateAuth
 
         session = requests.Session()
-        session.auth = HttpNegotiateAuth()  # passwordless; ambient gMSA identity
+        session.auth = NegotiateAuth(self._host, ca_bundle=self._ca_bundle)
         session.headers.update({"User-agent": _CERTFNSH_USER_AGENT})
         session.verify = self._ca_bundle if self._ca_bundle else True
         return cast(HttpSession, session)
