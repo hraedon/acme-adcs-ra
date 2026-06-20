@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import binascii
 import importlib.resources
+import logging
 import os
 import re
 import sys
@@ -24,6 +25,8 @@ from typing import Protocol, Sequence, cast
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +324,9 @@ class CertsrvEnrollmentLeg:
         except EnrollmentTransportError:
             raise
         except Exception as exc:
+            # Preserve the stack for diagnosis — the wrapped message alone loses
+            # where in the request/parse flow an unexpected error originated.
+            _log.exception("certsrv enrollment failed (unexpected error)")
             raise EnrollmentTransportError(
                 f"ADCS enrollment transport error: {exc}"
             ) from exc
