@@ -298,12 +298,19 @@ class CertsrvEnrollmentLeg:
                 timeout=timeout,
             )
             cert_resp.raise_for_status()
-            ct = cert_resp.headers.get("Content-Type")
-            if ct != "application/pkix-cert":
+            # ADCS Web Enrollment is inconsistent about the certnew.cer
+            # content-type (observed live: text/html wrapping an Enc=b64 PEM
+            # body). Don't gate on the header — parse the body as a certificate
+            # and fail only if that fails, surfacing a snippet for diagnosis.
+            try:
+                cert_pem = _parse_cert_body(cert_resp.content)
+            except Exception as exc:
+                ct = cert_resp.headers.get("Content-Type")
+                snippet = " ".join(cert_resp.text[:400].split())
                 raise EnrollmentTransportError(
-                    f"unexpected content-type from certnew.cer: {ct!r}"
-                )
-            cert_pem = _parse_cert_body(cert_resp.content)
+                    f"certnew.cer did not return a parseable certificate "
+                    f"(content-type {ct!r}): {exc}; body: {snippet}"
+                ) from exc
 
             # 3. Fetch the CA chain (PKCS#7).  First scrape nRenewals from
             #    certcarc.asp, then GET certnew.p7b (mirrors spike_mode_a.py).
@@ -369,12 +376,39 @@ def _parse_pkcs7_chain(body: bytes) -> list[str]:
     back to ``load_pem_pkcs7_certificates``.  This is a read/parse operation —
     no signing primitive is involved (the pkcs7 *builder* is never used).
     """
-    try:
-        cleaned = body.replace(b"\n", b"").replace(b"\r", b"").replace(b" ", b"")
-        der = base64.b64decode(cleaned, validate=True)
-        certs = pkcs7.load_der_pkcs7_certificates(der)
-    except (binascii.Error, ValueError):
-        certs = pkcs7.load_pem_pkcs7_certificates(body)
+    text = body.decode("latin-1", errors="replace")
+    # The PEM markers ADCS uses here are unreliable: this surface returns a PKCS7
+    # SignedData wrapped in -----BEGIN CERTIFICATE----- markers (text/html
+    # content-type). So collect the DER blob from any PEM block (or the whole
+    # body as raw base64), then try to read each blob as a PKCS7 bundle first and
+    # a single DER certificate second.
+    blobs: list[bytes] = []
+    for match in re.finditer(r"-----BEGIN [A-Z0-9 ]+-----(.*?)-----END [A-Z0-9 ]+-----", text, re.DOTALL):
+        try:
+            blobs.append(base64.b64decode(re.sub(r"\s+", "", match.group(1))))
+        except (binascii.Error, ValueError):
+            continue
+    if not blobs:
+        try:
+            blobs.append(base64.b64decode(re.sub(rb"\s+", b"", body)))
+        except (binascii.Error, ValueError):
+            pass
+
+    certs: list[x509.Certificate] = []
+    for der in blobs:
+        try:
+            certs.extend(pkcs7.load_der_pkcs7_certificates(der))
+            continue
+        except (ValueError, TypeError):
+            pass
+        try:
+            certs.append(x509.load_der_x509_certificate(der))
+        except (ValueError, TypeError):
+            pass
+
     if not certs:
-        raise EnrollmentTransportError("CA returned an empty PKCS#7 chain")
+        snippet = " ".join(text[:300].split())
+        raise EnrollmentTransportError(
+            f"certnew.p7b did not contain a parseable chain (len={len(body)}); body: {snippet}"
+        )
     return [c.public_bytes(serialization.Encoding.PEM).decode("ascii") for c in certs]
