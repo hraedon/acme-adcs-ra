@@ -57,6 +57,7 @@ param(
     [switch]$ConfigureIIS,
     [string]$SitePath = "C:\inetpub\acme-adcs-ra",
     [string]$HostName = "",
+    [int]$Port = 443,
     [switch]$SharePort443,
     [string]$TlsCertThumbprint = ""
 )
@@ -75,7 +76,7 @@ $logs     = Join-Path $InstallDir "logs"
 $envFile  = Join-Path $InstallDir "acme-ra.env"
 
 # --- Validate the gMSA: resolve its SID and (best-effort) confirm it installed -
-if ($GmsaAccount -notmatch "\$$") {
+if ($GmsaAccount -notmatch '\$$') {
     Write-Host "[warn] -GmsaAccount `"$GmsaAccount`" has no trailing `$ -- gMSA SAM names end in `$. Continuing, but verify."
 }
 try {
@@ -86,7 +87,7 @@ try {
     throw "Could not resolve gMSA account `"$GmsaAccount`". Use DOMAIN\gMSA-name$ form and confirm it exists."
 }
 # Strip the domain for Test-ADServiceAccount (it wants the SAM without DOMAIN\).
-$gmsaSam = ($GmsaAccount -replace ".*\\", "") -replace "\$$", ""
+$gmsaSam = ($GmsaAccount -replace ".*\\", "") -replace '\$$', ""
 if (Get-Command Test-ADServiceAccount -ErrorAction SilentlyContinue) {
     try {
         if (Test-ADServiceAccount -Identity $gmsaSam) {
@@ -391,7 +392,7 @@ if ($ConfigureIIS) {
 
         $siteName = "acme-adcs-ra"
         $sitePathIIS = "IIS:\Sites\$siteName"
-        $bindingInfo = "*:443:$HostName"
+        $bindingInfo = "*:$($Port):$HostName"
         $sslFlagsValue = if ($SharePort443) { 1 } else { 0 }
         if (-not (Get-Item $sitePathIIS -ErrorAction SilentlyContinue)) {
             Write-Host "  Creating IIS site `"$siteName`" ..."
@@ -427,8 +428,8 @@ if ($ConfigureIIS) {
         if ($TlsCertThumbprint) {
             Write-Host "  Binding TLS certificate $TlsCertThumbprint ..."
             $appId = "{B2C3D4E5-F6A7-8901-BCDE-F23456789012}"
-            $ipport = "0.0.0.0:443"
-            $hostPort = "$HostName`:443"
+            $ipport = "0.0.0.0:$Port"
+            $hostPort = "$HostName`:$Port"
             if ($SharePort443) {
                 Ensure-SslCertBinding -BindingArgument "hostnameport=$hostPort" -Thumbprint $TlsCertThumbprint -AppId $appId
                 $catchallShow = & netsh http show sslcert ipport="$ipport" 2>&1 | Out-String
@@ -471,7 +472,9 @@ Write-Host "Done. acme-adcs-ra installed to $venv"
 Write-Host "Data dir: $InstallDir   Audit DB: $InstallDir\acme_ra.db   Env file: $envFile"
 if ($script:iisActuallyConfigured) {
     Write-Host "IIS site: $SitePath   App pool: $AppPool (as $GmsaAccount)"
-    if ($HostName) { Write-Host "ACME directory: https://$HostName/acme/directory" }
+    $dispHost = if ($HostName) { $HostName } else { $env:COMPUTERNAME }
+    $portSuffix = if ($Port -eq 443) { "" } else { ":$Port" }
+    Write-Host "ACME directory: https://$dispHost$portSuffix/directory"
 }
 Write-Host ""
 Write-Host "Before first use:"
