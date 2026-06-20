@@ -37,8 +37,11 @@ The minimum to serve an enterprise client:
 
 ## Enrollment leg (RA → ADCS)
 
-- Submit the CSR to `/certsrv/certfnsh.asp` with **Negotiate/SSPI**, authenticated
-  as the service's ambient **gMSA** identity — no stored password.
+- Submit the CSR to `/certsrv/certfnsh.asp` with **SPNEGO/Negotiate + channel
+  binding** (RFC 5929 `tls-server-end-point`, via the in-tree
+  `negotiate_auth.NegotiateAuth` over `pyspnego`), authenticated as the service's
+  ambient **gMSA** identity — no stored password. Channel binding is what lets it
+  work against `/certsrv/` hardened with **EPA=Require** (the secure setting).
 - The **certificate template** governs validity, EKU, key rules, and subject
   handling. The RA does not set validity; the template does.
 - **Reference implementation (read, do not depend on):** acme2certifier's

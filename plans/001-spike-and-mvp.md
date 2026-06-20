@@ -1,6 +1,8 @@
 # Plan 001 — Lab spike & MVP
 
-**Status:** proposed 2026-06-13
+**Status:** WI-1 **DONE** (2026-06-20, proven on the lab); Phase 0 + Phase 2
+(ACME server + EAB/policy) + Phase 3 (audit + threat model) shipped. Originally
+proposed 2026-06-13.
 **Author:** Opus 4.8 (promoted from `maybe-projects/acme-to-adcs-bridge.md`)
 **Strategic role:** acme-adcs-ra is charter-stage. Unlike the read-only siblings,
 this is **issuance-path infrastructure**, so the sequencing is built around one
@@ -20,7 +22,15 @@ them into a proven round-trip, then a minimal server.
 
 ## The feasibility gate (do this before writing the ACME server)
 
-### WI-1 — Mode A enrollment spike on CA01
+### WI-1 — Mode A enrollment spike on CA01  ✅ DONE (2026-06-20)
+
+> Proven **not** via the standalone spike script but via the **deployed RA** (IIS
+> app pool as the gMSA) driven by an ACME client: a real serverAuth-only cert
+> issued off the existing CA, SAN from the CSR, chaining to the existing root,
+> requester = the gMSA. The layered fixes (channel-bound pyspnego auth for
+> EPA=Require, root-pinned trust, a proper `/certsrv/` TLS cert, tolerant
+> certnew/p7b parsing) are in the RA + `docs/spike-runbook.md`.
+
 Execute `docs/certsrv-setup.md` Mode A end to end and **correct the runbook from
 reality**: install Web Enrollment on CA01, create the `ACME-ServerAuth`
 server-auth template, create + install `gMSA-acme-ra`, and prove that a process

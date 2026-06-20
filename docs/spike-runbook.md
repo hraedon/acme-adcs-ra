@@ -1,14 +1,20 @@
 # Spike runbook — WI-1, Mode A enrollment round-trip
 
-The project's **feasibility gate**. Execute this on the **domain-joined Windows
-RA host, running as the gMSA**, to prove the `/certsrv/` enrollment round-trip
-against the lab CA. This is the one step whose physics is unproven; everything
-else in the plan is ordinary engineering.
+> **RESULT: WI-1 PASSED (2026-06-20).** Proven on the lab **not** via the
+> standalone `lab/spike_mode_a.py` script (now superseded — it still uses the old
+> auth + strict parsing and would fail) but via the **deployed RA itself**: an IIS
+> app pool running as the gMSA, driven by an ACME client, issued a real cert
+> through `finalize` — serverAuth-only EKU, SAN from the CSR, off the existing CA,
+> chaining to the existing root. The layered issues found are in the
+> troubleshooting table; the durable fixes live in the RA (`negotiate_auth.py`,
+> `enrollment.py`) and `scripts/install-windows.ps1`.
+
+This runbook proves the `/certsrv/` enrollment round-trip against the CA. It was
+the project's **feasibility gate** — the one step whose physics was unproven.
 
 > Placeholders: `CA01` = issuing CA host; `WORK-DOMAIN.local` = AD domain;
-> `gMSA-acme-ra$` = the RA's gMSA. Set the real values via env vars at run
-> time — **never commit them.** (The lab CA's real FQDN, `ca01…`, is set
-> via `ACME_RA_SPIKE_HOST` in the Scheduled Task below.)
+> `gMSA-acme-ra$` = the RA's gMSA. Set real values via env / gitignored config at
+> run time — **never commit them.**
 
 ## What runs
 
@@ -23,19 +29,22 @@ requester in the CA database is the gMSA**. On success it prints `SUCCESS`.
 1. **Web Enrollment** installed on the CA (`Install-WindowsFeature ADCS-Web-Enrollment` + `Install-AdcsWebEnrollment`).
 2. **`ACME-ServerAuth` template** published: Server Authentication EKU *only*; subject supplied in the request; **no manager approval**; `gMSA-acme-ra$` granted Read + Enroll only.
 3. **gMSA installed on the RA host**: `Install-ADServiceAccount -Identity "gMSA-acme-ra"`; `Test-ADServiceAccount` green.
-4. **`/certsrv/` locked down** (IIS on the CA): Windows Authentication enabled, Anonymous disabled, HTTPS required, EPA = Accept, IP-restricted to the RA host.
+4. **`/certsrv/` locked down** (IIS on the CA): Windows Authentication enabled, Anonymous disabled, HTTPS required, **EPA = Require** (the RA channel-binds, so the hardened setting works), IP-restricted to the RA host.
+5. **`/certsrv/` presents a proper serverAuth TLS cert** — NOT the CA's own certificate (a CA cert as a TLS leaf is rejected by the RA/OpenSSL as "unsuitable purpose"). Issue a server cert for the CA's FQDN and bind it; an **SNI binding** works without disturbing the catch-all. The RA verifies it against `ACME_RA_ADCS_CA_BUNDLE` = the enterprise **root** PEM (Python uses certifi, not the Windows store).
 
 ## Step 1 — Python env on the RA host
 
-The RA package's platform-gated deps (`requests`, `requests-negotiate-sspi`) are
-pulled automatically on Windows. On the RA host, as a human admin:
+The RA package's platform-gated deps (`requests` base + `pyspnego` on win32) are
+pulled automatically. **In practice the canonical deployment is
+`scripts/install-windows.ps1`** (IIS + HttpPlatformHandler, app pool as the gMSA);
+the manual venv below is just for an ad-hoc check. On the RA host, as an admin:
 
 ```powershell
 # Python 3.12+ on the RA host
 py -m venv C:\acme-ra\venv
 C:\acme-ra\venv\Scripts\python -m pip install -U pip
 # Install the RA package from your private remote / a drop, editable:
-C:\acme-ra\venv\Scripts\python -m pip install -e .      # pulls requests + requests-negotiate-sspi on win32
+C:\acme-ra\venv\Scripts\python -m pip install -e .      # pulls requests + pyspnego on win32
 C:\acme-ra\venv\Scripts\python -m pip install cryptography   # already a dep; belt-and-braces for the spike
 ```
 
@@ -46,7 +55,7 @@ principal is the gMSA, triggered on demand. Register and run it (as a human
 admin with permission to create tasks under the gMSA principal):
 
 ```powershell
-$env:ACME_RA_SPIKE_HOST     = "ca01.work-domain.local"   # the REAL lab CA FQDN — do not commit
+$env:ACME_RA_SPIKE_HOST     = "CA01.WORK-DOMAIN.local"   # your CA FQDN — real value via env, do not commit
 $env:ACME_RA_SPIKE_TEMPLATE = "ACME-ServerAuth"
 $env:ACME_RA_SPIKE_SAN      = "spike.acme-ra.test"
 # If ADCS TLS uses a private CA the host doesn't trust, point at the chain:
@@ -70,9 +79,9 @@ Get-Content "C:\acme-ra\spike-out\spike-run.log" -Wait -ErrorAction SilentlyCont
 ```
 
 > A gMSA's negotiable identity is its **ambient** process identity — that is
-> exactly what `requests-negotiate-sspi`'s `HttpNegotiateAuth()` uses. No
-> password is read or stored. This is the same posture the production RA
-> service uses.
+> exactly what the in-tree `negotiate_auth.NegotiateAuth` (pyspnego, with channel
+> binding) uses. No password is read or stored. This is the same posture the
+> production RA app pool uses.
 
 ## Step 3 — read the result
 
@@ -114,12 +123,16 @@ loudly and falls back to printing the manual `certutil -view` command.
   revocation endpoint; `revokeCert` remains a documented gap pending the
   mechanism decision (`docs/threat-model.md` §E). See the runbook follow-up.
 
-## Troubleshooting (from the spike docstring)
+## Troubleshooting — the actual issues hit getting WI-1 to pass
 
 | Symptom | Cause / fix |
 |---|---|
-| 401 loop / auth fail | Not running as the gMSA (check the task principal), or the host can't reach a DC. |
-| TLS error | ADCS uses a private CA; set `ACME_RA_SPIKE_CA_BUNDLE` to the CA chain. |
+| TLS verify "unable to get local issuer" | Python verifies against certifi, not the Windows store. Set `ACME_RA_ADCS_CA_BUNDLE` to the enterprise **root** PEM (export from the box's store). |
+| TLS verify "unsuitable certificate purpose" | `/certsrv/` is serving the **CA's own cert** as its TLS leaf. Bind a real serverAuth cert for the CA FQDN (an SNI binding leaves the catch-all intact). |
+| `SEC_E_INVALID_TOKEN` on auth | `/certsrv/` has **EPA=Require** and the client didn't channel-bind. The in-tree `NegotiateAuth` (pyspnego) binds via `tls-server-end-point`; confirm it's in use. |
+| `'error' object is not subscriptable` | Still on `requests-negotiate-sspi` on Python 3.14 — it crashes logging the real SSPI error. Use the in-tree `NegotiateAuth`. |
+| `template ... is not supported` (`0x80094800`) | `ACME-ServerAuth` isn't **published** on the CA (`Add-CATemplate`), even if it exists in AD. |
+| `unexpected content-type ... text/html` / "no PKCS7 tag" | ADCS returns `certnew.cer` as `text/html` and `certnew.p7b` as PKCS7-in-CERTIFICATE-markers; the leg already tolerates this — extend it if a new variant appears. |
 | "Certificate Pending" | Manager approval is still on for the template — turn it off (the RA is the gate). |
-| "denied" / disposition | gMSA lacks Enroll on the template, or the SAN falls outside template policy. |
-| Kerberos fails, NTLM ok | In IIS Windows Auth set EPA to "Accept" (not "Required"); then drop NTLM once Kerberos is proven. |
+| 401 / "denied" disposition | Not running as the gMSA, or the gMSA lacks Enroll on the template, or the SAN is out of template policy. |
+| CA/AD op fails `ERROR_NOT_AUTHENTICATED` over PS-remoting | Kerberos double-hop — run the op in a **scheduled task** (full token), not directly in the WinRM session. |

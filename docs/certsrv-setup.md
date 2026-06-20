@@ -73,7 +73,15 @@ the OCSP responder, so this is incremental, not net-new IIS).
 - **Windows Authentication: enabled; Anonymous: disabled** on the `/certsrv/`
   app.
 - Prefer **Negotiate (Kerberos)** providers; keep Negotiate above NTLM.
-- Require **HTTPS** on the site (bind a server-auth cert; CA01 can issue its own).
+- Require **HTTPS** — bind a **dedicated server-auth cert** for the CA's FQDN
+  (CA01 can issue one to itself). **Do not leave the CA's own certificate bound**
+  as the TLS cert: a non-Windows client (the RA, via OpenSSL) rejects a CA cert
+  used as a TLS leaf ("unsuitable certificate purpose"), even though SChannel
+  tolerates it. An **SNI binding** for the CA FQDN can add the proper cert
+  without disturbing a catch-all binding (`netsh http add sslcert hostnameport=`).
+- **Extended Protection (EPA): Require.** The RA channel-binds (RFC 5929
+  `tls-server-end-point`, via pyspnego), so the hardened setting works — no need
+  to drop to Accept.
 - Restrict access to the RA host at the IIS/firewall layer (the RA is the only
   legitimate caller).
 
@@ -81,8 +89,10 @@ the OCSP responder, so this is incremental, not net-new IIS).
 
 From the RA host, running as the gMSA, a Negotiate-authenticated POST to
 `https://CA01/certsrv/certfnsh.asp` with a test CSR should return an issued cert.
-(The spike automates this with `requests-negotiate-sspi`.) Confirm the cert
-appears in the CA database with requester = `gMSA-acme-ra$`.
+(The RA's `negotiate_auth.NegotiateAuth` over pyspnego does this with channel
+binding; it trusts the CA's TLS cert via `ACME_RA_ADCS_CA_BUNDLE` = the
+enterprise root PEM.) Confirm the cert appears in the CA database with
+requester = `gMSA-acme-ra$`.
 
 **Trade-off:** adds an enrollment surface to the CA box. Bounded by gMSA-only
 Enroll + the server-auth-only template.

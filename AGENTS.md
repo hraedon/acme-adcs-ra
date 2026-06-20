@@ -72,11 +72,12 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-ACME server (RFC 8555 subset) + EAB/policy + SIEM audit + revokeCert are built
-and unit-tested; the real ADCS **enrollment** leg is implemented (real
-`certfnsh.asp` payload, pending the live WI-1 spike confirmation — see
-`docs/spike-runbook.md` and the STUB GATE in `docs/threat-model.md`). **CA-side
-revocation is a documented gap**: ADCS Web Enrollment exposes no revocation
-endpoint, so `CertsrvRevocationLeg` is an honest `NotImplementedError` stub
-pending the mechanism decision (threat-model §E). The live spike is still the
-feasibility gate before a production pilot.
+**WI-1 proven end-to-end on the lab (2026-06-20):** the deployed RA (IIS +
+HttpPlatformHandler, app pool as the gMSA) drives `/certsrv/` and issues a real
+serverAuth-only cert (SAN from the CSR, chaining to the existing root). ACME
+server + EAB/policy + SIEM audit + revokeCert and the ADCS **enrollment** leg are
+built, unit-tested, and live-validated. Auth is SPNEGO + channel binding
+(`negotiate_auth.NegotiateAuth` over `pyspnego`) against `/certsrv/` **EPA=Require**.
+**CA-side revocation is still a documented gap**: ADCS Web Enrollment exposes no
+revocation endpoint, so `CertsrvRevocationLeg` is an honest `NotImplementedError`
+stub pending the mechanism decision (threat-model §E).

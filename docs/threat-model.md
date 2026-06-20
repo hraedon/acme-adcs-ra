@@ -1,6 +1,7 @@
 # Threat Model — acme-adcs-ra
 
-**Status:** Phase 3 gate (plan 001), pre-production-pilot. Living document —
+**Status:** post-WI-1 (enrollment proven on the lab 2026-06-20), pre-production-
+pilot. Living document —
 re-review on any change to the issuance path, the gMSA, the template scope, or
 the dependency set.
 
@@ -9,18 +10,19 @@ and holds a standing enrollment identity. Worst case is *mis-issuance* or *leak
 of that identity* — not "wrong analysis." The read-only family conventions do
 not apply.
 
-> **⚠️ STUB GATE — the issuance HTTP path is implemented but unconfirmed until
-> WI-1 closes; revocation has no `/certsrv/` endpoint at all.**
+> **✅ WI-1 CONFIRMED (2026-06-20) — the enrollment round-trip issues a real
+> cert on the lab CA. Revocation still has no `/certsrv/` endpoint (by design —
+> see below).**
 >
-> - **Enrollment (`CertsrvEnrollmentLeg`)** is now a **real implementation**
->   (the proven `certfnsh.asp` / `certnew.cer` / `certnew.p7b` payload, with
->   `raise_for_status`, content-type checks, and PKCS#7 chain parsing). It is
->   unit-tested against a fake HTTP session on Linux; the live round-trip
->   (Negotiate/SSPI as the gMSA → ADCS CA database write with **requester =
->   `gMSA-acme-ra$`**, cert chaining to the existing root) has **not yet been
->   exercised against a live CA**. The spike (`docs/spike-runbook.md`,
->   `lab/spike_mode_a.py`) is the confirmation run. Until it passes, the
->   enrollment path is *built, not deployed*.
+> - **Enrollment (`CertsrvEnrollmentLeg`)** is **live-validated**: the deployed
+>   RA (IIS app pool running as the gMSA) authenticates to `/certsrv/` over SPNEGO
+>   **with channel binding** (`negotiate_auth.NegotiateAuth` over `pyspnego`, so
+>   it works against EPA=Require), POSTs the CSR to `certfnsh.asp`, and gets back
+>   a **serverAuth-only** cert (SAN from the CSR) issued off the existing CA and
+>   **chaining to the existing root**, with requester = `gMSA-acme-ra$`. The leg
+>   tolerates the CA's real response formats (`certnew.cer` returned as
+>   `text/html`; `certnew.p7b` returned as PKCS7 wrapped in
+>   `-----BEGIN CERTIFICATE-----` markers — see `docs/spike-runbook.md`).
 > - **Revocation (`CertsrvRevocationLeg`)** is an **honest `NotImplementedError`
 >   stub.** ADCS Web Enrollment exposes **no revocation endpoint** (Microsoft
 >   Learn enumerates only request-cert / retrieve-CA-cert / retrieve-CRL;
@@ -33,12 +35,11 @@ not apply.
 >   `revokeCert` endpoint remains wired to this leg via `FakeRevocationLeg`
 >   (dev) so the mechanism drops in without an ACME-surface change.
 >
-> Every control downstream of "ADCS issued a cert" (chain fetch, error mapping,
-> requester capture, audit fields) is *analyzed and unit-tested*, not
-> *live-verified*. The enrollment spike's acceptance criterion — **requester =
->   `gMSA-acme-ra$` in the CA database, cert chains to the existing root** — is
->   the gate. Until it passes, this document describes intent, not deployed
->   behavior.
+> Controls downstream of "ADCS issued a cert" (chain fetch, requester capture,
+> audit fields) are now **live-verified**, not just unit-tested. The remaining
+> gate before a production pilot is the §6 checklist (host hardening, network
+> allowlist, rate limits, operational runbook) — not the enrollment physics,
+> which is proven.
 
 ## 1. System & trust model
 
@@ -254,6 +255,13 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   Negotiate preferred, **NTLM removed** once Kerberos is proven; **EPA=Require**
   (the RA channel-binds via `pyspnego`, so the hardened setting is supported —
   no need to weaken to Accept); IP-restricted to the RA host.
+- **CA `/certsrv/` TLS cert + RA trust:** `/certsrv/` must present a **server-
+  auth** TLS certificate — **not the CA's own certificate** (a CA cert used as a
+  TLS leaf is rejected by OpenSSL/the RA as "unsuitable purpose"; SChannel
+  tolerates it, so the misconfig hides until a non-Windows client connects). The
+  RA verifies that cert against `ACME_RA_ADCS_CA_BUNDLE` = the **enterprise root**
+  (Python verifies against certifi, not the Windows store, so the private root
+  must be pinned; the server supplies the intermediate).
 - **Reverse proxy:** network allowlist enforced here (the RA endpoint is not
   public); `--proxy-headers` + `--forwarded-allow-ips` on uvicorn; per-account
   rate limit.
@@ -264,9 +272,9 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 
 ## 6. Conditions for a production pilot
 
-1. **Spike confirmed (WI-1)** — the STUB GATE above: requester=`gMSA-acme-ra$`
-   in the CA DB; cert chains to the existing root; the real
-   `CertsrvEnrollmentLeg`/`CertsrvRevocationLeg` filled from the proven payload.
+1. **Spike confirmed (WI-1)** — **DONE 2026-06-20**: requester=`gMSA-acme-ra$`
+   in the CA DB; cert chains to the existing root; serverAuth-only EKU; SAN from
+   the CSR. The `CertsrvEnrollmentLeg` is live-validated against the lab CA.
 2. **Template hardened** per §5; verified by inspection (adcs-lens can analyze
    the RA's own enrollment surface).
 3. **gMSA host hardened** to the §4.A bar (tier-0-adjacent, auditable).
@@ -291,10 +299,11 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 
 ## 7. Known gaps & residuals (tracked, not resolved)
 
-- **Real enrollment HTTP path implemented, pending live confirmation** (the
-  stub gate): `CertsrvEnrollmentLeg` is real and unit-tested against a fake
-  session; the WI-1 spike (`docs/spike-runbook.md`) confirms requester, chain,
-  and EKU against the lab CA.
+- **Enrollment HTTP path — CLOSED (WI-1 confirmed 2026-06-20):** the leg issues
+  a real cert off the lab CA (requester, chain, serverAuth EKU verified). The
+  live findings — channel binding (`pyspnego`) for EPA=Require, `certnew.cer`
+  served as `text/html`, `certnew.p7b` as PKCS7-in-CERTIFICATE-markers — are
+  folded into the leg and `docs/spike-runbook.md`. Kept here only as a pointer.
 - **Revocation has no `/certsrv/` endpoint** — `CertsrvRevocationLeg` is an
   honest `NotImplementedError` stub. The mechanism (`certutil`/`ICertAdmin2`)
   + its gMSA CA-officer privilege implication is an **operator decision**

@@ -85,19 +85,23 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-Built and unit-tested; **live-spike-gated.** The ACME server (RFC 8555 subset:
-directory, EAB-gated accounts, orders, finalize, cert retrieval, revokeCert),
-deterministic issuance policy, SIEM audit emission, and the real ADCS
-**enrollment** leg (`/certsrv/` `certfnsh.asp` → issued cert + PKCS#7 chain,
-passwordless gMSA/Negotiate) are implemented — see
-[`docs/architecture.md`](docs/architecture.md),
-[`docs/threat-model.md`](docs/threat-model.md) (note the **STUB GATE**), and
-[`docs/certsrv-setup.md`](docs/certsrv-setup.md).
+**WI-1 proven end-to-end on the lab (2026-06-20).** The full pipeline — ACME
+server (RFC 8555 subset: directory, EAB-gated accounts, orders, finalize, cert
+retrieval, revokeCert), deterministic issuance policy, SIEM audit, and the real
+ADCS **enrollment** leg — issues a real certificate: a deployed RA running as the
+gMSA behind IIS drives `/certsrv/` and returns a **serverAuth-only** cert with the
+**SAN from the CSR**, issued off the existing CA and **chaining to the existing
+root** (no new intermediate). See [`docs/architecture.md`](docs/architecture.md),
+[`docs/threat-model.md`](docs/threat-model.md),
+[`docs/certsrv-setup.md`](docs/certsrv-setup.md), and the result in
+[`docs/spike-runbook.md`](docs/spike-runbook.md).
 
-The single **live feasibility gate** remaining is the WI-1 lab spike
-([`docs/spike-runbook.md`](docs/spike-runbook.md)): prove FastAPI-as-gMSA →
-`/certsrv/` Negotiate → ADCS issuance with **requester = `gMSA-acme-ra$`** in the
-CA database and the cert chaining to the existing root. **CA-side revocation is
-a documented gap** — ADCS Web Enrollment exposes no revocation endpoint; the
-mechanism + its gMSA privilege implication is an operator decision
-(threat-model §E).
+Authentication to `/certsrv/` is the ambient **gMSA** identity over SPNEGO with
+**channel binding** (RFC 5929 `tls-server-end-point`), via the in-tree
+`negotiate_auth.NegotiateAuth` over `pyspnego` — so it works against a `/certsrv/`
+hardened with **EPA=Require**. Deploy with `scripts/install-windows.ps1` (IIS +
+HttpPlatformHandler, app pool as the gMSA, on a configurable port).
+
+**CA-side revocation remains a documented gap** — ADCS Web Enrollment exposes no
+revocation endpoint; the mechanism + its gMSA privilege implication is an operator
+decision (threat-model §E).
