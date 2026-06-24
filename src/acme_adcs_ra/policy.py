@@ -7,7 +7,6 @@ No LLM, no network, no time-based randomness.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from typing import Sequence
 
 
@@ -18,6 +17,41 @@ class PolicyDecision:
     allowed: bool
     template: str | None
     reason: str
+
+
+def _match_dns_pattern(san: str, pattern: str) -> bool:
+    """Match a DNS name against an allowed pattern.
+
+    Supports:
+    - **Exact match**: ``srv01.example.com`` matches ``srv01.example.com``.
+    - **Leftmost-label wildcard**: ``*.example.com`` matches
+      ``foo.example.com`` but NOT ``a.b.example.com`` or ``example.com``
+      (RFC 4592 single-label semantics — the wildcard absorbs exactly one
+      DNS label).
+
+    Case-insensitive per RFC 4343. Trailing dots (FQDN form) are stripped.
+
+    Patterns containing ``*`` outside the leftmost ``*.`` position (e.g.
+    ``foo*.example.com``) are treated as exact-match literals — they will
+    not match any valid DNS name, which is fail-closed.
+    """
+    san = san.rstrip(".").lower()
+    pattern = pattern.rstrip(".").lower()
+
+    # Defense-in-depth: a SAN containing '*' is not a valid hostname.
+    # Wildcard certificates (*.example.com as a SAN) are a distinct concept
+    # from wildcard scope patterns and must not be authorized by a
+    # *.example.com scope. The CSR gate rejects these; this is the backstop.
+    if "*" in san:
+        return False
+
+    if pattern.startswith("*."):
+        base = pattern[2:]
+        idx = san.find(".")
+        if idx <= 0:
+            return False
+        return san[idx + 1:] == base
+    return san == pattern
 
 
 class IssuancePolicy:
@@ -70,12 +104,13 @@ class IssuancePolicy:
             )
 
         # 3. Every SAN must match at least one allowed pattern for this account.
-        # DNS names are case-insensitive (RFC 4343), so fold case before matching.
+        # DNS names are case-insensitive (RFC 4343); _match_dns_pattern folds
+        # case. Wildcard patterns use RFC 4592 single-label semantics:
+        # *.example.com matches foo.example.com but NOT a.b.example.com.
         allowed_patterns = self._san_scopes.get(eab_kid, [])
         for san in requested_sans:
-            san_lower = san.lower()
             if not any(
-                fnmatch(san_lower, pat.lower()) for pat in allowed_patterns
+                _match_dns_pattern(san, pat) for pat in allowed_patterns
             ):
                 return PolicyDecision(
                     allowed=False,

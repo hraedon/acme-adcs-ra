@@ -881,6 +881,73 @@ class TestCsrSanTypeValidation:
         assert finalize_resp.status_code == 400
         assert "UniformResourceIdentifier" in finalize_resp.json()["detail"]
 
+    def test_csr_with_wildcard_san_rejected(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """A CSR with a wildcard SAN (*.example.com) must be rejected.
+
+        Wildcard certificates are a distinct risk profile from wildcard scope
+        patterns. Without this gate, a *.example.com SAN would match a
+        *.example.com scope pattern, silently authorizing a wildcard cert.
+        """
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        resp = acme_client.new_order(["*.WORK-DOMAIN.local"])
+        order = resp.json()
+        for authz_url in order["authorizations"]:
+            authz = acme_client.get_authorization(authz_url).json()
+            for challenge in authz["challenges"]:
+                acme_client.validate_challenge(challenge["url"])
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "*.WORK-DOMAIN.local")])
+        san = x509.SubjectAlternativeName([x509.DNSName("*.WORK-DOMAIN.local")])
+        csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(subject)
+            .add_extension(san, critical=False)
+            .sign(key, hashes.SHA256())
+        )
+        csr_der = csr.public_bytes(serialization.Encoding.DER)
+        finalize_resp = acme_client.finalize_order(order["finalize"], csr_der)
+        assert finalize_resp.status_code == 400
+        assert finalize_resp.json()["type"] == "urn:ietf:params:acme:error:badCSR"
+        assert "wildcard" in finalize_resp.json()["detail"]
+
+    def test_csr_with_partial_wildcard_san_rejected(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """A CSR with a partial-wildcard SAN (foo*.example.com) must be rejected.
+
+        Without this gate, foo*.example.com would bypass the scope matcher
+        because the suffix after the first dot still matches the pattern base.
+        """
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        resp = acme_client.new_order(["foo*.WORK-DOMAIN.local"])
+        order = resp.json()
+        for authz_url in order["authorizations"]:
+            authz = acme_client.get_authorization(authz_url).json()
+            for challenge in authz["challenges"]:
+                acme_client.validate_challenge(challenge["url"])
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "foo*.WORK-DOMAIN.local")])
+        san = x509.SubjectAlternativeName([x509.DNSName("foo*.WORK-DOMAIN.local")])
+        csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(subject)
+            .add_extension(san, critical=False)
+            .sign(key, hashes.SHA256())
+        )
+        csr_der = csr.public_bytes(serialization.Encoding.DER)
+        finalize_resp = acme_client.finalize_order(order["finalize"], csr_der)
+        assert finalize_resp.status_code == 400
+        assert finalize_resp.json()["type"] == "urn:ietf:params:acme:error:badCSR"
+        assert "wildcard" in finalize_resp.json()["detail"]
+
 
 # ---------------------------------------------------------------------------
 # M5: Minimum key strength

@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from acme_adcs_ra.jws import _base64url_decode
@@ -23,9 +23,25 @@ class EABEntry(BaseModel):
 
 
 class SANScope(BaseModel):
-    """DNS SAN patterns allowed for a given account (EAB kid)."""
+    """DNS SAN patterns allowed for a given account (EAB kid).
+
+    Patterns support exact-match domain names and leftmost-label wildcards
+    (``*.example.com``). Wildcard semantics follow RFC 4592: ``*.example.com``
+    matches ``foo.example.com`` but not ``a.b.example.com``.
+    """
 
     dns_patterns: list[str] = []
+
+    @field_validator("dns_patterns")
+    @classmethod
+    def _validate_dns_patterns(cls, v: list[str]) -> list[str]:
+        for p in v:
+            if "*" in p and not (p.startswith("*.") and "*" not in p[2:] and p[2:]):
+                raise ValueError(
+                    f"invalid DNS pattern {p!r}: only leftmost-label wildcards "
+                    f"(*.example.com) are supported"
+                )
+        return v
 
 
 class RAConfig(BaseSettings):

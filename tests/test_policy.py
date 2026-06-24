@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from acme_adcs_ra.policy import IssuancePolicy
+from acme_adcs_ra.policy import IssuancePolicy, _match_dns_pattern
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +149,204 @@ class TestPolicyDeny:
         )
         assert result.allowed is False
         assert "out of scope" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# _match_dns_pattern — RFC 4592 single-label wildcard semantics
+# ---------------------------------------------------------------------------
+
+
+class TestMatchDnsPattern:
+    """Direct unit tests for the DNS pattern matcher.
+
+    The critical regression: fnmatch treated ``*`` as matching any character
+    sequence including dots, so ``*.example.com`` matched ``a.b.example.com``.
+    RFC 4592 says a wildcard absorbs exactly one label.
+    """
+
+    # --- wildcard: single-label match (should pass) ---
+
+    def test_wildcard_matches_single_label(self) -> None:
+        assert _match_dns_pattern("foo.example.com", "*.example.com") is True
+
+    def test_wildcard_matches_different_single_label(self) -> None:
+        assert _match_dns_pattern("bar.example.com", "*.example.com") is True
+
+    def test_wildcard_matches_single_label_deep_base(self) -> None:
+        assert _match_dns_pattern("foo.sub.example.com", "*.sub.example.com") is True
+
+    # --- wildcard: multi-label overmatch (the critical fix) ---
+
+    def test_wildcard_rejects_multi_label_subdomain(self) -> None:
+        """*.example.com must NOT match a.b.example.com (RFC 4592)."""
+        assert _match_dns_pattern("a.b.example.com", "*.example.com") is False
+
+    def test_wildcard_rejects_deeply_nested_subdomain(self) -> None:
+        assert _match_dns_pattern("x.y.z.example.com", "*.example.com") is False
+
+    def test_deep_wildcard_rejects_extra_label(self) -> None:
+        """*.a.b.example.com matches foo.a.b.example.com but not bar.foo.a.b.example.com."""
+        assert _match_dns_pattern("foo.a.b.example.com", "*.a.b.example.com") is True
+        assert _match_dns_pattern("bar.foo.a.b.example.com", "*.a.b.example.com") is False
+
+    # --- wildcard: apex / boundary cases ---
+
+    def test_wildcard_rejects_apex(self) -> None:
+        """*.example.com must NOT match example.com (wildcard needs ≥1 label)."""
+        assert _match_dns_pattern("example.com", "*.example.com") is False
+
+    def test_wildcard_rejects_different_base_domain(self) -> None:
+        assert _match_dns_pattern("foo.other.com", "*.example.com") is False
+
+    def test_wildcard_rejects_prefix_confusion(self) -> None:
+        """fooexample.com is not a subdomain of example.com."""
+        assert _match_dns_pattern("fooexample.com", "*.example.com") is False
+
+    def test_wildcard_rejects_single_label_san(self) -> None:
+        """A SAN with no dots cannot match a *.pattern."""
+        assert _match_dns_pattern("localhost", "*.example.com") is False
+
+    # --- exact match ---
+
+    def test_exact_match(self) -> None:
+        assert _match_dns_pattern("srv01.example.com", "srv01.example.com") is True
+
+    def test_exact_match_different_host_denied(self) -> None:
+        assert _match_dns_pattern("srv02.example.com", "srv01.example.com") is False
+
+    def test_exact_match_not_substring(self) -> None:
+        """Exact match must not substring-match."""
+        assert _match_dns_pattern("x_srv01.example.com", "srv01.example.com") is False
+
+    # --- case-insensitivity (RFC 4343) ---
+
+    def test_wildcard_case_insensitive_san(self) -> None:
+        assert _match_dns_pattern("FOO.EXAMPLE.COM", "*.example.com") is True
+
+    def test_wildcard_case_insensitive_pattern(self) -> None:
+        assert _match_dns_pattern("foo.example.com", "*.EXAMPLE.COM") is True
+
+    def test_wildcard_mixed_case_both(self) -> None:
+        assert _match_dns_pattern("Foo.Example.Com", "*.EXAMPLE.com") is True
+
+    def test_exact_match_case_insensitive(self) -> None:
+        assert _match_dns_pattern("SRV01.EXAMPLE.COM", "srv01.example.com") is True
+
+    # --- trailing dot (FQDN form) ---
+
+    def test_wildcard_san_trailing_dot_stripped(self) -> None:
+        assert _match_dns_pattern("foo.example.com.", "*.example.com") is True
+
+    def test_wildcard_pattern_trailing_dot_stripped(self) -> None:
+        assert _match_dns_pattern("foo.example.com", "*.example.com.") is True
+
+    def test_exact_match_trailing_dot_stripped(self) -> None:
+        assert _match_dns_pattern("srv01.example.com.", "srv01.example.com") is True
+
+    # --- fail-closed: non-leftmost wildcards treated as literals ---
+
+    def test_non_leftmost_wildcard_is_literal_no_match(self) -> None:
+        """foo*.example.com is treated as a literal — matches nothing real."""
+        assert _match_dns_pattern("foobar.example.com", "foo*.example.com") is False
+
+    def test_bare_star_no_dot_is_literal_no_match(self) -> None:
+        """* without a dot is treated as a literal — matches nothing real."""
+        assert _match_dns_pattern("anything.example.com", "*") is False
+
+    # --- defense-in-depth: SANs containing '*' are rejected ---
+
+    def test_wildcard_san_rejected_by_matcher(self) -> None:
+        """A SAN of *.example.com must NOT match a *.example.com scope.
+
+        A wildcard certificate request is a distinct concept from a wildcard
+        scope pattern. The CSR gate rejects these; the matcher is the backstop.
+        """
+        assert _match_dns_pattern("*.example.com", "*.example.com") is False
+
+    def test_partial_wildcard_san_rejected_by_matcher(self) -> None:
+        """foo*.example.com must NOT match *.example.com.
+
+        Without the guard, the suffix after the first dot would match.
+        """
+        assert _match_dns_pattern("foo*.example.com", "*.example.com") is False
+
+    def test_star_in_second_label_rejected_by_matcher(self) -> None:
+        """foo.*.example.com must NOT match *.example.com."""
+        assert _match_dns_pattern("foo.*.example.com", "*.example.com") is False
+
+    def test_double_wildcard_san_rejected_by_matcher(self) -> None:
+        assert _match_dns_pattern("**.example.com", "*.example.com") is False
+
+
+# ---------------------------------------------------------------------------
+# Integration: IssuancePolicy enforces RFC 4592 wildcard semantics
+# ---------------------------------------------------------------------------
+
+
+class TestPolicyWildcardSemantics:
+    """The critical regression test: an IssuancePolicy with *.example.com
+    must deny a multi-label subdomain SAN that fnmatch would have allowed."""
+
+    def test_multi_label_subdomain_denied(self) -> None:
+        """*.internal.WORK-DOMAIN.local must NOT allow a.b.internal.WORK-DOMAIN.local.
+
+        Under the old fnmatch, this would have been allowed — the ``*``
+        matched across dots. This is the load-bearing security fix.
+        """
+        policy = IssuancePolicy(
+            allowed_kids={"acct-001"},
+            san_scopes={"acct-001": ["*.internal.WORK-DOMAIN.local"]},
+        )
+        result = policy.evaluate(
+            eab_kid="acct-001",
+            csr_subject="CN=any",
+            requested_sans=["a.b.internal.WORK-DOMAIN.local"],
+        )
+        assert result.allowed is False
+        assert "out of scope" in result.reason
+
+    def test_single_label_subdomain_still_allowed(self) -> None:
+        """The fix must not break legitimate single-label subdomain matching."""
+        policy = IssuancePolicy(
+            allowed_kids={"acct-001"},
+            san_scopes={"acct-001": ["*.internal.WORK-DOMAIN.local"]},
+        )
+        result = policy.evaluate(
+            eab_kid="acct-001",
+            csr_subject="CN=any",
+            requested_sans=["web.internal.WORK-DOMAIN.local"],
+        )
+        assert result.allowed is True
+
+    def test_deep_wildcard_multi_label_denied(self) -> None:
+        """*.prod.WORK-DOMAIN.local must deny a.b.prod.WORK-DOMAIN.local."""
+        policy = IssuancePolicy(
+            allowed_kids={"acct-001"},
+            san_scopes={"acct-001": ["*.prod.WORK-DOMAIN.local"]},
+        )
+        result = policy.evaluate(
+            eab_kid="acct-001",
+            csr_subject="CN=any",
+            requested_sans=["x.y.prod.WORK-DOMAIN.local"],
+        )
+        assert result.allowed is False
+
+    def test_mixed_valid_and_overmatch_san_denies_all(self) -> None:
+        """If one SAN is a valid single-label match and another is an overmatch,
+        the entire request is denied."""
+        policy = IssuancePolicy(
+            allowed_kids={"acct-001"},
+            san_scopes={"acct-001": ["*.internal.WORK-DOMAIN.local"]},
+        )
+        result = policy.evaluate(
+            eab_kid="acct-001",
+            csr_subject="CN=any",
+            requested_sans=[
+                "web.internal.WORK-DOMAIN.local",       # valid
+                "a.b.internal.WORK-DOMAIN.local",       # overmatch — must deny
+            ],
+        )
+        assert result.allowed is False
 
 
 # ---------------------------------------------------------------------------

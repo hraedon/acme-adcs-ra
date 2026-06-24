@@ -171,6 +171,25 @@ def _reject_non_dns_sans(san_value: x509.SubjectAlternativeName) -> None:
             )
 
 
+def _reject_wildcard_sans(san_values: list[str]) -> None:
+    """Reject SAN values containing wildcard characters.
+
+    The RA issues server-auth certs for specific hostnames, not wildcard
+    certificates. A SAN like ``*.example.com`` is a wildcard cert request —
+    a distinct risk profile that the SAN scope policy is not designed to
+    authorize. Malformed names like ``foo*.example.com`` would also bypass
+    the scope matcher (the suffix after the first dot still matches) if
+    not rejected here. This is the primary gate; ``_match_dns_pattern``
+    has a defense-in-depth backstop.
+    """
+    for san in san_values:
+        if "*" in san:
+            raise bad_csr(
+                f"CSR SAN contains wildcard character '*': {san!r}; "
+                f"wildcard certificates are not supported"
+            )
+
+
 def _validate_csr_key_strength(csr: x509.CertificateSigningRequest) -> None:
     """M5: enforce minimum key size — RSA ≥ 2048, EC over P-256/P-384/P-521."""
     pub = csr.public_key()
@@ -332,6 +351,7 @@ def _finalize_parse_and_validate_csr(
         san_value = cast(x509.SubjectAlternativeName, san_ext.value)
         _reject_non_dns_sans(san_value)
         san_values = [str(v) for v in san_value.get_values_for_type(DNSName)]
+        _reject_wildcard_sans(san_values)
 
     requested_sans = san_values
 

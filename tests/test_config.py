@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from acme_adcs_ra.config import EABEntry, RAConfig
+from acme_adcs_ra.config import EABEntry, RAConfig, SANScope
 
 
 class TestEABEntry:
@@ -41,3 +41,52 @@ class TestRAConfig:
         """Auditing is unconditional; there must be no toggle to disable it."""
         with pytest.raises(AttributeError):
             _ = RAConfig().audit_emit
+
+
+class TestSANScopeValidation:
+    """SANScope.dns_patterns must reject invalid wildcard patterns at config time."""
+
+    def test_valid_wildcard_accepted(self) -> None:
+        scope = SANScope(dns_patterns=["*.example.com"])
+        assert scope.dns_patterns == ["*.example.com"]
+
+    def test_valid_exact_match_accepted(self) -> None:
+        scope = SANScope(dns_patterns=["srv01.example.com"])
+        assert scope.dns_patterns == ["srv01.example.com"]
+
+    def test_valid_deep_wildcard_accepted(self) -> None:
+        scope = SANScope(dns_patterns=["*.sub.example.com"])
+        assert scope.dns_patterns == ["*.sub.example.com"]
+
+    def test_mixed_valid_patterns_accepted(self) -> None:
+        scope = SANScope(dns_patterns=["*.example.com", "srv01.example.com"])
+        assert len(scope.dns_patterns) == 2
+
+    def test_empty_patterns_accepted(self) -> None:
+        scope = SANScope(dns_patterns=[])
+        assert scope.dns_patterns == []
+
+    def test_wildcard_not_leftmost_rejected(self) -> None:
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["foo*.example.com"])
+
+    def test_wildcard_not_entire_label_rejected(self) -> None:
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["*foo.example.com"])
+
+    def test_multiple_wildcards_rejected(self) -> None:
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["*.foo.*.example.com"])
+
+    def test_bare_star_rejected(self) -> None:
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["*"])
+
+    def test_double_wildcard_rejected(self) -> None:
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["**.example.com"])
+
+    def test_wildcard_with_empty_base_rejected(self) -> None:
+        """*.  (no domain after wildcard) must be rejected."""
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["*."])

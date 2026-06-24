@@ -1,11 +1,17 @@
 """The certnew.p7b chain parser must survive ADCS's format quirks — in
 particular a PKCS7 SignedData returned under -----BEGIN CERTIFICATE----- markers
-with a text/html content-type, as observed against a live CA."""
+with a text/html content-type, as observed against a live CA.
+
+Extended coverage (WI-008): CMS markers, raw-base64 fallback, multiple blocks,
+mixed marker types, HTML-wrapped responses, and the failure path.
+"""
 
 from __future__ import annotations
 
 import base64
 import datetime
+
+import pytest
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -13,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 
-from acme_adcs_ra.enrollment import _parse_pkcs7_chain
+from acme_adcs_ra.enrollment import EnrollmentTransportError, _parse_pkcs7_chain
 
 
 def _cert(cn: str) -> x509.Certificate:
@@ -56,3 +62,62 @@ def test_single_der_certificate_block() -> None:
     pems = _parse_pkcs7_chain(_wrap(der, "CERTIFICATE"))
     assert len(pems) == 1
     assert pems[0].startswith("-----BEGIN CERTIFICATE-----")
+
+
+def test_pkcs7_wrapped_in_cms_markers() -> None:
+    """CMS is a valid standard PEM type (RFC 7468). The regex [A-Z0-9 ]+ must
+    match it, not just CERTIFICATE and PKCS7."""
+    der = pkcs7.serialize_certificates(
+        [_cert("leaf"), _cert("ca")], serialization.Encoding.DER
+    )
+    assert len(_parse_pkcs7_chain(_wrap(der, "CMS"))) == 2
+
+
+def test_raw_base64_no_pem_wrapper() -> None:
+    """The fallback path (lines 391-395): when no PEM markers are present,
+    the entire body is treated as raw base64."""
+    der = pkcs7.serialize_certificates(
+        [_cert("ca"), _cert("root")], serialization.Encoding.DER
+    )
+    raw_b64 = base64.b64encode(der)
+    assert len(_parse_pkcs7_chain(raw_b64)) == 2
+
+
+def test_multiple_pem_blocks() -> None:
+    """Multiple PEM blocks in one response — re.finditer must collect all."""
+    der1 = _cert("cert-a").public_bytes(serialization.Encoding.DER)
+    der2 = _cert("cert-b").public_bytes(serialization.Encoding.DER)
+    body = _wrap(der1, "CERTIFICATE") + _wrap(der2, "CERTIFICATE")
+    pems = _parse_pkcs7_chain(body)
+    assert len(pems) == 2
+
+
+def test_mixed_marker_types() -> None:
+    """A single DER cert in a CERTIFICATE block + a PKCS7 bundle in a PKCS7
+    block — both must be extracted and parsed."""
+    single_der = _cert("standalone").public_bytes(serialization.Encoding.DER)
+    p7b_der = pkcs7.serialize_certificates(
+        [_cert("chain-ca"), _cert("chain-root")], serialization.Encoding.DER
+    )
+    body = _wrap(single_der, "CERTIFICATE") + _wrap(p7b_der, "PKCS7")
+    pems = _parse_pkcs7_chain(body)
+    assert len(pems) == 3
+
+
+def test_pem_block_embedded_in_html() -> None:
+    """ADCS certnew.p7b returns text/html wrapping the PEM payload.
+    The regex must find the PEM block within surrounding HTML."""
+    der = pkcs7.serialize_certificates(
+        [_cert("leaf"), _cert("ca"), _cert("root")], serialization.Encoding.DER
+    )
+    pem_block = _wrap(der, "CERTIFICATE")
+    html = (
+        b"<html><head><title>Certificate Chain</title></head>"
+        b"<body><pre>" + pem_block + b"</pre></body></html>"
+    )
+    assert len(_parse_pkcs7_chain(html)) == 3
+
+
+def test_empty_body_raises_transport_error() -> None:
+    with pytest.raises(EnrollmentTransportError, match="did not contain a parseable chain"):
+        _parse_pkcs7_chain(b"")
