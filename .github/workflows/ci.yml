@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-typecheck-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The cert-watch local/CI version gap (dev venv 3.12, CI on 3.13) is on
+        # record across the family — gate both. The Windows SSPI enrollment dep
+        # (pyspnego) is platform-gated and simply not installed on Linux; the
+        # one test that needs it skips (211 pass / 1 skip).
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Create venv and install
+        # setup-uv@v8 no longer auto-creates a project venv — create it
+        # explicitly so the tool steps below can invoke via `.venv/bin/...`.
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: .venv/bin/ruff check .
+
+      - name: Mypy typecheck (strict)
+        run: .venv/bin/mypy src
+
+      - name: Run tests
+        run: .venv/bin/pytest -q
+
+  pip-audit:
+    # This is issuance-path infrastructure: audit the third-party dependency
+    # closure for known CVEs. Mirrors cert-watch's security posture.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Audit dependency closure
+        # Snapshot the closure before installing pip-audit (so the audit tool's
+        # own deps aren't included) and drop the editable acme-adcs-ra line —
+        # it's an unpublished editable install that --strict would fail on
+        # ("not found on PyPI").
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+          uv pip freeze | grep -v 'acme-adcs-ra' > /tmp/audit-reqs.txt
+          uv pip install pip-audit
+          .venv/bin/pip-audit --strict --requirement /tmp/audit-reqs.txt

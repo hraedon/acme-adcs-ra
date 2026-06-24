@@ -105,3 +105,9 @@ HttpPlatformHandler, app pool as the gMSA, on a configurable port).
 **CA-side revocation remains a documented gap** — ADCS Web Enrollment exposes no
 revocation endpoint; the mechanism + its gMSA privilege implication is an operator
 decision (threat-model §E).
+
+**Before deploying, work through [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).**
+The code passing its tests is necessary but not sufficient for issuance-path
+infra; the checklist gates the operator-owned prerequisites (network allowlist,
+EAB rotation, admin-token handling, monitoring, and a live re-issue against the
+deployed commit).
