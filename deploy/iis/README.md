@@ -9,12 +9,22 @@ stored ADCS credential.
 
 ## Prerequisites
 
-- **HttpPlatformHandler** IIS module installed (Microsoft-signed).
-- **Python 3.12+** on the host (3.14 is fine if `requests-negotiate-sspi` has a
-  wheel for it — verify; that dep is the one part Linux CI never exercises).
+- **IIS** role + `Web-Mgmt-Console`, `Web-Scripting-Tools`, `Web-IP-Security`.
+  `install-windows.ps1 -InstallPrereqs` installs these via `Install-WindowsFeature`.
+- **HttpPlatformHandler** IIS module installed (Microsoft-signed). Not a Windows
+  feature and not auto-downloaded (its download has been unreliable, and this is
+  issuance-path infra) — install the v1.2 amd64 MSI by hand or pass
+  `-HttpPlatformHandlerMsi <path>` to the installer.
+- **Python 3.12+** on the host (the Windows-only `pyspnego` dep — used by the
+  in-tree `negotiate_auth` for channel-bound Negotiate — must have a wheel for
+  this Python; it ships abi3 wheels. This dep is the one part Linux CI never
+  exercises). `-InstallPrereqs` installs Python via `winget` if missing.
 - **The gMSA installed on this host**: `Install-ADServiceAccount` →
   `Test-ADServiceAccount` returns `True`. (See the project memory on the AES
   Kerberos-etype + group-membership gotchas if that fails.)
+
+The installer prints a **prerequisite check** (IIS role, IIS module, Python,
+RSAT) up front on every run, so you can see what is missing before it acts.
 
 ## Install
 
