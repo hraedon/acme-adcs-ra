@@ -12,12 +12,32 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from cryptography import x509
 
 from acme_adcs_ra.jws import jwk_thumbprint
+
+
+# ---------------------------------------------------------------------------
+# Status enums — replace bare string literals throughout the codebase
+# ---------------------------------------------------------------------------
+
+
+class OrderStatus(StrEnum):
+    PENDING = "pending"
+    READY = "ready"
+    PROCESSING = "processing"
+    VALID = "valid"
+    INVALID = "invalid"
+    REVOKED = "revoked"
+
+
+class CertStatus(StrEnum):
+    VALID = "valid"
+    REVOKED = "revoked"
 
 
 # ---------------------------------------------------------------------------
@@ -43,15 +63,11 @@ _ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 def _parse_iso(ts: str) -> datetime:
     """Parse a UTC RFC 3339 timestamp produced by ``_now_iso``.
 
-    Tolerates a trailing ``Z`` or an explicit ``+00:00`` offset. Returns a
-    timezone-aware datetime (UTC). Raises ``ValueError`` if *ts* is not parseable.
+    Only accepts the ``%Y-%m-%dT%H:%M:%SZ`` format that ``_now_iso`` emits.
+    Returns a timezone-aware datetime (UTC). Raises ``ValueError`` if *ts*
+    does not match.
     """
-    if ts.endswith("Z"):
-        return datetime.strptime(ts, _ISO_FORMAT).replace(tzinfo=timezone.utc)
-    parsed = datetime.fromisoformat(ts)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return datetime.strptime(ts, _ISO_FORMAT).replace(tzinfo=timezone.utc)
 
 
 def is_expired(expires: str, *, now: datetime | None = None) -> bool:
@@ -199,8 +215,7 @@ CREATE TABLE IF NOT EXISTS authorizations (
     order_id TEXT NOT NULL REFERENCES orders(id),
     identifier TEXT NOT NULL,  -- JSON object
     status TEXT NOT NULL,
-    expires TEXT NOT NULL,
-    challenges TEXT NOT NULL  -- JSON array
+    expires TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS challenges (
@@ -282,6 +297,7 @@ class Store:
             self._migrate_certificates_table(conn)
             self._migrate_accounts_table(conn)
             self._migrate_orders_table(conn)
+            self._migrate_authorizations_table(conn)
 
     def _migrate_accounts_table(self, conn: sqlite3.Connection) -> None:
         """Add the jwk_thumbprint column to accounts if missing (dedup support)."""
@@ -322,6 +338,26 @@ class Store:
         }
         if "processing_started_at" not in columns:
             conn.execute("ALTER TABLE orders ADD COLUMN processing_started_at TEXT")
+
+    def _migrate_authorizations_table(self, conn: sqlite3.Connection) -> None:
+        """Drop the dead challenges JSON column from authorizations if present.
+
+        WI-005: the column was written but never read — challenges are sourced
+        from the challenges table via JOIN in get_authorization. SQLite 3.35.0+
+        supports ALTER TABLE DROP COLUMN; older versions leave it as harmless
+        dead weight.
+        """
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(authorizations)"
+            ).fetchall()
+        }
+        if "challenges" in columns:
+            try:
+                conn.execute("ALTER TABLE authorizations DROP COLUMN challenges")
+            except sqlite3.OperationalError:
+                pass
 
     def _certificate_from_row(self, row: sqlite3.Row) -> CertificateRecord:
         reason_raw = row["revocation_reason"]
@@ -527,8 +563,9 @@ class Store:
         with self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE orders SET status = ?, updated_at = ?, processing_started_at = ? "
-                "WHERE id = ? AND status = 'ready'",
-                ("processing", updated_at, updated_at, order_id),
+                "WHERE id = ? AND status = ?",
+                (OrderStatus.PROCESSING, updated_at, updated_at, order_id,
+                 OrderStatus.READY),
             )
             return cursor.rowcount == 1
 
@@ -548,9 +585,9 @@ class Store:
         updated_at = _now_iso()
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE orders SET status = 'ready', processing_started_at = NULL, "
-                "updated_at = ? WHERE id = ? AND status = 'processing'",
-                (updated_at, order_id),
+                "UPDATE orders SET status = ?, processing_started_at = NULL, "
+                "updated_at = ? WHERE id = ? AND status = ?",
+                (OrderStatus.READY, updated_at, order_id, OrderStatus.PROCESSING),
             )
             return cursor.rowcount == 1
 
@@ -567,10 +604,11 @@ class Store:
         updated_at = _now_iso()
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE orders SET status = 'valid', certificate_url = ?, "
+                "UPDATE orders SET status = ?, certificate_url = ?, "
                 "processing_started_at = NULL, updated_at = ? "
-                "WHERE id = ? AND status = 'processing'",
-                (certificate_url, updated_at, order_id),
+                "WHERE id = ? AND status = ?",
+                (OrderStatus.VALID, certificate_url, updated_at, order_id,
+                 OrderStatus.PROCESSING),
             )
             return cursor.rowcount == 1
 
@@ -586,9 +624,32 @@ class Store:
         updated_at = _now_iso()
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE orders SET status = 'invalid', updated_at = ? "
-                "WHERE id = ? AND status IN ('pending', 'ready')",
-                (updated_at, order_id),
+                "UPDATE orders SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status IN (?, ?)",
+                (OrderStatus.INVALID, updated_at, order_id,
+                 OrderStatus.PENDING, OrderStatus.READY),
+            )
+            return cursor.rowcount == 1
+
+    def transition_to_revoked(self, order_id: str) -> bool:
+        """Atomically transition an order to 'revoked' (CAS-guarded).
+
+        WI-003: replaces the non-CAS ``update_order_status(order_id, "revoked")``
+        call in ``revoke_cert``. CAS-guarded on ``status IN ('valid', 'processing')``
+        so it can never clobber an order a concurrent finalize has moved to
+        ``invalid`` or that is still ``pending``/``ready`` (no cert to revoke).
+        The ``valid``→``revoked`` path is the normal case; ``processing``→``revoked``
+        handles the crash-window where the cert was recorded but the status flip
+        was missed (same window as ``transition_processing_to_valid``). Returns
+        True if the transition was applied.
+        """
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE orders SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status IN (?, ?)",
+                (OrderStatus.REVOKED, updated_at, order_id,
+                 OrderStatus.VALID, OrderStatus.PROCESSING),
             )
             return cursor.rowcount == 1
 
@@ -629,7 +690,8 @@ class Store:
         now_str = _now_iso()
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, expires FROM orders WHERE status IN ('pending', 'ready')"
+                "SELECT id, expires FROM orders WHERE status IN (?, ?)",
+                (OrderStatus.PENDING, OrderStatus.READY),
             ).fetchall()
             expired_ids = [
                 row["id"] for row in rows
@@ -643,9 +705,10 @@ class Store:
                 batch = expired_ids[i:i + 900]
                 placeholders = ",".join("?" for _ in batch)
                 cursor = conn.execute(
-                    f"UPDATE orders SET status = 'invalid', updated_at = ? "
-                    f"WHERE id IN ({placeholders}) AND status IN ('pending', 'ready')",
-                    (now_str, *batch),
+                    f"UPDATE orders SET status = ?, updated_at = ? "
+                    f"WHERE id IN ({placeholders}) AND status IN (?, ?)",
+                    (OrderStatus.INVALID, now_str, *batch,
+                     OrderStatus.PENDING, OrderStatus.READY),
                 )
                 total += cursor.rowcount
             return total
@@ -684,7 +747,7 @@ class Store:
                 (
                     order_id,
                     account_id,
-                    "pending",
+                    OrderStatus.PENDING,
                     _dump_json(list(identifiers)),
                     _dump_json([]),  # placeholder
                     finalize_url_fn(order_id),
@@ -711,13 +774,12 @@ class Store:
                     (challenge_id, authz_id, "http-01", "pending", token, challenge_url, None),
                 )
 
-                # Insert authorization with a minimal JSON blob (H4: challenges
-                # table is the source of truth, this blob is legacy).
+                # Insert authorization — challenges are in the challenges table (SSoT).
                 conn.execute(
                     """
                     INSERT INTO authorizations
-                    (id, account_id, order_id, identifier, status, expires, challenges)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, account_id, order_id, identifier, status, expires)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         authz_id,
@@ -726,7 +788,6 @@ class Store:
                         _dump_json(identifier),
                         "pending",
                         expires,
-                        _dump_json([]),  # H4: unused blob, challenges table is SSoT
                     ),
                 )
 
@@ -741,7 +802,7 @@ class Store:
         return OrderRecord(
             id=order_id,
             account_id=account_id,
-            status="pending",
+            status=OrderStatus.PENDING,
             identifiers=list(identifiers),
             authorizations=authz_urls,
             finalize_url=finalize_url_fn(order_id),
@@ -886,7 +947,7 @@ class Store:
                     issued_at,
                     _dump_json(metadata or {}),
                     serial_number,
-                    "valid",
+                    CertStatus.VALID,
                     None,
                     None,
                 ),
@@ -953,14 +1014,12 @@ class Store:
         timestamp = revoked_at or _now_iso()
         with self._connect() as conn:
             conn.execute(
-                """
-                UPDATE certificates
-                SET status = 'revoked',
-                    revocation_reason = ?,
-                    revoked_at = ?
-                WHERE id = ?
-                """,
-                (reason, timestamp, cert_id),
+                "UPDATE certificates "
+                "SET status = ?, "
+                "    revocation_reason = ?, "
+                "    revoked_at = ? "
+                "WHERE id = ?",
+                (CertStatus.REVOKED, reason, timestamp, cert_id),
             )
         return self.get_certificate(cert_id)
 

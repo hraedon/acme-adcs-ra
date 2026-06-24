@@ -29,12 +29,16 @@ from acme_adcs_ra.store import Store
 def _kid_to_account_id(kid: str) -> str:
     """Extract the account UUID from a kid (account URL).
 
-    Tolerates both full URLs and relative paths because tests may use either.
+    RFC 8555 §6.2.1 requires kid to be the account URL. A bare ID is a
+    protocol violation and is rejected.
     """
     marker = "/acme/acct/"
-    if marker in kid:
-        return kid.split(marker, 1)[1].split("/", 1)[0]
-    return kid
+    idx = kid.find(marker)
+    if idx == -1:
+        raise malformed(
+            f"kid is not a valid account URL (missing {marker!r}): {kid!r}"
+        )
+    return kid[idx + len(marker):].split("/", 1)[0]
 
 
 def _verify_url(header: dict[str, Any], request_url: str) -> None:
@@ -104,13 +108,14 @@ async def _parse_jws_body(request: Request) -> dict[str, Any]:
     return data
 
 
-async def verify_existing_account_jws(
+async def _parse_jws_header(
     request: Request,
     store: Store,
-) -> tuple[dict[str, Any], dict[str, Any], str]:
-    """Verify a JWS signed by an existing account (kid lookup).
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Parse the JWS body, decode the protected header, consume the nonce,
+    and verify the URL binding.
 
-    Returns (protected_header, payload_dict, account_id).
+    Returns (header, jws_dict).
     """
     jws = await _parse_jws_body(request)
     protected_b64 = jws.get("protected")
@@ -125,6 +130,37 @@ async def verify_existing_account_jws(
     # burns the nonce, limiting replay probing (M6).
     _consume_nonce(store, header, str(request.url))
     _verify_url(header, str(request.url))
+
+    return header, jws
+
+
+def _verify_jws_signature(
+    jws: dict[str, Any],
+    public_key: Any,
+) -> dict[str, Any]:
+    """Verify the JWS signature and return the parsed payload dict."""
+    try:
+        payload = verify_flattened_jws(jws, public_key)
+    except JWSValidationError as exc:
+        raise unauthorized(f"JWS verification failed: {exc}") from exc
+
+    try:
+        payload_dict: dict[str, Any] = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise malformed(f"JWS payload is not valid JSON: {exc}") from exc
+
+    return payload_dict
+
+
+async def verify_existing_account_jws(
+    request: Request,
+    store: Store,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Verify a JWS signed by an existing account (kid lookup).
+
+    Returns (protected_header, payload_dict, account_id).
+    """
+    header, jws = await _parse_jws_header(request, store)
 
     kid = header.get("kid")
     if not kid:
@@ -139,15 +175,7 @@ async def verify_existing_account_jws(
     except Exception as exc:
         raise bad_public_key(f"stored account key is invalid: {exc}") from exc
 
-    try:
-        payload = verify_flattened_jws(jws, public_key)
-    except JWSValidationError as exc:
-        raise unauthorized(f"JWS verification failed: {exc}") from exc
-
-    try:
-        payload_dict = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise malformed(f"JWS payload is not valid JSON: {exc}") from exc
+    payload_dict = _verify_jws_signature(jws, public_key)
 
     return header, payload_dict, account_id
 
@@ -160,19 +188,7 @@ async def verify_new_account_jws(
 
     Returns (protected_header, payload_dict, account_jwk).
     """
-    jws = await _parse_jws_body(request)
-    protected_b64 = jws.get("protected")
-    if not isinstance(protected_b64, str):
-        raise malformed("JWS missing protected header")
-    try:
-        header = json.loads(_base64url_decode(protected_b64))
-    except Exception as exc:
-        raise malformed(f"invalid protected header: {exc}") from exc
-
-    # Consume nonce BEFORE verifying URL so that a bad-URL probe still
-    # burns the nonce, limiting replay probing (M6).
-    _consume_nonce(store, header, str(request.url))
-    _verify_url(header, str(request.url))
+    header, jws = await _parse_jws_header(request, store)
 
     account_jwk = header.get("jwk")
     if not account_jwk:
@@ -183,14 +199,6 @@ async def verify_new_account_jws(
     except Exception as exc:
         raise bad_public_key(f"invalid account JWK: {exc}") from exc
 
-    try:
-        payload = verify_flattened_jws(jws, public_key)
-    except JWSValidationError as exc:
-        raise unauthorized(f"JWS verification failed: {exc}") from exc
-
-    try:
-        payload_dict = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise malformed(f"JWS payload is not valid JSON: {exc}") from exc
+    payload_dict = _verify_jws_signature(jws, public_key)
 
     return header, payload_dict, account_jwk
