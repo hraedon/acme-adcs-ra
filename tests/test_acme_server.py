@@ -950,6 +950,63 @@ class TestCsrSanTypeValidation:
 
 
 # ---------------------------------------------------------------------------
+# M4c: DNS name syntax validation (RFC 1123)
+# ---------------------------------------------------------------------------
+
+
+class TestCsrDnsNameValidation:
+    """CSRs with malformed DNS SANs must be rejected before reaching ADCS.
+
+    ``cryptography.x509.DNSName`` accepts names that violate RFC 1123 label
+    rules (empty labels, invalid characters, leading/trailing hyphens). The
+    ADCS template might honor them. These tests verify the general syntax
+    gate catches them — the DNS validation runs before the order-mismatch
+    check, so the order identifier can differ from the CSR SAN.
+    """
+
+    @pytest.mark.parametrize("san,fragment", [
+        ("web..WORK-DOMAIN.local", "empty label"),
+        ("web!.WORK-DOMAIN.local", "invalid character"),
+        ("web_.WORK-DOMAIN.local", "invalid character"),
+        ("-web.WORK-DOMAIN.local", "hyphen"),
+        ("web-.WORK-DOMAIN.local", "hyphen"),
+    ])
+    def test_malformed_san_rejected(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        san: str,
+        fragment: str,
+    ) -> None:
+        """A CSR with a malformed DNS SAN must be rejected with badCSR."""
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+
+        csr_der = _make_csr([san])
+        finalize_resp = acme_client.finalize_order(order["finalize"], csr_der)
+        assert finalize_resp.status_code == 400
+        assert finalize_resp.json()["type"] == "urn:ietf:params:acme:error:badCSR"
+        assert "valid DNS name" in finalize_resp.json()["detail"]
+
+    def test_hyphenated_san_accepted(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """A CSR with a valid hyphenated SAN (my-host) must be accepted.
+
+        Regression test: the DNS syntax validator must not reject hyphens
+        in the middle of a label — only leading/trailing hyphens.
+        """
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["my-host.WORK-DOMAIN.local"])
+
+        csr_der = _make_csr(["my-host.WORK-DOMAIN.local"])
+        finalize_resp = acme_client.finalize_order(order["finalize"], csr_der)
+        assert finalize_resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # M5: Minimum key strength
 # ---------------------------------------------------------------------------
 

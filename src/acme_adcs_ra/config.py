@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from acme_adcs_ra.jws import _base64url_decode
+from acme_adcs_ra.policy import validate_dns_name
 
 
 class EABEntry(BaseModel):
@@ -36,11 +37,21 @@ class SANScope(BaseModel):
     @classmethod
     def _validate_dns_patterns(cls, v: list[str]) -> list[str]:
         for p in v:
-            if "*" in p and not (p.startswith("*.") and "*" not in p[2:] and p[2:]):
+            if "*" in p:
+                if not (p.startswith("*.") and "*" not in p[2:] and p[2:]):
+                    raise ValueError(
+                        f"invalid DNS pattern {p!r}: only leftmost-label wildcards "
+                        f"(*.example.com) are supported"
+                    )
+                domain = p[2:]
+            else:
+                domain = p
+            try:
+                validate_dns_name(domain)
+            except ValueError as exc:
                 raise ValueError(
-                    f"invalid DNS pattern {p!r}: only leftmost-label wildcards "
-                    f"(*.example.com) are supported"
-                )
+                    f"invalid DNS pattern {p!r}: {exc}"
+                ) from exc
         return v
 
 
