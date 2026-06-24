@@ -19,7 +19,7 @@ domain-joined machine.
 
 ## ⚠️ This is not a read-only tool — know the risk class
 
-The sibling projects ([cert-watch](https://github.com/hraedon/cert-watch/), [adcs-lens]((https://github.com/hraedon)/adcs-lens/))
+The sibling projects ([cert-watch](https://github.com/hraedon/cert-watch/), adcs-lens)
 are read-only/observability — worst case they're *wrong*. **acme-adcs-ra is in
 the certificate-issuance path.** It mints real certs and holds a standing ADCS
 enrollment identity. Worst case it *mis-issues* or leaks that identity. It is
@@ -55,8 +55,8 @@ separate Web-Enrollment/CES host) — both documented in
 **Out of scope / non-goals:**
 - **Being a CA / holding any signing key — ever.** If a change would make this
   sign certificates itself, it's the wrong change. This is the cardinal guardrail.
-- Endpoint TLS lifecycle ([cert-watch](../cert-watch/)'s job).
-- CA posture / misconfiguration analysis ([adcs-lens](../adcs-lens/)'s job).
+- Endpoint TLS lifecycle ([cert-watch](https://github.com/hraedon/cert-watch/)'s job).
+- CA posture / misconfiguration analysis (adcs-lens's job).
 - Public-CA / Let's Encrypt-style domain-control as the trust model — gating here
   is enterprise identity (EAB + network), not public DV.
 
@@ -106,8 +106,80 @@ HttpPlatformHandler, app pool as the gMSA, on a configurable port).
 revocation endpoint; the mechanism + its gMSA privilege implication is an operator
 decision (threat-model §E).
 
-**Before deploying, work through [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).**
-The code passing its tests is necessary but not sufficient for issuance-path
-infra; the checklist gates the operator-owned prerequisites (network allowlist,
-EAB rotation, admin-token handling, monitoring, and a live re-issue against the
+## Installation
+
+The RA runs on **Windows Server** behind **IIS** (HttpPlatformHandler), with the
+application pool running **as a gMSA** — that ambient Kerberos identity is what
+authenticates to `/certsrv/`. `scripts/install-windows.ps1` does the whole host
+side; the CA side (Web Enrollment + the issuance template) is set up once per CA
+via [`docs/certsrv-setup.md`](docs/certsrv-setup.md).
+
+### Prerequisites
+
+| Prerequisite | How to satisfy it |
+|---|---|
+| **IIS** role + `Web-Mgmt-Console`, `Web-Scripting-Tools`, `Web-IP-Security` | `install-windows.ps1 -InstallPrereqs` (uses `Install-WindowsFeature`) |
+| **HttpPlatformHandler** (IIS module — third-party MSI) | Get the v1.2 amd64 MSI from [iis.net](https://www.iis.net/downloads/microsoft/httpplatformhandler); install by hand or pass `-HttpPlatformHandlerMsi <path>` (see note below) |
+| **Python 3.12+** on the host | `install-windows.ps1 -InstallPrereqs` (uses `winget`), or `winget install Python.Python.3.12` |
+| **A gMSA installed on this host** | `Install-ADServiceAccount`; `Test-ADServiceAccount` must return `True` |
+| **CA: Web Enrollment + `ACME-ServerAuth` template** (server-auth-only EKU, subject from request, gMSA granted Enroll only) | one-time per CA — see [`docs/certsrv-setup.md`](docs/certsrv-setup.md) |
+
+> **HttpPlatformHandler is never auto-downloaded.** It is a separate Microsoft
+> module whose download has historically been unreliable, and this is
+> issuance-path infrastructure — so the installer detects it and, if missing,
+> installs it **only** from an MSI you point at (`-HttpPlatformHandlerMsi`),
+> rather than fetching an unverified binary from the internet.
+
+### Install
+
+Run from an **elevated** PowerShell on the RA host, from the repo root:
+
+```powershell
+# 1. (optional) install the native prereqs first — IIS features + Python.
+#    HttpPlatformHandler is installed too if you point at its MSI.
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
+    -GmsaAccount "WORK-DOMAIN\gMSA-acme-ra$" -InstallPrereqs `
+    -HttpPlatformHandlerMsi "C:\path\to\HttpPlatformHandler_amd64.msi"
+
+# 2. install + configure IIS (app pool as the gMSA, TLS, site on :443 by SNI).
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
+    -GmsaAccount "WORK-DOMAIN\gMSA-acme-ra$" -ConfigureIIS `
+    -HostName "acme-ra.work-domain.local" -SharePort443 `
+    -TlsCertThumbprint "<thumbprint in LocalMachine\My>"
+```
+
+Both can be combined in one invocation (`-InstallPrereqs -ConfigureIIS`). The
+script always prints a **prerequisite check** up front (IIS role, IIS module,
+Python, RSAT) so you see what is missing before it does anything. It is **safe to
+re-run**: the secret env file and an existing `web.config` are never clobbered,
+and the IIS steps are idempotent. `-SharePort443 -HostName` lets the RA share
+port 443 by SNI with cert-watch / gpo-lens on the same VM; omit them for a
+single-site catch-all binding. Full IIS detail is in
+[`deploy/iis/README.md`](deploy/iis/README.md).
+
+### After install — required before first use
+
+1. **Fill the EAB credential + SAN scope** in `…\acme-ra.env` (laid down locked,
+   readable by the gMSA + Administrators only), pinned to your ACME client.
+2. **Set `ACME_RA_BASE_URL` + `ACME_RA_ADCS_*`** in the site's `web.config`
+   (`BASE_URL` must be the *public* `https://host:port/` or every JWS is rejected
+   on day 1).
+3. **Restrict the endpoint to the ACME client** — add `<ipSecurity>` to
+   `web.config` (needs `Web-IP-Security`, which `-InstallPrereqs` installs) or a
+   scoped firewall rule. A threat-model pilot condition, deliberately not done
+   for you.
+
+### Verify
+
+```powershell
+# ACME directory should return JSON:
+Invoke-WebRequest https://acme-ra.work-domain.local/directory -UseBasicParsing
+# The Negotiate stack imports (run as the venv python):
+& C:\ProgramData\acme-adcs-ra\venv\Scripts\python.exe -c "import spnego; import acme_adcs_ra.negotiate_auth"
+```
+
+**Before going live, work through [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).**
+Passing tests is necessary but not sufficient for issuance-path infra; the
+checklist gates the operator-owned prerequisites (network allowlist, EAB
+rotation, admin-token handling, monitoring, and a live re-issue against the
 deployed commit).

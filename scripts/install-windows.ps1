@@ -59,7 +59,14 @@ param(
     [string]$HostName = "",
     [int]$Port = 443,
     [switch]$SharePort443,
-    [string]$TlsCertThumbprint = ""
+    [string]$TlsCertThumbprint = "",
+    # Prerequisite handling. -InstallPrereqs installs the safely-native prereqs
+    # (IIS role + features via Install-WindowsFeature; Python 3.12+ via winget).
+    # HttpPlatformHandler is a third-party MSI with an unreliable download, so it
+    # is NEVER auto-fetched from the internet: pass a vetted local path (or an
+    # explicit URL you trust) via -HttpPlatformHandlerMsi to have it installed.
+    [switch]$InstallPrereqs,
+    [string]$HttpPlatformHandlerMsi = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -74,6 +81,112 @@ $repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $venv     = Join-Path $InstallDir "venv"
 $logs     = Join-Path $InstallDir "logs"
 $envFile  = Join-Path $InstallDir "acme-ra.env"
+
+# --- Prerequisites -----------------------------------------------------------
+# IIS features the installer relies on:
+#   Web-Server          the IIS role itself
+#   Web-Mgmt-Console    appcmd / IIS management
+#   Web-Scripting-Tools the WebAdministration PowerShell module (IIS:\ drive)
+#   Web-IP-Security     <ipSecurity> IP-and-Domain-Restrictions (the threat-model
+#                       pilot condition: restrict the endpoint to the ACME client)
+$RequiredIisFeatures = @("Web-Server", "Web-Mgmt-Console", "Web-Scripting-Tools", "Web-IP-Security")
+
+function Test-HttpPlatformHandler {
+    # HttpPlatformHandler is the IIS module that launches+supervises uvicorn and
+    # reverse-proxies to it. It is a separate (third-party) install, NOT a Windows
+    # feature. Detect it as a registered IIS global module; fall back to the DLL.
+    try {
+        if (Get-Command Get-WebGlobalModule -ErrorAction SilentlyContinue) {
+            $m = Get-WebGlobalModule -ErrorAction SilentlyContinue | Where-Object { $_.Name -ieq "httpPlatformHandler" }
+            if ($m) { return $true }
+        }
+    } catch { }
+    $dll = Join-Path $env:windir "System32\inetsrv\httpPlatformHandler.dll"
+    return (Test-Path $dll)
+}
+
+function Install-Prerequisites {
+    Write-Host ""
+    Write-Host "Installing prerequisites (-InstallPrereqs) ..."
+
+    # 1. IIS role + features (native, idempotent). Server only (Install-WindowsFeature).
+    if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+        foreach ($f in $RequiredIisFeatures) {
+            $state = Get-WindowsFeature -Name $f -ErrorAction SilentlyContinue
+            if ($state -and $state.Installed) {
+                Write-Host "  [ok]   IIS feature $f already installed."
+            } else {
+                Write-Host "  [..]   Installing IIS feature $f ..."
+                $res = Install-WindowsFeature -Name $f -IncludeManagementTools -ErrorAction Continue
+                if ($res -and $res.Success) { Write-Host "  [ok]   $f installed." }
+                else { Write-Host "  [warn] Install-WindowsFeature $f did not report success; install it manually." }
+            }
+        }
+    } else {
+        Write-Host "  [warn] Install-WindowsFeature not available (not Windows Server?). Install the IIS"
+        Write-Host "         role + features manually: $($RequiredIisFeatures -join ', ')."
+    }
+
+    # 2. HttpPlatformHandler -- only from a vetted MSI the operator points at.
+    if (Test-HttpPlatformHandler) {
+        Write-Host "  [ok]   HttpPlatformHandler already registered."
+    } elseif ($HttpPlatformHandlerMsi) {
+        $msi = $HttpPlatformHandlerMsi
+        if ($msi -match "^https?://") {
+            $dest = Join-Path $env:TEMP "HttpPlatformHandler.msi"
+            Write-Host "  [..]   Downloading HttpPlatformHandler from $msi ..."
+            try { Invoke-WebRequest -Uri $msi -OutFile $dest -UseBasicParsing } catch { throw "Download failed: $($_.Exception.Message)" }
+            $msi = $dest
+        }
+        if (-not (Test-Path $msi)) { throw "HttpPlatformHandler MSI not found: $msi" }
+        Write-Host "  [..]   Installing HttpPlatformHandler from $msi ..."
+        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+        if ($p.ExitCode -ne 0) { throw "msiexec failed installing HttpPlatformHandler (exit $($p.ExitCode))." }
+        if (Test-HttpPlatformHandler) { Write-Host "  [ok]   HttpPlatformHandler installed." }
+        else { Write-Host "  [warn] HttpPlatformHandler MSI ran but the module is not detected; verify in IIS." }
+    } else {
+        Write-Host "  [warn] HttpPlatformHandler is MISSING and no -HttpPlatformHandlerMsi was given."
+        Write-Host "         It is a separate Microsoft IIS module (the download has been unreliable, so"
+        Write-Host "         it is not auto-fetched). Get the v1.2 amd64 MSI from"
+        Write-Host "         https://www.iis.net/downloads/microsoft/httpplatformhandler and either run it"
+        Write-Host "         by hand or re-run with -HttpPlatformHandlerMsi <path-to-msi>."
+    }
+
+    # 3. Python 3.12+ via winget (winget verifies its own packages). Best-effort.
+    $havePy = $false
+    foreach ($probe in @("py -3.12 --version", "py -3 --version", "python --version")) {
+        $parts = $probe.Split(" ")
+        if (Get-Command $parts[0] -ErrorAction SilentlyContinue) {
+            $out = & cmd /c "$probe 2>&1"
+            if ($out -match "Python\s+3\.(1[2-9]|[2-9]\d)") { $havePy = $true; break }
+        }
+    }
+    if ($havePy) {
+        Write-Host "  [ok]   Python 3.12+ already present."
+    } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Host "  [..]   Installing Python 3.12 via winget ..."
+        & winget install --id Python.Python.3.12 -e --source winget --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+        Write-Host "  [ok]   winget install attempted (the discovery step below confirms)."
+    } else {
+        Write-Host "  [warn] No Python 3.12+ and winget is unavailable. Install Python 3.12+ manually."
+    }
+    Write-Host ""
+}
+
+if ($InstallPrereqs) { Install-Prerequisites }
+
+# Read-only prerequisite report (always) -- a quick green/red of what the app pool
+# needs, before we touch anything.
+Write-Host "Prerequisite check:"
+$iisRole = $null
+if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) { $iisRole = Get-WindowsFeature -Name Web-Server -ErrorAction SilentlyContinue }
+if ($iisRole) { Write-Host "  IIS Web-Server role .......... $(if ($iisRole.Installed) { 'present' } else { 'MISSING (install IIS or pass -InstallPrereqs)' })" }
+$haveWebAdmin = [bool](Get-Module -ListAvailable WebAdministration -ErrorAction SilentlyContinue)
+Write-Host "  WebAdministration module ..... $(if ($haveWebAdmin) { 'present' } else { 'MISSING (Web-Scripting-Tools)' })"
+Write-Host "  HttpPlatformHandler module .... $(if (Test-HttpPlatformHandler) { 'present' } else { 'MISSING (see -HttpPlatformHandlerMsi / iis.net)' })"
+$haveRsat = [bool](Get-Command Test-ADServiceAccount -ErrorAction SilentlyContinue)
+Write-Host "  RSAT AD PowerShell ........... $(if ($haveRsat) { 'present' } else { 'absent (gMSA test will be skipped)' })"
+Write-Host ""
 
 # --- Validate the gMSA: resolve its SID and (best-effort) confirm it installed -
 if ($GmsaAccount -notmatch '\$$') {
@@ -253,10 +366,11 @@ Write-Host "  venv verified: $venvProbe"
 
 Write-Host "Installing acme-adcs-ra ..."
 & $venvPy -m pip install --upgrade pip | Out-Null
-# Installs from the source tree on this host. The Windows-only SSPI deps
-# (requests-negotiate-sspi) resolve here; confirm wheels exist for this Python
-# (3.14 may lack prebuilt wheels). To install a prebuilt wheel instead, replace
-# $repoRoot with the .whl path.
+# Installs from the source tree on this host. The Windows-only SSPI dep
+# (pyspnego, used by the in-tree negotiate_auth for channel-bound Negotiate)
+# resolves here; confirm wheels exist for this Python (pyspnego ships abi3
+# wheels). To install a prebuilt wheel instead, replace $repoRoot with the
+# .whl path.
 & $venvPy -m pip install --upgrade $repoRoot
 if ($LASTEXITCODE -ne 0) { throw "pip install of acme-adcs-ra failed (exit $LASTEXITCODE)." }
 $installedVer = ((& $venvPy -m pip show acme-adcs-ra 2>$null | Select-String "^Version:") -replace "^Version:\s*", "").Trim()
@@ -483,4 +597,4 @@ Write-Host "  2. Set ACME_RA_BASE_URL + ACME_RA_ADCS_* in $SitePath\web.config."
 Write-Host "  3. RESTRICT the endpoint to the ACME client (threat-model pilot condition): add"
 Write-Host "     <ipSecurity> to web.config (needs the IP-and-Domain-Restrictions role) or a"
 Write-Host "     scoped firewall rule. Port 443 may be SNI-shared with cert-watch on this VM."
-Write-Host "  4. Confirm requests-negotiate-sspi imported (Python $major.$minor): & `"$venvPy`" -c `"import requests_negotiate_sspi`""
+Write-Host "  4. Confirm the Negotiate stack imports (Python $major.$minor): & `"$venvPy`" -c `"import spnego; import acme_adcs_ra.negotiate_auth`""
