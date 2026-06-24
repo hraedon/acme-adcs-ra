@@ -54,6 +54,59 @@ def _match_dns_pattern(san: str, pattern: str) -> bool:
     return san == pattern
 
 
+def _is_valid_label_char(ch: str) -> bool:
+    """Check if a character is valid in a DNS label (RFC 1123 §2.1).
+
+    Permitted: ``a``–``z``, ``A``–``Z``, ``0``–``9``, hyphen.
+    All other characters — including underscores, wildcards, and any
+    non-ASCII codepoint — are rejected.
+    """
+    return (
+        ("a" <= ch <= "z")
+        or ("A" <= ch <= "Z")
+        or ("0" <= ch <= "9")
+        or ch == "-"
+    )
+
+
+def validate_dns_name(name: str) -> None:
+    """Validate a DNS name per RFC 1123 / RFC 1034 label rules.
+
+    Checks:
+    - Non-empty after stripping a trailing dot (FQDN notation).
+    - Total length ≤ 253 characters (excluding the trailing dot).
+    - Each dot-separated label: 1–63 characters, ASCII alphanumeric or
+      hyphen, no leading or trailing hyphen.
+
+    Raises ``ValueError`` with a descriptive message if the name is not
+    a valid DNS hostname. Intended as the general syntax gate for CSR
+    SANs and config-time scope patterns — catching malformed names that
+    ``cryptography.x509.DNSName`` accepts but that should never reach
+    the ADCS template.
+    """
+    name = name.rstrip(".")
+
+    if not name:
+        raise ValueError("empty DNS name")
+
+    if len(name) > 253:
+        raise ValueError(f"DNS name exceeds 253 characters (got {len(name)})")
+
+    labels = name.split(".")
+    for label in labels:
+        if not label:
+            raise ValueError("DNS name contains empty label (consecutive dots)")
+        if len(label) > 63:
+            raise ValueError(f"DNS label exceeds 63 characters: {label!r}")
+        if label[0] == "-" or label[-1] == "-":
+            raise ValueError(f"DNS label starts or ends with hyphen: {label!r}")
+        for ch in label:
+            if not _is_valid_label_char(ch):
+                raise ValueError(
+                    f"DNS label contains invalid character {ch!r}: {label!r}"
+                )
+
+
 class IssuancePolicy:
     """Deterministic issuance policy.
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from acme_adcs_ra.policy import IssuancePolicy, _match_dns_pattern
+from acme_adcs_ra.policy import IssuancePolicy, _match_dns_pattern, validate_dns_name
 
 
 # ---------------------------------------------------------------------------
@@ -376,3 +376,86 @@ class TestPolicyDeterminism:
         d2 = policy.evaluate(**kwargs)
         assert d1 == d2
         assert d1.allowed is False
+
+
+# ---------------------------------------------------------------------------
+# validate_dns_name — RFC 1123 / RFC 1034 label syntax validation
+# ---------------------------------------------------------------------------
+
+
+class TestValidateDnsNameValid:
+    """Names that should pass validation."""
+
+    @pytest.mark.parametrize("name", [
+        "localhost",
+        "a",
+        "web.example.com",
+        "srv01.example.com",
+        "my-host.example.com",
+        "a.b.c.d.example.com",
+        "web.example.com.",
+        "localhost.",
+        "a.",
+    ])
+    def test_valid_names(self, name: str) -> None:
+        validate_dns_name(name)
+
+    def test_single_char_label(self) -> None:
+        validate_dns_name("a.b")
+
+    def test_max_label_length_63(self) -> None:
+        label = "a" * 63
+        validate_dns_name(f"{label}.example.com")
+
+    def test_max_total_length_253(self) -> None:
+        name = ".".join(["a" * 62] * 4) + ".c"
+        assert len(name) == 253
+        validate_dns_name(name)
+
+    def test_numeric_label(self) -> None:
+        validate_dns_name("123.456.example.com")
+
+    def test_mixed_case(self) -> None:
+        validate_dns_name("Web.Example.COM")
+
+
+class TestValidateDnsNameInvalid:
+    """Names that should be rejected."""
+
+    @pytest.mark.parametrize("name,fragment", [
+        ("", "empty"),
+        (".", "empty"),
+        ("foo..example.com", "empty label"),
+        (".example.com", "empty label"),
+        ("foo!.example.com", "invalid character"),
+        ("foo_.example.com", "invalid character"),
+        ("foo bar.example.com", "invalid character"),
+        ("-host.example.com", "hyphen"),
+        ("host-.example.com", "hyphen"),
+        ("web.-example.com", "hyphen"),
+        ("web.example-.com", "hyphen"),
+        ("*.example.com", "invalid character"),
+        ("café.example.com", "invalid character"),
+        ("web@example.com", "invalid character"),
+    ])
+    def test_invalid_names(self, name: str, fragment: str) -> None:
+        with pytest.raises(ValueError, match=fragment):
+            validate_dns_name(name)
+
+    def test_label_exceeds_63_chars(self) -> None:
+        label = "a" * 64
+        with pytest.raises(ValueError, match="exceeds 63"):
+            validate_dns_name(f"{label}.example.com")
+
+    def test_total_exceeds_253_chars(self) -> None:
+        name = "a" * 254
+        with pytest.raises(ValueError, match="exceeds 253"):
+            validate_dns_name(name)
+
+    def test_empty_string(self) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            validate_dns_name("")
+
+    def test_only_dots(self) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            validate_dns_name("...")

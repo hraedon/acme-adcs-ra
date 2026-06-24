@@ -90,3 +90,28 @@ class TestSANScopeValidation:
         """*.  (no domain after wildcard) must be rejected."""
         with pytest.raises(ValueError, match="invalid DNS pattern"):
             SANScope(dns_patterns=["*."])
+
+    def test_wildcard_with_invalid_domain_rejected(self) -> None:
+        """*.!!!.example.com — invalid characters in domain part."""
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["*.!!!.example.com"])
+
+    def test_wildcard_with_empty_label_rejected(self) -> None:
+        """*.example..com — empty label in domain part."""
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["*.example..com"])
+
+    def test_wildcard_with_leading_hyphen_rejected(self) -> None:
+        """*.-example.com — leading hyphen in domain part."""
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["*.-example.com"])
+
+    def test_exact_pattern_with_invalid_domain_rejected(self) -> None:
+        """web!.example.com — invalid characters in exact pattern."""
+        with pytest.raises(ValueError, match="invalid DNS pattern"):
+            SANScope(dns_patterns=["web!.example.com"])
+
+    def test_wildcard_with_hyphenated_domain_accepted(self) -> None:
+        """*.my-host.example.com — hyphens in the middle are valid."""
+        scope = SANScope(dns_patterns=["*.my-host.example.com"])
+        assert scope.dns_patterns == ["*.my-host.example.com"]
