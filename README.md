@@ -19,7 +19,7 @@ domain-joined machine.
 
 ## ⚠️ This is not a read-only tool — know the risk class
 
-The sibling projects ([cert-watch](../cert-watch/), [adcs-lens](../adcs-lens/))
+The sibling projects ([cert-watch](https://github.com/hraedon/cert-watch/), [adcs-lens]((https://github.com/hraedon)/adcs-lens/))
 are read-only/observability — worst case they're *wrong*. **acme-adcs-ra is in
 the certificate-issuance path.** It mints real certs and holds a standing ADCS
 enrollment identity. Worst case it *mis-issues* or leaks that identity. It is
