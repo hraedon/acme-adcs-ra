@@ -83,3 +83,23 @@ honest: check a box only when the thing is actually true, not when it's planned.
 
 When every box above is checked, the deployment has cleared the bar this tool is
 engineered to. Until then it has not — regardless of a green local test run.
+
+---
+
+## Validation log
+
+- **2026-06-24 — §A cleared.** Working tree committed; CI green on the deployed
+  commit (`lint-typecheck-test` 3.12/3.13 + `pip-audit`); **live re-issue against
+  the deployed commit performed on the lab.** A full ACME round-trip
+  (new-account → new-order → challenge → finalize) driven through the deployed RA
+  (IIS app pool as the gMSA) issued a real **serverAuth-only** cert with the
+  **SAN from the CSR**, off the existing CA, chaining leaf → issuing CA → existing
+  root (no new intermediate); the CA database recorded the requester as the gMSA.
+  A first attempt was correctly **denied by the CA policy module**
+  (`CERTSRV_E_KEY_LENGTH`, an EC test key below the template's minimum) and the RA
+  mapped it to `400 rejectedIdentifier` — incidentally exercising the new
+  enrollment-error wiring against a genuine CA denial. The throwaway test cert was
+  revoked CA-side and the temporary EAB credential removed.
+  - **Still open before pilot:** all operator-owned items in §C.4 (network
+    allowlist), §C (EAB rotation procedure), §D (admin token), §E (rate
+    limiting, crons, monitoring), and the §F revocation-runbook acknowledgement.
