@@ -26,6 +26,8 @@ from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from acme_adcs_ra.config import RAConfig
+
 logger = logging.getLogger("acme_adcs_ra.siem")
 
 
@@ -78,7 +80,7 @@ class SiemEmitter:
         self._jsonl_path = config.jsonl_path
         self._syslog: logging.Logger | None = None
         self._pool: ThreadPoolExecutor | None = None
-        self._enabled: bool | None = None  # None = not yet probed
+        self._enabled: bool = False
 
         if config.sink == "syslog":
             if config.syslog_host:
@@ -87,14 +89,16 @@ class SiemEmitter:
                 logger.error(
                     "SIEM syslog sink enabled but syslog_host is empty; disabling"
                 )
-        if config.sink == "hec":
+            self._enabled = self._syslog is not None
+        elif config.sink == "hec":
             if config.hec_url and config.hec_token:
                 self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ra-siem-hec")
             else:
                 logger.error(
                     "SIEM HEC sink enabled but hec_url or hec_token is empty; disabling"
                 )
-        if config.sink == "jsonl":
+            self._enabled = self._pool is not None
+        elif config.sink == "jsonl":
             self._probe_jsonl()
 
     def _probe_jsonl(self) -> None:
@@ -130,14 +134,7 @@ class SiemEmitter:
 
     @property
     def enabled(self) -> bool:
-        if self._enabled is not None:
-            return self._enabled
-        # Fallback for non-jsonl sinks that don't set _enabled during init.
-        if self._config.sink == "syslog":
-            return self._syslog is not None
-        if self._config.sink == "hec":
-            return bool(self._config.hec_url and self._config.hec_token)
-        return False
+        return self._enabled
 
     def close(self) -> None:
         if self._syslog is not None:
@@ -245,24 +242,22 @@ class SiemEmitter:
             logger.warning("HEC export failed", exc_info=True)
 
 
-def build_siem_config(config: Any) -> SiemConfig:
+def build_siem_config(config: RAConfig) -> SiemConfig:
     """Build a ``SiemConfig`` from ``RAConfig`` SIEM fields."""
-    hec_token_secret = getattr(config, "siem_hec_token", None)
-    hec_token = (
-        hec_token_secret.get_secret_value()
-        if hec_token_secret is not None and hasattr(hec_token_secret, "get_secret_value")
-        else str(hec_token_secret or "")
-    )
+    jsonl_path = config.siem_jsonl_path
+    if jsonl_path is None and config.siem_sink == "jsonl":
+        jsonl_path = default_jsonl_path(config.db_path)
+    hec_token = config.siem_hec_token.get_secret_value()
     return SiemConfig(
-        sink=getattr(config, "siem_sink", "jsonl"),
-        jsonl_path=getattr(config, "siem_jsonl_path", None),
-        syslog_host=getattr(config, "siem_syslog_host", ""),
-        syslog_port=getattr(config, "siem_syslog_port", 514),
-        syslog_proto=getattr(config, "siem_syslog_proto", "udp"),
-        hec_url=getattr(config, "siem_hec_url", ""),
+        sink=config.siem_sink,
+        jsonl_path=jsonl_path,
+        syslog_host=config.siem_syslog_host,
+        syslog_port=config.siem_syslog_port,
+        syslog_proto=config.siem_syslog_proto,
+        hec_url=config.siem_hec_url,
         hec_token=hec_token,
-        hec_index=getattr(config, "siem_hec_index", ""),
-        hec_sourcetype=getattr(config, "siem_hec_sourcetype", "acme-adcs-ra"),
+        hec_index=config.siem_hec_index,
+        hec_sourcetype=config.siem_hec_sourcetype,
     )
 
 

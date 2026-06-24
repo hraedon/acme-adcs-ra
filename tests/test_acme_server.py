@@ -12,13 +12,14 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from acme_adcs_ra.config import EABEntry, RAConfig
-from acme_adcs_ra.enrollment import FakeEnrollmentLeg
+from acme_adcs_ra.enrollment import EnrollmentDenied, EnrollmentResult, FakeEnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
-from acme_adcs_ra.store import NONCE_TTL_SECONDS, Store
+from acme_adcs_ra.store import NONCE_TTL_SECONDS, Store, is_expired
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
 
@@ -44,6 +45,7 @@ def _make_test_config(tmp_path: Path) -> RAConfig:
             "kid-002": {"dns_patterns": ["*.prod.WORK-DOMAIN.local"]},
         },
         adcs_template="ACME-ServerAuth",
+        admin_token=SecretStr("test-admin-token"),
     )
 
 
@@ -112,6 +114,142 @@ def _make_csr(sans: list[str]) -> bytes:
         .sign(key, hashes.SHA256())
     )
     return csr.public_bytes(serialization.Encoding.DER)
+
+
+def _order_id_from_finalize_url(finalize_url: str) -> str:
+    return finalize_url.rsplit("/", 1)[-1]
+
+
+def _backdate_order(store: Store, order_id: str, seconds_ago: int = 60) -> None:
+    """Set an order's `expires` into the past so it is expired."""
+    past = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    with store._connect() as conn:
+        conn.execute("UPDATE orders SET expires = ? WHERE id = ?", (past, order_id))
+
+
+def _force_order_status(store: Store, order_id: str, status: str) -> None:
+    """Test-only direct write of an order status (simulates a crash mid-flight)."""
+    ts = (
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if status == "processing"
+        else None
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE orders SET status = ?, processing_started_at = ? WHERE id = ?",
+            (status, ts, order_id),
+        )
+
+
+def _walk_to_ready(acme_client: HandRolledAcmeClient, identifiers: list[str]) -> Any:
+    """Create an order and validate its challenges so it transitions to 'ready'."""
+    order = acme_client.new_order(identifiers).json()
+    for authz_url in order["authorizations"]:
+        authz = acme_client.get_authorization(authz_url).json()
+        acme_client.validate_challenge(authz["challenges"][0]["url"])
+    return order
+
+
+class _CountingEnrollmentLeg:
+    """Wraps FakeEnrollmentLeg and counts submit_csr calls.
+
+    Used to prove that reconciliation paths (reclaim-to-valid, finalize self-heal)
+    do NOT re-enroll at the CA — the security property, not just 'one cert row'.
+    """
+
+    def __init__(self, inner: FakeEnrollmentLeg | None = None) -> None:
+        self._inner = inner or FakeEnrollmentLeg()
+        self.submit_csr_call_count = 0
+
+    def submit_csr(self, csr_pem: str, *, account_id: str, requested_sans: Any) -> EnrollmentResult:
+        self.submit_csr_call_count += 1
+        return self._inner.submit_csr(csr_pem, account_id=account_id, requested_sans=requested_sans)
+
+
+class _DenyingEnrollmentLeg:
+    """Enrollment leg that always raises EnrollmentDenied.
+
+    An optional ``pre_hook`` fires before the denial so tests can simulate
+    a concurrent operation moving the order out of 'processing' (lost race).
+    """
+
+    def __init__(self, *, pre_hook: Any | None = None) -> None:
+        self.submit_csr_call_count = 0
+        self._pre_hook = pre_hook
+
+    def submit_csr(self, csr_pem: str, *, account_id: str, requested_sans: Any) -> EnrollmentResult:
+        self.submit_csr_call_count += 1
+        if self._pre_hook is not None:
+            self._pre_hook()
+        raise EnrollmentDenied("Denied by CA policy")
+
+
+class _RacingDenyingEnrollmentLeg:
+    """Denies enrollment after moving the order, simulating a concurrent reclaim.
+
+    Set ``order_id`` after creating the order, before finalizing.
+    """
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+        self.order_id: str = ""
+        self.submit_csr_call_count = 0
+
+    def submit_csr(self, csr_pem: str, *, account_id: str, requested_sans: Any) -> EnrollmentResult:
+        self.submit_csr_call_count += 1
+        self._store.transition_processing_to_ready(self.order_id)
+        raise EnrollmentDenied("Denied by CA policy")
+
+
+class _RacingEnrollmentLeg:
+    """Enrollment leg that moves the order to 'valid' before returning.
+
+    Simulates a concurrent self-heal: inside submit_csr it creates a cert and
+    CAS-transitions the order to 'valid', so the success-path CAS-to-valid
+    in finalize loses the race. Set ``order_id`` after creating the order.
+    """
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+        self.order_id: str = ""
+        self.submit_csr_call_count = 0
+
+    def submit_csr(self, csr_pem: str, *, account_id: str, requested_sans: Any) -> EnrollmentResult:
+        self.submit_csr_call_count += 1
+        inner = FakeEnrollmentLeg()
+        result = inner.submit_csr(csr_pem, account_id=account_id, requested_sans=requested_sans)
+        cert = self._store.create_certificate(
+            order_id=self.order_id,
+            account_id=account_id,
+            cert_pem=result.cert_pem,
+            chain_pem=result.chain_pem,
+            template=result.template,
+            requester=result.requester,
+            metadata=dict(result.metadata),
+        )
+        cert_url = f"http://testserver/acme/cert/{cert.id}"
+        self._store.transition_processing_to_valid(self.order_id, cert_url)
+        return result
+
+
+def _make_context(config: RAConfig, enrollment: Any) -> tuple[Store, ServerContext]:
+    """Build a (store, ServerContext) with an injectable enrollment leg."""
+    store = Store(config.db_path)
+    policy = IssuancePolicy(
+        allowed_kids=set(config.eab_keys_by_kid().keys()),
+        san_scopes={k: s.dns_patterns for k, s in config.san_scopes.items()},
+        template=config.adcs_template,
+    )
+    context = ServerContext(
+        config=config,
+        store=store,
+        policy=policy,
+        enrollment=enrollment,
+        revocation=FakeRevocationLeg(),
+    )
+    return store, context
 
 
 # ---------------------------------------------------------------------------
@@ -883,3 +1021,688 @@ class TestReviewFixes:
         resp = acme_client._post_jws(url, {"onlyReturnExisting": True}, is_new_account=True)
         assert resp.status_code == 400
         assert resp.json()["type"] == "urn:ietf:params:acme:error:accountDoesNotExist"
+
+
+# ---------------------------------------------------------------------------
+# RFC 8555 §7.1.6: order expiry enforcement at finalize
+# ---------------------------------------------------------------------------
+
+
+class TestOrderExpiryEnforcement:
+    """An expired order MUST NOT be finalizable (RFC 8555 §7.1.6)."""
+
+    def test_finalize_expired_order_rejected_and_marked_invalid(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        store = Store(test_config.db_path)
+        _backdate_order(store, order_id)
+
+        resp = acme_client.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        assert resp.status_code == 400
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:malformed"
+        assert "expired" in resp.json()["detail"]
+
+        # The order was transitioned to invalid (RFC 8555 §7.1.6).
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "invalid"
+
+        # Audited as a denied finalize.
+        events = store.list_audit_events(event_type="finalize-expired-order")
+        assert any(e["order_id"] == order_id and e["outcome"] == "denied" for e in events)
+
+    def test_fresh_order_still_finalizes(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        # Guard against the expiry check being over-broad: a fresh order issues.
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+        resp = acme_client.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "valid"
+
+
+# ---------------------------------------------------------------------------
+# Operator reconciliation of an order stuck in 'processing'
+# ---------------------------------------------------------------------------
+
+
+class TestStuckProcessingReclaim:
+    """Admin endpoint to reconcile an order wedged in 'processing'."""
+
+    def test_reclaim_without_certificate_returns_ready(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        store = Store(test_config.db_path)
+        # Simulate a crash mid-enrollment: order stuck in 'processing', no cert.
+        _force_order_status(store, order_id, "processing")
+        assert store.get_certificate_by_order(order_id) is None
+
+        resp = client.post(
+            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ready"
+
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "ready"
+        assert refreshed.processing_started_at is None
+
+        events = store.list_audit_events(event_type="admin-order-reclaimed")
+        assert any(
+            e["order_id"] == order_id
+            and e["details"].get("new_status") == "ready"
+            and e["details"].get("had_certificate") is False
+            for e in events
+        )
+
+    def test_reclaim_with_certificate_returns_valid(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        # Reproduce the crash window BETWEEN create_certificate and the status
+        # flip: complete a real issue, then reset the order to 'processing'.
+        # The cert row remains, so reclaim must close the loop to 'valid'
+        # without re-enrolling (no double-issuance at the CA).
+        config = _make_test_config(tmp_path)
+        leg = _CountingEnrollmentLeg()
+        store, context = _make_context(config, leg)
+        client = TestClient(create_app(context))
+        acme = HandRolledAcmeClient(client, "http://testserver", account_key)
+        acme.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+        order = _walk_to_ready(acme, ["web.WORK-DOMAIN.local"])
+        acme.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        order_id = _order_id_from_finalize_url(order["finalize"])
+        assert leg.submit_csr_call_count == 1  # one enrollment so far
+
+        assert store.get_certificate_by_order(order_id) is not None
+        _force_order_status(store, order_id, "processing")
+
+        resp = client.post(
+            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "valid"
+        assert "certificate" in body
+
+        # Reclaim closed the loop WITHOUT contacting the CA again.
+        assert leg.submit_csr_call_count == 1
+
+        # Exactly one cert row exists.
+        with store._connect() as conn:
+            cert_count = conn.execute(
+                "SELECT COUNT(*) FROM certificates WHERE order_id = ?", (order_id,)
+            ).fetchone()[0]
+        assert cert_count == 1
+
+        events = store.list_audit_events(event_type="admin-order-reclaimed")
+        assert any(
+            e["order_id"] == order_id
+            and e["details"].get("new_status") == "valid"
+            and e["details"].get("had_certificate") is True
+            for e in events
+        )
+
+    def test_finalize_self_heals_processing_order_with_existing_cert(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        # Crash window: a cert row exists but the order is stuck in 'processing'.
+        # A client re-finalizing must get back valid + the certificate URL
+        # (self-heal), NOT be told to poll forever — and must NOT re-enroll.
+        config = _make_test_config(tmp_path)
+        leg = _CountingEnrollmentLeg()
+        store, context = _make_context(config, leg)
+        client = TestClient(create_app(context))
+        acme = HandRolledAcmeClient(client, "http://testserver", account_key)
+        acme.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+        order = _walk_to_ready(acme, ["web.WORK-DOMAIN.local"])
+        acme.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        order_id = _order_id_from_finalize_url(order["finalize"])
+        _force_order_status(store, order_id, "processing")
+
+        resp = acme.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "valid"
+        assert "certificate" in body
+        assert leg.submit_csr_call_count == 1  # not re-enrolled
+
+        events = store.list_audit_events(event_type="finalize-order-reconciled")
+        assert any(e["order_id"] == order_id and e["outcome"] == "success" for e in events)
+
+    def test_reclaim_to_ready_then_finalize_enrolls_exactly_once(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        # The most dangerous path: reclaim-to-ready (no cert recorded) is the
+        # one operator action that can enable a re-enroll. Prove end-to-end that
+        # after reclaim, a re-finalize produces EXACTLY ONE enrollment — not
+        # zero (the order is still issuable) and not two (no double-enrollment).
+        config = _make_test_config(tmp_path)
+        leg = _CountingEnrollmentLeg()
+        store, context = _make_context(config, leg)
+        client = TestClient(create_app(context))
+        acme = HandRolledAcmeClient(client, "http://testserver", account_key)
+        acme.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+        order = _walk_to_ready(acme, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        # Crash mid-enrollment: no cert recorded, order stuck in 'processing'.
+        _force_order_status(store, order_id, "processing")
+        assert leg.submit_csr_call_count == 0
+        assert store.get_certificate_by_order(order_id) is None
+
+        # Operator (having confirmed no cert at the CA) reclaims to ready.
+        resp = client.post(
+            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ready"
+        assert leg.submit_csr_call_count == 0  # reclaim does not enroll
+
+        # Client re-finalizes -> exactly one enrollment, order ends valid.
+        finalize_resp = acme.finalize_order(
+            order["finalize"], _make_csr(["web.WORK-DOMAIN.local"])
+        )
+        assert finalize_resp.status_code == 200
+        assert finalize_resp.json()["status"] == "valid"
+        assert leg.submit_csr_call_count == 1
+
+    def test_reclaim_requires_admin_token(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        # No Authorization header.
+        resp = client.post(f"/acme/admin/orders/{order_id}/reclaim-processing")
+        assert resp.status_code == 401
+
+        # Wrong token.
+        resp = client.post(
+            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+
+        # Order unchanged.
+        store = Store(test_config.db_path)
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "ready"
+
+    def test_reclaim_non_processing_is_idempotent_noop(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        # Order is 'ready' (not stuck): reclaim returns current state, and the
+        # no-op is audited (so a stolen admin token probing order IDs is visible
+        # to SIEM — threat-model §4.F).
+        resp = client.post(
+            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ready"
+
+        store = Store(test_config.db_path)
+        noop_events = store.list_audit_events(event_type="admin-order-reclaim-noop")
+        assert any(
+            e["order_id"] == order_id
+            and e["outcome"] == "noop"
+            and e["details"].get("order_status") == "ready"
+            for e in noop_events
+        )
+        # No success reclaim row for the no-op.
+        success_events = store.list_audit_events(event_type="admin-order-reclaimed")
+        assert not any(e["order_id"] == order_id for e in success_events)
+
+    def test_reclaim_unknown_order_is_not_found_and_audited(
+        self, test_config: RAConfig, client: TestClient
+    ) -> None:
+        resp = client.post(
+            "/acme/admin/orders/does-not-exist/reclaim-processing",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 404
+
+        # The probe is audited as a denied reclaim (order-not-found).
+        store = Store(test_config.db_path)
+        events = store.list_audit_events(event_type="admin-order-reclaim-denied")
+        assert any(
+            e["outcome"] == "failed" and e["details"].get("reason") == "order-not-found"
+            for e in events
+        )
+
+
+# ---------------------------------------------------------------------------
+# Admin maintenance sweeps (nonce cleanup + expired-order sweep)
+# ---------------------------------------------------------------------------
+
+
+class TestAdminSweeps:
+    """Admin cron endpoints: nonce cleanup and expired-order sweep."""
+
+    def test_nonce_cleanup_endpoint_requires_token(self, client: TestClient) -> None:
+        resp = client.delete("/acme/admin/nonces")
+        assert resp.status_code == 401
+
+    def test_nonce_cleanup_endpoint_deletes_expired(
+        self, test_config: RAConfig, client: TestClient
+    ) -> None:
+        store = Store(test_config.db_path)
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(seconds=NONCE_TTL_SECONDS + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with store._connect() as conn:
+            conn.execute("INSERT INTO nonces (nonce, created_at) VALUES (?, ?)", ("stale-nonce", old))
+
+        resp = client.delete(
+            "/acme/admin/nonces",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] >= 1
+
+    def test_expired_orders_sweep_requires_token(self, client: TestClient) -> None:
+        resp = client.delete("/acme/admin/expired-orders")
+        assert resp.status_code == 401
+
+    def test_expired_orders_sweep_invalidates_expired(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = acme_client.new_order(["web.WORK-DOMAIN.local"]).json()
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        store = Store(test_config.db_path)
+        _backdate_order(store, order_id)
+
+        resp = client.delete(
+            "/acme/admin/expired-orders",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["invalidated"] >= 1
+
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "invalid"
+
+        events = store.list_audit_events(event_type="admin-expired-order-sweep")
+        assert any(e["outcome"] == "success" for e in events)
+
+    def test_sweep_leaves_processing_order_alone(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        # A 'processing' order must NOT be auto-invalidated by the sweep — that
+        # is operator-reconciliation territory (the reclaim endpoint).
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        store = Store(test_config.db_path)
+        _force_order_status(store, order_id, "processing")
+        _backdate_order(store, order_id)
+
+        resp = client.delete(
+            "/acme/admin/expired-orders",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "processing"
+
+    def test_sweep_and_is_expired_agree_on_boundary(self, tmp_path: Path) -> None:
+        # The sweep now uses the datetime-based is_expired (same as finalize);
+        # this test verifies they agree across the expiry boundary.
+        # Use a single parsed `now` for both sides so the test is not flaky
+        # across a one-second boundary, and exercise the REAL sweep against
+        # a temp store.
+        from acme_adcs_ra.store import _now_iso, _parse_iso
+
+        now_str = _now_iso()
+        now_dt = _parse_iso(now_str)  # same instant as the sweep's `now`
+
+        # Account + order rows so the sweep has something to act on per delta.
+        store = Store(tmp_path / "boundary.db")
+        with store._connect() as conn:
+            conn.execute(
+                "INSERT INTO accounts (id, status, jwk_json, eab_kid, contact, created_at) "
+                "VALUES ('acct-1', 'valid', '{}', 'kid', '[]', ?)",
+                (now_str,),
+            )
+        for delta in (-120, -1, 0, 1, 120):
+            ts = (now_dt + timedelta(seconds=delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            datetime_expired = is_expired(ts, now=now_dt)
+            # What the sweep's `WHERE expires <= <now_str>` will compute:
+            sql_expired = ts <= now_str
+            assert datetime_expired == sql_expired, (
+                f"sweep/is_expired divergence at delta={delta}: ts={ts} now={now_str} "
+                f"is_expired={datetime_expired} sql={sql_expired}"
+            )
+
+            # And confirm the real sweep agrees: insert an order at this ts,
+            # run the sweep, and check it was invalidated iff is_expired is True.
+            oid = f"order-d{delta}"
+            with store._connect() as conn:
+                conn.execute(
+                    "INSERT INTO orders (id, account_id, status, identifiers, authorizations, "
+                    "finalize_url, certificate_url, expires, created_at, updated_at) "
+                    "VALUES (?, 'acct-1', 'ready', '[]', '[]', '', NULL, ?, ?, ?)",
+                    (oid, ts, now_str, now_str),
+                )
+            before = store.get_order(oid)
+            assert before is not None and before.status == "ready"
+            store.sweep_expired_orders()  # uses a fresh _now_iso() internally
+            # Sweep's now is >= now_str, so if is_expired(ts, now_dt) the sweep
+            # must have invalidated; if not expired at now_dt+epsilon it must not.
+            after = store.get_order(oid)
+            assert after is not None
+            if datetime_expired:
+                assert after.status == "invalid", f"delta={delta} ts={ts} not swept"
+            else:
+                # delta=+120 is safely in the future; +1 could race the sweep's
+                # slightly-later now, so only assert strictly-future cases.
+                if delta >= 60:
+                    assert after.status == "ready", f"delta={delta} wrongly swept"
+
+
+# ---------------------------------------------------------------------------
+# CAS-guarded enrollment error / success transitions (threat-model §4.D)
+# ---------------------------------------------------------------------------
+
+
+class TestEnrollmentCasRevert:
+    """Verify that enrollment error and success paths use CAS-guarded
+    transitions so a concurrent reclaim/self-heal cannot be clobbered."""
+
+    def test_enrollment_denied_reverts_to_ready(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        # Normal path: CA denies, CAS revert succeeds, order is retryable.
+        config = _make_test_config(tmp_path)
+        leg = _DenyingEnrollmentLeg()
+        store, context = _make_context(config, leg)
+        client = TestClient(create_app(context))
+        acme = HandRolledAcmeClient(client, "http://testserver", account_key)
+        acme.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+        order = _walk_to_ready(acme, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        resp = acme.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        assert resp.status_code == 400
+        assert "rejectedIdentifier" in resp.json()["type"]
+
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "ready"
+        assert refreshed.processing_started_at is None
+
+        events = store.list_audit_events(event_type="finalize-enrollment-denied")
+        assert any(
+            e["order_id"] == order_id
+            and e["details"].get("revert_applied") is True
+            for e in events
+        )
+
+    def test_enrollment_denial_lost_race_does_not_clobber(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        # A concurrent reclaim moved the order out of 'processing' before the
+        # denial handler's CAS runs. The handler must NOT clobber the order —
+        # it returns the current state (200) instead of raising 400.
+        config = _make_test_config(tmp_path)
+        store = Store(config.db_path)
+        leg = _RacingDenyingEnrollmentLeg(store)
+        _, context = _make_context(config, leg)
+        client = TestClient(create_app(context))
+        acme = HandRolledAcmeClient(client, "http://testserver", account_key)
+        acme.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+        order = _walk_to_ready(acme, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+        leg.order_id = order_id
+
+        resp = acme.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        # Lost the race: 200 with current state, NOT 400 rejectedIdentifier.
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ready"
+
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "ready"
+
+        events = store.list_audit_events(event_type="finalize-enrollment-denied")
+        assert any(
+            e["order_id"] == order_id
+            and e["details"].get("revert_applied") is False
+            for e in events
+        )
+
+    def test_enrollment_success_lost_race_audited(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        # A concurrent self-heal moved the order to 'valid' (with a cert)
+        # during the enrollment call. The success-path CAS loses the race;
+        # the anomaly is audited and the client sees the valid order.
+        # The re-check prevents a duplicate cert row (orphan).
+        config = _make_test_config(tmp_path)
+        store = Store(config.db_path)
+        leg = _RacingEnrollmentLeg(store)
+        _, context = _make_context(config, leg)
+        client = TestClient(create_app(context))
+        acme = HandRolledAcmeClient(client, "http://testserver", account_key)
+        acme.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+        order = _walk_to_ready(acme, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+        leg.order_id = order_id
+
+        resp = acme.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "valid"
+        assert "certificate" in body
+
+        # The race anomaly is audited.
+        race_events = store.list_audit_events(event_type="finalize-enrollment-race")
+        assert any(
+            e["order_id"] == order_id
+            and e["outcome"] == "failed"
+            and e["details"].get("reason") == "lost-processing-cas"
+            for e in race_events
+        )
+
+        # The normal certificate-issued event was NOT emitted (CAS lost).
+        issued_events = store.list_audit_events(event_type="certificate-issued")
+        assert not any(e["order_id"] == order_id for e in issued_events)
+
+        # No orphaned cert row — the re-check found the racing leg's cert.
+        with store._connect() as conn:
+            cert_count = conn.execute(
+                "SELECT COUNT(*) FROM certificates WHERE order_id = ?", (order_id,)
+            ).fetchone()[0]
+        assert cert_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Admin order listing endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestAdminOrderListing:
+    """GET /acme/admin/orders?status=processing — stuck-order visibility."""
+
+    def test_list_processing_orders_requires_token(self, client: TestClient) -> None:
+        resp = client.get("/acme/admin/orders")
+        assert resp.status_code == 401
+
+    def test_list_processing_orders_returns_stuck(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        store = Store(test_config.db_path)
+        _force_order_status(store, order_id, "processing")
+
+        resp = client.get(
+            "/acme/admin/orders",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        orders = resp.json()["orders"]
+        assert any(o["status"] == "processing" for o in orders)
+        stuck = next(o for o in orders if o["status"] == "processing")
+        assert "processing_started_at" in stuck
+
+    def test_list_orders_filter_by_ready(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+
+        resp = client.get(
+            "/acme/admin/orders?status=ready",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        orders = resp.json()["orders"]
+        assert all(o["status"] == "ready" for o in orders)
+        assert len(orders) >= 1
+
+    def test_list_orders_rejects_invalid_status(
+        self,
+        client: TestClient,
+    ) -> None:
+        resp = client.get(
+            "/acme/admin/orders?status=invalid_status",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 400
+
+    def test_list_orders_rejects_negative_limit(
+        self,
+        client: TestClient,
+    ) -> None:
+        resp = client.get(
+            "/acme/admin/orders?limit=-1",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 400
+
+    def test_list_orders_rejects_excessive_limit(
+        self,
+        client: TestClient,
+    ) -> None:
+        resp = client.get(
+            "/acme/admin/orders?limit=999",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 400
+
+    def test_list_orders_is_audited(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+
+        client.get(
+            "/acme/admin/orders?status=ready",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+        store = Store(test_config.db_path)
+        events = store.list_audit_events(event_type="admin-list-orders")
+        assert any(
+            e["outcome"] == "success"
+            and e["details"].get("status") == "ready"
+            and e["details"].get("returned", 0) >= 1
+            for e in events
+        )
+
+    def test_list_orders_minimal_view_no_sans(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        order = _walk_to_ready(acme_client, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        store = Store(test_config.db_path)
+        _force_order_status(store, order_id, "processing")
+
+        resp = client.get(
+            "/acme/admin/orders",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        orders = resp.json()["orders"]
+        stuck = next(o for o in orders if o["id"] == order_id)
+        # Minimal admin view: no SANs, no certificate URL.
+        assert "identifiers" not in stuck
+        assert "certificate" not in stuck
+        assert "authorizations" not in stuck
+        assert "finalize" not in stuck
+        # But monitoring-relevant fields are present.
+        assert stuck["status"] == "processing"
+        assert "processing_started_at" in stuck
+        assert "account_id" in stuck

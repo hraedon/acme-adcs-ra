@@ -6,12 +6,13 @@ All values use placeholders (CA01, WORK-DOMAIN.local, etc.).
 
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from acme_adcs_ra.jws import _base64url_decode
 
 
 class EABEntry(BaseModel):
@@ -136,9 +137,7 @@ class RAConfig(BaseSettings):
 
     def eab_key_bytes(self, kid: str) -> bytes | None:
         """Return the decoded EAB MAC key bytes for a kid, or None if unknown."""
-        mac_key_b64 = self.eab_keys_by_kid().get(kid)
-        if mac_key_b64 is None:
-            return None
-        # base64url decode, tolerating missing padding.
-        padding_needed = (-len(mac_key_b64)) % 4
-        return base64.urlsafe_b64decode(mac_key_b64 + ("=" * padding_needed))
+        for entry in self.eab_allowlist:
+            if entry.kid == kid:
+                return _base64url_decode(entry.mac_key.get_secret_value())
+        return None

@@ -37,6 +37,32 @@ def _now_iso_plus(seconds: int) -> str:
     )
 
 
+_ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _parse_iso(ts: str) -> datetime:
+    """Parse a UTC RFC 3339 timestamp produced by ``_now_iso``.
+
+    Tolerates a trailing ``Z`` or an explicit ``+00:00`` offset. Returns a
+    timezone-aware datetime (UTC). Raises ``ValueError`` if *ts* is not parseable.
+    """
+    if ts.endswith("Z"):
+        return datetime.strptime(ts, _ISO_FORMAT).replace(tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(ts)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def is_expired(expires: str, *, now: datetime | None = None) -> bool:
+    """Return True if an RFC 3339 ``expires`` timestamp is at or past ``now``.
+
+    Used to enforce RFC 8555 §7.1.6: an order whose ``expires`` is in the past
+    MUST NOT be finalized, and the server SHOULD transition it to ``invalid``.
+    """
+    return _parse_iso(expires) <= (now or datetime.now(timezone.utc))
+
+
 def _dump_json(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
@@ -54,6 +80,7 @@ def _serial_from_pem(cert_pem: str) -> str:
 
 
 NONCE_TTL_SECONDS: int = 1800  # 30 minutes
+NONCE_GC_PROBABILITY: int = 100  # 1-in-N chance to clean expired nonces on create
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +174,8 @@ CREATE TABLE IF NOT EXISTS nonces (
     nonce TEXT PRIMARY KEY,
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_nonces_created_at
+    ON nonces (created_at);
 
 CREATE TABLE IF NOT EXISTS orders (
     id TEXT PRIMARY KEY,
@@ -161,6 +190,8 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TEXT NOT NULL,
     processing_started_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_orders_status_created
+    ON orders (status, created_at);
 
 CREATE TABLE IF NOT EXISTS authorizations (
     id TEXT PRIMARY KEY,
@@ -311,6 +342,31 @@ class Store:
             revoked_at=row["revoked_at"],
         )
 
+    def _account_from_row(self, row: sqlite3.Row) -> AccountRecord:
+        return AccountRecord(
+            id=row["id"],
+            status=row["status"],
+            jwk_json=row["jwk_json"],
+            eab_kid=row["eab_kid"],
+            created_at=row["created_at"],
+            contact=_load_json(row["contact"]) or [],
+        )
+
+    def _order_from_row(self, row: sqlite3.Row) -> OrderRecord:
+        return OrderRecord(
+            id=row["id"],
+            account_id=row["account_id"],
+            status=row["status"],
+            identifiers=_load_json(row["identifiers"]),
+            authorizations=_load_json(row["authorizations"]),
+            finalize_url=row["finalize_url"],
+            certificate_url=row["certificate_url"],
+            expires=row["expires"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            processing_started_at=row["processing_started_at"],
+        )
+
 
     # ------------------------------------------------------------------
     # Accounts
@@ -361,14 +417,7 @@ class Store:
             ).fetchone()
         if row is None:
             return None
-        return AccountRecord(
-            id=row["id"],
-            status=row["status"],
-            jwk_json=row["jwk_json"],
-            eab_kid=row["eab_kid"],
-            created_at=row["created_at"],
-            contact=_load_json(row["contact"]) or [],
-        )
+        return self._account_from_row(row)
 
     def get_account_by_jwk(self, jwk: dict[str, Any]) -> AccountRecord | None:
         """Return the account whose key matches this JWK (RFC 7638 thumbprint).
@@ -383,14 +432,7 @@ class Store:
             ).fetchone()
         if row is None:
             return None
-        return AccountRecord(
-            id=row["id"],
-            status=row["status"],
-            jwk_json=row["jwk_json"],
-            eab_kid=row["eab_kid"],
-            created_at=row["created_at"],
-            contact=_load_json(row["contact"]) or [],
-        )
+        return self._account_from_row(row)
 
     # ------------------------------------------------------------------
     # Nonces
@@ -399,11 +441,25 @@ class Store:
     def create_nonce(self) -> str:
         nonce = uuid.uuid4().hex + uuid.uuid4().hex
         now = datetime.now(timezone.utc)
+        now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO nonces (nonce, created_at) VALUES (?, ?)",
-                (nonce, now.strftime("%Y-%m-%dT%H:%M:%SZ")),
+                (nonce, now_str),
             )
+            # Probabilistic GC safety net: clean expired nonces on ~1% of
+            # creations so the table doesn't grow unbounded if the admin
+            # cron is missed (threat-model §4.G). The admin endpoint remains
+            # the primary cleanup path; this is a belt-and-suspenders fallback.
+            # Bounded by LIMIT to avoid holding the writer lock too long.
+            if uuid.uuid4().int % NONCE_GC_PROBABILITY == 0:
+                cutoff = (now - timedelta(seconds=NONCE_TTL_SECONDS)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+                conn.execute(
+                    "DELETE FROM nonces WHERE created_at < ? LIMIT 5000",
+                    (cutoff,),
+                )
         return nonce
 
     def consume_nonce(self, nonce: str) -> bool:
@@ -423,55 +479,6 @@ class Store:
     # Orders
     # ------------------------------------------------------------------
 
-    def create_order(
-        self,
-        *,
-        account_id: str,
-        identifiers: Sequence[dict[str, str]],
-        authorizations: Sequence[str],
-        finalize_url: str,
-        certificate_url: str | None = None,
-        status: str = "pending",
-        expires: str | None = None,
-    ) -> OrderRecord:
-        order_id = uuid.uuid4().hex
-        created_at = _now_iso()
-        if expires is None:
-            expires = _now_iso_plus(self._order_expiry_seconds)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO orders
-                (id, account_id, status, identifiers, authorizations, finalize_url,
-                 certificate_url, expires, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    order_id,
-                    account_id,
-                    status,
-                    _dump_json(list(identifiers)),
-                    _dump_json(list(authorizations)),
-                    finalize_url,
-                    certificate_url,
-                    expires,
-                    created_at,
-                    created_at,
-                ),
-            )
-        return OrderRecord(
-            id=order_id,
-            account_id=account_id,
-            status=status,
-            identifiers=list(identifiers),
-            authorizations=list(authorizations),
-            finalize_url=finalize_url,
-            certificate_url=certificate_url,
-            expires=expires,
-            created_at=created_at,
-            updated_at=created_at,
-        )
-
     def get_order(self, order_id: str) -> OrderRecord | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -479,19 +486,7 @@ class Store:
             ).fetchone()
         if row is None:
             return None
-        return OrderRecord(
-            id=row["id"],
-            account_id=row["account_id"],
-            status=row["status"],
-            identifiers=_load_json(row["identifiers"]),
-            authorizations=_load_json(row["authorizations"]),
-            finalize_url=row["finalize_url"],
-            certificate_url=row["certificate_url"],
-            expires=row["expires"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            processing_started_at=row["processing_started_at"],
-        )
+        return self._order_from_row(row)
 
     def update_order_status(
         self,
@@ -536,6 +531,124 @@ class Store:
                 ("processing", updated_at, updated_at, order_id),
             )
             return cursor.rowcount == 1
+
+    def transition_processing_to_ready(self, order_id: str) -> bool:
+        """Atomically transition an order from 'processing' back to 'ready'.
+
+        Operator-initiated reconciliation of an order wedged in 'processing'
+        (e.g. after a crash mid-enrollment where no certificate was recorded).
+        CAS-guarded on ``status = 'processing'`` so it can never clobber a live
+        enrollment or a concurrent transition. Clears ``processing_started_at``.
+        Returns True if the transition was applied.
+
+        **Safety:** the caller (an operator via the admin endpoint) MUST first
+        confirm from the ADCS CA database that no certificate was issued for
+        this order's request — otherwise re-finalizing would double-issue.
+        """
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE orders SET status = 'ready', processing_started_at = NULL, "
+                "updated_at = ? WHERE id = ? AND status = 'processing'",
+                (updated_at, order_id),
+            )
+            return cursor.rowcount == 1
+
+    def transition_processing_to_valid(
+        self, order_id: str, certificate_url: str
+    ) -> bool:
+        """Atomically transition an order from 'processing' to 'valid'.
+
+        Reconciliation for the case where enrollment succeeded and a certificate
+        row was recorded, but the order's status flip was missed (e.g. a crash
+        between ``create_certificate`` and ``update_order_status``). CAS-guarded
+        on ``status = 'processing'``. Returns True if the transition was applied.
+        """
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE orders SET status = 'valid', certificate_url = ?, "
+                "processing_started_at = NULL, updated_at = ? "
+                "WHERE id = ? AND status = 'processing'",
+                (certificate_url, updated_at, order_id),
+            )
+            return cursor.rowcount == 1
+
+    def transition_active_to_invalid(self, order_id: str) -> bool:
+        """Atomically transition a still-active order to 'invalid'.
+
+        CAS-guarded on ``status IN ('pending', 'ready')`` so it can never clobber
+        an order a concurrent finalize has already moved to ``processing`` or
+        ``valid`` (the double-issuance guard). Used by finalize's expiry check
+        (RFC 8555 §7.1.6) so a stale snapshot cannot flip a now-processing order
+        to ``invalid`` out from under a live enrollment. Returns True if applied.
+        """
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE orders SET status = 'invalid', updated_at = ? "
+                "WHERE id = ? AND status IN ('pending', 'ready')",
+                (updated_at, order_id),
+            )
+            return cursor.rowcount == 1
+
+    def list_orders_by_status(
+        self, status: str, *, limit: int = 100
+    ) -> list[OrderRecord]:
+        """Return orders with the given status, newest first.
+
+        Used by the admin monitoring endpoint to list orders stuck in
+        ``processing`` (threat-model §4.D: monitor time-in-``processing`` p99).
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM orders WHERE status = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        return [self._order_from_row(row) for row in rows]
+
+    def sweep_expired_orders(self) -> int:
+        """Transition every still-active expired order to 'invalid'.
+
+        RFC 8555 §7.1.6: the server SHOULD move an expired order (and its
+        authorizations) to ``invalid``. This sweep transitions the **order**
+        rows; the order's authorization/challenge rows are left as-is (a
+        follow-up — the invalid order can no longer be finalized, so the stale
+        authz are unreachable, not a security gap). Only ``pending``/``ready``
+        orders are swept — ``processing``/``valid``/``invalid``/``revoked`` are
+        terminal or operator-reconcilable and are left alone. Returns the count
+        transitioned.
+
+        Intended to be driven by an external cron via the admin endpoint (the
+        same operator pattern as ``cleanup_expired_nonces``); expiry is also
+        enforced lazily at finalize so issuance can never proceed past expiry
+        even between sweeps.
+        """
+        now = datetime.now(timezone.utc)
+        now_str = _now_iso()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, expires FROM orders WHERE status IN ('pending', 'ready')"
+            ).fetchall()
+            expired_ids = [
+                row["id"] for row in rows
+                if is_expired(row["expires"], now=now)
+            ]
+            if not expired_ids:
+                return 0
+            # Batch to stay under SQLite's default 999 host-parameter limit.
+            total = 0
+            for i in range(0, len(expired_ids), 900):
+                batch = expired_ids[i:i + 900]
+                placeholders = ",".join("?" for _ in batch)
+                cursor = conn.execute(
+                    f"UPDATE orders SET status = 'invalid', updated_at = ? "
+                    f"WHERE id IN ({placeholders}) AND status IN ('pending', 'ready')",
+                    (now_str, *batch),
+                )
+                total += cursor.rowcount
+            return total
 
     def create_order_with_authz(
         self,
@@ -642,67 +755,6 @@ class Store:
     # Authorizations + Challenges
     # ------------------------------------------------------------------
 
-    def create_authorization(
-        self,
-        *,
-        account_id: str,
-        order_id: str,
-        identifier: dict[str, str],
-        challenge_type: str = "http-01",
-        challenge_url: str = "",
-        status: str = "pending",
-        expires: str | None = None,
-    ) -> AuthorizationRecord:
-        authz_id = uuid.uuid4().hex
-        challenge_id = uuid.uuid4().hex
-        token = uuid.uuid4().hex + uuid.uuid4().hex
-        if expires is None:
-            expires = _now_iso()
-        challenge = ChallengeRecord(
-            id=challenge_id,
-            authz_id=authz_id,
-            type=challenge_type,
-            status="pending",
-            token=token,
-            url=challenge_url,
-            validated_at=None,
-        )
-        challenges = [challenge]
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO authorizations
-                (id, account_id, order_id, identifier, status, expires, challenges)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    authz_id,
-                    account_id,
-                    order_id,
-                    _dump_json(identifier),
-                    status,
-                    expires,
-                    _dump_json([c.__dict__ for c in challenges]),
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO challenges
-                (id, authz_id, type, status, token, url, validated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (challenge_id, authz_id, challenge_type, "pending", token, challenge_url, None),
-            )
-        return AuthorizationRecord(
-            id=authz_id,
-            account_id=account_id,
-            order_id=order_id,
-            identifier=identifier,
-            status=status,
-            expires=expires,
-            challenges=challenges,
-        )
-
     def get_authorization(self, authz_id: str) -> AuthorizationRecord | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -780,18 +832,6 @@ class Store:
                 WHERE id = ?
                 """,
                 (status, validated_at, challenge_id),
-            )
-
-    def update_challenge_url(self, challenge_id: str, url: str) -> None:
-        """Update the URL of a challenge after its id is known.
-
-        H4: the challenges table is the single source of truth; no longer
-        dual-writes the authorizations.challenges JSON blob.
-        """
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE challenges SET url = ? WHERE id = ?",
-                (url, challenge_id),
             )
 
     # ------------------------------------------------------------------

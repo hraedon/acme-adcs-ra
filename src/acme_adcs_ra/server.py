@@ -23,11 +23,6 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509 import (
     DNSName,
-    IPAddress,
-    OtherName,
-    RFC822Name,
-    RegisteredID,
-    UniformResourceIdentifier,
     load_der_x509_csr,
     load_pem_x509_csr,
 )
@@ -59,8 +54,8 @@ from acme_adcs_ra.server_jws import (
     verify_existing_account_jws,
     verify_new_account_jws,
 )
-from acme_adcs_ra.siem import SiemEmitter, SiemConfig, build_siem_config, default_jsonl_path
-from acme_adcs_ra.store import Store, _now_iso
+from acme_adcs_ra.siem import SiemEmitter, build_siem_config
+from acme_adcs_ra.store import Store, _now_iso, is_expired
 
 logger = logging.getLogger("acme_adcs_ra.server")
 
@@ -160,28 +155,6 @@ def _reject_non_dns_sans(san_value: x509.SubjectAlternativeName) -> None:
     With server-auth-only scope, IPAddress/otherName/URI/RFC822Name SANs
     are an expansion risk — the ADCS template might honor them.
     """
-    # These are the GeneralName types that the cryptography library exposes.
-    # We check for each one that is NOT DNSName.
-    non_dns_types: list[type] = [
-        IPAddress,
-        RFC822Name,
-        UniformResourceIdentifier,
-        RegisteredID,
-        OtherName,
-    ]
-    for gn_type in non_dns_types:
-        try:
-            values = san_value.get_values_for_type(gn_type)
-        except Exception:
-            values = []
-        if values:
-            raise bad_csr(
-                f"CSR contains unsupported SAN type {gn_type.__name__}; "
-                f"only DNSName SANs are accepted"
-            )
-    # Also iterate the SAN extension to catch any type we didn't explicitly
-    # check above (e.g. OtherName via iteration even if get_values_for_type
-    # missed it, or future GeneralName subtypes).
     for gn in san_value:
         if not isinstance(gn, DNSName):
             raise bad_csr(
@@ -216,12 +189,7 @@ def _validate_csr_key_strength(csr: x509.CertificateSigningRequest) -> None:
 
 def _default_siem_emitter(config: RAConfig) -> SiemEmitter:
     """Build the default SIEM emitter from RAConfig."""
-    siem_config = build_siem_config(config)
-    if siem_config.sink == "jsonl" and siem_config.jsonl_path is None:
-        siem_config = SiemConfig(
-            **{**siem_config.__dict__, "jsonl_path": default_jsonl_path(config.db_path)}
-        )
-    return SiemEmitter(siem_config)
+    return SiemEmitter(build_siem_config(config))
 
 
 def create_app(context: ServerContext) -> FastAPI:
@@ -301,7 +269,6 @@ def create_app(context: ServerContext) -> FastAPI:
         if not auth_header.startswith("Bearer "):
             raise unauthorized("missing Bearer token")
         provided = auth_header.split(" ", 1)[1]
-        import hmac
         if not hmac.compare_digest(provided, admin_token):
             raise unauthorized("invalid admin token")
 
@@ -319,6 +286,128 @@ def create_app(context: ServerContext) -> FastAPI:
             details={"deleted": deleted},
         )
         return JSONResponse(content={"deleted": deleted})
+
+    # Administrative: sweep expired orders to 'invalid' (RFC 8555 §7.1.6).
+    # Intended for an external cron; expiry is also enforced lazily at finalize.
+    @app.delete("/acme/admin/expired-orders")
+    async def sweep_expired_orders(
+        request: Request, ctx: ServerContext = Depends(_ctx)
+    ) -> JSONResponse:
+        _require_admin_token(request, ctx)
+        invalidated = ctx.store.sweep_expired_orders()
+        _audit(ctx,
+            event_type="admin-expired-order-sweep",
+            outcome="success",
+            details={"invalidated": invalidated},
+        )
+        return JSONResponse(content={"invalidated": invalidated})
+
+    # Administrative: reconcile an order wedged in 'processing' after a crash
+    # mid-enrollment. See Store.transition_processing_to_ready / _to_valid for
+    # the two-branch recovery and its double-issuance precondition.
+    @app.post("/acme/admin/orders/{order_id}/reclaim-processing")
+    async def reclaim_processing_order(
+        order_id: str,
+        request: Request,
+        ctx: ServerContext = Depends(_ctx),
+    ) -> JSONResponse:
+        _require_admin_token(request, ctx)
+        order = ctx.store.get_order(order_id)
+        if order is None:
+            # Audit the probe — a stolen admin token enumerating order IDs is a
+            # meaningful reconnaissance signal (threat-model §4.A/§4.F).
+            _audit(ctx,
+                event_type="admin-order-reclaim-denied",
+                order_id=order_id,
+                outcome="failed",
+                details={"reason": "order-not-found"},
+            )
+            raise not_found("order not found")
+
+        # Idempotent no-op for anything not actually stuck in 'processing'.
+        # Audited so a stolen admin token probing many order IDs is visible.
+        if order.status != "processing":
+            _audit(ctx,
+                event_type="admin-order-reclaim-noop",
+                order_id=order_id,
+                account_id=order.account_id,
+                outcome="noop",
+                details={"reason": "not-processing", "order_status": order.status},
+            )
+            return JSONResponse(content=_order_to_json(order))
+
+        existing_cert = ctx.store.get_certificate_by_order(order_id)
+        if existing_cert is not None:
+            # Enrollment succeeded but the status flip was missed — close the
+            # loop safely (no re-enrollment, no double-issuance).
+            certificate_url = _certificate_url(ctx, existing_cert.id)
+            applied = ctx.store.transition_processing_to_valid(order_id, certificate_url)
+            new_status = "valid"
+            had_certificate = True
+        else:
+            # No cert recorded — the operator has verified at the ADCS CA DB
+            # that no cert was issued for this request before calling this.
+            applied = ctx.store.transition_processing_to_ready(order_id)
+            new_status = "ready"
+            had_certificate = False
+
+        if not applied:
+            # Lost a race with a concurrent finalize/reclaim; audit + return state.
+            refreshed = ctx.store.get_order(order_id)
+            if refreshed is None:
+                raise server_internal("order disappeared during reclaim")
+            _audit(ctx,
+                event_type="admin-order-reclaim-denied",
+                order_id=order_id,
+                account_id=order.account_id,
+                outcome="failed",
+                details={"reason": "lost-race", "current_status": refreshed.status},
+            )
+            return JSONResponse(content=_order_to_json(refreshed))
+
+        _audit(ctx,
+            event_type="admin-order-reclaimed",
+            order_id=order_id,
+            account_id=order.account_id,
+            outcome="success",
+            details={
+                "new_status": new_status,
+                "had_certificate": had_certificate,
+            },
+        )
+        refreshed = ctx.store.get_order(order_id)
+        if refreshed is None:
+            raise server_internal("order disappeared after reclaim")
+        return JSONResponse(content=_order_to_json(refreshed))
+
+    # Administrative: list orders by status — primarily for monitoring
+    # stuck-processing orders (threat-model §4.D: monitor time-in-
+    # ``processing`` p99). Requires admin token. Returns a minimal admin
+    # view (no SANs/cert URLs) to limit blast radius of a stolen token.
+    @app.get("/acme/admin/orders")
+    async def list_orders(
+        request: Request,
+        ctx: ServerContext = Depends(_ctx),
+        status: str = "processing",
+        limit: int = 100,
+    ) -> JSONResponse:
+        _require_admin_token(request, ctx)
+        valid_statuses = {
+            "processing", "valid", "invalid", "ready", "pending", "revoked",
+        }
+        if status not in valid_statuses:
+            raise malformed(f"invalid status filter: {status}")
+        if not 1 <= limit <= 500:
+            raise malformed("limit must be between 1 and 500")
+        orders = ctx.store.list_orders_by_status(status, limit=limit)
+        _audit(ctx,
+            event_type="admin-list-orders",
+            outcome="success",
+            details={"status": status, "limit": limit, "returned": len(orders)},
+        )
+        return JSONResponse(
+            content={"orders": [_order_to_admin_json(o) for o in orders]}
+        )
 
     # ------------------------------------------------------------------
     # newAccount
@@ -399,7 +488,7 @@ def create_app(context: ServerContext) -> FastAPI:
 
         contact = payload.get("contact", [])
         if not isinstance(contact, list):
-            contact = []
+            raise malformed("contact must be a list")
 
         account = ctx.store.create_account(
             jwk=account_jwk,
@@ -601,9 +690,33 @@ def create_app(context: ServerContext) -> FastAPI:
         existing_cert = ctx.store.get_certificate_by_order(order_id)
         if existing_cert is not None:
             refreshed = ctx.store.get_order(order_id)
-            if refreshed is not None:
-                return JSONResponse(content=_order_to_json(refreshed))
-            raise server_internal("order disappeared after double-finalize check")
+            if refreshed is None:
+                raise server_internal("order disappeared after double-finalize check")
+            # Self-heal the crash window between create_certificate and the
+            # status flip to 'valid': a cert row exists, so issuance definitively
+            # succeeded — close the loop so the client isn't left polling a
+            # 'processing' order with no certificate URL. CAS-guarded (only
+            # processing->valid), no re-enrollment, no double-issuance. Only
+            # audit success when the CAS actually applied; on a lost race the
+            # winner records the reconcile and we just return current state.
+            if refreshed.status == "processing":
+                certificate_url = _certificate_url(ctx, existing_cert.id)
+                applied = ctx.store.transition_processing_to_valid(order_id, certificate_url)
+                if applied:
+                    _audit(ctx,
+                        event_type="finalize-order-reconciled",
+                        account_id=account_id,
+                        order_id=order_id,
+                        outcome="success",
+                        details={
+                            "certificate_id": existing_cert.id,
+                            "prior_status": refreshed.status,
+                        },
+                    )
+                refreshed = ctx.store.get_order(order_id)
+                if refreshed is None:
+                    raise server_internal("order disappeared after reconcile")
+            return JSONResponse(content=_order_to_json(refreshed))
 
         # M3: an order at 'processing' with no cert means another finalize is
         # mid-enrollment (or crashed mid-flight). We MUST NOT re-enroll - that
@@ -613,6 +726,43 @@ def create_app(context: ServerContext) -> FastAPI:
             return JSONResponse(
                 content=_order_to_json(order),
                 headers={"Retry-After": "3"},
+            )
+
+        # RFC 8555 §7.1.6: an expired order MUST NOT be issued against. CAS-flip
+        # pending/ready orders past their `expires` to `invalid` and refuse.
+        # The CAS (status IN pending/ready) is load-bearing: without it, a
+        # concurrent finalize that already moved this order to 'processing'
+        # would be clobbered to 'invalid' out from under a live enrollment
+        # (corrupting the audit trail and transient state).
+        if is_expired(order.expires):
+            applied = ctx.store.transition_active_to_invalid(order_id)
+            if applied:
+                _audit(ctx,
+                    event_type="finalize-expired-order",
+                    account_id=account_id,
+                    order_id=order_id,
+                    outcome="denied",
+                    details={"expires": order.expires},
+                )
+                raise malformed(
+                    f"order has expired (expires={order.expires}); "
+                    f"create a new order to retry"
+                )
+            # Lost the race: a concurrent finalize/reclaim moved the order out
+            # of pending/ready after our snapshot. Return its current state
+            # rather than erroring on a stale view.
+            refreshed = ctx.store.get_order(order_id)
+            if refreshed is None:
+                raise server_internal("order disappeared during expiry check")
+            if refreshed.status == "valid":
+                return JSONResponse(content=_order_to_json(refreshed))
+            if refreshed.status == "processing":
+                return JSONResponse(
+                    content=_order_to_json(refreshed), headers={"Retry-After": "3"}
+                )
+            raise malformed(
+                f"order has expired (expires={order.expires}); "
+                f"create a new order to retry"
             )
 
         if order.status != "ready":
@@ -745,9 +895,10 @@ def create_app(context: ServerContext) -> FastAPI:
             )
         except EnrollmentDenied as exc:
             # The CA definitively denied the request (policy violation) — no cert
-            # was issued, so there is no double-issuance risk from reverting the
-            # order back to 'ready'. This keeps the order retryable for the client.
-            ctx.store.update_order_status(order_id, "ready")
+            # was issued, so reverting to 'ready' is safe. Use the CAS-guarded
+            # transition so a concurrent reclaim or finalize self-heal that
+            # already moved the order cannot be clobbered (threat-model §4.D).
+            applied = ctx.store.transition_processing_to_ready(order_id)
             _audit(ctx,
                 event_type="finalize-enrollment-denied",
                 account_id=account_id,
@@ -755,8 +906,17 @@ def create_app(context: ServerContext) -> FastAPI:
                 sans=requested_sans,
                 template=decision.template,
                 outcome="denied",
-                details={"error": str(exc)},
+                details={"error": str(exc), "revert_applied": applied},
             )
+            if not applied:
+                # Lost the race: a concurrent reclaim or self-heal already moved
+                # the order. Return its current state instead of clobbering it.
+                refreshed = ctx.store.get_order(order_id)
+                if refreshed is None:
+                    raise server_internal(
+                        "order disappeared during enrollment denial"
+                    )
+                return JSONResponse(content=_order_to_json(refreshed))
             raise rejected_identifier(str(exc)) from exc
         except EnrollmentTransportError as exc:
             _audit(ctx,
@@ -788,36 +948,73 @@ def create_app(context: ServerContext) -> FastAPI:
             )
             raise server_internal(f"enrollment failed: {exc}") from exc
 
-        cert_record = ctx.store.create_certificate(
-            order_id=order_id,
-            account_id=account_id,
-            cert_pem=enrollment_result.cert_pem,
-            chain_pem=enrollment_result.chain_pem,
-            template=enrollment_result.template,
-            requester=enrollment_result.requester,
-            metadata=dict(enrollment_result.metadata),
-        )
+        # Re-check for an existing cert before creating one. A concurrent
+        # self-heal or reclaim-to-valid may have already recorded a cert for
+        # this order; if so, use it instead of inserting a duplicate row.
+        existing_cert = ctx.store.get_certificate_by_order(order_id)
+        if existing_cert is not None:
+            cert_record = existing_cert
+        else:
+            cert_record = ctx.store.create_certificate(
+                order_id=order_id,
+                account_id=account_id,
+                cert_pem=enrollment_result.cert_pem,
+                chain_pem=enrollment_result.chain_pem,
+                template=enrollment_result.template,
+                requester=enrollment_result.requester,
+                metadata=dict(enrollment_result.metadata),
+            )
 
         certificate_url = _certificate_url(ctx, cert_record.id)
-        ctx.store.update_order_status(
-            order_id,
-            "valid",
-            certificate_url=certificate_url,
+        applied = ctx.store.transition_processing_to_valid(
+            order_id, certificate_url
         )
 
-        _audit(ctx, 
-            event_type="certificate-issued",
-            account_id=account_id,
-            order_id=order_id,
-            sans=requested_sans,
-            template=enrollment_result.template,
-            requester=enrollment_result.requester,
-            outcome="success",
-            details={
-                "certificate_id": cert_record.id,
-                "csr_subject": csr_subject,
-            },
-        )
+        if applied:
+            _audit(ctx,
+                event_type="certificate-issued",
+                account_id=account_id,
+                order_id=order_id,
+                sans=requested_sans,
+                template=enrollment_result.template,
+                requester=enrollment_result.requester,
+                outcome="success",
+                details={
+                    "certificate_id": cert_record.id,
+                    "csr_subject": csr_subject,
+                },
+            )
+        else:
+            # Lost the CAS race with a concurrent reclaim or finalize self-heal.
+            # Audit the anomaly for operator investigation — this indicates the
+            # RA's view of an issuance diverged from its own store.
+            refreshed = ctx.store.get_order(order_id)
+            winner_cert_id = (
+                refreshed.certificate_url.rsplit("/", 1)[-1]
+                if refreshed and refreshed.certificate_url
+                else None
+            )
+            _audit(ctx,
+                event_type="finalize-enrollment-race",
+                account_id=account_id,
+                order_id=order_id,
+                sans=requested_sans,
+                template=enrollment_result.template,
+                requester=enrollment_result.requester,
+                outcome="failed",
+                details={
+                    "certificate_id": cert_record.id,
+                    "winner_certificate_id": winner_cert_id,
+                    "reason": "lost-processing-cas",
+                },
+            )
+            logger.error(
+                "finalize CAS lost race for order %s; cert %s recorded but "
+                "order was moved by a concurrent operation (winner cert=%s)",
+                order_id,
+                cert_record.id,
+                winner_cert_id,
+            )
 
         refreshed_order = ctx.store.get_order(order_id)
         if refreshed_order is None:
@@ -996,4 +1193,19 @@ def _challenge_to_json(challenge: Any) -> dict[str, Any]:
     }
     if challenge.validated_at:
         obj["validated"] = challenge.validated_at
+    return obj
+
+
+def _order_to_admin_json(order: Any) -> dict[str, Any]:
+    """Minimal admin view — no SANs or certificate URLs (blast-radius bound)."""
+    obj: dict[str, Any] = {
+        "id": order.id,
+        "account_id": order.account_id,
+        "status": order.status,
+        "expires": order.expires,
+        "created_at": order.created_at,
+        "updated_at": order.updated_at,
+    }
+    if order.processing_started_at:
+        obj["processing_started_at"] = order.processing_started_at
     return obj
