@@ -130,6 +130,15 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   logged and alerted.
 - **Residual:** the gMSA is a chokepoint **and** a target; this does not reduce
   to zero. Bounded by the server-auth-only EKU — no client-auth/PKINIT.
+- **Admin surface (operator-owned):** maintenance endpoints under
+  `/acme/admin/*` (nonce cleanup, expired-order sweep, stuck-`processing`
+    reclaim) are gated by a single `admin_token` Bearer secret (`RAConfig`).
+    The token is a high-value secret (a holder can reconcile a stuck order to
+    `ready`, the one action that can enable a re-enroll) and MUST be rotated,
+    ACL'd, and distributed with the same care as an EAB MAC key. The reclaim
+    `ready` branch is the operator's double-issuance gate (confirm at the ADCS
+    CA DB that no cert was issued first); the server cannot make that decision
+    itself.
 
 ### B. Stolen/compromised EAB key
 - **Controls:** EAB MAC verified **constant-time** (`hmac.compare_digest`); the
@@ -138,9 +147,11 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   is audited** (`account-creation-denied`) to detect kid-space probing.
 - **Kids must be high-entropy** (UUID / ≥128-bit random) — a kid guess is a
   meaningful probe event; operator-chosen, **not** a hostname or customer name.
-- **Timing residual:** the unknown-kid path returns before the HMAC compute, so
-  kid *existence* is a (minor) timing side-channel. Mitigated by high-entropy
-  kids; a dummy-HMAC equalization is a cheap follow-up.
+- **Timing residual:** the unknown-kid path runs a dummy HMAC
+  (`server._dummy_hmac`) so the known/unknown-kid wall-clock is comparable,
+  closing the kid-*existence* timing side-channel. High-entropy kids remain the
+  primary control (a kid guess is still a meaningful probe event that is
+  audited as `account-creation-denied`).
 - **Rotation:** a documented EAB rotation procedure (kid + MAC key + SAN scope)
   must exist before pilot.
 - **Residual:** in-scope issuance is possible until the kid is rotated. Bounded
@@ -177,11 +188,36 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   `base_url` must be the *public* hostname — otherwise every legitimate JWS is
   rejected as a URL mismatch (fail-closed) on day 1. This is a deployment
   prerequisite, not optional.
-- **Stuck-`processing` blast radius:** there is no `processing_started_at` and
-  no auto-recovery. A finalize that crashes mid-enrollment wedges the order
-  (client polls forever; the SAN set can't be re-issued by that client). **Ops
-  must reconcile wedged orders manually** (a follow-up adds `processing_started_at`
-  + an alert). The cert is never double-issued.
+- **Stuck-`processing` blast radius:** `processing_started_at` is recorded on
+  the `ready`→`processing` CAS. *Auto*-recovery is intentionally absent for the
+  no-cert case — blindly reverting an order to `ready` risks double-issuance if
+  the CA accepted the first request and the RA crashed before recording the
+  cert. Two reconciliation paths exist:
+  - **Cert recorded, status flip missed** (crash window between
+    `create_certificate` and the status flip): self-heals automatically.
+    `finalize` detects the cert row and CAS-closes the loop to `valid`
+    (`finalize-order-reconciled` audit); the admin `reclaim-processing`
+    endpoint does the same. No re-enrollment, no operator judgment needed.
+  - **No cert recorded** (enrollment did not visibly complete): operator
+    reconciliation via the audited `POST /acme/admin/orders/{id}/reclaim-processing`
+    endpoint (admin-token-gated), which CAS-reverts to `ready`. **Before this
+    `ready` branch the operator MUST confirm from the ADCS CA database that no
+    cert was issued for the order's ReqID** — this is the one operator action
+    that can enable a re-enroll, and it is the operator's double-issuance gate,
+    not the server's. No-op, lost-race, and not-found reclaim attempts are
+    audited (`admin-order-reclaim-noop` / `-denied`) so a stolen admin token
+    probing order IDs is visible to SIEM.
+  The server's **automated** paths never double-issue (the `ready`→`processing`
+  CAS is the guard); the reclaim `ready` branch is the one operator-enabled
+  exception, gated by the documented CA-DB pre-condition. Both the
+  `EnrollmentDenied` revert and the success-path `processing`→`valid` flip
+  are CAS-guarded so a concurrent reclaim or self-heal cannot be clobbered; a
+  lost CAS race is audited (`finalize-enrollment-race` at ERROR + SIEM) and
+  returns the order's current state without clobbering it. The success path
+  re-checks for an existing cert before creating one, preventing orphaned
+  duplicate cert rows. **Monitoring MUST alert on time-in-`processing` p99**
+  (pilot condition); the audited `GET /acme/admin/orders?status=processing`
+  endpoint surfaces stuck orders (minimal admin view — no SANs/cert URLs).
 
 ### E. Revocation abuse
 - **Only the issuing account may revoke** its own cert (lookup scoped to
@@ -234,16 +270,22 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   tamper-evident, backed-up storage (consider a write-once/append-only sink for
   `audit_log`).
 
-### G. Resource exhaustion / DoS *(none of these are in code today — rely on the proxy + add caps before pilot)*
+### G. Resource exhaustion / DoS *(per-request caps + expiry in code; rate-limiting still operator/proxy)*
 - **Per-account / per-IP rate limiting** at the reverse proxy (the RA has none
   in code). The ADCS `/certsrv/` leg is not high-performance — a flood here
   becomes a flood at the CA.
-- **Caps to add:** max identifiers per order; max CSR body size; max authz per
-  order; audit-log / cert-table retention+archival; nonce-table size (GC is
-  probabilistic 1% on create + a public `cleanup_expired_nonces()` for an
-  external cron — wire the cron at pilot).
-- **Residual:** without these, a single in-scope EAB account can amplify work
-  O(n) per order (identifier count) and grow the store without bound.
+- **Caps in code:** `max_identifiers_per_order` (default 50, 1 identifier = 1
+  authz) and `max_csr_size_bytes` (default 8192) are enforced on the request
+  path. Order/authz lifetime is bounded by `order_expiry_seconds` (default
+  3600) and enforced at `finalize` (expired → `invalid` + audited as
+  `finalize-expired-order`) and via the `DELETE /acme/admin/expired-orders`
+  sweep for cron (RFC 8555 §7.1.6).
+- **Caps still to add (operator):** audit-log / cert-table retention+archival;
+  nonce-table size (GC is a probabilistic 1% cleanup on `create_nonce` as a
+  safety net, bounded by `LIMIT 5000` and indexed on `created_at`, + the public
+  `DELETE /acme/admin/nonces` for an external cron — wire the cron at pilot).
+- **Residual:** a single in-scope EAB account can still amplify work O(n) per
+  order up to the identifier cap, and grow the store up to the retention bound.
 
 ## 5. Platform & deployment controls (operator-owned)
 
@@ -308,15 +350,41 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   honest `NotImplementedError` stub. The mechanism (`certutil`/`ICertAdmin2`)
   + its gMSA CA-officer privilege implication is an **operator decision**
   (§4.E). Until then `revokeCert` flips the RA store only, not the CA CRL.
-- **Stuck-`processing` orders** have no auto-recovery; ops reconciles manually.
-  Follow-up: add `processing_started_at` + an alert.
-- **`EnrollmentDenied` vs `EnrollmentTransportError`** are scaffolded and now
-  **raised** by the real enrollment leg, but not yet **wired through the
-  finalize handler** (all enrollment failures still map to 500 today); wire so
-  transport errors map to 503+`Retry-After` and policy denials to 400, with
-  distinct audit categories.
-- **EAB kid-existence timing side-channel** (§4.B) — cheap dummy-HMAC follow-up.
-- **DoS caps not in code** (§4.G) — proxy + code follow-up before pilot.
+- **Stuck-`processing` orders** have no *auto*-recovery for the no-cert case
+  (intentional — blindly reverting risks double-issuance). `processing_started_at`
+  is recorded. Two reconciliation paths: (a) **cert recorded, status flip
+  missed** self-heals — `finalize` and the admin reclaim endpoint both CAS-close
+  the loop to `valid` (`finalize-order-reconciled` / `admin-order-reclaimed`),
+  no re-enrollment; (b) **no cert recorded** — operator reconciliation via the
+  audited `POST /acme/admin/orders/{id}/reclaim-processing` (admin-token-gated;
+  CAS revert to `ready`; no-op / lost-race / not-found are audited). **Pilot
+  condition: monitor time-in-`processing`** and alert; before the `ready` branch
+  the operator MUST confirm from the ADCS CA DB that no cert was issued.
+- **`EnrollmentDenied` vs `EnrollmentTransportError` are wired through
+  finalize** — CLOSED. Transport errors return 503+`Retry-After` (order stays
+  `processing`, client polls); CA policy denials CAS-revert the order to
+  `ready` and return 400 (`rejectedIdentifier`); both emit distinct audit
+  categories. The revert is CAS-guarded (`transition_processing_to_ready`) so
+  a concurrent reclaim or self-heal cannot be clobbered; a lost CAS race
+  returns the current state and is audited.
+- **Success-path `processing`→`valid` is CAS-guarded** — CLOSED. The
+  non-atomic `update_order_status` was replaced with
+  `transition_processing_to_valid` (CAS on `status = 'processing'`). A lost
+  race is audited as `finalize-enrollment-race` (ERROR + SIEM) and the
+  success path re-checks for an existing cert before creating one, preventing
+  orphaned duplicate cert rows.
+- **EAB kid-existence timing side-channel** (§4.B) — CLOSED: the unknown-kid
+  path runs a dummy HMAC (`server._dummy_hmac`) before returning, equalising
+  the known/unknown-kid timing. Residual: high-entropy kids remain the primary
+  control.
+- **Per-request DoS caps are in code** (§4.G) — CLOSED:
+  `max_identifiers_per_order` + `max_csr_size_bytes` are enforced on the
+  request path. Still operator: proxy rate-limiting and retention/archival.
+- **Order expiry is enforced** (RFC 8555 §7.1.6) — CLOSED: an expired
+  pending/ready order cannot be finalized (flipped to `invalid` + audited as
+  `finalize-expired-order`) and expired pending/ready orders are swept by
+  `DELETE /acme/admin/expired-orders` for cron. (Processing/valid/revoked
+  orders are left alone — they are terminal or operator-reconcilable.)
 - **Enterprise-trust shortcut:** in-scope SANs issue without domain proof; the
   SAN scope is the critical control (not a bug — the model).
 
