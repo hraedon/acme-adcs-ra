@@ -17,6 +17,7 @@ from acme_adcs_ra.acme_errors import (
     bad_revocation_reason,
     malformed,
     not_found,
+    rejected_identifier,
     server_internal,
     unauthorized,
     unsupported_identifier,
@@ -44,6 +45,7 @@ from acme_adcs_ra.finalize import (
     _finalize_transition_to_processing,
 )
 from acme_adcs_ra.jws import JWSValidationError, _base64url_decode, verify_eab_jws
+from acme_adcs_ra.policy import validate_dns_name
 from acme_adcs_ra.serializers import (
     _account_to_json,
     _authz_to_json,
@@ -228,6 +230,16 @@ async def new_order(
             raise unsupported_identifier(
                 "only DNS identifiers are supported and value must be non-empty"
             )
+        if "*" in value:
+            raise rejected_identifier(
+                f"wildcard DNS identifiers are not supported: {value!r}"
+            )
+        try:
+            validate_dns_name(value)
+        except ValueError as exc:
+            raise rejected_identifier(
+                f"invalid DNS identifier {value!r}: {exc}"
+            ) from exc
         identifiers.append({"type": "dns", "value": value})
 
     # H5: atomic order creation — all order/authz/challenge rows and URLs

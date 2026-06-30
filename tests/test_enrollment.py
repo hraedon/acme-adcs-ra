@@ -23,6 +23,7 @@ from acme_adcs_ra.enrollment import (
     EnrollmentResult,
     EnrollmentTransportError,
     FakeEnrollmentLeg,
+    _parse_certfnsh_disposition,
 )
 
 
@@ -447,3 +448,138 @@ class TestCertsrvEnrollmentLeg:
         assert len(result.chain_pem) == 2
         for pem in result.chain_pem:
             assert "BEGIN CERTIFICATE" in pem
+
+
+# ---------------------------------------------------------------------------
+# WI-007: locale-independent certfnsh.asp disposition parsing
+# ---------------------------------------------------------------------------
+
+
+class TestCertfnshDispositionParsing:
+    """WI-007: certfnsh.asp disposition parsing must not depend on OS locale.
+
+    The success signal (certnew.cer?ReqID=<n>&) is a URL and is locale-
+    independent. For non-success, structured tokens (ReqID= query param,
+    quoted disposition message) are preferred over English prose strings.
+    English strings remain as a backward-compatibility fallback.
+    """
+
+    def test_issued_extracts_req_id(self) -> None:
+        body = '<a href="certnew.cer?ReqID=42&Enc=b64">Download</a>'
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "issued"
+        assert detail == "42"
+
+    def test_pending_via_req_id_query_param(self) -> None:
+        """A ReqID= query param without a download link means pending."""
+        body = (
+            '<html><body>'
+            '<a href="certnew.cer?ReqID=7">Check status</a>'
+            '</body></html>'
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "pending"
+        assert detail == "7"
+
+    def test_pending_english_fallback(self) -> None:
+        body = "... Certificate Pending ... Your Request Id is 7 ..."
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "pending"
+        assert detail == "7"
+
+    def test_pending_english_fallback_no_req_id(self) -> None:
+        body = "... Certificate Pending ..."
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "pending"
+        assert detail == "?"
+
+    def test_denied_english(self) -> None:
+        body = '... The disposition message is "Denied by policy" ...'
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "denied"
+        assert detail == "Denied by policy"
+
+    def test_denied_non_english_locale(self) -> None:
+        """A non-English denied page must be detected via the quoted message.
+
+        The disposition message is in quotes regardless of locale; the
+        word+space prefix before the quote distinguishes it from HTML
+        attributes (href=\"...\").
+        """
+        body = (
+            '<html><body>'
+            '<h2>Anforderung abgelehnt</h2>'
+            'Die Dispositionsnachricht lautet "Richtlinie verweigert"'
+            '</body></html>'
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "denied"
+        assert "Richtlinie verweigert" in detail
+
+    def test_pending_non_english_locale(self) -> None:
+        """A non-English pending page must be detected via ReqID= query param."""
+        body = (
+            '<html><body>'
+            '<h2>Zertifikat ausstehend</h2>'
+            'Ihre Anforderungs-ID lautet 42.'
+            '<br><a href="certnew.cer?ReqID=42">Status abrufen</a>'
+            '</body></html>'
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "pending"
+        assert detail == "42"
+
+    def test_issued_with_quoted_message_still_issued(self) -> None:
+        """The issued check runs first — a download link wins over any
+        quoted message in the body."""
+        body = (
+            '<a href="certnew.cer?ReqID=99&Enc=b64">Download</a>'
+            '<p>The disposition message is "Issued"</p>'
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "issued"
+        assert detail == "99"
+
+    def test_denied_quoted_message_excludes_urls(self) -> None:
+        """A quoted JavaScript string must not be mistaken for a disposition
+        message — the word+space prefix distinguishes text quotes from
+        assignment quotes (``= \"…\"``)."""
+        body = (
+            '<script>var title = "Certificate Services Page"</script>'
+            '<p>is "Denied by policy"</p>'
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "denied"
+        assert detail == "Denied by policy"
+
+    def test_denied_regex_ignores_script_blocks(self) -> None:
+        """JavaScript return/string literals inside <script> blocks must
+        not false-positive as a denied disposition message."""
+        body = (
+            '<script>function check() { return "Certificate Pending"; }</script>'
+            '<body>Die Nachricht lautet "Abgelehnt"</body>'
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "denied"
+        assert detail == "Abgelehnt"
+
+    def test_denied_colon_separated_falls_through(self) -> None:
+        """A denied page with a colon-separated disposition (not word+space)
+        is not matched by the locale-independent denied regex — it falls
+        through to the English fallback or 'unknown'. Documents a known
+        limitation: the live re-proof should capture real non-English
+        certfnsh.asp bodies to validate the heuristic."""
+        body = '<p>Disposition: "Refusé par la politique"</p>'
+        disposition, _detail = _parse_certfnsh_disposition(body, 200)
+        # No word+space before the quote (it's `: "..."`), and no ReqID=,
+        # and no English strings → unknown (visible, not silent).
+        assert disposition == "unknown"
+
+    def test_unrecognized_surfaces_body_snippet(self) -> None:
+        """An unrecognized response must surface a body snippet, not a
+        generic error (WI-007: no silent misreading)."""
+        body = "<html><body>Something completely unexpected</body></html>"
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "unknown"
+        assert "HTTP 200" in detail
+        assert "Something completely unexpected" in detail

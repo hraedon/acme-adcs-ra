@@ -53,7 +53,20 @@ def tls_server_end_point_digest(cert_der: bytes) -> bytes:
 
 class NegotiateAuth(requests.auth.AuthBase):
     """SPNEGO/Negotiate as the ambient identity, channel-bound to the server's
-    TLS certificate (works with ``EPA = Require``)."""
+    TLS certificate (works with ``EPA = Require``).
+
+    **Single-backend assumption (WI-006):** The channel-binding token is
+    derived from a *side-channel* TLS probe (``_server_cert_der``), on the
+    assumption that the probed certificate is the same one the enrollment
+    HTTP connection will see. This holds for **Mode A** (Web Enrollment on
+    the CA itself — one host) and for a single-host Mode C deployment. Under
+    **NLB / ARR** fronting multiple ``/certsrv/`` backends, the probe and
+    the auth connection may hit different hosts with different certificates;
+    the computed CBT then does not match the cert the server presented on the
+    auth connection, so EPA=Require rejects the token (fail-closed). Multi-
+    backend topologies are **unsupported** without reworking the CBT
+    derivation (e.g. extracting the cert from the auth connection itself).
+    """
 
     def __init__(
         self,
@@ -70,9 +83,19 @@ class NegotiateAuth(requests.auth.AuthBase):
         self._app_data: bytes | None = None
 
     def _server_cert_der(self) -> bytes:
-        # The CBT is over the server's certificate (stable for the host), so a
-        # side TLS probe with the same SNI yields the same cert the auth
-        # connection uses. Verify it with the same trust anchor as the leg.
+        """Probe the server's TLS certificate for the channel-binding token.
+
+        Opens a *side-channel* TLS connection to ``(host, port)`` and reads
+        the server certificate. This is correct only when the backend is a
+        single, stable host (Mode A / single-host Mode C): the probed cert
+        is then the same cert the enrollment connection will see. Under
+        NLB/ARR with multiple backends, the two connections may land on
+        different hosts — see the class docstring.
+        """
+        # The CBT is over the server's certificate (stable for a single host —
+        # see the docstring for the NLB limitation), so a side TLS probe with
+        # the same SNI yields the same cert the auth connection uses. Verify
+        # it with the same trust anchor as the leg.
         ctx = (
             ssl.create_default_context(cafile=self._ca_bundle)
             if self._ca_bundle

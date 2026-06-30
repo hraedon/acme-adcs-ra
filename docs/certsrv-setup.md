@@ -155,6 +155,13 @@ Same as A.3, but targeting the separate host, and additionally confirm the
 delegation actually lets the enrollment host forward to CA01 (the failure mode is
 a Kerberos delegation/SPN error, not an auth-to-the-frontend error).
 
+> **Single-host only (WI-006):** the RA's channel-binding token is derived from
+> a side-channel TLS probe of the `/certsrv/` host, which assumes one stable
+> backend. Mode C1 with a single `ENROLL01` is fine; **NLB/ARR fronting multiple
+> `/certsrv/` hosts is unsupported** (the probe and the enrollment connection may
+> see different certs → EPA=Require fails, fail-closed). See
+> `negotiate_auth.NegotiateAuth`.
+
 ---
 
 ## Choosing A vs C

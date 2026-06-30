@@ -50,6 +50,13 @@ The minimum to serve an enterprise client:
 - Transport modes A and C differ only in *where* `/certsrv/` lives and whether
   Kerberos delegation is required — see `certsrv-setup.md`. The ACME server side
   is identical across modes.
+- **Single-backend CBT assumption (WI-006):** the channel-binding token is
+  derived from a side-channel TLS probe of the `/certsrv/` host. This is correct
+  for Mode A (one CA host) and single-host Mode C. If `/certsrv/` is fronted by
+  **NLB/ARR** with multiple backends, the probe and the enrollment connection may
+  see different certificates, so EPA=Require rejects the channel-bound token
+  (fail-closed). Multi-backend topologies are unsupported without reworking the
+  CBT derivation — see `negotiate_auth.NegotiateAuth`.
 
 ## Security model
 

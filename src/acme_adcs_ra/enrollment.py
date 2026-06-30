@@ -273,23 +273,20 @@ class CertsrvEnrollmentLeg:
             }
             resp = session.post(f"{base}/certfnsh.asp", data=form, timeout=timeout)
             resp.raise_for_status()
-            body = resp.text
-            m = re.search(r"certnew\.cer\?ReqID=(\d+)&", body)
-            if not m:
-                if re.search(r"Certificate Pending", body, re.IGNORECASE):
-                    rid = re.search(r"Your Request Id is (\d+)", body)
-                    raise EnrollmentTransportError(
-                        "certificate pending CA-manager approval "
-                        f"(ReqID={rid.group(1) if rid else '?'}); "
-                        "turn off manager approval on the template — the RA is the gate"
-                    )
-                msg = re.search(r'The disposition message is "([^"]+)', body)
-                if msg:
-                    raise EnrollmentDenied(f"CA denied the request: {msg.group(1)}")
+            disposition, detail = _parse_certfnsh_disposition(
+                resp.text, resp.status_code
+            )
+            if disposition == "pending":
                 raise EnrollmentTransportError(
-                    f"unexpected certfnsh.asp response (HTTP {resp.status_code})"
+                    f"certificate pending or not issued (ReqID={detail}); "
+                    "check the CA — manager approval may be on, "
+                    "or the template policy denied the request"
                 )
-            req_id = m.group(1)
+            if disposition == "denied":
+                raise EnrollmentDenied(f"CA denied the request: {detail}")
+            if disposition != "issued":
+                raise EnrollmentTransportError(detail)
+            req_id = detail
 
             # 2. Fetch the issued certificate (base64 or PEM).
             cert_resp = session.get(
@@ -352,6 +349,72 @@ class CertsrvEnrollmentLeg:
             requester=self._requester(),
             metadata=metadata,
         )
+
+
+def _parse_certfnsh_disposition(body: str, status_code: int) -> tuple[str, str]:
+    """Parse a ``certfnsh.asp`` response body into a disposition.
+
+    WI-007: prefers locale-independent structured signals over English
+    prose strings. The signals, in priority order:
+
+    1. **Issued** — ``certnew.cer?ReqID=<n>&`` (a download URL; the ``&``
+       after the ReqID distinguishes it from a status-only link). URLs are
+       locale-independent.
+    2. **Denied** — a quoted disposition message preceded by a word and
+       whitespace (e.g. ``is "Denied by policy"`` or ``lautet "Abgelehnt"``).
+       The quoting and the word+space prefix are locale-independent; the
+       word is typically a verb like "is"/"lautet"/"est". HTML attributes
+       (``href="…"``) are excluded because they have no space before the
+       quote.
+    3. **Pending** — ``ReqID=<n>`` as a query/form parameter (the request
+       was submitted and assigned a ReqID, but no download link and no
+       denial message are present). Locale-independent — ``ReqID`` is a
+       URL parameter name, not prose.
+    4. **English fallback** — ``"Certificate Pending"`` and
+       ``'The disposition message is "…"'`` (backward compatibility for
+       English-locale ADCS).
+    5. **Unrecognized** — surfaces a body snippet so the operator can see
+       what the CA returned, rather than silently misreading a non-English
+       locale as a generic transport error.
+
+    Returns ``(disposition, detail)`` where disposition is one of
+    ``"issued"``, ``"pending"``, ``"denied"``, ``"unknown"`` and detail
+    is the ReqID (issued/pending), the denial message (denied), or a
+    diagnostic snippet (unknown).
+    """
+    # 1. Issued: download link with ReqID=<n>& (the & precedes Enc=).
+    m = re.search(r"certnew\.cer\?ReqID=(\d+)&", body)
+    if m:
+        return ("issued", m.group(1))
+
+    # 2. Denied: a quoted message preceded by word+space (locale-independent).
+    #    Strip <script> blocks first to avoid matching JavaScript string
+    #    literals (e.g. return "...", var s = "..."). Filters out URL-like
+    #    strings (JavaScript redirects, href values).
+    noscript = re.sub(r"<script\b[^>]*>.*?</script>", "", body, flags=re.DOTALL | re.IGNORECASE)
+    for match in re.finditer(r'\b\w+\s+"([^"]{5,})"', noscript):
+        candidate = match.group(1)
+        if "://" not in candidate and "certnew.cer" not in candidate.lower():
+            return ("denied", candidate)
+
+    # 3. Pending: ReqID= as a query/form parameter, no download link, no
+    #    denial message. Locale-independent — ReqID is a URL parameter name.
+    rid = re.search(r"ReqID=(\d+)", body)
+    if rid:
+        return ("pending", rid.group(1))
+
+    # 4. English-locale fallback (backward compatibility).
+    if re.search(r"Certificate Pending", body, re.IGNORECASE):
+        rid = re.search(r"Your Request Id is (\d+)", body)
+        return ("pending", rid.group(1) if rid else "?")
+
+    msg = re.search(r'The disposition message is "([^"]+)', body)
+    if msg:
+        return ("denied", msg.group(1))
+
+    # 5. Unrecognized: surface the body for diagnosis (not silent).
+    snippet = " ".join(body[:400].split())
+    return ("unknown", f"unrecognized certfnsh.asp response (HTTP {status_code}); body: {snippet}")
 
 
 def _parse_cert_body(body: bytes) -> str:
