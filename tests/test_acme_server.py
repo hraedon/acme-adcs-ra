@@ -495,6 +495,76 @@ class TestPolicyViaFinalize:
         assert resp.json()["type"] == "urn:ietf:params:acme:error:unauthorized"
 
 
+class TestNewOrderDnsIdentifierValidation:
+    """WI-009: malformed DNS identifiers must be rejected at newOrder, not at finalize.
+
+    ``validate_dns_name`` (RFC 1123) is called at order creation so the client
+    learns of a rejection immediately rather than wasting a challenge +
+    finalize round-trip. The CSR path keeps its own copy of the gate as
+    defense-in-depth.
+    """
+
+    @pytest.mark.parametrize("identifier", [
+        "*.WORK-DOMAIN.local",
+        "foo*.WORK-DOMAIN.local",
+        "web..WORK-DOMAIN.local",
+        "web!.WORK-DOMAIN.local",
+        "web_.WORK-DOMAIN.local",
+        "-web.WORK-DOMAIN.local",
+        "web-.WORK-DOMAIN.local",
+        "a" * 254 + ".WORK-DOMAIN.local",
+    ])
+    def test_malformed_identifier_rejected_at_new_order(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        identifier: str,
+    ) -> None:
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        resp = acme_client.new_order([identifier])
+        assert resp.status_code == 400
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:rejectedIdentifier"
+        if "*" in identifier:
+            assert "wildcard" in resp.json()["detail"]
+        else:
+            assert "invalid DNS identifier" in resp.json()["detail"]
+
+    def test_valid_identifier_accepted(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """A valid DNS identifier must still create an order (regression)."""
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        resp = acme_client.new_order(["web.WORK-DOMAIN.local"])
+        assert resp.status_code == 201
+        assert resp.json()["status"] == "pending"
+
+    def test_fqdn_with_trailing_dot_accepted(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """A trailing-dot FQDN (RFC 1034 notation) is valid DNS syntax."""
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        resp = acme_client.new_order(["web.WORK-DOMAIN.local."])
+        assert resp.status_code == 201
+
+    def test_one_bad_identifier_among_many_rejects_whole_order(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+    ) -> None:
+        """If any identifier is malformed, the whole order is rejected."""
+        acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+        resp = acme_client.new_order([
+            "web.WORK-DOMAIN.local",
+            "web..WORK-DOMAIN.local",
+        ])
+        assert resp.status_code == 400
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:rejectedIdentifier"
+
+
 # ---------------------------------------------------------------------------
 # Full round trip
 # ---------------------------------------------------------------------------
@@ -891,9 +961,12 @@ class TestCsrSanTypeValidation:
         Wildcard certificates are a distinct risk profile from wildcard scope
         patterns. Without this gate, a *.example.com SAN would match a
         *.example.com scope pattern, silently authorizing a wildcard cert.
+
+        The order uses a valid identifier (WI-009 rejects wildcards at newOrder);
+        the CSR gate is defense-in-depth — it fires before the CSR⊆order check.
         """
         acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
-        resp = acme_client.new_order(["*.WORK-DOMAIN.local"])
+        resp = acme_client.new_order(["web.WORK-DOMAIN.local"])
         order = resp.json()
         for authz_url in order["authorizations"]:
             authz = acme_client.get_authorization(authz_url).json()
@@ -924,9 +997,12 @@ class TestCsrSanTypeValidation:
 
         Without this gate, foo*.example.com would bypass the scope matcher
         because the suffix after the first dot still matches the pattern base.
+
+        The order uses a valid identifier (WI-009 rejects wildcards at newOrder);
+        the CSR gate is defense-in-depth — it fires before the CSR⊆order check.
         """
         acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
-        resp = acme_client.new_order(["foo*.WORK-DOMAIN.local"])
+        resp = acme_client.new_order(["web.WORK-DOMAIN.local"])
         order = resp.json()
         for authz_url in order["authorizations"]:
             authz = acme_client.get_authorization(authz_url).json()
