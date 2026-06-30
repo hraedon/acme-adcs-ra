@@ -583,3 +583,64 @@ class TestCertfnshDispositionParsing:
         assert disposition == "unknown"
         assert "HTTP 200" in detail
         assert "Something completely unexpected" in detail
+
+    # -- Real ADCS bodies captured live (lab re-proof, 2026-06-30) --------
+    # issued_real.html / denied_real.html are REAL certfnsh.asp responses from
+    # a live ADCS CA (the lab CA common name scrubbed to CONTOSO-CA01). They
+    # lock the parser against actual ADCS output, not just hand-written HTML.
+    # pending_synthetic.html is modeled on English ADCS pending output (a real
+    # pending capture needs manager approval on a template, rights-blocked at
+    # capture time — see the WI on the live pending re-proof).
+
+    def _fixture(self, name: str) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).parent / "fixtures" / "certfnsh" / name).read_text(
+            encoding="utf-8"
+        )
+
+    def test_real_issued_body_parses_as_issued(self) -> None:
+        disposition, detail = _parse_certfnsh_disposition(
+            self._fixture("issued_real.html"), 200
+        )
+        assert disposition == "issued"
+        assert detail.isdigit()  # the ReqID
+
+    def test_real_denied_body_parses_as_denied(self) -> None:
+        disposition, detail = _parse_certfnsh_disposition(
+            self._fixture("denied_real.html"), 200
+        )
+        assert disposition == "denied"
+        # The real ADCS policy-module denial message is surfaced.
+        assert "Denied by Policy Module" in detail
+
+    def test_synthetic_pending_body_parses_as_pending(self) -> None:
+        disposition, detail = _parse_certfnsh_disposition(
+            self._fixture("pending_synthetic.html"), 200
+        )
+        assert disposition == "pending"
+        assert detail == "85"
+
+    @pytest.mark.xfail(
+        reason="Known defect: the denied heuristic runs before the pending "
+        "check against under-sanitized HTML (only <script> is stripped, not "
+        "<!-- comments -->), so a pending body containing word+space+quoted "
+        "prose is misclassified as denied (hard ACME 400 on a still-processing "
+        "request). This is the unsafe misclassification direction; the "
+        "documented fail-safe one is denied->pending. Asserts the DESIRED "
+        "behavior so a future fix flips this from xfail to a failing xpass.",
+        strict=True,
+    )
+    def test_pending_with_quoted_prose_should_not_be_denied(self) -> None:
+        """A pending page (ReqID present, no download link) that happens to
+        contain a word+space+quoted string must classify as pending, not
+        denied. Currently it does not — see the WI-007 pending->denied
+        breadcrumb."""
+        body = (
+            "<html><body>"
+            '<p>The request status is "received and queued for the operator"</p>'
+            "Your Request Id is 85."
+            "</body></html>"
+        )
+        disposition, _detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "pending"
