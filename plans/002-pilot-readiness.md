@@ -13,6 +13,14 @@ this plan is a *checked* `docs/pre-pilot-checklist.md`.
 
 ## Ground truth at time of writing
 
+> **Update (2026-06-30):** Phase 1 is complete — **WI-006, WI-007, WI-009 are
+> closed**. WI-007 was additionally hardened after a live lab re-proof (the
+> pending/denied/issued paths are now regression-tested against *real* captured
+> `certfnsh.asp` bodies, and a pending→denied misclassification was fixed). The
+> snapshot below is preserved as the point-in-time state when this plan was
+> written; cross-reference the work-item store for current status. The remaining
+> objective is **WI-010 (out-of-band manual revocation)** — see Phase 2.
+
 - `main` is green (ruff, mypy --strict, pytest, pip-audit on 3.12/3.13). Last
   live E2E re-issue against the deployed commit was 2026-06-24 (checklist §A
   cleared). The finalize decomposition + RFC 1123 DNS validation landed after.
