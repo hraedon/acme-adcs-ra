@@ -585,12 +585,10 @@ class TestCertfnshDispositionParsing:
         assert "Something completely unexpected" in detail
 
     # -- Real ADCS bodies captured live (lab re-proof, 2026-06-30) --------
-    # issued_real.html / denied_real.html are REAL certfnsh.asp responses from
-    # a live ADCS CA (the lab CA common name scrubbed to CONTOSO-CA01). They
-    # lock the parser against actual ADCS output, not just hand-written HTML.
-    # pending_synthetic.html is modeled on English ADCS pending output (a real
-    # pending capture needs manager approval on a template, rights-blocked at
-    # capture time — see the WI on the live pending re-proof).
+    # issued_real / denied_real / pending_real are REAL certfnsh.asp responses
+    # captured from a live ADCS CA (CA common name scrubbed to CONTOSO-CA01).
+    # The pending body was captured via a throwaway PEND_ALL_REQUESTS template.
+    # They lock the parser against actual ADCS output, not hand-written HTML.
 
     def _fixture(self, name: str) -> str:
         from pathlib import Path
@@ -614,12 +612,12 @@ class TestCertfnshDispositionParsing:
         # The real ADCS policy-module denial message is surfaced.
         assert "Denied by Policy Module" in detail
 
-    def test_synthetic_pending_body_parses_as_pending(self) -> None:
+    def test_real_pending_body_parses_as_pending(self) -> None:
         disposition, detail = _parse_certfnsh_disposition(
-            self._fixture("pending_synthetic.html"), 200
+            self._fixture("pending_real.html"), 200
         )
         assert disposition == "pending"
-        assert detail == "85"
+        assert detail == "89"  # the ReqID assigned to the pending request
 
     def test_pending_with_quoted_prose_is_not_denied(self) -> None:
         """Regression guard (fixed 2026-06-30): a pending page (a Request Id
