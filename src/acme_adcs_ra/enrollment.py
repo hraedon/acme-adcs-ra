@@ -360,19 +360,24 @@ def _parse_certfnsh_disposition(body: str, status_code: int) -> tuple[str, str]:
     1. **Issued** — ``certnew.cer?ReqID=<n>&`` (a download URL; the ``&``
        after the ReqID distinguishes it from a status-only link). URLs are
        locale-independent.
-    2. **Denied** — a quoted disposition message preceded by a word and
-       whitespace (e.g. ``is "Denied by policy"`` or ``lautet "Abgelehnt"``).
-       The quoting and the word+space prefix are locale-independent; the
-       word is typically a verb like "is"/"lautet"/"est". HTML attributes
-       (``href="…"``) are excluded because they have no space before the
-       quote.
-    3. **Pending** — ``ReqID=<n>`` as a query/form parameter (the request
-       was submitted and assigned a ReqID, but no download link and no
-       denial message are present). Locale-independent — ``ReqID`` is a
-       URL parameter name, not prose.
-    4. **English fallback** — ``"Certificate Pending"`` and
-       ``'The disposition message is "…"'`` (backward compatibility for
-       English-locale ADCS).
+    2. **Explicit denial** — high-confidence structural markers
+       (``'The disposition message is "…"'`` / ``"your certificate request
+       was denied"``). Checked *before* pending so a request denied *after*
+       a ReqID was assigned (a manager denial) is not misread as pending.
+    3. **Pending** — a request was accepted but not yet issued: ``ReqID=<n>``
+       (locale-independent), ``"Certificate Pending"`` or ``"Your Request Id
+       is <n>"`` (English chrome), with no download link and no explicit
+       denial. Runs *before* the loose quoted-message heuristic so innocent
+       quoted prose on a pending page is not misread as a denial — that
+       would be a hard ``400`` on a still-processing request, the unsafe
+       direction.
+    4. **Loose denial fallback** — a quoted disposition message preceded by
+       a word and whitespace (``is "Denied by policy"`` / ``lautet
+       "Abgelehnt"``), for *non-English* denials that lack the explicit
+       markers and carry no ReqID (real ADCS policy denials have no ReqID).
+       A non-English denial that *does* carry a ReqID is read as pending in
+       (3) — the fail-safe direction (the client polls) rather than a hard
+       ``400``.
     5. **Unrecognized** — surfaces a body snippet so the operator can see
        what the CA returned, rather than silently misreading a non-English
        locale as a generic transport error.
@@ -382,35 +387,38 @@ def _parse_certfnsh_disposition(body: str, status_code: int) -> tuple[str, str]:
     is the ReqID (issued/pending), the denial message (denied), or a
     diagnostic snippet (unknown).
     """
+    # Strip <script> blocks AND <!-- comments --> before any prose heuristic:
+    # neither a JavaScript string literal nor commented-out markup may
+    # masquerade as a disposition message. (Real ADCS pages contain both.)
+    clean = re.sub(r"<script\b[^>]*>.*?</script>", "", body, flags=re.DOTALL | re.IGNORECASE)
+    clean = re.sub(r"<!--.*?-->", "", clean, flags=re.DOTALL)
+
     # 1. Issued: download link with ReqID=<n>& (the & precedes Enc=).
     m = re.search(r"certnew\.cer\?ReqID=(\d+)&", body)
     if m:
         return ("issued", m.group(1))
 
-    # 2. Denied: a quoted message preceded by word+space (locale-independent).
-    #    Strip <script> blocks first to avoid matching JavaScript string
-    #    literals (e.g. return "...", var s = "..."). Filters out URL-like
-    #    strings (JavaScript redirects, href values).
-    noscript = re.sub(r"<script\b[^>]*>.*?</script>", "", body, flags=re.DOTALL | re.IGNORECASE)
-    for match in re.finditer(r'\b\w+\s+"([^"]{5,})"', noscript):
-        candidate = match.group(1)
-        if "://" not in candidate and "certnew.cer" not in candidate.lower():
-            return ("denied", candidate)
+    # 2. Explicit denial — wins even when a ReqID is present.
+    msg = re.search(r'The disposition message is "([^"]+)', clean)
+    if msg:
+        return ("denied", msg.group(1))
+    if re.search(r"your certificate request was denied", clean, re.IGNORECASE):
+        return ("denied", "the CA denied the request")
 
-    # 3. Pending: ReqID= as a query/form parameter, no download link, no
-    #    denial message. Locale-independent — ReqID is a URL parameter name.
+    # 3. Pending: a ReqID assigned (or English pending chrome) with no
+    #    download link and no explicit denial.
     rid = re.search(r"ReqID=(\d+)", body)
     if rid:
         return ("pending", rid.group(1))
+    pending_id = re.search(r"Your Request Id is (\d+)", clean, re.IGNORECASE)
+    if pending_id or re.search(r"Certificate Pending", clean, re.IGNORECASE):
+        return ("pending", pending_id.group(1) if pending_id else "?")
 
-    # 4. English-locale fallback (backward compatibility).
-    if re.search(r"Certificate Pending", body, re.IGNORECASE):
-        rid = re.search(r"Your Request Id is (\d+)", body)
-        return ("pending", rid.group(1) if rid else "?")
-
-    msg = re.search(r'The disposition message is "([^"]+)', body)
-    if msg:
-        return ("denied", msg.group(1))
+    # 4. Loose denial fallback (non-English denials without a ReqID).
+    for match in re.finditer(r'\b\w+\s+"([^"]{5,})"', clean):
+        candidate = match.group(1)
+        if "://" not in candidate and "certnew.cer" not in candidate.lower():
+            return ("denied", candidate)
 
     # 5. Unrecognized: surface the body for diagnosis (not silent).
     snippet = " ".join(body[:400].split())

@@ -621,26 +621,34 @@ class TestCertfnshDispositionParsing:
         assert disposition == "pending"
         assert detail == "85"
 
-    @pytest.mark.xfail(
-        reason="Known defect: the denied heuristic runs before the pending "
-        "check against under-sanitized HTML (only <script> is stripped, not "
-        "<!-- comments -->), so a pending body containing word+space+quoted "
-        "prose is misclassified as denied (hard ACME 400 on a still-processing "
-        "request). This is the unsafe misclassification direction; the "
-        "documented fail-safe one is denied->pending. Asserts the DESIRED "
-        "behavior so a future fix flips this from xfail to a failing xpass.",
-        strict=True,
-    )
-    def test_pending_with_quoted_prose_should_not_be_denied(self) -> None:
-        """A pending page (ReqID present, no download link) that happens to
+    def test_pending_with_quoted_prose_is_not_denied(self) -> None:
+        """Regression guard (fixed 2026-06-30): a pending page (a Request Id
+        assigned, no download link, no explicit denial) that happens to
         contain a word+space+quoted string must classify as pending, not
-        denied. Currently it does not — see the WI-007 pending->denied
-        breadcrumb."""
+        denied. The pending check now runs before the loose quoted-message
+        heuristic, so innocent quoted prose no longer triggers a hard ACME
+        400 on a still-processing request (the unsafe misclassification
+        direction)."""
         body = (
             "<html><body>"
             '<p>The request status is "received and queued for the operator"</p>'
             "Your Request Id is 85."
             "</body></html>"
         )
-        disposition, _detail = _parse_certfnsh_disposition(body, 200)
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
         assert disposition == "pending"
+        assert detail == "85"
+
+    def test_html_comment_with_quoted_prose_is_not_denied(self) -> None:
+        """An HTML comment containing a word+space+quoted string must not be
+        read as a denial — comments are stripped alongside <script> before the
+        loose heuristic (real ADCS pages carry boilerplate comments)."""
+        body = (
+            "<html><body>"
+            '<!-- template note: the "ACME-ServerAuth" policy applies here -->'
+            "Your Request Id is 90."
+            "</body></html>"
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "pending"
+        assert detail == "90"
