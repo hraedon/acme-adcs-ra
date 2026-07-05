@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from importlib import resources
 from typing import Any
 
 import pytest
@@ -24,6 +25,16 @@ from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import Store
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
+
+
+# The package-shipped fixture cert (pre-generated, non-sensitive) is reused for
+# the CertsrvRevocationLeg unit tests so they don't need a live CA or a freshly
+# minted cert (the architecture test forbids cert-minting primitives in src/,
+# not in tests, but reusing the fixture keeps these fast and deterministic).
+_FAKE_CERT_PEM = resources.files("acme_adcs_ra.fixtures").joinpath("fake_cert.pem").read_text()
+_FAKE_CERT_SERIAL_HEX = format(
+    x509.load_pem_x509_certificate(_FAKE_CERT_PEM.encode("utf-8")).serial_number, "x"
+).upper()
 
 
 def _make_test_config(tmp_path: Any) -> RAConfig:
@@ -305,6 +316,298 @@ class TestRevokeCertStoreAndAudit:
 
 
 # ---------------------------------------------------------------------------
+# WI-010: out-of-band revocation — the RA records-and-surfaces honestly
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def out_of_band_client(
+    test_config: RAConfig, tmp_path: Any
+) -> TestClient:
+    """A client wired with the production CertsrvRevocationLeg (out-of-band),
+    so route-level tests exercise the real audit/response shape rather than the
+    FakeRevocationLeg (which claims ca_crl_updated=true)."""
+    store = Store(test_config.db_path)
+    policy = IssuancePolicy(
+        allowed_kids=set(test_config.eab_keys_by_kid().keys()),
+        san_scopes={
+            kid: scope.dns_patterns for kid, scope in test_config.san_scopes.items()
+        },
+        template=test_config.adcs_template,
+    )
+    context = ServerContext(
+        config=test_config,
+        store=store,
+        policy=policy,
+        enrollment=FakeEnrollmentLeg(),
+        revocation=CertsrvRevocationLeg(),
+    )
+    return TestClient(create_app(context))
+
+
+class TestOutOfBandRevocation:
+    """WI-010: the production leg records the revocation in the RA store and
+    surfaces the out-of-band step; the audit honestly distinguishes RA-revoked
+    from CA-CRL-revoked and never implies the CRL was written when it was not."""
+
+    def test_response_surfaces_out_of_band_step(
+        self,
+        out_of_band_client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        ac, cert_der = _issue_cert(out_of_band_client, test_config, account_key)
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial_hex = format(cert.serial_number, "x").upper()
+
+        resp = ac.revoke_certificate(cert_der, reason=1)
+        assert resp.status_code == 200
+        body = resp.json()
+        hint = body.get("out_of_band_revocation")
+        assert hint is not None, "out-of-band leg must surface the out_of_band_revocation hint"
+        assert hint["ca_crl_updated"] is False
+        assert hint["revocation_scope"] == "ra-store-only"
+        assert hint["serial"] == serial_hex
+
+    def test_audit_distinguishes_ra_store_only_from_ca_crl(
+        self,
+        out_of_band_client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """The audit details must record revocation_scope=ra-store-only and
+        ca_crl_updated=false so the audit log never implies the CA CRL was
+        written when it was not (the dishonesty WI-010 removes)."""
+        ac, cert_der = _issue_cert(out_of_band_client, test_config, account_key)
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial_hex = format(cert.serial_number, "x").upper()
+
+        resp = ac.revoke_certificate(cert_der, reason=0)
+        assert resp.status_code == 200
+
+        account_id = ac.account_url.split("/")[-1]
+        store = Store(test_config.db_path)
+        events = store.list_audit_events(account_id=account_id, event_type="certificate-revoked")
+        revoked_events = [e for e in events if e["outcome"] == "success"]
+        assert revoked_events, "expected a successful certificate-revoked audit event"
+        details = revoked_events[0]["details"]
+        assert details["revocation_scope"] == "ra-store-only"
+        assert details["ca_crl_updated"] == "false"
+        assert details["serial"] == serial_hex
+
+    def test_audit_surfaces_req_id_when_present(
+        self,
+        out_of_band_client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """When the cert's RA-store metadata carries an ADCS ReqID (the real
+        enrollment leg records it; FakeEnrollmentLeg does not), the audit and
+        response surface it so the operator's Revoke-Cert.ps1 has both
+        identifiers. Simulate the real leg by writing req_id into the cert
+        metadata directly before revoking."""
+        ac, cert_der = _issue_cert(out_of_band_client, test_config, account_key)
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial_hex = format(cert.serial_number, "x").upper()
+
+        # Write a req_id into the stored cert metadata, mimicking what the real
+        # CertsrvEnrollmentLeg does at enrollment time (enrollment.py:338).
+        store = Store(test_config.db_path)
+        cert_record = store.get_certificate_by_serial(serial_hex)
+        assert cert_record is not None
+        cert_record.metadata["req_id"] = "77"
+        # Persist the updated metadata directly (the store doesn't expose a
+        # metadata-only updater; replicate the minimal UPDATE).
+        with store._connect() as conn:  # noqa: SLF001 — test-only metadata poke
+            conn.execute(
+                "UPDATE certificates SET metadata = ? WHERE id = ?",
+                (json.dumps(cert_record.metadata), cert_record.id),
+            )
+
+        resp = ac.revoke_certificate(cert_der, reason=0)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["out_of_band_revocation"]["req_id"] == "77"
+
+        account_id = ac.account_url.split("/")[-1]
+        events = store.list_audit_events(account_id=account_id, event_type="certificate-revoked")
+        revoked_events = [e for e in events if e["outcome"] == "success"]
+        assert revoked_events
+        assert revoked_events[0]["details"].get("req_id") == "77"
+
+    def test_already_revoked_is_idempotent_under_out_of_band_leg(
+        self,
+        out_of_band_client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """H-4 holds under the out-of-band leg: re-revoking returns 200 (the
+        already-revoked short-circuit fires before the leg is called). The
+        body is {} — the out_of_band_revocation hint is NOT re-emitted on the
+        idempotent second call (the first call's audit already recorded it)."""
+        ac, cert_der = _issue_cert(out_of_band_client, test_config, account_key)
+        assert ac.revoke_certificate(cert_der, reason=0).status_code == 200
+        resp = ac.revoke_certificate(cert_der, reason=0)
+        assert resp.status_code == 200
+        assert resp.json() == {}
+
+    def test_store_reflects_revoked_under_out_of_band_leg(
+        self,
+        out_of_band_client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """The out-of-band leg still flips the RA store (cert → revoked, order
+        → revoked, GET cert → 410) — the only thing it does NOT do is write the
+        CA CRL."""
+        ac, cert_der = _issue_cert(out_of_band_client, test_config, account_key)
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial_hex = format(cert.serial_number, "x").upper()
+
+        resp = ac.revoke_certificate(cert_der, reason=1)
+        assert resp.status_code == 200
+
+        store = Store(test_config.db_path)
+        record = store.get_certificate_by_serial(serial_hex)
+        assert record is not None
+        assert record.status == "revoked"
+        assert record.revocation_reason == 1
+        assert record.revoked_at is not None
+        order = store.get_order(record.order_id)
+        assert order is not None
+        assert order.status == "revoked"
+
+        cert_resp = out_of_band_client.get(f"/acme/cert/{record.id}")
+        assert cert_resp.status_code == 410
+
+    def test_siem_event_for_out_of_band_path_carries_honest_scope(
+        self,
+        out_of_band_client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """T2: the SIEM JSONL for the out-of-band path must carry
+        revocation_scope=ra-store-only and ca_crl_updated=false so the SIEM
+        never implies the CA CRL was written when it was not."""
+        ac, cert_der = _issue_cert(out_of_band_client, test_config, account_key)
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial_hex = format(cert.serial_number, "x").upper()
+
+        resp = ac.revoke_certificate(cert_der, reason=0)
+        assert resp.status_code == 200
+
+        siem_lines = test_config.siem_jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+        siem_events = [json.loads(line) for line in siem_lines]
+        assert any(
+            e.get("event_type") == "certificate-revoked"
+            and e.get("outcome") == "success"
+            and e.get("details", {}).get("serial") == serial_hex
+            and e.get("details", {}).get("revocation_scope") == "ra-store-only"
+            and e.get("details", {}).get("ca_crl_updated") == "false"
+            and e.get("schema_version") == "acme-adcs-ra-audit/1"
+            for e in siem_events
+        )
+
+    def test_req_id_absent_when_enrollment_leg_does_not_set_it(
+        self,
+        out_of_band_client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """T4: when the cert's RA-store metadata does not carry an ADCS ReqID
+        (the FakeEnrollmentLeg case — only the real CertsrvEnrollmentLeg sets
+        it), the audit omits req_id entirely and the response hint omits it."""
+        ac, cert_der = _issue_cert(out_of_band_client, test_config, account_key)
+
+        resp = ac.revoke_certificate(cert_der, reason=0)
+        assert resp.status_code == 200
+        hint = resp.json()["out_of_band_revocation"]
+        assert "req_id" not in hint, "req_id must be absent when the cert has none"
+
+        account_id = ac.account_url.split("/")[-1]
+        store = Store(test_config.db_path)
+        events = store.list_audit_events(account_id=account_id, event_type="certificate-revoked")
+        revoked_events = [e for e in events if e["outcome"] == "success"]
+        assert revoked_events
+        assert "req_id" not in revoked_events[0]["details"]
+
+    def test_failed_revocation_path_audits_failure_and_preserves_state(
+        self,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """T1: when the revocation leg raises, the audit records outcome=failed
+        (without revocation_scope/ca_crl_updated — a failure must not claim a
+        scope), the response is 500, and the cert/order are NOT flipped to
+        revoked (the RA store stays honest about what didn't happen)."""
+
+        class _RaisingRevocationLeg:
+            def revoke(self, cert_pem: str, reason: int | None) -> RevocationResult:
+                raise RuntimeError("simulated CA-officer leg failure")
+
+        store = Store(test_config.db_path)
+        policy = IssuancePolicy(
+            allowed_kids=set(test_config.eab_keys_by_kid().keys()),
+            san_scopes={
+                kid: scope.dns_patterns for kid, scope in test_config.san_scopes.items()
+            },
+            template=test_config.adcs_template,
+        )
+        context = ServerContext(
+            config=test_config,
+            store=store,
+            policy=policy,
+            enrollment=FakeEnrollmentLeg(),
+            revocation=_RaisingRevocationLeg(),  # type: ignore[arg-type]
+        )
+        client = TestClient(create_app(context))
+
+        ac, cert_der = _issue_cert(client, test_config, account_key)
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial_hex = format(cert.serial_number, "x").upper()
+
+        resp = ac.revoke_certificate(cert_der, reason=0)
+        assert resp.status_code == 500
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:serverInternal"
+
+        # Audit: failed, and must NOT carry revocation_scope or ca_crl_updated
+        # (a failure cannot honestly claim a scope).
+        account_id = ac.account_url.split("/")[-1]
+        events = store.list_audit_events(account_id=account_id, event_type="certificate-revoked")
+        failed_events = [e for e in events if e["outcome"] == "failed"]
+        assert failed_events, "expected a failed certificate-revoked audit event"
+        details = failed_events[0]["details"]
+        assert "revocation_scope" not in details
+        assert "ca_crl_updated" not in details
+        assert details["serial"] == serial_hex
+
+        # State: cert is still valid, order is still valid (not flipped).
+        record = store.get_certificate_by_serial(serial_hex)
+        assert record is not None
+        assert record.status == "valid"
+        order = store.get_order(record.order_id)
+        assert order is not None
+        assert order.status == "valid"
+
+
+class TestFakeLegRevocationResponseShape:
+    """T5: the FakeRevocationLeg (ca_crl_updated=true) returns a bare 200 {} —
+    the out_of_band_revocation hint is absent when the CRL was (pretend) written."""
+
+    def test_fake_leg_response_has_no_out_of_band_hint(
+        self,
+        client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        ac, cert_der = _issue_cert(client, test_config, account_key)
+        resp = ac.revoke_certificate(cert_der, reason=0)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {}, f"expected empty body for ca_crl_updated=true, got {body}"
+
+
+# ---------------------------------------------------------------------------
 # RevocationLeg protocol and platform-gated stub
 # ---------------------------------------------------------------------------
 
@@ -325,17 +628,35 @@ class TestRevocationLeg:
         leg = CertsrvRevocationLeg()
         assert isinstance(leg, CertsrvRevocationLeg)
 
-    def test_certsrv_leg_revoke_is_not_implemented(self) -> None:
+    def test_certsrv_leg_revoke_is_out_of_band_record_and_surface(self) -> None:
+        """WI-010: the production leg records the revocation in the RA store
+        and surfaces the out-of-band step; it does NOT call the CA and does
+        NOT raise. The gMSA gains no CA-officer rights."""
         leg = CertsrvRevocationLeg()
-        with pytest.raises(NotImplementedError, match="no revocation endpoint"):
-            leg.revoke("no-matter", reason=0)
+        result = leg.revoke(_FAKE_CERT_PEM, reason=1)
+        assert isinstance(result, RevocationResult)
+        assert result.revoked is True
+        assert result.reason == 1
+        assert result.revoked_at is not None
+        # The honest scope markers the route + audit rely on.
+        assert result.metadata["revocation_scope"] == "ra-store-only"
+        assert result.metadata["ca_crl_updated"] == "false"
+        # The serial the operator's Revoke-Cert.ps1 consumes is surfaced.
+        assert result.metadata["serial"] == _FAKE_CERT_SERIAL_HEX
 
-    def test_certsrv_leg_error_cites_mechanism(self) -> None:
+    def test_certsrv_leg_does_not_pretend_crl_was_written(self) -> None:
+        """WI-010: the leg must never claim ca_crl_updated=true — that would
+        make the audit log imply the CA CRL was written when it was not,
+        which is the exact dishonesty this WI removes."""
         leg = CertsrvRevocationLeg()
-        with pytest.raises(NotImplementedError) as exc_info:
-            leg.revoke("no-matter", reason=0)
-        msg = str(exc_info.value)
-        assert "certutil" in msg or "ICertAdmin" in msg
+        result = leg.revoke(_FAKE_CERT_PEM, reason=0)
+        assert result.metadata.get("ca_crl_updated") != "true"
+
+    def test_certsrv_leg_cites_mechanism_in_docstring(self) -> None:
+        """The mechanism (certutil / ICertAdmin2) and the privilege rationale
+        must remain documented in the leg so a future in-band change is
+        forced to confront the security decision."""
+        assert "certutil" in CertsrvRevocationLeg.__doc__ or "ICertAdmin" in CertsrvRevocationLeg.__doc__
 
 
 # ---------------------------------------------------------------------------

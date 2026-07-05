@@ -78,6 +78,10 @@ serverAuth-only cert (SAN from the CSR, chaining to the existing root). ACME
 server + EAB/policy + SIEM audit + revokeCert and the ADCS **enrollment** leg are
 built, unit-tested, and live-validated. Auth is SPNEGO + channel binding
 (`negotiate_auth.NegotiateAuth` over `pyspnego`) against `/certsrv/` **EPA=Require**.
-**CA-side revocation is still a documented gap**: ADCS Web Enrollment exposes no
-revocation endpoint, so `CertsrvRevocationLeg` is an honest `NotImplementedError`
-stub pending the mechanism decision (threat-model §E).
+**CA-side revocation is out-of-band (WI-010)**: ADCS Web Enrollment exposes no
+revocation endpoint, so `revokeCert` records the revocation in the RA store
+only (cert → revoked, GET → 410) with an honest audit
+(`revocation_scope=ra-store-only`, `ca_crl_updated=false`). The operator closes
+the loop by running `scripts/Revoke-Cert.ps1` (a CA officer, not the gMSA),
+which runs `certutil -revoke` and republishes the CRL. The enrollment gMSA
+gains no CA-officer rights (threat-model §E).

@@ -73,11 +73,17 @@ honest: check a box only when the thing is actually true, not when it's planned.
 
 ## F. Known limitation to accept with eyes open
 
-- [ ] **CA-side revocation is a `NotImplementedError` stub** (§4.E, §8).
-      `revokeCert` flips the RA store only — it does **not** write the CA CRL.
-      ADCS Web Enrollment exposes no revocation endpoint. **Out-of-band
-      revocation** (`certutil` / CA console) is the operator's path if a cert
-      must be killed. Confirm the on-call runbook documents this before pilot.
+- [ ] **CA-side revocation is out-of-band, operator-run (WI-010, §4.E).**
+      `revokeCert` records the revocation in the RA store only (cert → revoked,
+      order → revoked, GET cert → 410 Gone) — it does **not** write the CA CRL.
+      The audit event honestly records `revocation_scope=ra-store-only`,
+      `ca_crl_updated=false`; the ACME response surfaces an
+      `out_of_band_revocation` hint. The operator closes the loop by running
+      `scripts/Revoke-Cert.ps1` (a CA officer, **not** the gMSA) which runs
+      `certutil -revoke` and republishes the CRL. The enrollment gMSA gains no
+      CA-officer rights (the project's tightest security tenet). Confirm the
+      on-call runbook references `Revoke-Cert.ps1` and that the operator
+      verifies the CRL republished after each revocation before pilot.
 
 ---
 
