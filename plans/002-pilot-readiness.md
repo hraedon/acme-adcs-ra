@@ -97,6 +97,16 @@ re-proof since it touches the enrollment leg.
 
 ## Phase 2 — The revocation gap (headline limitation)
 
+> **Update (2026-07-05):** WI-010 is implemented — the out-of-band path is
+> first-class. `revokeCert` records the revocation in the RA store and
+> surfaces the out-of-band step (`revocation_scope=ra-store-only`,
+> `ca_crl_updated=false`, `out_of_band_revocation` response hint);
+> `scripts/Revoke-Cert.ps1` is the operator-run, CA-officer credential that
+> writes the CRL. Threat-model §E/§7/§8 and checklist §F are updated. The
+> enrollment gMSA gains no CA-officer rights. The lab re-proof (revoking a
+> throwaway cert via `Revoke-Cert.ps1`) is the remaining AC item — see
+> Phase 4 / WI-015.
+
 This is the one place the project's worst case (a mis-issued cert that cannot be
 killed in-band) lives. The honest engineering question is **whether to close it
 in-band or to make the out-of-band path operationally first-class.**

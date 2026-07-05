@@ -525,6 +525,30 @@ async def revoke_cert(
             cert_record.order_id, cert_record.id,
         )
 
+    # WI-010: honestly distinguish RA-store revocation from CA-CRL revocation.
+    # The out-of-band leg records revocation_scope="ra-store-only" and
+    # ca_crl_updated="false" — the cert is revoked in the RA (GET → 410, order
+    # → revoked) but the CA CRL was NOT written. The operator must run
+    # scripts/Revoke-Cert.ps1 out-of-band to write the CRL entry. Surfacing
+    # this in the audit + response prevents the audit log from implying the
+    # CA CRL was written when it was not.
+    rev_meta = revocation_result.metadata
+    revocation_scope = rev_meta.get("revocation_scope", "ra-store-only")
+    ca_crl_updated = rev_meta.get("ca_crl_updated", "false")
+    # The ADCS ReqID is carried in the cert's RA-store metadata (set by the
+    # enrollment leg), not on the cert itself — surface it so the operator's
+    # Revoke-Cert.ps1 has both identifiers (serial + ReqID) without re-parsing.
+    req_id = cert_record.metadata.get("req_id", "")
+    audit_details: dict[str, Any] = {
+        "certificate_id": cert_record.id,
+        "serial": serial_hex,
+        "reason": reason,
+        "revocation_scope": revocation_scope,
+        "ca_crl_updated": ca_crl_updated,
+    }
+    if req_id:
+        audit_details["req_id"] = req_id
+
     _audit(
         ctx,
         event_type="certificate-revoked",
@@ -532,11 +556,26 @@ async def revoke_cert(
         order_id=cert_record.order_id,
         sans=cert_sans,
         outcome="success",
-        details={
-            "certificate_id": cert_record.id,
-            "serial": serial_hex,
-            "reason": reason,
-        },
+        details=audit_details,
     )
 
-    return JSONResponse(status_code=200, content={})
+    # WI-010: surface the out-of-band step in the ACME response. RFC 8555 §7.6
+    # specifies an empty body on success; extra fields are non-normative and
+    # ignored by standard ACME clients. The "out_of_band_revocation" hint tells
+    # the operator (and any inspecting client) that the CA CRL was not written
+    # and points at the runbook. It is absent when the leg reports the CRL was
+    # written (ca_crl_updated == "true"), so a future in-band leg that does
+    # write the CRL simply omits the hint.
+    response_body: dict[str, Any] = {}
+    if ca_crl_updated == "false":
+        hint: dict[str, Any] = {
+            "ca_crl_updated": False,
+            "revocation_scope": revocation_scope,
+            "serial": serial_hex,
+            "runbook": "scripts/Revoke-Cert.ps1 (run by a CA officer; see docs/threat-model.md §E)",
+        }
+        if req_id:
+            hint["req_id"] = req_id
+        response_body = {"out_of_band_revocation": hint}
+
+    return JSONResponse(status_code=200, content=response_body)

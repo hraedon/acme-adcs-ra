@@ -23,17 +23,22 @@ not apply.
 >   tolerates the CA's real response formats (`certnew.cer` returned as
 >   `text/html`; `certnew.p7b` returned as PKCS7 wrapped in
 >   `-----BEGIN CERTIFICATE-----` markers — see `docs/spike-runbook.md`).
-> - **Revocation (`CertsrvRevocationLeg`)** is an **honest `NotImplementedError`
->   stub.** ADCS Web Enrollment exposes **no revocation endpoint** (Microsoft
->   Learn enumerates only request-cert / retrieve-CA-cert / retrieve-CRL;
->   `magnuswatn/certsrv` has no `revoke()`; `acme2certifier` returns "not
->   supported"). A fictional `certrev.asp` form that appeared in one draft was
->   removed. The real mechanism is `certutil -revoke` or `ICertAdmin2`
->   `RevokeCertificate`, which requires granting the gMSA **CA-officer
->   ("Manage CA") rights** — a blast-radius change that is an operator
->   decision (see §E) and is **out of scope until then**. The server's
->   `revokeCert` endpoint remains wired to this leg via `FakeRevocationLeg`
->   (dev) so the mechanism drops in without an ACME-surface change.
+> - **Revocation (`CertsrvRevocationLeg`)** is **out-of-band, operator-runbook'd
+>   (WI-010, decided 2026-06-30).** ADCS Web Enrollment exposes **no revocation
+>   endpoint** (Microsoft Learn enumerates only request-cert / retrieve-CA-cert /
+>   retrieve-CRL; `magnuswatn/certsrv` has no `revoke()`; `acme2certifier`
+>   returns "not supported"). A fictional `certrev.asp` form that appeared in one
+>   draft was removed. The real mechanism is `certutil -revoke` or
+>   `ICertAdmin2::RevokeCertificate`, which requires **CA-officer ("Manage CA")
+>   rights**. To preserve least privilege the enrollment gMSA gains **no**
+>   CA-officer rights; instead the RA's `revokeCert` records the revocation in
+>   the RA store (cert → `revoked`, order → `revoked`, GET cert → 410 Gone) and
+>   emits an honest audit event (`revocation_scope=ra-store-only`,
+>   `ca_crl_updated=false`), and `scripts/Revoke-Cert.ps1` is the operator-run,
+>   CA-officer credential that writes the CRL out-of-band. The server's
+>   `revokeCert` endpoint remains wired to this leg via the `RevocationLeg`
+>   protocol, so a future in-band mechanism (an explicit, recorded privilege
+>   decision) can drop in without an ACME-surface change.
 >
 > Controls downstream of "ADCS issued a cert" (chain fetch, requester capture,
 > audit fields) are now **live-verified**, not just unit-tested. The remaining
@@ -235,19 +240,40 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   design, accepted here.
 - **Residual:** a compromised issuing account can revoke its own certs (denial
   of availability for that account's services). Bounded; audited.
-- **CA-side revocation is a documented gap (operator decision required).** The
-  controls above are all **RA-store-level** (the RA marks the cert revoked and
-  stops serving it). The passthrough to the ADCS CA database / CRL is **not
-  implemented**: ADCS Web Enrollment exposes no revocation endpoint, so
-  `CertsrvRevocationLeg` is an honest `NotImplementedError` stub. The real
-  mechanism (`certutil -revoke` or `ICertAdmin2` COM) requires granting the
-  gMSA **CA-officer ("Manage CA") rights** — which would let a compromised RA
-  host revoke *any* cert on the CA, not just its own. That blast-radius
-  increase is an **operator decision**: either accept it (separate, more-
-  privileged revoke identity preferred over widening the enrollment gMSA), or
-  treat revocation as an out-of-band CA-officer action and have the RA's
-  `revokeCert` decline/record-only. Until decided, a `revokeCert` that succeeds
-  flips the RA store only — **the cert is still valid against the CA's CRL.**
+- **CA-side revocation is out-of-band, operator-runbook'd (WI-010, decided
+  2026-06-30).** The controls above are all **RA-store-level** (the RA marks
+  the cert revoked and stops serving it). The passthrough to the ADCS CA
+  database / CRL is **deliberately not wired in-band**: ADCS Web Enrollment
+  exposes no revocation endpoint, and the real mechanism (`certutil -revoke`
+  or `ICertAdmin2` COM) requires granting the caller **CA-officer ("Manage
+  CA") rights** — which would let a compromised RA host revoke *any* cert on
+  the CA, not just its own. That blast-radius increase was an **operator
+  decision** and the decision is **out-of-band first-class** (preserve least
+  privilege): the enrollment gMSA gains **no** CA-officer rights. Instead:
+
+  - The RA's `revokeCert` endpoint records the revocation in the RA store
+    (cert → `revoked`, order → `revoked`, GET cert → 410 Gone) and emits an
+    honest audit event whose `details.revocation_scope` is `"ra-store-only"`
+    and `details.ca_crl_updated` is `false` — the audit log never implies the
+    CA CRL was written when it was not. The ACME response carries an
+    `out_of_band_revocation` hint (non-normative; ignored by standard ACME
+    clients) naming the runbook and the serial/ReqID the operator needs.
+  - `scripts/Revoke-Cert.ps1` is the operator-run, CA-officer credential that
+    performs the actual `certutil -revoke` against the CA and republishes the
+    CRL, taking the serial or ReqID the RA already stores. It is run by a CA
+    officer, **not** the gMSA, so the standing enrollment identity never gains
+    CA-officer power. The RA audit log and this script's CA-database record
+    (operator identity) are the matching halves of the revocation trail;
+    keep both in incident review.
+
+  A future in-band revocation capability (gMSA granted CA-officer rights and
+  `certutil`/`ICertAdmin2` called from the RA) remains a **deferred, explicit
+  privilege decision** — it would drop into the `RevocationLeg` protocol
+  without changing the ACME surface, and only the `revocation_scope` metadata
+  would change from `"ra-store-only"` to `"ca-crl"`. Until that decision is
+  made and recorded here, `revokeCert` flips the RA store only — **the cert
+  is still valid against the CA's CRL until the operator runs
+  `Revoke-Cert.ps1`.**
 
 ### F. Audit / SIEM
 - **Every** issuance, policy-denial, enrollment-failure, account creation
@@ -346,10 +372,18 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   live findings — channel binding (`pyspnego`) for EPA=Require, `certnew.cer`
   served as `text/html`, `certnew.p7b` as PKCS7-in-CERTIFICATE-markers — are
   folded into the leg and `docs/spike-runbook.md`. Kept here only as a pointer.
-- **Revocation has no `/certsrv/` endpoint** — `CertsrvRevocationLeg` is an
-  honest `NotImplementedError` stub. The mechanism (`certutil`/`ICertAdmin2`)
-  + its gMSA CA-officer privilege implication is an **operator decision**
-  (§4.E). Until then `revokeCert` flips the RA store only, not the CA CRL.
+- **Revocation is out-of-band, operator-runbook'd (WI-010)** — CLOSED for
+  the RA-store half: `revokeCert` records the revocation in the RA store
+  (cert → `revoked`, order → `revoked`, GET cert → 410 Gone) and emits an
+  honest audit event (`revocation_scope=ra-store-only`, `ca_crl_updated=false`).
+  The CA-CRL write is **deliberately out-of-band**: `scripts/Revoke-Cert.ps1`
+  is the operator-run, CA-officer credential that runs `certutil -revoke` and
+  republishes the CRL, taking the serial/ReqID the RA stores. The enrollment
+  gMSA gains no CA-officer rights (decision recorded 2026-06-30; see §4.E).
+  A future in-band revocation capability remains a deferred, explicit
+  privilege decision. **Pilot condition: the on-call runbook must reference
+  `Revoke-Cert.ps1` and the operator must confirm the CRL republished after
+  each revocation** (the RA audit cannot see the CA side).
 - **Stuck-`processing` orders** have no *auto*-recovery for the no-cert case
   (intentional — blindly reverting risks double-issuance). `processing_started_at`
   is recorded. Two reconciliation paths: (a) **cert recorded, status flip
@@ -394,5 +428,8 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 - Public-DV trust model.
 - CES/WSTEP (Mode C2) transport — documented only.
 - Auto-recovery of a stuck `processing` order (near-term follow-up, §7).
-- CA-side revocation (CRL write) — `revokeCert` is RA-store-only until the
-  mechanism decision (§4.E); the `/certsrv/` enrollment bodies are now real.
+- **In-band** CA-side revocation (CRL write from the RA) — deferred behind an
+  explicit, recorded privilege decision to grant the gMSA CA-officer rights
+  (§4.E). The out-of-band path (`scripts/Revoke-Cert.ps1`, operator-run) is
+  the shipped mechanism; the in-band path would drop into the `RevocationLeg`
+  protocol without an ACME-surface change.
