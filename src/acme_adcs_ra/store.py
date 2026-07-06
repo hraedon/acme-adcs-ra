@@ -569,6 +569,26 @@ class Store:
             )
             return cursor.rowcount == 1
 
+    def transition_pending_to_ready(self, order_id: str) -> bool:
+        """Atomically transition an order from 'pending' to 'ready'.
+
+        M-2: CAS-guarded on ``status = 'pending'`` so a concurrent finalize
+        that has already moved the order to ``processing`` (or any other state)
+        cannot be clobbered back to ``ready`` by a late/racing challenge
+        validation. Clears ``processing_started_at`` (it should already be
+        NULL for a pending order, but the clear is explicit for safety).
+        Returns True if the transition was applied, False if the order was no
+        longer ``pending`` (the caller simply returns — the order has moved on).
+        """
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE orders SET status = ?, processing_started_at = NULL, "
+                "updated_at = ? WHERE id = ? AND status = ?",
+                (OrderStatus.READY, updated_at, order_id, OrderStatus.PENDING),
+            )
+            return cursor.rowcount == 1
+
     def transition_processing_to_ready(self, order_id: str) -> bool:
         """Atomically transition an order from 'processing' back to 'ready'.
 
@@ -1010,17 +1030,38 @@ class Store:
         *,
         revoked_at: str | None = None,
     ) -> CertificateRecord | None:
-        """Mark a certificate as revoked in the RA store."""
+        """Mark a certificate as revoked in the RA store (CAS-guarded).
+
+        M-3: the UPDATE is guarded on ``status = 'valid'`` so concurrent
+        revocations are idempotent — the first revocation wins and its
+        reason/timestamp are preserved; a concurrent caller sees the existing
+        (now-revoked) record returned unchanged. If the cert was already
+        revoked, no row is updated and the existing revoked record is returned
+        (the caller treats this as idempotent success). Returns ``None`` only
+        when no certificate row exists for *cert_id*.
+        """
         timestamp = revoked_at or _now_iso()
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE certificates "
                 "SET status = ?, "
                 "    revocation_reason = ?, "
                 "    revoked_at = ? "
-                "WHERE id = ?",
-                (CertStatus.REVOKED, reason, timestamp, cert_id),
+                "WHERE id = ? AND status = ?",
+                (CertStatus.REVOKED, reason, timestamp, cert_id, CertStatus.VALID),
             )
+            if cursor.rowcount == 1:
+                # This caller won the CAS — the cert was 'valid', now 'revoked'.
+                row = conn.execute(
+                    "SELECT * FROM certificates WHERE id = ?", (cert_id,)
+                ).fetchone()
+                if row is None:
+                    return None
+                return self._certificate_from_row(row)
+            # No row updated: either the cert doesn't exist, or it was already
+            # revoked (a concurrent revocation won the CAS). Return the current
+            # record so the caller can distinguish the two cases (None = not
+            # found; a revoked record = idempotent success).
         return self.get_certificate(cert_id)
 
     # ------------------------------------------------------------------

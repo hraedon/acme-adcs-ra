@@ -1,6 +1,6 @@
 [project]
 name = "acme-adcs-ra"
-version = "0.1.0"
+version = "1.0.0"
 description = "ACME Registration Authority for ADCS — speaks ACME, holds no signing key, enrolls via /certsrv/ as a gMSA"
 requires-python = ">=3.12"
 license = { text = "MIT" }

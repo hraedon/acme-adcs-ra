@@ -85,16 +85,23 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-**WI-1 proven end-to-end on the lab (2026-06-20).** The full pipeline — ACME
-server (RFC 8555 subset: directory, EAB-gated accounts, orders, finalize, cert
-retrieval, revokeCert), deterministic issuance policy, SIEM audit, and the real
-ADCS **enrollment** leg — issues a real certificate: a deployed RA running as the
-gMSA behind IIS drives `/certsrv/` and returns a **serverAuth-only** cert with the
-**SAN from the CSR**, issued off the existing CA and **chaining to the existing
-root** (no new intermediate). See [`docs/architecture.md`](docs/architecture.md),
+**WI-001–WI-010 are complete and WI-011–WI-014 are now in place for 1.0.** The
+full pipeline — ACME server (RFC 8555 subset: directory, EAB-gated accounts,
+orders, finalize, cert retrieval, revokeCert), deterministic issuance policy,
+SIEM audit, and the real ADCS **enrollment** leg — issues a real certificate: a
+deployed RA running as the gMSA behind IIS drives `/certsrv/` and returns a
+**serverAuth-only** cert with the **SAN from the CSR**, issued off the existing
+CA and **chaining to the existing root** (no new intermediate). See
+[`docs/architecture.md`](docs/architecture.md),
 [`docs/threat-model.md`](docs/threat-model.md),
 [`docs/certsrv-setup.md`](docs/certsrv-setup.md), and the result in
-[`docs/spike-runbook.md`](docs/spike-runbook.md).
+[`docs/spike-runbook.md`](docs/spike-runbook.md). The Phase 3 operator-
+enablement artifacts (EAB lifecycle tooling, deployment-hardening snippets,
+scheduled maintenance units, and the operations runbook) ship with 1.0 — see
+[`docs/operations.md`](docs/operations.md). **WI-015** (a live lab re-proof
+against the exact commit to be piloted) is the remaining gate before a
+production pilot; see [`plans/002-pilot-readiness.md`](plans/002-pilot-readiness.md)
+and [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).
 
 Authentication to `/certsrv/` is the ambient **gMSA** identity over SPNEGO with
 **channel binding** (RFC 5929 `tls-server-end-point`), via the in-tree
@@ -104,7 +111,11 @@ HttpPlatformHandler, app pool as the gMSA, on a configurable port).
 
 **CA-side revocation remains a documented gap** — ADCS Web Enrollment exposes no
 revocation endpoint; the mechanism + its gMSA privilege implication is an operator
-decision (threat-model §E).
+decision (threat-model §E). The out-of-band path (`scripts/Revoke-Cert.ps1`,
+operator-run) is the shipped mechanism; `revokeCert` records the revocation in
+the RA store only and surfaces an `out_of_band_revocation` hint. Reason 7 is
+rejected by both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil`
+rejects it) so an accepted reason can never silently break the out-of-band loop.
 
 ## Installation
 
@@ -167,7 +178,11 @@ single-site catch-all binding. Full IIS detail is in
 3. **Restrict the endpoint to the ACME client** — add `<ipSecurity>` to
    `web.config` (needs `Web-IP-Security`, which `-InstallPrereqs` installs) or a
    scoped firewall rule. A threat-model pilot condition, deliberately not done
-   for you.
+   for you. See [`docs/operations.md`](docs/operations.md) for the full network-
+   allowlist snippet, reverse-proxy rate-limit guidance, EAB rotation runbook,
+   scheduled-maintenance tasks, the admin-token + reclaim runbook,
+   monitoring/SLOs, retention/archival, the revocation runbook, and
+   backup/restore.
 
 ### Verify
 

@@ -39,13 +39,19 @@ honest: check a box only when the thing is actually true, not when it's planned.
 - [ ] **EAB enabled and pinned** to the authorized Certify-the-Web client(s).
       Kids are high-entropy (UUID / ≥128-bit), **not** hostnames/customer names.
 - [ ] **EAB MAC keys placed in `acme-ra.env` by hand** (never committed, never on
-      a command line); file readable only by the gMSA + Administrators.
+      a command line); file readable only by the gMSA + Administrators. Use
+      `scripts/eab.py` to mint a high-entropy kid + MAC key (stdout-only; see
+      `docs/operations.md` ## EAB lifecycle).
 - [ ] **Documented EAB rotation procedure exists** (kid + MAC key + SAN scope)
-      *before* pilot — threat-model §B calls this a precondition.
+      *before* pilot — threat-model §B calls this a precondition. Runbook:
+      `docs/operations.md` ## EAB lifecycle (mint + rotate via
+      `scripts/eab.py`).
 - [ ] **Network allowlist in place.** The installer deliberately does **not**
       restrict the endpoint. Add `<ipSecurity>` (IP and Domain Restrictions role
       service) or a scoped firewall rule to the Certify-the-Web host. Do **not**
-      blanket-firewall 443 if it is SNI-shared with cert-watch/gpo-lens.
+      blanket-firewall 443 if it is SNI-shared with cert-watch/gpo-lens. Snippet
+      + caveats: `docs/operations.md` ## Network allowlist and reverse-proxy
+      rate limiting.
 - [ ] **`base_url` is the public hostname.** A mismatch fail-closes every
       legitimate JWS on day 1 (URL binding) — deployment prerequisite, not
       optional (§4.D).
@@ -54,22 +60,30 @@ honest: check a box only when the thing is actually true, not when it's planned.
 
 - [ ] **`admin_token` set, high-entropy, ACL'd, and rotatable** — treat it like an
       EAB MAC key. A holder can reconcile a stuck order to `ready`, the one
-      action that can enable a re-enroll.
+      action that can enable a re-enroll. Runbook: `docs/operations.md` ##
+      Admin token and reclaim runbook.
 - [ ] **Reclaim runbook understood:** before using the reclaim→`ready` branch the
       operator MUST confirm at the ADCS CA database that no cert was issued for
       the order's ReqID. The server cannot make that double-issuance call itself.
+      Runbook: `docs/operations.md` ## Admin token and reclaim runbook.
 
 ## E. Operations / DoS / observability (§4.G, §6)
 
 - [ ] **Reverse-proxy rate limiting** per-account / per-IP (the RA has none in
-      code; a flood here becomes a flood at the CA).
+      code; a flood here becomes a flood at the CA). Snippets + tuning guidance:
+      `docs/operations.md` ## Network allowlist and reverse-proxy rate limiting.
 - [ ] **Crons wired:** `DELETE /acme/admin/nonces` (nonce GC) and
       `DELETE /acme/admin/expired-orders` (order sweep, RFC 8555 §7.1.6).
+      Install via `scripts/Register-MaintenanceTasks.ps1` (WI-013); see
+      `docs/operations.md` ## Scheduled maintenance tasks.
 - [ ] **Monitoring alerts on time-in-`processing` p99** (pilot condition);
-      `GET /acme/admin/orders?status=processing` surfaces stuck orders.
+      `GET /acme/admin/orders?status=processing` surfaces stuck orders. SLOs +
+      alerting guidance: `docs/operations.md` ## Monitoring and SLOs.
 - [ ] **Audit/SIEM sink live** — every issuance is emitted; consider a
-      write-once/append-only sink for `audit_log` (§6).
-- [ ] **Retention/archival** for `audit_log` and the cert table decided.
+      write-once/append-only sink for `audit_log` (§6). SIEM delivery monitoring:
+      `docs/operations.md` ## Monitoring and SLOs.
+- [ ] **Retention/archival** for `audit_log` and the cert table decided. Guidance:
+      `docs/operations.md` ## Retention and archival.
 
 ## F. Known limitation to accept with eyes open
 
@@ -83,7 +97,10 @@ honest: check a box only when the thing is actually true, not when it's planned.
       `certutil -revoke` and republishes the CRL. The enrollment gMSA gains no
       CA-officer rights (the project's tightest security tenet). Confirm the
       on-call runbook references `Revoke-Cert.ps1` and that the operator
-      verifies the CRL republished after each revocation before pilot.
+      verifies the CRL republished after each revocation before pilot. Runbook:
+      `docs/operations.md` ## Revocation runbook. **Reason 7 is rejected** by
+      both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil` rejects
+      it) so an accepted reason can never silently break the out-of-band loop.
 
 ---
 
@@ -109,3 +126,17 @@ engineered to. Until then it has not — regardless of a green local test run.
   - **Still open before pilot:** all operator-owned items in §C.4 (network
     allowlist), §C (EAB rotation procedure), §D (admin token), §E (rate
     limiting, crons, monitoring), and the §F revocation-runbook acknowledgement.
+
+- **WI-015 (placeholder — pending live re-proof against current `main`):**
+  Re-run a full ACME round-trip (new-account → new-order → challenge →
+  finalize) through the deployed RA on the lab against the exact commit to be
+  piloted (the M-1/M-2/M-3 security fixes + Phase 3 operator-enablement
+  artifacts landed after the 2026-06-24 proof). Exercise one issue, one
+  policy-denial, and one out-of-band revocation (the latter two confirm the
+  WI-010 audit shape + the reason-7 rejection). Append the result here:
+  - [ ] §A re-cleared on the new commit (CI green on the deployed SHA; live
+        re-issue + denial + revocation performed).
+  - [ ] §F revocation runbook acknowledged (`docs/operations.md` ##
+        Revocation runbook; `scripts/Revoke-Cert.ps1` lab-validated revoking a
+        throwaway cert; reason 7 rejection confirmed at the RA surface).
+  - [ ] The proven artifact == the shipped artifact (same SHA).

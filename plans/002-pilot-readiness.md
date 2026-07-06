@@ -55,6 +55,10 @@ this plan is a *checked* `docs/pre-pilot-checklist.md`.
 
 ## Phase 1 — Issuance-path correctness hardening
 
+> **Update (2026-07-06):** Phase 1 is **complete** — WI-006, WI-007, WI-009
+> are closed (see the 2026-06-30 update below for WI-006/007/009). The
+> remaining objective was WI-010 (Phase 2), also closed.
+
 Small, high-confidence engineering fixes that remove latent foot-guns before
 real traffic. All three are synthetic/unit-testable; WI-007 also wants a live
 re-proof since it touches the enrollment leg.
@@ -150,6 +154,24 @@ separate choice, not the default. WI-010 below is the path.
 
 ## Phase 3 — Operator-enablement artifacts (turn the checklist into shippables)
 
+> **Update (2026-07-06):** Phase 3 is **complete for 1.0** — WI-011, WI-012,
+> WI-013, WI-014 are implemented. The artifacts:
+> - **WI-011** — `scripts/eab.py` (EAB lifecycle helper: mint + rotate) +
+>   `tests/test_eab.py` + `docs/operations.md` ## EAB lifecycle.
+> - **WI-012** — `docs/operations.md` ## Network allowlist and reverse-proxy
+>   rate limiting + `deploy/iis/web.config` `<ipSecurity>` comment pointing
+>   at the runbook.
+> - **WI-013** — `scripts/Register-MaintenanceTasks.ps1` (nonce GC + expired-
+>   order sweep scheduled tasks) + `docs/operations.md` ## Scheduled
+>   maintenance tasks.
+> - **WI-014** — `docs/operations.md` ## Admin token and reclaim runbook, ##
+>   Monitoring and SLOs, ## Retention and archival, ## Revocation runbook,
+>   ## Backup and restore.
+>
+> Additionally, three post-review security fixes (M-1 reason-7 rejection,
+> M-2 CAS-guarded pending→ready, M-3 CAS-guarded cert revocation) landed
+> alongside Phase 3. WI-015 (Phase 4) remains the pilot gate.
+
 The checklist §C–§F items are "operator-owned," but most are blocked on an
 artifact that does not exist yet. This phase ships those artifacts so the
 operator's job becomes *apply + verify*, not *design from scratch*.
@@ -161,6 +183,8 @@ operator's job becomes *apply + verify*, not *design from scratch*.
   (never logged, never committed). Threat-model §B names this a precondition.
 - **AC:** `docs/operations.md` (new) has an EAB rotation runbook; the helper
   mints a ≥128-bit kid + MAC key; checklist §C EAB items are *checkable*.
+  **DONE (2026-07-06):** `scripts/eab.py` + `tests/test_eab.py` +
+  `docs/operations.md` ## EAB lifecycle.
 
 ### WI-012 (new) — Deployment hardening snippets (§C, §E)
 - Ship copy-paste-ready, placeholder-only artifacts: an `<ipSecurity>` /
@@ -171,14 +195,20 @@ operator's job becomes *apply + verify*, not *design from scratch*.
 - **AC:** `docs/operations.md` carries the allowlist + rate-limit snippets with
   placeholders; checklist §C network-allowlist and §E rate-limit items are
   actionable from the doc alone.
+  **DONE (2026-07-06):** `docs/operations.md` ## Network allowlist and
+  reverse-proxy rate limiting + `deploy/iis/web.config` `<ipSecurity>`
+  comment pointing at the runbook.
 
 ### WI-013 (new) — Scheduled maintenance units (§E)
 - Ship the two crons the checklist requires as ready-to-install units: nonce GC
   (`DELETE /acme/admin/nonces`) and expired-order sweep
-  (`DELETE /acme/admin/expired-orders`, RFC 8555 §7.1.6) — as a Windows
+  (`DELETE /acme/admin/expired-orders`, RFC 8555 §7.1.6) – as a Windows
   Scheduled Task XML/PS (matches the deployment host) plus a documented cadence.
 - **AC:** the units install and fire against the deployed RA on the lab;
   checklist §E cron item is checkable.
+  **DONE (2026-07-06):** `scripts/Register-MaintenanceTasks.ps1` +
+  `docs/operations.md` ## Scheduled maintenance tasks. (Lab firing is part of
+  WI-015 — the units are ready-to-install; the live re-proof confirms.)
 
 ### WI-014 (new) — Monitoring + retention guidance (§D, §E)
 - `docs/operations.md`: how to alert on time-in-`processing` p99 (using
@@ -189,6 +219,9 @@ operator's job becomes *apply + verify*, not *design from scratch*.
   retention decision.
 - **AC:** checklist §D + §E monitoring/retention/admin-token items are each
   backed by a doc section an operator can follow.
+  **DONE (2026-07-06):** `docs/operations.md` ## Admin token and reclaim
+  runbook, ## Monitoring and SLOs, ## Retention and archival, ## Revocation
+  runbook, ## Backup and restore.
 
 ---
 
