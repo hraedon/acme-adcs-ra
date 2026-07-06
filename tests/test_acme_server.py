@@ -19,7 +19,7 @@ from acme_adcs_ra.enrollment import EnrollmentDenied, EnrollmentResult, FakeEnro
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
-from acme_adcs_ra.store import NONCE_TTL_SECONDS, Store, is_expired
+from acme_adcs_ra.store import NONCE_TTL_SECONDS, Store, _now_iso, is_expired
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
 
@@ -795,6 +795,132 @@ class TestChallengePayloadValidation:
         resp = acme_client.http.post(url, json=body)
         assert resp.status_code == 400
         assert "empty object" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# M-2: CAS-guarded pending→ready transition (_maybe_ready_order)
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeReadyOrderCasGuard:
+    """M-2: _maybe_ready_order uses transition_pending_to_ready (CAS on
+    status='pending') so a concurrent finalize that has moved the order to
+    'processing' cannot be clobbered back to 'ready' by a late/racing
+    challenge validation."""
+
+    def test_pending_to_ready_does_not_clobber_processing(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """A pending order whose authz are all valid should transition to
+        ready; but if a concurrent finalize has moved it to 'processing'
+        between the authz check and the CAS UPDATE, the CAS must NOT clobber
+        it back to 'ready' (which would allow a re-enroll / double-issue)."""
+        from acme_adcs_ra.routes.acme import _maybe_ready_order
+
+        config = _make_test_config(tmp_path)
+        store, context = _make_context(config, FakeEnrollmentLeg())
+        client = TestClient(create_app(context))
+        ac = HandRolledAcmeClient(client, config.base_url, account_key)
+        ac.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+        order = _walk_to_ready(ac, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+
+        # The order is 'ready' after _walk_to_ready. Simulate the race: a
+        # concurrent finalize moved it to 'processing' (no cert yet). Manually
+        # flip ready→processing so the CAS in transition_pending_to_ready loses.
+        assert store.transition_order_to_processing(order_id) is True
+        assert store.get_order(order_id).status == "processing"
+
+        # Reset the order to 'pending' so _maybe_ready_order's status check
+        # passes, then immediately move it to 'processing' to simulate the
+        # race. We exercise the CAS directly via the store method, which is
+        # what _maybe_ready_order now calls.
+        _force_order_status(store, order_id, "pending")
+        # Now simulate: a concurrent finalize flips pending→ready→processing
+        # before _maybe_ready_order's CAS runs. First walk to processing:
+        assert store.transition_order_to_processing(
+            order_id
+        ) is False  # can't: it's pending, not ready
+        # Manually set to processing to simulate the concurrent finalize.
+        _force_order_status(store, order_id, "processing")
+
+        # The CAS must lose: transition_pending_to_ready returns False, the
+        # order stays 'processing' (NOT clobbered to 'ready').
+        assert store.transition_pending_to_ready(order_id) is False
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "processing"
+        assert refreshed.processing_started_at is not None
+
+        # And _maybe_ready_order itself is a no-op when the order is not
+        # pending (it returns before touching the store). Confirm by calling
+        # it directly: the order stays 'processing'.
+        _maybe_ready_order(context, order_id)
+        refreshed2 = store.get_order(order_id)
+        assert refreshed2 is not None
+        assert refreshed2.status == "processing"
+
+    def test_pending_to_ready_succeeds_when_still_pending(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """The happy path: a genuinely pending order with all valid authz
+        transitions to ready (the CAS applies because status is still
+        'pending'). Regression guard for the M-2 CAS change."""
+        config = _make_test_config(tmp_path)
+        store, context = _make_context(config, FakeEnrollmentLeg())
+        client = TestClient(create_app(context))
+        ac = HandRolledAcmeClient(client, config.base_url, account_key)
+        ac.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+
+        # Create an order but do NOT walk its challenges — it stays 'pending'.
+        order = ac.new_order(["web.WORK-DOMAIN.local"]).json()
+        order_id = _order_id_from_finalize_url(order["finalize"])
+        assert store.get_order(order_id).status == "pending"
+
+        # Mark all authz valid directly so _maybe_ready_order's authz check
+        # passes, without driving the challenge endpoint (which would itself
+        # call _maybe_ready_order).
+        for authz_url in order["authorizations"]:
+            authz_id = authz_url.rsplit("/", 1)[-1]
+            store.update_authorization_status(authz_id, "valid")
+            # Mark the challenge valid too so the authz is internally consistent.
+            authz = store.get_authorization(authz_id)
+            assert authz is not None
+            for ch in authz.challenges:
+                store.update_challenge_status(ch.id, "valid", validated_at=_now_iso())
+
+        # The CAS applies: pending→ready.
+        assert store.transition_pending_to_ready(order_id) is True
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "ready"
+        assert refreshed.processing_started_at is None
+
+    def test_idempotent_pending_to_ready_returns_false_on_second_call(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """A second transition_pending_to_ready on an already-ready order
+        returns False (the CAS no longer applies) — no clobber."""
+        config = _make_test_config(tmp_path)
+        store, _context = _make_context(config, FakeEnrollmentLeg())
+        client = TestClient(create_app(_make_context(config, FakeEnrollmentLeg())[1]))
+        ac = HandRolledAcmeClient(client, config.base_url, account_key)
+        ac.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+        order = _walk_to_ready(ac, ["web.WORK-DOMAIN.local"])
+        order_id = _order_id_from_finalize_url(order["finalize"])
+        assert store.get_order(order_id).status == "ready"
+
+        # Already ready — the pending→ready CAS does not apply.
+        assert store.transition_pending_to_ready(order_id) is False
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "ready"
 
 
 # ---------------------------------------------------------------------------

@@ -228,7 +228,10 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 - **Only the issuing account may revoke** its own cert (lookup scoped to
   `(serial, account_id)`); cross-account → 404 (no leak). Already-revoked →
   **200** (RFC §7.6 idempotent). Revoked certs are **not served** (GET → 410
-  Gone); the order is flipped to `revoked`.
+  Gone); the order is flipped to `revoked`. **Reason 7 is rejected** (RFC 5280
+  reason 7 is "unused" and `certutil` rejects it) — the valid set is
+  `{0,1,2,3,4,5,6,8,9,10}`, consistent with `scripts/Revoke-Cert.ps1`, so an
+  accepted reason can never silently break the out-of-band revocation loop.
 - **Cert-URL discoverability (acknowledged):** the cert URL remains in the order
   JSON after revocation (the URL is 128-bit unguessable); the *body* is 410.
   This is RFC-shaped and intentional. `GET /acme/cert/{id}` and
@@ -299,7 +302,8 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 ### G. Resource exhaustion / DoS *(per-request caps + expiry in code; rate-limiting still operator/proxy)*
 - **Per-account / per-IP rate limiting** at the reverse proxy (the RA has none
   in code). The ADCS `/certsrv/` leg is not high-performance — a flood here
-  becomes a flood at the CA.
+  becomes a flood at the CA. See `docs/operations.md` ## Network allowlist and
+  reverse-proxy rate limiting for copy-paste-ready snippets.
 - **Caps in code:** `max_identifiers_per_order` (default 50, 1 identifier = 1
   authz) and `max_csr_size_bytes` (default 8192) are enforced on the request
   path. Order/authz lifetime is bounded by `order_expiry_seconds` (default
@@ -310,6 +314,9 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   nonce-table size (GC is a probabilistic 1% cleanup on `create_nonce` as a
   safety net, bounded by `LIMIT 5000` and indexed on `created_at`, + the public
   `DELETE /acme/admin/nonces` for an external cron — wire the cron at pilot).
+  `scripts/Register-MaintenanceTasks.ps1` (WI-013) ships the two scheduled
+  tasks (nonce GC + expired-order sweep) ready-to-install; see
+  `docs/operations.md` ## Scheduled maintenance tasks.
 - **Residual:** a single in-scope EAB account can still amplify work O(n) per
   order up to the identifier cap, and grow the store up to the retention bound.
 
@@ -332,11 +339,19 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   must be pinned; the server supplies the intermediate).
 - **Reverse proxy:** network allowlist enforced here (the RA endpoint is not
   public); `--proxy-headers` + `--forwarded-allow-ips` on uvicorn; per-account
-  rate limit.
+  rate limit. See `docs/operations.md` ## Network allowlist and reverse-proxy
+  rate limiting.
 - **CA renewal / chain rollover:** when the ADCS CA renews (`nRenewals`), the
   served chain changes and consumers (ADFS/Exchange) need the new root/OCSP.
   Coordinate with cert-watch; validate the chain the RA serves after any CA
   renewal.
+
+> **Operational runbook:** `docs/operations.md` is the single reference for
+> the operator-owned prerequisites the pre-pilot checklist names as blockers
+> (EAB lifecycle, network allowlist / rate limiting, scheduled maintenance,
+> admin token + reclaim, monitoring/SLOs, retention/archival, revocation
+> runbook, backup/restore). It is a pilot condition that the runbook exists
+> and is reviewed.
 
 ## 6. Conditions for a production pilot
 

@@ -294,7 +294,12 @@ def _maybe_ready_order(ctx: ServerContext, order_id: str) -> None:
         authz = ctx.store.get_authorization(authz_id)
         if authz is None or authz.status != "valid":
             return
-    ctx.store.update_order_status(order_id, OrderStatus.READY)
+    # M-2: CAS-guard the pending→ready transition so a concurrent finalize
+    # that has already moved the order to 'processing' (or any other state)
+    # cannot be clobbered back to 'ready' by this late challenge validation.
+    # If the CAS does not apply (returns False), the order is no longer
+    # pending — simply return; whatever moved it owns the state.
+    ctx.store.transition_pending_to_ready(order_id)
 
 
 @router.post("/acme/challenge/{challenge_id}")
@@ -453,11 +458,20 @@ async def revoke_cert(
     except Exception as exc:
         raise malformed(f"unable to parse certificate: {exc}") from exc
 
+    # RFC 5280 §5.3.1 reason codes 0-10 are valid for ACME revocation,
+    # EXCEPT reason 7 ("unused" in RFC 5280). M-1: the out-of-band
+    # `scripts/Revoke-Cert.ps1` rejects reason 7 (certutil rejects it), so the
+    # ACME route must reject it too — otherwise an accepted reason 7 would
+    # silently break the out-of-band revocation loop (the operator's
+    # `Revoke-Cert.ps1` would fail on the recorded reason). The valid set is
+    # {0,1,2,3,4,5,6,8,9,10} (7 excluded); the error uses bad_revocation_reason.
+    _VALID_REVOCATION_REASONS = frozenset({0, 1, 2, 3, 4, 5, 6, 8, 9, 10})
     reason = payload.get("reason")
     if reason is not None:
-        if not isinstance(reason, int) or reason < 0 or reason > 10:
+        if not isinstance(reason, int) or isinstance(reason, bool) or reason not in _VALID_REVOCATION_REASONS:
             raise bad_revocation_reason(
-                "reason code must be an integer in the range 0-10"
+                "reason code must be an integer in the set 0-6, 8-10 "
+                "(reason 7 is unused in RFC 5280 and rejected by certutil)"
             )
 
     serial_hex = format(cert.serial_number, "x").upper()
@@ -511,7 +525,19 @@ async def revoke_cert(
         revoked_at=revoked_at,
     )
     if updated is None:
-        raise server_internal("certificate disappeared during revocation")
+        # The cert row vanished between the serial lookup and the UPDATE —
+        # surface as 404 (no information leak; same outcome as not-found above).
+        raise not_found("certificate not found in RA store")
+
+    # M-3: the CAS-guarded revoke_certificate returns the existing (already-
+    # revoked) record when a concurrent revocation won the race. Treat this
+    # as idempotent success (RFC 8555 §7.6) and DO NOT emit a duplicate
+    # audit event — the winning revocation already recorded one with its
+    # own reason/timestamp. Return 200 with an empty body (the
+    # out_of_band_revocation hint is NOT re-emitted on the idempotent second
+    # call; the first call's audit already recorded it).
+    if updated.status == CertStatus.REVOKED and updated.revoked_at != revoked_at:
+        return JSONResponse(status_code=200, content={})
 
     # H-1: flip the order to a revoked state so order and cert are consistent.
     # WI-003: CAS-guarded on status IN ('valid', 'processing') so a concurrent

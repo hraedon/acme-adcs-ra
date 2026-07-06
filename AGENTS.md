@@ -72,11 +72,16 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**WI-1 proven end-to-end on the lab (2026-06-20):** the deployed RA (IIS +
-HttpPlatformHandler, app pool as the gMSA) drives `/certsrv/` and issues a real
-serverAuth-only cert (SAN from the CSR, chaining to the existing root). ACME
-server + EAB/policy + SIEM audit + revokeCert and the ADCS **enrollment** leg are
-built, unit-tested, and live-validated. Auth is SPNEGO + channel binding
+**WI-010 closed; Phase 3 operator-enablement artifacts complete for 1.0.**
+WI-001–WI-010 are complete (ACME server, EAB/policy, enrollment, SIEM audit,
+out-of-band revocation). WI-011–WI-014 (EAB lifecycle tooling, deployment-
+hardening snippets, scheduled maintenance units, operations runbook) are in
+place for 1.0 — see `docs/operations.md`. **WI-015** (live lab re-proof against
+the exact commit to be piloted) is the remaining pilot gate. Three post-review
+security fixes landed alongside 1.0: M-1 (reason 7 rejected), M-2 (CAS-guarded
+pending→ready), M-3 (CAS-guarded cert revocation).
+
+Auth is SPNEGO + channel binding
 (`negotiate_auth.NegotiateAuth` over `pyspnego`) against `/certsrv/` **EPA=Require**.
 **CA-side revocation is out-of-band (WI-010)**: ADCS Web Enrollment exposes no
 revocation endpoint, so `revokeCert` records the revocation in the RA store
