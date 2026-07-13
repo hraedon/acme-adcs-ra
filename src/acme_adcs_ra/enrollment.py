@@ -204,6 +204,7 @@ class CertsrvEnrollmentLeg:
         ca_bundle: str | None = None,
         timeout: float = 30.0,
         session_factory: Callable[[], HttpSession] | None = None,
+        locale: str = "en",
     ) -> None:
         self._host = host
         self._template = template
@@ -211,6 +212,7 @@ class CertsrvEnrollmentLeg:
         self._ca_bundle = ca_bundle
         self._timeout = timeout
         self._session_factory = session_factory
+        self._locale = locale
 
     def _build_session(self) -> HttpSession:
         """Build the live ADCS session: SPNEGO/Negotiate as the ambient gMSA,
@@ -274,7 +276,7 @@ class CertsrvEnrollmentLeg:
             resp = session.post(f"{base}/certfnsh.asp", data=form, timeout=timeout)
             resp.raise_for_status()
             disposition, detail = _parse_certfnsh_disposition(
-                resp.text, resp.status_code
+                resp.text, resp.status_code, locale=self._locale
             )
             if disposition == "pending":
                 raise EnrollmentTransportError(
@@ -351,11 +353,13 @@ class CertsrvEnrollmentLeg:
         )
 
 
-def _parse_certfnsh_disposition(body: str, status_code: int) -> tuple[str, str]:
+def _parse_certfnsh_disposition(
+    body: str, status_code: int, *, locale: str = "en"
+) -> tuple[str, str]:
     """Parse a ``certfnsh.asp`` response body into a disposition.
 
-    WI-007: prefers locale-independent structured signals over English
-    prose strings. The signals, in priority order:
+    WI-007/WI-020: prefers locale-independent structured signals over
+    English prose strings. The signals, in priority order:
 
     1. **Issued** — ``certnew.cer?ReqID=<n>&`` (a download URL; the ``&``
        after the ReqID distinguishes it from a status-only link). URLs are
@@ -364,13 +368,16 @@ def _parse_certfnsh_disposition(body: str, status_code: int) -> tuple[str, str]:
        (``'The disposition message is "…"'`` / ``"your certificate request
        was denied"``). Checked *before* pending so a request denied *after*
        a ReqID was assigned (a manager denial) is not misread as pending.
+       **WI-020:** these markers are English-specific and are only checked
+       when ``locale == "en"``. A non-English locale skips them and relies
+       on the locale-independent signals + the loose denial fallback.
     3. **Pending** — a request was accepted but not yet issued: ``ReqID=<n>``
        (locale-independent), ``"Certificate Pending"`` or ``"Your Request Id
-       is <n>"`` (English chrome), with no download link and no explicit
-       denial. Runs *before* the loose quoted-message heuristic so innocent
-       quoted prose on a pending page is not misread as a denial — that
-       would be a hard ``400`` on a still-processing request, the unsafe
-       direction.
+       is <n>"`` (English chrome, ``locale == "en"`` only), with no download
+       link and no explicit denial. Runs *before* the loose quoted-message
+       heuristic so innocent quoted prose on a pending page is not misread
+       as a denial — that would be a hard ``400`` on a still-processing
+       request, the unsafe direction.
     4. **Loose denial fallback** — a quoted disposition message preceded by
        a word and whitespace (``is "Denied by policy"`` / ``lautet
        "Abgelehnt"``), for *non-English* denials that lack the explicit
@@ -380,13 +387,16 @@ def _parse_certfnsh_disposition(body: str, status_code: int) -> tuple[str, str]:
        ``400``.
     5. **Unrecognized** — surfaces a body snippet so the operator can see
        what the CA returned, rather than silently misreading a non-English
-       locale as a generic transport error.
+       locale as a generic transport error. **WI-020:** when
+       ``locale != "en"``, the message explicitly names the locale
+       assumption so the operator knows to verify it.
 
     Returns ``(disposition, detail)`` where disposition is one of
     ``"issued"``, ``"pending"``, ``"denied"``, ``"unknown"`` and detail
     is the ReqID (issued/pending), the denial message (denied), or a
     diagnostic snippet (unknown).
     """
+    is_english = locale == "en"
     # Strip <script> blocks AND <!-- comments --> before any prose heuristic:
     # neither a JavaScript string literal nor commented-out markup may
     # masquerade as a disposition message. (Real ADCS pages contain both.)
@@ -399,30 +409,45 @@ def _parse_certfnsh_disposition(body: str, status_code: int) -> tuple[str, str]:
         return ("issued", m.group(1))
 
     # 2. Explicit denial — wins even when a ReqID is present.
-    msg = re.search(r'The disposition message is "([^"]+)', clean)
-    if msg:
-        return ("denied", msg.group(1))
-    if re.search(r"your certificate request was denied", clean, re.IGNORECASE):
-        return ("denied", "the CA denied the request")
+    #    WI-020: English-specific markers are skipped for non-English locales.
+    if is_english:
+        msg = re.search(r'The disposition message is "([^"]+)', clean)
+        if msg:
+            return ("denied", msg.group(1))
+        if re.search(r"your certificate request was denied", clean, re.IGNORECASE):
+            return ("denied", "the CA denied the request")
 
-    # 3. Pending: a ReqID assigned (or English pending chrome) with no
-    #    download link and no explicit denial.
+    # 3. Pending: a ReqID assigned (locale-independent) or English pending
+    #    chrome (English only) with no download link and no explicit denial.
     rid = re.search(r"ReqID=(\d+)", body)
     if rid:
         return ("pending", rid.group(1))
-    pending_id = re.search(r"Your Request Id is (\d+)", clean, re.IGNORECASE)
-    if pending_id or re.search(r"Certificate Pending", clean, re.IGNORECASE):
-        return ("pending", pending_id.group(1) if pending_id else "?")
+    if is_english:
+        pending_id = re.search(r"Your Request Id is (\d+)", clean, re.IGNORECASE)
+        if pending_id or re.search(r"Certificate Pending", clean, re.IGNORECASE):
+            return ("pending", pending_id.group(1) if pending_id else "?")
 
-    # 4. Loose denial fallback (non-English denials without a ReqID).
-    for match in re.finditer(r'\b\w+\s+"([^"]{5,})"', clean):
-        candidate = match.group(1)
-        if "://" not in candidate and "certnew.cer" not in candidate.lower():
-            return ("denied", candidate)
+    # 4. Loose denial fallback (locale-independent — works for non-English
+    #    denials without a ReqID). WI-020: only runs for non-English locales
+    #    where the English-specific markers in step 2 were skipped. For
+    #    English, the explicit markers in step 2 already caught structured
+    #    denials, so the loose heuristic is unnecessary and risks false
+    #    positives on innocent quoted prose.
+    if not is_english:
+        for match in re.finditer(r'\b\w+\s+"([^"]{5,})"', clean):
+            candidate = match.group(1)
+            if "://" not in candidate and "certnew.cer" not in candidate.lower():
+                return ("denied", candidate)
 
     # 5. Unrecognized: surface the body for diagnosis (not silent).
     snippet = " ".join(body[:400].split())
-    return ("unknown", f"unrecognized certfnsh.asp response (HTTP {status_code}); body: {snippet}")
+    if is_english:
+        return ("unknown", f"unrecognized certfnsh.asp response (HTTP {status_code}); body: {snippet}")
+    return (
+        "unknown",
+        f"unrecognized certfnsh.asp response (HTTP {status_code}, locale={locale!r}); "
+        f"no locale-independent signal matched — check CA locale setting. body: {snippet}"
+    )
 
 
 def _parse_cert_body(body: bytes) -> str:

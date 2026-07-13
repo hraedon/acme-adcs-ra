@@ -14,9 +14,12 @@ from fastapi.responses import JSONResponse
 from acme_adcs_ra.acme_errors import (
     account_does_not_exist,
     bad_external_account_binding,
+    bad_nonce,
+    bad_public_key,
     bad_revocation_reason,
     malformed,
     not_found,
+    rate_limited,
     rejected_identifier,
     server_internal,
     unauthorized,
@@ -44,7 +47,13 @@ from acme_adcs_ra.finalize import (
     _finalize_submit_enrollment,
     _finalize_transition_to_processing,
 )
-from acme_adcs_ra.jws import JWSValidationError, _base64url_decode, verify_eab_jws
+from acme_adcs_ra.jws import (
+    JWSValidationError,
+    _base64url_decode,
+    _public_key_from_jwk,
+    verify_eab_jws,
+    verify_flattened_jws,
+)
 from acme_adcs_ra.policy import validate_dns_name
 from acme_adcs_ra.serializers import (
     _account_to_json,
@@ -72,6 +81,7 @@ async def directory(ctx: ServerContext = Depends(get_context)) -> dict[str, Any]
         "newAccount": _url(ctx, _ACME_PATHS["newAccount"]),
         "newOrder": _url(ctx, _ACME_PATHS["newOrder"]),
         "revokeCert": _url(ctx, _ACME_PATHS["revokeCert"]),
+        "keyChange": _url(ctx, _ACME_PATHS["keyChange"]),
         "meta": meta,
     }
 
@@ -202,12 +212,80 @@ async def new_account(
     )
 
 
+def _check_rate_limit(ctx: ServerContext, account_id: str) -> None:
+    """Enforce per-account (per-kid) and global order rate limits.
+
+    WI-016: defense-in-depth that does not depend on the operator's reverse-
+    proxy config. On breach, raises ``rateLimited`` (RFC 8555) with a
+    ``Retry-After`` header and emits a SIEM-audited denial event. The limit
+    is per EAB kid (not per ACME account_id) so a leaked credential cannot
+    evade it by creating multiple account keys.
+    """
+    window = ctx.config.rate_limit_window_seconds
+    per_kid_limit = ctx.config.rate_limit_orders_per_window
+
+    if per_kid_limit > 0:
+        account = ctx.store.get_account(account_id)
+        if account is None:
+            raise unauthorized("account not found")
+        kid = account.eab_kid
+        limit = ctx.config.rate_limit_overrides.get(kid, per_kid_limit)
+        if limit > 0:
+            count = ctx.store.count_recent_orders_by_kid(kid, window)
+            if count >= limit:
+                _audit(ctx,
+                    event_type="order-rate-limited",
+                    account_id=account_id,
+                    outcome="denied",
+                    details={
+                        "limit": limit,
+                        "window_seconds": window,
+                        "count": count,
+                        "scope": "per-account",
+                        "kid": kid,
+                    },
+                )
+                raise rate_limited(
+                    f"order rate limit exceeded: {count} orders in the last "
+                    f"{window}s (limit: {limit})",
+                    retry_after=window,
+                )
+
+    global_limit = ctx.config.rate_limit_global_per_window
+    if global_limit > 0:
+        global_count = ctx.store.count_all_recent_orders(window)
+        if global_count >= global_limit:
+            _audit(ctx,
+                event_type="order-rate-limited",
+                account_id=account_id,
+                outcome="denied",
+                details={
+                    "limit": global_limit,
+                    "window_seconds": window,
+                    "count": global_count,
+                    "scope": "global",
+                },
+            )
+            raise rate_limited(
+                f"global order rate limit exceeded: {global_count} orders in "
+                f"the last {window}s (limit: {global_limit})",
+                retry_after=window,
+            )
+
+
 @router.post(_ACME_PATHS["newOrder"])
 async def new_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
     header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+
+    # WI-016: in-app per-account rate limiting (defense-in-depth inside the
+    # trust model). The window is computed from order-creation timestamps
+    # already in the store — no wall-clock nondeterminism in the tested path.
+    # This bounds a leaked EAB credential's cert flood even when no reverse-
+    # proxy rate limit is configured or correct.
+    _check_rate_limit(ctx, account_id)
 
     identifiers_raw = payload.get("identifiers")
     if not isinstance(identifiers_raw, list) or not identifiers_raw:
@@ -605,3 +683,104 @@ async def revoke_cert(
         response_body = {"out_of_band_revocation": hint}
 
     return JSONResponse(status_code=200, content=response_body)
+
+
+@router.post(_ACME_PATHS["keyChange"])
+async def key_change(
+    request: Request,
+    ctx: ServerContext = Depends(get_context),
+) -> JSONResponse:
+    """Account-key rollover (RFC 8555 §7.3.5).
+
+    The outer JWS is signed by the *old* account key (kid lookup). Its
+    payload is the *inner* JWS, signed by the *new* account key (jwk in
+    the inner protected header). The inner payload carries the account
+    URL and the old key JWK. After validation the account's stored key is
+    replaced; the old key is no longer accepted.
+    """
+    outer_header, outer_payload, account_id = await verify_existing_account_jws(
+        request, ctx.store
+    )
+
+    account = ctx.store.get_account(account_id)
+    if account is None:
+        raise unauthorized("account not found")
+
+    inner_jws = outer_payload
+    if not isinstance(inner_jws, dict) or "protected" not in inner_jws:
+        raise malformed("keyChange payload must be an inner JWS object")
+
+    try:
+        inner_header = json.loads(_base64url_decode(inner_jws["protected"]))
+    except Exception as exc:
+        raise malformed(f"invalid inner JWS protected header: {exc}") from exc
+
+    new_jwk = inner_header.get("jwk")
+    if not new_jwk:
+        raise malformed("inner JWS protected header missing jwk")
+
+    inner_url = inner_header.get("url")
+    if inner_url != outer_header.get("url"):
+        raise malformed(
+            "inner JWS url does not match outer JWS url (RFC 8555 §7.3.5)"
+        )
+
+    inner_nonce = inner_header.get("nonce")
+    if not inner_nonce:
+        raise bad_nonce("inner JWS protected header missing nonce")
+    if not ctx.store.consume_nonce(inner_nonce):
+        raise bad_nonce("invalid or replayed inner JWS nonce")
+
+    try:
+        new_public_key = _public_key_from_jwk(new_jwk)
+    except Exception as exc:
+        raise bad_public_key(f"invalid new account JWK: {exc}") from exc
+
+    try:
+        inner_payload_bytes = verify_flattened_jws(inner_jws, new_public_key)
+    except JWSValidationError as exc:
+        raise unauthorized(f"inner JWS verification failed: {exc}") from exc
+
+    try:
+        inner_payload = json.loads(inner_payload_bytes)
+    except json.JSONDecodeError as exc:
+        raise malformed(f"inner JWS payload is not valid JSON: {exc}") from exc
+
+    inner_account = inner_payload.get("account")
+    if inner_account != outer_header.get("kid"):
+        raise malformed(
+            "inner JWS account does not match outer JWS kid "
+            "(RFC 8555 §7.3.5)"
+        )
+
+    old_key_jwk = inner_payload.get("oldKey")
+    if not isinstance(old_key_jwk, dict):
+        raise malformed("inner JWS payload missing oldKey")
+
+    from acme_adcs_ra.jws import jwk_thumbprint
+
+    old_key_thumbprint = jwk_thumbprint(old_key_jwk)
+    if old_key_thumbprint != jwk_thumbprint(json.loads(account.jwk_json)):
+        raise unauthorized("oldKey in inner JWS does not match account key")
+
+    new_key_thumbprint = jwk_thumbprint(new_jwk)
+    if new_key_thumbprint == old_key_thumbprint:
+        raise malformed("new key must differ from the current account key")
+
+    existing = ctx.store.get_account_by_jwk(new_jwk)
+    if existing is not None:
+        raise bad_public_key("new account key is already registered to another account")
+
+    ctx.store.update_account_key(account_id, new_jwk)
+
+    _audit(ctx,
+        event_type="account-key-changed",
+        account_id=account_id,
+        outcome="success",
+        details={
+            "eab_kid": account.eab_kid,
+            "new_key_thumbprint": new_key_thumbprint,
+        },
+    )
+
+    return JSONResponse(content={})

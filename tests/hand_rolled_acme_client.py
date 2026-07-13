@@ -236,3 +236,34 @@ class HandRolledAcmeClient:
         if reason is not None:
             payload["reason"] = reason
         return self._post_jws(url, payload)
+
+    def key_change(
+        self,
+        new_key: rsa.RSAPrivateKey | ec.EllipticCurvePrivateKey,
+    ) -> Any:
+        """Perform an account key rollover (RFC 8555 §7.3.5).
+
+        The outer JWS is signed by the current (old) account key. Its
+        payload is the inner JWS, signed by *new_key*. The inner payload
+        carries the account URL and the old key JWK.
+        """
+        url = f"{self.base_url}/acme/key-change"
+        if self.account_url is None:
+            raise RuntimeError("account URL not known; call new_account first")
+
+        new_jwk = jwk_from_private_key(new_key)
+        old_jwk = self.account_jwk
+
+        inner_protected: dict[str, Any] = {
+            "alg": "RS256" if isinstance(new_key, rsa.RSAPrivateKey) else "ES256",
+            "nonce": self._nonce_for(),
+            "url": url,
+            "jwk": new_jwk,
+        }
+        inner_payload: dict[str, Any] = {
+            "account": self.account_url,
+            "oldKey": old_jwk,
+        }
+        inner_jws = sign_jws(inner_payload, new_key, inner_protected)
+
+        return self._post_jws(url, inner_jws)
