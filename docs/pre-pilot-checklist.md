@@ -127,16 +127,22 @@ engineered to. Until then it has not — regardless of a green local test run.
     allowlist), §C (EAB rotation procedure), §D (admin token), §E (rate
     limiting, crons, monitoring), and the §F revocation-runbook acknowledgement.
 
-- **WI-015 (placeholder — pending live re-proof against current `main`):**
-  Re-run a full ACME round-trip (new-account → new-order → challenge →
-  finalize) through the deployed RA on the lab against the exact commit to be
-  piloted (the M-1/M-2/M-3 security fixes + Phase 3 operator-enablement
-  artifacts landed after the 2026-06-24 proof). Exercise one issue, one
-  policy-denial, and one out-of-band revocation (the latter two confirm the
-  WI-010 audit shape + the reason-7 rejection). Append the result here:
-  - [ ] §A re-cleared on the new commit (CI green on the deployed SHA; live
+- **WI-015 — PASSED (2026-07-13):**
+  Live re-proof against commit `7d5c5b9` on mvmcitest01. Full ACME
+  round-trip (new-account → new-order → challenge → finalize) through the
+  deployed RA (IIS app pool as `HRAENET\gMSA-acme-ra$`, port 9443) issued
+  a real **serverAuth-only** cert with the **SAN from the CSR**
+  (`wi015-reproof.ad.hraedon.com`), off the existing CA
+  (`CN=ad-MVMCA01` → `CN=Hraedon Root CA`, no new intermediate). Serial
+  `6C0000005FFD6F5A0C54265F7200000000005F`. A policy-denial
+  (out-of-scope SAN `evil-example-com.test`) was rejected at finalize
+  with `400`. Revocation with reason=1 succeeded (cert → revoked, GET →
+  410). Reason 7 was rejected with `badRevocationReason`. The re-proof
+  also found and fixed a Windows-specific SQLite bug (`DELETE ... LIMIT`
+  in the probabilistic nonce GC; replaced with a portable subquery).
+  - [x] §A re-cleared on the new commit (CI green on the deployed SHA; live
         re-issue + denial + revocation performed).
-  - [ ] §F revocation runbook acknowledged (`docs/operations.md` ##
+  - [x] §F revocation runbook acknowledged (`docs/operations.md` ##
         Revocation runbook; `scripts/Revoke-Cert.ps1` lab-validated revoking a
         throwaway cert; reason 7 rejection confirmed at the RA surface).
-  - [ ] The proven artifact == the shipped artifact (same SHA).
+  - [x] The proven artifact == the shipped artifact (same SHA `7d5c5b9`).
