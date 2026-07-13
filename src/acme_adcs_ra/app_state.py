@@ -40,6 +40,7 @@ _ACME_PATHS = {
     "newAccount": "/acme/new-acct",
     "newOrder": "/acme/new-order",
     "revokeCert": "/acme/revoke-cert",
+    "keyChange": "/acme/key-change",
 }
 
 

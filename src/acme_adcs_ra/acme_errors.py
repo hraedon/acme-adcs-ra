@@ -16,11 +16,13 @@ class AcmeError(Exception):
         detail: str,
         status: int = 400,
         title: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.typ = typ
         self.detail = detail
         self.status = status
         self.title = title or typ.rsplit(":", 1)[-1]
+        self.headers = headers or {}
         super().__init__(detail)
 
     def to_problem(self) -> dict[str, str | int]:
@@ -125,4 +127,20 @@ def account_does_not_exist(detail: str = "account does not exist") -> AcmeError:
         "urn:ietf:params:acme:error:accountDoesNotExist",
         detail,
         status=400,
+    )
+
+
+def rate_limited(
+    detail: str = "rate limited",
+    *,
+    retry_after: int | None = None,
+) -> AcmeError:
+    headers: dict[str, str] = {}
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    return AcmeError(
+        "urn:ietf:params:acme:error:rateLimited",
+        detail,
+        status=429,
+        headers=headers,
     )

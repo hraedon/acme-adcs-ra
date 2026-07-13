@@ -83,13 +83,93 @@ This mints a new credential and prints a rotation checklist. Follow it:
 - **Client decommissioning** (rotate to retire the kid cleanly).
 - **Routine rotation** per your org's secrets policy (e.g. annually).
 
-## Network allowlist and reverse-proxy rate limiting
+### Auditing EAB scopes
 
-The RA has **no in-code rate limit** and the installer deliberately does not
-restrict the endpoint (threat-model §4.G). A flood at the RA becomes a flood
-at the ADCS `/certsrv/` leg. Two operator controls bound this: a network
-allowlist (who may reach the RA at all) and reverse-proxy rate limiting (how
-fast they may go).
+The challenge is intentionally a no-op (enterprise trust model), so the
+kid→scope mapping *is* the entire authorization surface. Run the audit
+subcommand periodically to confirm no scope has quietly widened and that
+every configured kid is accounted for:
+
+```bash
+python scripts/eab.py audit --env acme-ra.env --db acme_ra.db
+```
+
+Output (example — placeholders only; the real kid prefix comes from
+`acme-ra.env`):
+
+```
+EAB scope audit — kid → SAN scope → last-used (no MAC keys shown)
+
+KID          SAN SCOPE PATTERNS                            LAST USED             FLAGS
+-----------  --------------------------------------------  --------------------  --------
+a1b2c3d4...  *.WORK-DOMAIN.local, srv01.WORK-DOMAIN.local  2026-01-03T00:00:00Z  WILDCARD
+b2c3d4e5...  exact.WORK-DOMAIN.local                       2026-02-01T00:00:00Z
+c3d4e5f6...  (no scope — fail-closed)                      never                 NO SCOPE
+
+3 kid(s): 1 wildcard, 1 no-scope, 1 never-used.
+```
+
+- **KID** — first 8 chars + `...` (the full kid is never printed; cross-reference
+  with `acme-ra.env` to identify the account).
+- **SAN SCOPE PATTERNS** — the DNS patterns this kid may request. A kid with no
+  scope configured shows `(no scope — fail-closed)` and the `NO SCOPE` flag
+  (no SANs are allowed for it).
+- **LAST USED** — the most recent `account-created` or `order-created`
+  timestamp for this kid in the RA store. `never` means no account has ever
+  been created with this kid (it may be a freshly minted, not-yet-deployed
+  credential, or a stale entry that should be cleaned up).
+- **FLAGS** — `WILDCARD` if any pattern is a leftmost-label wildcard
+  (`*.example.com`), the widest blast radius. `NO SCOPE` if the kid has no
+  SAN scope configured.
+
+The audit **never prints MAC key material** and is strictly read-only — it
+does not write to the store. `--env` and `--db` are optional; if omitted the
+config is read from `ACME_RA_*` environment variables and the store from
+`ACME_RA_DB_PATH` (or the default `acme_ra.db`).
+
+**What to look for:**
+
+- A `WILDCARD` scope you did not expect (e.g. `*.corp.local`) — the widest
+  blast radius; confirm it is intended.
+- A `NO SCOPE` kid — this kid can authenticate but issue nothing; either add a
+  scope or remove it from the allowlist.
+- A `never`-used kid that has been configured for a long time — may indicate
+  a stale entry or a client that was never switched over after rotation.
+
+## Network allowlist and in-app rate limiting
+
+The RA has an **in-app per-account rate limit** (WI-016) that bounds order
+creation per EAB kid per rolling window, plus an optional global backstop.
+This is defense-in-depth that does not depend on the operator's reverse-proxy
+config being present or correct: even a directly-fronted RA, or one whose
+proxy rule was fat-fingered, is protected so a leaked EAB credential cannot
+mint an unbounded cert flood before the network layer notices.
+
+The installer deliberately does not restrict the endpoint itself
+(threat-model §4.G). Three operator controls bound this: the in-app rate
+limit (how many orders per kid), a network allowlist (who may reach the RA
+at all), and reverse-proxy rate limiting (how fast they may go).
+
+### In-app rate limit (WI-016)
+
+The in-app rate limit is configured via environment variables in
+`acme-ra.env`:
+
+| Env var | Default | Description |
+|---|---|---|
+| `ACME_RA_RATE_LIMIT_ORDERS_PER_WINDOW` | `50` | Max new orders per EAB kid per window. `0` = disabled. |
+| `ACME_RA_RATE_LIMIT_WINDOW_SECONDS` | `3600` | Rolling window duration in seconds. |
+| `ACME_RA_RATE_LIMIT_GLOBAL_PER_WINDOW` | `0` | Global backstop across all accounts. `0` = disabled. |
+| `ACME_RA_RATE_LIMIT_OVERRIDES__<KID>` | (default) | Per-kid override: `ACME_RA_RATE_LIMIT_OVERRIDES__a1b2c3d4=10` sets kid `a1b2c3d4`'s limit to 10. |
+
+On breach, the RA returns RFC 8555 `rateLimited` (HTTP 429) with a
+`Retry-After` header and emits a SIEM audit event (`order-rate-limited`)
+with the account, window, count, and scope (`per-account` or `global`).
+
+**This is in addition to, not instead of, the reverse-proxy guidance below.**
+The in-app limit bounds order creation (the expensive path that reaches
+ADCS); the proxy limit bounds raw request rate (including polls and
+challenge POSTs). Both should be configured.
 
 ### Network allowlist (`<ipSecurity>`)
 
@@ -404,6 +484,41 @@ republished — the operator must verify this on the CA side. The RA's
 `GET /acme/cert/{id}` returns 410 Gone for revoked certs (RA-store level);
 clients that check the CA's CRL will see the revocation only after
 `Revoke-Cert.ps1` runs.
+
+### Revocation reconciliation (WI-017)
+
+Because revocation is out-of-band, the RA store and the CA database can
+silently diverge: an operator may call `revokeCert` (RA store flipped) but
+forget the out-of-band `Revoke-Cert.ps1` step (CA CRL not written), or the
+CA may be revoked directly without the RA knowing. Run the reconciliation
+tool periodically (e.g. daily, or after each revocation) to catch drift:
+
+```powershell
+powershell -File .\scripts\Reconcile-Revocation.ps1 `
+    -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -DbPath 'C:\acme-adcs-ra\acme_ra.db'
+```
+
+Or run the Python reconciler directly against a pre-exported CA-DB dump:
+
+```bash
+python scripts/reconcile_revocation.py --db acme_ra.db --ca-export ca_dump.txt
+```
+
+The tool classifies each certificate into three buckets:
+
+- **in-sync** — both RA and CA agree (both revoked or both active).
+- **revoked-in-RA-but-active-at-CA** — the dangerous one: the operator
+  called `revokeCert` but the out-of-band CA step was never done. The cert
+  is revoked in the RA (GET → 410) but still valid on the CA's CRL. Run
+  `Revoke-Cert.ps1` immediately.
+- **revoked-at-CA-but-valid-in-RA** — the CA revoked a cert the RA still
+  shows valid. Investigate whether the cert was revoked directly at the CA
+  without going through the RA.
+
+The tool is **read-only**: it never revokes, reactivates, or writes to
+either store. Exit code: `0` = all in-sync, `1` = drift found, `2` = error.
+Use `--json` for machine-readable output (e.g. for SIEM ingestion).
 
 ## Backup and restore
 

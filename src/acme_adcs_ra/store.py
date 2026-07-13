@@ -470,6 +470,23 @@ class Store:
             return None
         return self._account_from_row(row)
 
+    def update_account_key(
+        self, account_id: str, new_jwk: dict[str, Any]
+    ) -> None:
+        """Replace an account's public key (RFC 8555 §7.3.5 keyChange).
+
+        Updates both ``jwk_json`` and the ``jwk_thumbprint`` index so
+        subsequent JWS verifications use the new key and the old key is
+        no longer accepted. The thumbprint is recomputed from ``new_jwk``
+        so the caller cannot desync the index from the stored JWK.
+        """
+        thumbprint = jwk_thumbprint(new_jwk)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE accounts SET jwk_json = ?, jwk_thumbprint = ? WHERE id = ?",
+                (_dump_json(new_jwk), thumbprint, account_id),
+            )
+
     # ------------------------------------------------------------------
     # Nonces
     # ------------------------------------------------------------------
@@ -493,7 +510,8 @@ class Store:
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
                 conn.execute(
-                    "DELETE FROM nonces WHERE created_at < ? LIMIT 5000",
+                    "DELETE FROM nonces WHERE rowid IN "
+                    "(SELECT rowid FROM nonces WHERE created_at < ? LIMIT 5000)",
                     (cutoff,),
                 )
         return nonce
@@ -688,6 +706,56 @@ class Store:
                 (status, limit),
             ).fetchall()
         return [self._order_from_row(row) for row in rows]
+
+    def count_recent_orders_by_kid(
+        self,
+        eab_kid: str,
+        window_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Count orders created within the rolling window for a given EAB kid.
+
+        WI-016: the rate-limit check counts orders across all ACME accounts
+        that share the same EAB kid, so a leaked credential cannot evade the
+        limit by creating multiple account keys. The window is computed from
+        ``created_at`` timestamps in the store. Pass ``now`` for deterministic
+        testing; production callers omit it (uses wall-clock UTC).
+        """
+        current = now or datetime.now(timezone.utc)
+        cutoff = (current - timedelta(seconds=window_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM orders o "
+                "JOIN accounts a ON o.account_id = a.id "
+                "WHERE a.eab_kid = ? AND o.created_at >= ?",
+                (eab_kid, cutoff),
+            ).fetchone()
+        return int(row[0])
+
+    def count_all_recent_orders(
+        self,
+        window_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Count all orders created within the rolling window (global backstop).
+
+        WI-016: a global ceiling that bounds total order creation across all
+        accounts, independent of the per-kid limit.
+        """
+        current = now or datetime.now(timezone.utc)
+        cutoff = (current - timedelta(seconds=window_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM orders WHERE created_at >= ?",
+                (cutoff,),
+            ).fetchone()
+        return int(row[0])
 
     def sweep_expired_orders(self) -> int:
         """Transition every still-active expired order to 'invalid'.

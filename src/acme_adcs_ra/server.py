@@ -49,7 +49,7 @@ def create_app(context: ServerContext) -> FastAPI:
         return JSONResponse(
             status_code=exc.status,
             content=exc.to_problem(),
-            headers={"Content-Type": "application/problem+json"},
+            headers={"Content-Type": "application/problem+json", **exc.headers},
         )
 
     app.include_router(acme_router)

@@ -512,7 +512,7 @@ class TestCertfnshDispositionParsing:
             'Die Dispositionsnachricht lautet "Richtlinie verweigert"'
             '</body></html>'
         )
-        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="de")
         assert disposition == "denied"
         assert "Richtlinie verweigert" in detail
 
@@ -548,7 +548,7 @@ class TestCertfnshDispositionParsing:
             '<script>var title = "Certificate Services Page"</script>'
             '<p>is "Denied by policy"</p>'
         )
-        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="de")
         assert disposition == "denied"
         assert detail == "Denied by policy"
 
@@ -559,7 +559,7 @@ class TestCertfnshDispositionParsing:
             '<script>function check() { return "Certificate Pending"; }</script>'
             '<body>Die Nachricht lautet "Abgelehnt"</body>'
         )
-        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="de")
         assert disposition == "denied"
         assert detail == "Abgelehnt"
 
@@ -650,3 +650,92 @@ class TestCertfnshDispositionParsing:
         disposition, detail = _parse_certfnsh_disposition(body, 200)
         assert disposition == "pending"
         assert detail == "90"
+
+
+class TestLocaleRobustDisposition:
+    """WI-020: locale-robust certfnsh.asp disposition parsing."""
+
+    def test_english_locale_default(self) -> None:
+        body = (
+            '<html><body>'
+            'The disposition message is "Denied by policy".'
+            '</body></html>'
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "denied"
+        assert "Denied by policy" in detail
+
+    def test_non_english_locale_skips_english_denial_markers(self) -> None:
+        body = (
+            "<html><body>"
+            "Your certificate request was denied."
+            "</body></html>"
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="de")
+        assert disposition == "unknown"
+        assert "locale='de'" in detail
+
+    def test_non_english_locale_issued_via_locale_independent_signal(self) -> None:
+        body = (
+            '<html><body><a href="certnew.cer?ReqID=42&Enc=b64">Download</a>'
+            "</body></html>"
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="de")
+        assert disposition == "issued"
+        assert detail == "42"
+
+    def test_non_english_locale_pending_via_reqid(self) -> None:
+        body = "<html><body>ReqID=77</body></html>"
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="de")
+        assert disposition == "pending"
+        assert detail == "77"
+
+    def test_non_english_locale_denied_via_loose_fallback(self) -> None:
+        body = (
+            "<html><body>"
+            'Die Disposition lautet "Abgelehnt durch Richtlinie".'
+            "</body></html>"
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="de")
+        assert disposition == "denied"
+        assert "Abgelehnt" in detail
+
+    def test_non_english_locale_unrecognized_fails_loudly(self) -> None:
+        body = "<html><body>Some completely unknown response format</body></html>"
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="fr")
+        assert disposition == "unknown"
+        assert "locale='fr'" in detail
+        assert "check CA locale" in detail
+
+    def test_english_locale_unrecognized_does_not_mention_locale(self) -> None:
+        body = "<html><body>Some completely unknown response format</body></html>"
+        disposition, detail = _parse_certfnsh_disposition(body, 200, locale="en")
+        assert disposition == "unknown"
+        assert "locale" not in detail
+
+    def test_existing_english_fixtures_pass_with_default_locale(self) -> None:
+        body = (
+            '<html><body>'
+            'The disposition message is "Denied by policy".'
+            '</body></html>'
+        )
+        d1, _ = _parse_certfnsh_disposition(body, 200)
+        d2, _ = _parse_certfnsh_disposition(body, 200, locale="en")
+        assert d1 == d2 == "denied"
+
+    def test_locale_parameter_does_not_break_issued(self) -> None:
+        body = (
+            '<html><body><a href="certnew.cer?ReqID=99&Enc=b64">Download</a>'
+            "</body></html>"
+        )
+        for loc in ("en", "de", "fr", "ja"):
+            disposition, detail = _parse_certfnsh_disposition(body, 200, locale=loc)
+            assert disposition == "issued"
+            assert detail == "99"
+
+    def test_locale_parameter_does_not_break_pending_reqid(self) -> None:
+        body = "<html><body>ReqID=55</body></html>"
+        for loc in ("en", "de", "fr", "ja"):
+            disposition, detail = _parse_certfnsh_disposition(body, 200, locale=loc)
+            assert disposition == "pending"
+            assert detail == "55"

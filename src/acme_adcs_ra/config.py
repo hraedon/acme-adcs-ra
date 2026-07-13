@@ -77,6 +77,11 @@ class RAConfig(BaseSettings):
     # Optional PEM bundle to verify the ADCS /certsrv/ TLS cert (private CA).
     # None/blank -> OS trust store (the gMSA host's local roots).
     adcs_ca_bundle: str | None = None
+    # WI-020: assumed CA Web Enrollment UI locale. "en" (default) enables
+    # English-string disposition heuristics. A non-"en" locale suppresses
+    # those heuristics and relies on locale-independent signals (ReqID,
+    # certnew.cer URL) only — failing loudly if none match.
+    adcs_locale: str = "en"
 
     # --- ACME server surface -------------------------------------------------
     base_url: str = "http://localhost:8000"
@@ -118,6 +123,20 @@ class RAConfig(BaseSettings):
     max_identifiers_per_order: int = 50
     # Maximum CSR body size in bytes (bounds memory + parsing work)
     max_csr_size_bytes: int = 8192
+
+    # --- In-app rate limiting (WI-016) --------------------------------------
+    # Per-account (per-kid) order creation ceiling per rolling window.
+    # 0 = disabled (rely on reverse-proxy only). Defense-in-depth: bounds a
+    # leaked EAB credential's cert flood even without a correctly-configured
+    # reverse proxy.
+    rate_limit_orders_per_window: int = 50
+    # Rolling window duration in seconds.
+    rate_limit_window_seconds: int = 3600
+    # Global backstop: max orders across ALL accounts per window. 0 = disabled.
+    rate_limit_global_per_window: int = 0
+    # Per-kid overrides: {kid: limit}. If a kid is not listed, the default
+    # rate_limit_orders_per_window applies.
+    rate_limit_overrides: dict[str, int] = {}
 
     # --- SIEM / audit emission -----------------------------------------------
     # Auditing every issuance is mandatory (hard rule). There is no toggle.
