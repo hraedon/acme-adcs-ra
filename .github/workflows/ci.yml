@@ -20,11 +20,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The cert-watch local/CI version gap (dev venv 3.12, CI on 3.13) is on
-        # record across the family — gate both. The Windows SSPI enrollment dep
-        # (pyspnego) is platform-gated and simply not installed on Linux; the
-        # one test that needs it skips (211 pass / 1 skip).
-        python-version: ["3.12", "3.13"]
+        # Gate the full range: dev venv is 3.12, the lab host runs 3.14
+        # (Python 3.14.6 on Windows). The project was already bitten by a
+        # 3.14-only breakage (requests-negotiate-sspi, which forced the
+        # pyspnego rewrite) — 3.14 in CI catches the next one. The Windows
+        # SSPI enrollment dep (pyspnego) is platform-gated and not installed
+        # on Linux; the one test that needs SHA1 signing skips
+        # (436 pass / 1 skip).
+        python-version: ["3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout
@@ -57,6 +60,50 @@ jobs:
 
       - name: Run tests
         run: .venv/bin/pytest -q
+
+  windows-import-check:
+    # The production platform is Windows (Python 3.14, IIS, gMSA). pyspnego
+    # is platform-gated (sys_platform == 'win32') and never installed on
+    # Linux, so the real auth path's imports are only exercised here. This
+    # job is the CI counterpart to the lab re-proof's import verification
+    # step (install-windows.ps1 step 4).
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Create venv and install
+        shell: pwsh
+        run: |
+          uv venv --python 3.14
+          uv pip install -e ".[dev]"
+
+      - name: Verify win32-gated imports resolve
+        # pyspnego + sspilib install on win32; negotiate_auth and the real
+        # enrollment/revocation legs import them. This is the only CI surface
+        # that catches a win32-only import breakage before it reaches the lab.
+        shell: pwsh
+        run: |
+          .venv\Scripts\python.exe -c "import spnego; import acme_adcs_ra.negotiate_auth; print('negotiate_auth: OK')"
+          .venv\Scripts\python.exe -c "from acme_adcs_ra.enrollment import CertsrvEnrollmentLeg; print('CertsrvEnrollmentLeg: OK')"
+          .venv\Scripts\python.exe -c "from acme_adcs_ra.revocation import CertsrvRevocationLeg; print('CertsrvRevocationLeg: OK')"
+
+      - name: Run tests
+        shell: pwsh
+        run: .venv\Scripts\python.exe -m pytest -q
 
   identifier-gate:
     # Mechanical gate against committing work-domain identifiers (the AGENTS.md
