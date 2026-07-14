@@ -403,8 +403,12 @@ def _parse_certfnsh_disposition(
     clean = re.sub(r"<script\b[^>]*>.*?</script>", "", body, flags=re.DOTALL | re.IGNORECASE)
     clean = re.sub(r"<!--.*?-->", "", clean, flags=re.DOTALL)
 
-    # 1. Issued: download link with ReqID=<n>& (the & precedes Enc=).
-    m = re.search(r"certnew\.cer\?ReqID=(\d+)&", body)
+    # 1. Issued: download link with ReqID=<n>& (the & precedes Enc=). LOW-1:
+    #    match against the script/comment-stripped ``clean`` body, not the raw
+    #    body, so a <script> literal containing a certnew.cer URL cannot
+    #    false-positive as "issued". (Failure mode if missed: safe — the cert
+    #    fetch would fail — but inconsistent with the denial/pending checks.)
+    m = re.search(r"certnew\.cer\?ReqID=(\d+)&", clean)
     if m:
         return ("issued", m.group(1))
 

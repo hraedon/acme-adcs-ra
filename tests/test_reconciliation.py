@@ -77,7 +77,10 @@ def _insert_cert(
         metadata={},
     )
     if revoked:
-        store.revoke_certificate(record.id, reason=1)
+        update = store.revoke_certificate(record.id, reason=1)
+        assert update.record is not None
+        assert update.record.status == "revoked"
+        assert update.won_cas is True
 
 
 def _load_ra_state(db_path: Path) -> dict[str, str]:

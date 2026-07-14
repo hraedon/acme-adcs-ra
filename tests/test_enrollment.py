@@ -540,6 +540,20 @@ class TestCertfnshDispositionParsing:
         assert disposition == "issued"
         assert detail == "99"
 
+    def test_issued_regex_ignores_script_blocks(self) -> None:
+        """LOW-1: a ``certnew.cer?ReqID=N&`` URL appearing only inside a
+        ``<script>`` literal of a PENDING page must not false-positive as
+        'issued'. The issued check now runs against the script/comment-stripped
+        body, consistent with the denied/pending checks. A pending ReqID in the
+        page chrome (without the download link) still classifies as pending."""
+        body = (
+            '<script>var link = "certnew.cer?ReqID=77&Enc=b64";</script>'
+            '<body>Your Request Id is 77</body>'
+        )
+        disposition, detail = _parse_certfnsh_disposition(body, 200)
+        assert disposition == "pending"
+        assert detail == "77"
+
     def test_denied_quoted_message_excludes_urls(self) -> None:
         """A quoted JavaScript string must not be mistaken for a disposition
         message — the word+space prefix distinguishes text quotes from

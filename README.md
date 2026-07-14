@@ -85,23 +85,24 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-**WI-001–WI-010 are complete and WI-011–WI-014 are now in place for 1.0.** The
+**At the production-pilot bar — Plans 001–003 complete (WI-001–WI-020).** The
 full pipeline — ACME server (RFC 8555 subset: directory, EAB-gated accounts,
-orders, finalize, cert retrieval, revokeCert), deterministic issuance policy,
-SIEM audit, and the real ADCS **enrollment** leg — issues a real certificate: a
-deployed RA running as the gMSA behind IIS drives `/certsrv/` and returns a
-**serverAuth-only** cert with the **SAN from the CSR**, issued off the existing
-CA and **chaining to the existing root** (no new intermediate). See
-[`docs/architecture.md`](docs/architecture.md),
+orders, finalize, cert retrieval, revokeCert, keyChange), deterministic
+issuance policy with **post-issuance SAN verification**, in-app per-account
+order rate limiting, SIEM audit, and the real ADCS **enrollment** leg — issues
+a real certificate: a deployed RA running as the gMSA behind IIS drives
+`/certsrv/` and returns a **serverAuth-only** cert with the **SAN from the
+CSR**, issued off the existing CA and **chaining to the existing root** (no new
+intermediate). See [`docs/architecture.md`](docs/architecture.md),
 [`docs/threat-model.md`](docs/threat-model.md),
 [`docs/certsrv-setup.md`](docs/certsrv-setup.md), and the result in
-[`docs/spike-runbook.md`](docs/spike-runbook.md). The Phase 3 operator-
-enablement artifacts (EAB lifecycle tooling, deployment-hardening snippets,
-scheduled maintenance units, and the operations runbook) ship with 1.0 — see
-[`docs/operations.md`](docs/operations.md). **WI-015** (a live lab re-proof
-against the exact commit to be piloted) is the remaining gate before a
-production pilot; see [`plans/002-pilot-readiness.md`](plans/002-pilot-readiness.md)
-and [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).
+[`docs/spike-runbook.md`](docs/spike-runbook.md). **WI-015** (the live lab
+re-proof against the exact piloted commit) **PASSED** 2026-07-13 — all 12 cases
+green; see [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).
+Plan 003 (WI-016–WI-020) added in-app rate limiting, RA-vs-CA revocation
+reconciliation (read-only), an EAB scope audit view, `keyChange`
+(RFC 8555 §7.3.5), and locale-robust `certfnsh.asp` parsing — see
+[`docs/operations.md`](docs/operations.md).
 
 Authentication to `/certsrv/` is the ambient **gMSA** identity over SPNEGO with
 **channel binding** (RFC 5929 `tls-server-end-point`), via the in-tree
@@ -109,11 +110,13 @@ Authentication to `/certsrv/` is the ambient **gMSA** identity over SPNEGO with
 hardened with **EPA=Require**. Deploy with `scripts/install-windows.ps1` (IIS +
 HttpPlatformHandler, app pool as the gMSA, on a configurable port).
 
-**CA-side revocation remains a documented gap** — ADCS Web Enrollment exposes no
-revocation endpoint; the mechanism + its gMSA privilege implication is an operator
-decision (threat-model §E). The out-of-band path (`scripts/Revoke-Cert.ps1`,
-operator-run) is the shipped mechanism; `revokeCert` records the revocation in
-the RA store only and surfaces an `out_of_band_revocation` hint. Reason 7 is
+**CA-side revocation is handled by a first-class out-of-band path** — ADCS Web
+Enrollment exposes no revocation endpoint, so the mechanism decision (WI-010,
+2026-06-30) was to keep the gMSA least-privileged and ship revocation as an
+operator tool rather than widening its rights (threat-model §E). The
+out-of-band path (`scripts/Revoke-Cert.ps1`, operator-run) is the shipped
+mechanism and was lab-validated in WI-015; `revokeCert` records the revocation
+in the RA store only and surfaces an `out_of_band_revocation` hint. Reason 7 is
 rejected by both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil`
 rejects it) so an accepted reason can never silently break the out-of-band loop.
 

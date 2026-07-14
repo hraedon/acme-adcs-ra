@@ -1,6 +1,8 @@
 # Plan 002 — Pilot readiness
 
-**Status:** Proposed 2026-06-30.
+**Status:** COMPLETE — Phase 1 (WI-006/007/009), Phase 2 (WI-010), Phase 3
+(WI-011..014), and Phase 4 (WI-015) all closed. WI-015 PASSED 2026-07-13
+(commit `7d5c5b9`, host `mvmcitest01`). Originally proposed 2026-06-30.
 **Author:** Opus 4.8 (forward plan after the WI-001..009 hardening cycle)
 **Strategic role:** WI-1 is proven end-to-end on the lab and the codebase is
 mature (ACME server + EAB/policy + SIEM audit + channel-bound gMSA enrollment,
@@ -170,7 +172,11 @@ separate choice, not the default. WI-010 below is the path.
 >
 > Additionally, three post-review security fixes (M-1 reason-7 rejection,
 > M-2 CAS-guarded pending→ready, M-3 CAS-guarded cert revocation) landed
-> alongside Phase 3. WI-015 (Phase 4) remains the pilot gate.
+> alongside Phase 3.
+>
+> **WI-015 PASSED 2026-07-13** (commit `7d5c5b9`, host `mvmcitest01`) — all 12
+> re-proof cases green (issue, policy denial, revocation, reason-7 rejection,
+> chain off the existing CA). Plan 002 is complete.
 
 The checklist §C–§F items are "operator-owned," but most are blocked on an
 artifact that does not exist yet. This phase ships those artifacts so the

@@ -1,7 +1,7 @@
 # Threat Model — acme-adcs-ra
 
-**Status:** post-WI-1 (enrollment proven on the lab 2026-06-20), pre-production-
-pilot. Living document —
+**Status:** post-WI-1 (enrollment proven on the lab 2026-06-20); WI-015 live
+re-proof PASSED 2026-07-13 against the piloted commit. Living document —
 re-review on any change to the issuance path, the gMSA, the template scope, or
 the dependency set.
 
@@ -41,10 +41,12 @@ not apply.
 >   decision) can drop in without an ACME-surface change.
 >
 > Controls downstream of "ADCS issued a cert" (chain fetch, requester capture,
-> audit fields) are now **live-verified**, not just unit-tested. The remaining
-> gate before a production pilot is the §6 checklist (host hardening, network
-> allowlist, rate limits, operational runbook) — not the enrollment physics,
-> which is proven.
+> audit fields) are now **live-verified**, not just unit-tested. WI-015 (the
+> live re-proof) PASSED 2026-07-13; the enrollment physics is proven. The
+> remaining per-deployment conditions are the §6 operator-owned items (host
+> hardening, network allowlist) — in-app per-account rate limiting (WI-016),
+> revocation reconciliation (WI-017), and the operational runbook (WI-011..014)
+> all ship with the RA.
 
 ## 1. System & trust model
 
@@ -170,6 +172,15 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   P-256/384/521); **non-DNSName SANs rejected** (IPAddress/otherName/URI/
   RFC822Name/RegisteredID) — prevents scope expansion via SAN type. CSR
   identifiers must be ⊆ the order's identifiers (RFC).
+- **Post-issuance SAN verification (MED-1):** the policy above gates the
+  *request*, but the ADCS template decides what SANs land on the cert. After
+  enrollment the RA inspects the *result*: every DNS SAN on the issued cert
+  must be ⊆ the order's requested SANs (same `rstrip('.').lower()`
+  normalization as the policy, so a trailing-dot/case difference cannot cause a
+  false rejection), and **no non-DNS SAN may be present at all**. A violation
+  is fail-closed — 500 + `finalize-issued-cert-san-mismatch` audit, the cert is
+  neither recorded nor served — catching a template that pulls SANs from AD or
+  appends extras instead of taking them from the CSR.
 - **Residual:** none beyond the configured SAN scope (the intended policy).
 
 ### D. ACME protocol attacks (replay, cross-endpoint, IDOR, alg confusion)
@@ -299,11 +310,19 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   tamper-evident, backed-up storage (consider a write-once/append-only sink for
   `audit_log`).
 
-### G. Resource exhaustion / DoS *(per-request caps + expiry in code; rate-limiting still operator/proxy)*
-- **Per-account / per-IP rate limiting** at the reverse proxy (the RA has none
-  in code). The ADCS `/certsrv/` leg is not high-performance — a flood here
-  becomes a flood at the CA. See `docs/operations.md` ## Network allowlist and
-  reverse-proxy rate limiting for copy-paste-ready snippets.
+### G. Resource exhaustion / DoS *(per-request caps + in-app per-account rate limit + expiry in code; raw-request rate-limiting operator/proxy)*
+- **In-app per-account order rate limiting (WI-016):** order creation is
+  capped per `kid` over a rolling window plus a global backstop, returning
+  RFC 8555 `rateLimited` + `Retry-After`, with denials SIEM-audited as
+  `order-rate-limited`. This bounds order creation even if the deployment
+  fronts the RA directly or the proxy rule is misconfigured. See the
+  `### In-app rate limit (WI-016)` section of `docs/operations.md`.
+- **Per-account / per-IP rate limiting** at the reverse proxy complements the
+  in-app limit by bounding **raw request rate** (polls, challenge POSTs), which
+  the in-app order limit does not cover. The ADCS `/certsrv/` leg is not
+  high-performance — a flood here becomes a flood at the CA. See
+  `docs/operations.md` ## Network allowlist and in-app rate limiting for
+  copy-paste-ready snippets.
 - **Caps in code:** `max_identifiers_per_order` (default 50, 1 identifier = 1
   authz) and `max_csr_size_bytes` (default 8192) are enforced on the request
   path. Order/authz lifetime is bounded by `order_expiry_seconds` (default

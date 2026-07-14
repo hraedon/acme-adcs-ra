@@ -900,6 +900,51 @@ class TestMaybeReadyOrderCasGuard:
         assert refreshed.status == "ready"
         assert refreshed.processing_started_at is None
 
+    def test_expired_pending_order_not_promoted_to_ready(
+        self,
+        tmp_path: Path,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """LOW-2: an expired-but-still-pending order (sweep hasn't run) whose
+        authz are all valid must NOT be advanced to 'ready' by
+        _maybe_ready_order. Finalize rejects expired orders anyway, so a
+        transient 'ready' serves no client. The order stays 'pending' for the
+        sweep to move to 'invalid'."""
+        from acme_adcs_ra.routes.acme import _maybe_ready_order
+
+        config = _make_test_config(tmp_path)
+        store, context = _make_context(config, FakeEnrollmentLeg())
+        client = TestClient(create_app(context))
+        ac = HandRolledAcmeClient(client, config.base_url, account_key)
+        ac.new_account("kid-001", _eab_mac_key(config, "kid-001"))
+
+        order = ac.new_order(["web.WORK-DOMAIN.local"]).json()
+        order_id = _order_id_from_finalize_url(order["finalize"])
+        assert store.get_order(order_id).status == "pending"
+
+        # Mark all authz valid so the only thing blocking ready is expiry.
+        for authz_url in order["authorizations"]:
+            authz_id = authz_url.rsplit("/", 1)[-1]
+            store.update_authorization_status(authz_id, "valid")
+            authz = store.get_authorization(authz_id)
+            assert authz is not None
+            for ch in authz.challenges:
+                store.update_challenge_status(ch.id, "valid", validated_at=_now_iso())
+
+        # Backdate the order's expiry into the past.
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE orders SET expires = ? WHERE id = ?",
+                ("1990-01-01T00:00:00Z", order_id),
+            )
+        assert store.get_order(order_id).expires == "1990-01-01T00:00:00Z"
+
+        # _maybe_ready_order must NOT promote an expired order to ready.
+        _maybe_ready_order(context, order_id)
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+
     def test_idempotent_pending_to_ready_returns_false_on_second_call(
         self,
         tmp_path: Path,

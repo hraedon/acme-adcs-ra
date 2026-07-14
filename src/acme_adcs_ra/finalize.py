@@ -314,6 +314,68 @@ def _finalize_submit_enrollment(
         raise server_internal(f"enrollment failed: {exc}") from exc
 
 
+# SAN types that carry identity but are NOT DNS. A server-auth-only template
+# driven by the CSR must never emit any of these; their presence on an issued
+# cert means the template is misconfigured (or pulling from AD). The RA's CSR
+# gate already rejects non-DNS SANs — this enforces the same on the *result*.
+_NON_DNS_SAN_TYPES: tuple[tuple[type, str], ...] = (
+    (x509.RFC822Name, "RFC822Name (email)"),
+    (x509.IPAddress, "IPAddress"),
+    (x509.UniformResourceIdentifier, "URI"),
+    (x509.OtherName, "OtherName"),
+    (x509.RegisteredID, "RegisteredID"),
+    (x509.DirectoryName, "DirectoryName"),
+)
+
+
+def _issued_cert_san_violations(
+    cert_pem: str, requested_sans: list[str]
+) -> tuple[list[str], list[str], list[str]]:
+    """MED-1: inspect the *issued* cert for SANs the order did not authorize.
+
+    The RA enforces SAN-scope policy on the *request* (the CSR), but the ADCS
+    template ultimately decides what SANs land on the cert. If the template is
+    misconfigured (e.g. it maps SANs from AD rather than the request, or appends
+    extras), the issued cert could authorize identities the RA's policy never
+    approved — and a relying party would trust them. This closes that gap by
+    inspecting the *result*:
+
+    - every DNS SAN on the issued cert must be in the authorized set (the
+      order's requested_sans), compared with the same normalization the policy
+      uses — ``rstrip('.').lower()`` — so a trailing-dot/FQDN form or a case
+      difference cannot cause a false rejection;
+    - NO non-DNS SAN (email, IP, URI, OtherName, …) may be present at all —
+      the CSR gate already rejects these, so their presence means the template
+      bypassed the request.
+
+    Returns ``(issued_dns_sans, unauthorized_dns, non_dns_san_types)``. A cert
+    with no SAN extension yields ``([], [], [])``. The caller fails closed
+    (500 + audit, no cert recorded) if either violation list is non-empty.
+    """
+    try:
+        issued = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive; enrollment parsed it
+        raise server_internal(f"issued cert unparseable: {exc}") from exc
+    try:
+        san_ext = issued.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+        )
+    except x509.ExtensionNotFound:
+        return [], [], []
+    san_value = cast(x509.SubjectAlternativeName, san_ext.value)
+    issued_dns = [str(v) for v in san_value.get_values_for_type(DNSName)]
+    authorized = {s.rstrip(".").lower() for s in requested_sans}
+    unauthorized = [
+        s for s in issued_dns if s.rstrip(".").lower() not in authorized
+    ]
+    non_dns = [
+        label
+        for san_type, label in _NON_DNS_SAN_TYPES
+        if san_value.get_values_for_type(san_type)
+    ]
+    return issued_dns, unauthorized, non_dns
+
+
 def _finalize_complete(
     ctx: ServerContext,
     order_id: str,
@@ -328,6 +390,50 @@ def _finalize_complete(
     Handles the post-enrollment completion: create cert record, CAS-flip
     processing→valid, audit, and return the final order state.
     """
+    # MED-1: verify the issued cert carries only DNS SANs the order authorized.
+    # A misconfigured template injecting an unauthorized SAN (or any non-DNS
+    # SAN) must not be recorded or served, even though the CSR was approved.
+    issued_dns_sans, unauthorized_dns, non_dns_san_types = _issued_cert_san_violations(
+        enrollment_result.cert_pem, requested_sans
+    )
+    if unauthorized_dns or non_dns_san_types:
+        violations: list[str] = []
+        if unauthorized_dns:
+            violations.append(
+                f"unauthorized DNS SANs: {unauthorized_dns} "
+                f"(authorized={requested_sans})"
+            )
+        if non_dns_san_types:
+            violations.append(
+                f"non-DNS SAN types present: {non_dns_san_types} "
+                "(only DNS SANs are permitted)"
+            )
+        reason = (
+            "issued cert SANs outside order scope — ADCS template likely "
+            "misconfigured (it must take only DNS SANs from the request)"
+        )
+        _audit(
+            ctx,
+            event_type="finalize-issued-cert-san-mismatch",
+            account_id=account_id,
+            order_id=order_id,
+            sans=requested_sans,
+            template=enrollment_result.template,
+            requester=enrollment_result.requester,
+            outcome="failed",
+            details={
+                "certificate_id_order": order_id,
+                "issued_dns_sans": issued_dns_sans,
+                "unauthorized_dns_sans": unauthorized_dns,
+                "non_dns_san_types": non_dns_san_types,
+                "reason": reason,
+            },
+        )
+        raise server_internal(
+            f"issued certificate fails SAN verification — {'; '.join(violations)}; "
+            "the ADCS template is likely misconfigured"
+        )
+
     existing_cert = ctx.store.get_certificate_by_order(order_id)
     if existing_cert is not None:
         cert_record = existing_cert

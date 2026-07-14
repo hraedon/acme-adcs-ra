@@ -200,9 +200,11 @@ the authorized client IP(s):
 ### Reverse-proxy rate limiting
 
 Apply per-account and per-IP rate limits at the reverse proxy / load balancer
-in front of the RA. The RA has no in-code rate limit; without a proxy limit a
-single in-scope EAB account can amplify work O(n) per order up to the
-identifier cap, and the flood reaches the ADCS CA.
+in front of the RA. The in-app per-account rate limit above bounds **order
+creation**; the proxy limit additionally bounds **raw request rate** (polls,
+challenge POSTs, finalize retries), which the in-app limit does not cover.
+Without a proxy limit, a flood of in-window non-order requests still reaches
+the ADCS CA, so both should be configured.
 
 - **nginx:** `limit_req_zone` keyed on the ACME account URL (from the JWS
   `kid`) for per-account, and on `$remote_addr` for per-IP. Example:

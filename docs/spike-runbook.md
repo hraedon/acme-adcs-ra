@@ -116,12 +116,13 @@ loudly and falls back to printing the manual `certutil -view` command.
 - The production `CertsrvEnrollmentLeg` (`src/acme_adcs_ra/enrollment.py`) uses
   the **same** `certfnsh.asp` / `certnew.cer` / `certnew.p7b` payload as this
   spike. Nothing more needs to be filled for enrollment — the RA selects it
-  automatically on win32 (`__main__.py`). Update `docs/threat-model.md`'s STUB
-  GATE from "implemented, pending live-CA confirmation" to **"confirmed
-  (ReqID …, requester …, date …)"**.
-- **Revocation is NOT covered by this spike.** ADCS Web Enrollment exposes no
-  revocation endpoint; `revokeCert` remains a documented gap pending the
-  mechanism decision (`docs/threat-model.md` §E). See the runbook follow-up.
+  automatically on win32 (`__main__.py`). The WI-1 enrollment gate has since
+  been **confirmed** live (WI-015 re-proof, 2026-07-13, on `mvmcitest01`).
+- **Revocation is out of scope for this spike** (WI-1 covered enrollment only).
+  ADCS Web Enrollment exposes no revocation endpoint; the out-of-band path
+  shipped in WI-010 (`scripts/Revoke-Cert.ps1`, operator-run, keeping the gMSA
+  least-privileged — see `docs/threat-model.md` §E) and was lab-validated in
+  WI-015 (reason=1 revoked; reason=7 rejected).
 
 ## Troubleshooting — the actual issues hit getting WI-1 to pass
 
