@@ -817,7 +817,7 @@ class TestMaybeReadyOrderCasGuard:
         ready; but if a concurrent finalize has moved it to 'processing'
         between the authz check and the CAS UPDATE, the CAS must NOT clobber
         it back to 'ready' (which would allow a re-enroll / double-issue)."""
-        from acme_adcs_ra.routes.acme import _maybe_ready_order
+        from acme_adcs_ra.routes.authorizations import _maybe_ready_order
 
         config = _make_test_config(tmp_path)
         store, context = _make_context(config, FakeEnrollmentLeg())
@@ -910,7 +910,7 @@ class TestMaybeReadyOrderCasGuard:
         _maybe_ready_order. Finalize rejects expired orders anyway, so a
         transient 'ready' serves no client. The order stays 'pending' for the
         sweep to move to 'invalid'."""
-        from acme_adcs_ra.routes.acme import _maybe_ready_order
+        from acme_adcs_ra.routes.authorizations import _maybe_ready_order
 
         config = _make_test_config(tmp_path)
         store, context = _make_context(config, FakeEnrollmentLeg())
