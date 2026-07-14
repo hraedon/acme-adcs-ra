@@ -149,3 +149,36 @@ engineered to. Until then it has not — regardless of a green local test run.
         Revocation runbook; `scripts/Revoke-Cert.ps1` lab-validated revoking a
         throwaway cert; reason 7 rejection confirmed at the RA surface).
   - [x] The proven artifact == the shipped artifact (same SHA `7d5c5b9`).
+
+- **MED-1/MED-2 re-proof — PASSED (2026-07-14):**
+  Live re-proof against commit `c283d81` (HEAD) on the lab RA host
+  (mvmcitest01, IIS app pool as the gMSA, port 9443, ADCS CA at mvmca01
+  Mode A). All 15 test cases passed:
+
+  1.  Account creation (EAB) — PASS
+  2.  Order creation (in-scope SAN) — PASS
+  3.  Challenge completion — PASS
+  4.  Finalize (CSR → real cert from ADCS) — PASS
+  5.  Certificate download — PASS
+  6.  SAN in cert matches request — PASS
+  7.  serverAuth EKU only (no clientAuth) — PASS
+  8.  Chain off existing CA (leaf → issuing CA → root, no new intermediate) — PASS
+  9.  Policy denial (out-of-scope SAN rejected at finalize) — PASS
+  10. Revocation (reason=1, RA store) — PASS
+  11. Revoked cert → 410 Gone — PASS
+  12. Reason 7 rejected — PASS
+  13. **MED-1 positive**: multi-SAN issue (two in-scope SANs), all issued
+      cert SANs verified within order scope, no non-DNS SANs — PASS
+  14. **MED-1 audit**: zero `finalize-issued-cert-san-mismatch` events in
+      the audit log — PASS
+  15. **MED-2**: revocation CAS completed deterministically, audit records
+      `revocation_scope=ra-store-only`, `ca_crl_updated=false` — PASS
+
+  CA-side verification (via svc-da on mvmca01): CA database confirms
+  Requester = `HRAENET\gMSA-acme-ra$` for both test certs (ReqID 96, 97),
+  Template = `ACME-ServerAuth`, Disposition = Issued. Both test certs
+  revoked CA-side (reason=1) and CRL republished. Lab database restored
+  to pre-test state; temporary scripts removed.
+  - [x] §A re-cleared on commit `c283d81` (live re-issue + denial +
+        revocation + MED-1/MED-2 performed).
+  - [x] The proven artifact == the shipped artifact (same SHA `c283d81`).
