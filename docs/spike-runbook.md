@@ -117,7 +117,7 @@ loudly and falls back to printing the manual `certutil -view` command.
   the **same** `certfnsh.asp` / `certnew.cer` / `certnew.p7b` payload as this
   spike. Nothing more needs to be filled for enrollment — the RA selects it
   automatically on win32 (`__main__.py`). The WI-1 enrollment gate has since
-  been **confirmed** live (WI-015 re-proof, 2026-07-13, on `mvmcitest01`).
+  been **confirmed** live (WI-015 re-proof, 2026-07-13, on the lab host).
 - **Revocation is out of scope for this spike** (WI-1 covered enrollment only).
   ADCS Web Enrollment exposes no revocation endpoint; the out-of-band path
   shipped in WI-010 (`scripts/Revoke-Cert.ps1`, operator-run, keeping the gMSA

@@ -76,7 +76,7 @@ ESC surface adcs-lens would flag — scope it tightly.
 WI-001–WI-010 (ACME server, EAB/policy, enrollment, SIEM audit, out-of-band
 revocation) and WI-011–WI-014 (operator-enablement artifacts) shipped for 1.0.
 **WI-015** (live lab re-proof against the exact piloted commit) **PASSED**
-2026-07-13 on `mvmcitest01` against `7d5c5b9` — all 12 cases (issue, policy
+2026-07-13 on the lab host against `7d5c5b9` — all 12 cases (issue, policy
 denial, revocation, reason-7 rejection, chain off the existing CA). **Plan 003**
 (WI-016–WI-020) is complete: in-app per-account order rate limiting, RA-vs-CA
 revocation reconciliation (read-only), EAB scope audit view, `keyChange`

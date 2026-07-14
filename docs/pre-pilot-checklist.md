@@ -130,13 +130,14 @@ engineered to. Until then it has not — regardless of a green local test run.
     limiting, crons, monitoring), and the §F revocation-runbook acknowledgement.
 
 - **WI-015 — PASSED (2026-07-13):**
-  Live re-proof against commit `7d5c5b9` on mvmcitest01. Full ACME
+  Live re-proof against commit `7d5c5b9` on the lab RA host. Full ACME
   round-trip (new-account → new-order → challenge → finalize) through the
-  deployed RA (IIS app pool as `HRAENET\gMSA-acme-ra$`, port 9443) issued
+  deployed RA (IIS app pool as the gMSA, port 9443) issued
   a real **serverAuth-only** cert with the **SAN from the CSR**
-  (`wi015-reproof.ad.hraedon.com`), off the existing CA
-  (`CN=ad-MVMCA01` → `CN=Hraedon Root CA`, no new intermediate). Serial
-  `6C0000005FFD6F5A0C54265F7200000000005F`. A policy-denial
+  (`reproof.WORK-DOMAIN.local` placeholder — real lab hostname recorded in
+  gitignored local notes, not committed per the AGENTS.md identifier rule),
+  off the existing CA (`CN=CA01` → existing root, no new intermediate). Serial
+  redacted (real lab serial kept in gitignored local notes). A policy-denial
   (out-of-scope SAN `evil-example-com.test`) was rejected at finalize
   with `400`. Revocation with reason=1 succeeded (cert → revoked, GET →
   410). Reason 7 was rejected with `badRevocationReason`. The re-proof
