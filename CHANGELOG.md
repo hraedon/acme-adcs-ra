@@ -71,8 +71,8 @@ against commit `c283d81` (15/15 E2E cases green, CA database confirms gMSA reque
 - **MED-1:** post-issuance SAN verification (issued cert SANs checked against
   the order, not just the CSR; non-DNS SANs rejected).
 - **MED-2:** deterministic `won_cas` signal replaces timestamp-inference.
-- **LOW-1..4:** expiry guard in `_maybe_ready_order`, UNIQUE index on
-  certificates.order_id (graceful migration), and other robustness fixes.
+- **LOW-1, LOW-2, LOW-4:** expiry guard in `_maybe_ready_order`, UNIQUE index
+  on certificates.order_id (graceful migration), and other robustness fixes.
 
 ### Stability contracts (from 1.0.0-rc1)
 - **ACME API surface:** the directory endpoints, JWS validation, EAB binding,
