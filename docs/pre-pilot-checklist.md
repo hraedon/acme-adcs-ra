@@ -151,9 +151,8 @@ engineered to. Until then it has not — regardless of a green local test run.
   - [x] The proven artifact == the shipped artifact (same SHA `7d5c5b9`).
 
 - **MED-1/MED-2 re-proof — PASSED (2026-07-14):**
-  Live re-proof against commit `c283d81` (HEAD) on the lab RA host
-  (mvmcitest01, IIS app pool as the gMSA, port 9443, ADCS CA at mvmca01
-  Mode A). All 15 test cases passed:
+  Live re-proof against commit `c283d81` on the lab RA host (IIS app pool
+  as the gMSA, ADCS CA in Mode A). All 15 test cases passed:
 
   1.  Account creation (EAB) — PASS
   2.  Order creation (in-scope SAN) — PASS
@@ -174,11 +173,14 @@ engineered to. Until then it has not — regardless of a green local test run.
   15. **MED-2**: revocation CAS completed deterministically, audit records
       `revocation_scope=ra-store-only`, `ca_crl_updated=false` — PASS
 
-  CA-side verification (via svc-da on mvmca01): CA database confirms
-  Requester = `HRAENET\gMSA-acme-ra$` for both test certs (ReqID 96, 97),
+  CA-side verification (via domain admin on the CA host): CA database
+  confirms Requester = `WORK-DOMAIN\gMSA-acme-ra$` for both test certs,
   Template = `ACME-ServerAuth`, Disposition = Issued. Both test certs
   revoked CA-side (reason=1) and CRL republished. Lab database restored
   to pre-test state; temporary scripts removed.
   - [x] §A re-cleared on commit `c283d81` (live re-issue + denial +
         revocation + MED-1/MED-2 performed).
-  - [x] The proven artifact == the shipped artifact (same SHA `c283d81`).
+  - [x] The live proof ran against source commit `c283d81`; the RC prep
+        commit (`4942178` and subsequent fixes) adds only non-issuance
+        artifacts (CHANGELOG, SECURITY, CI, checklist). The issuance-path
+        source is unchanged between the proof and the RC tag.
