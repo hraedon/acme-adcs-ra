@@ -69,9 +69,11 @@ honest: check a box only when the thing is actually true, not when it's planned.
 
 ## E. Operations / DoS / observability (§4.G, §6)
 
-- [ ] **Reverse-proxy rate limiting** per-account / per-IP (the RA has none in
-      code; a flood here becomes a flood at the CA). Snippets + tuning guidance:
-      `docs/operations.md` ## Network allowlist and reverse-proxy rate limiting.
+- [ ] **Reverse-proxy rate limiting** per-account / per-IP (complements the
+      in-app per-account order limit from WI-016, which bounds order creation
+      but not raw request rate; a proxy flood still reaches the CA). Snippets +
+      tuning guidance: `docs/operations.md` ## Network allowlist and in-app
+      rate limiting.
 - [ ] **Crons wired:** `DELETE /acme/admin/nonces` (nonce GC) and
       `DELETE /acme/admin/expired-orders` (order sweep, RFC 8555 §7.1.6).
       Install via `scripts/Register-MaintenanceTasks.ps1` (WI-013); see

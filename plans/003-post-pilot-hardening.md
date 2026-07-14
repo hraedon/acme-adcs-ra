@@ -1,9 +1,23 @@
 # Plan 003 — Post-pilot hardening: issuance-path defense-in-depth & operational visibility
 
-**Status:** Proposed 2026-07-07
+**Status:** COMPLETE — WI-016..020 implemented (commit `7d5c5b9`). Originally
+proposed 2026-07-07.
 **Author:** Claude (Fable 5), from the 2026-07-07 review
+
+> **Closure (2026-07-13):** all five work items shipped, reviewed by the kimi
+> adversarial reviewer (cross-lineage pass, all 5 → done), and WI-015 live
+> re-proof PASSED against the deployed commit. Test count is now 433 pass / 1
+> skip (up from the 376 cited in the ground-truth snapshot below). The
+> ground-truth bullets are preserved as the point-in-time "before" state; read
+> them as history, not as current gaps.
+>
+> Subsequent hardening (post-003): MED-1 added post-issuance SAN verification
+> (the issued cert's SANs are checked against the order, not just the CSR), and
+> the M-3 cert-revocation CAS now returns a deterministic `won_cas` signal so
+> the route no longer infers a lost CAS from timestamp inequality.
+
 **Strategic role:** 1.0 shipped a correct, well-documented RA and Plan 002
-carries it to the pilot gate (WI-015). This plan is what separates "works" from
+carried it through the pilot gate (WI-015 PASSED). This plan is what separates "works" from
 "responsible to run unattended" — the two operational-hardening items that a
 compromise or a silent drift would exploit, plus three smaller robustness/UX
 gaps. Nothing here adds a signing key, widens the gMSA's rights, or changes the

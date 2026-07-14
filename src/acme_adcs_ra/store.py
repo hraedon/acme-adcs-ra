@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
 from cryptography import x509
 
@@ -169,6 +169,20 @@ class CertificateRecord:
     revoked_at: str | None = None
 
 
+class RevocationUpdate(NamedTuple):
+    """Result of a CAS-guarded certificate revocation.
+
+    ``won_cas`` is True when *this* caller's UPDATE flipped the row from
+    ``valid`` to ``revoked``; False when a concurrent revocation had already
+    won (the returned ``record`` is the existing, already-revoked row, and
+    the caller should treat it as idempotent success without re-auditing).
+    ``record`` is None only when no certificate row exists for the id.
+    """
+
+    record: CertificateRecord | None
+    won_cas: bool
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -298,6 +312,39 @@ class Store:
             self._migrate_accounts_table(conn)
             self._migrate_orders_table(conn)
             self._migrate_authorizations_table(conn)
+            self._migrate_certificates_unique_order_index(conn)
+
+    def _migrate_certificates_unique_order_index(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """LOW-4: add a UNIQUE index on certificates(order_id).
+
+        A DB-level last line of defense against two cert rows for the same
+        order — the CAS on ``transition_order_to_processing`` plus the
+        existing-cert check already prevent this in normal operation. The
+        index is created inside the schema migration (not in ``_SCHEMA``) so
+        that an upgrade of an already-deployed DB that somehow accumulated a
+        duplicate ``order_id`` row (pre-CAS legacy data, manual repair) does
+        NOT crash Store init: a unique-index CREATE validates existing rows on
+        creation, so we catch that, log an operator-actionable warning, and
+        leave the RA running on its primary (CAS) defense rather than failing
+        to start. The operator reconciles the duplicates and the next start
+        installs the index.
+        """
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_certificates_order "
+                "ON certificates(order_id)"
+            )
+        except sqlite3.IntegrityError:
+            import logging
+            logging.getLogger(__name__).error(
+                "Cannot create the certificates(order_id) UNIQUE index: the "
+                "existing database contains duplicate order_id rows. The RA "
+                "will run on its CAS-based duplicate-prevention (still safe), "
+                "but the DB-level guarantee is NOT installed. Reconcile the "
+                "duplicate rows and restart to install the index."
+            )
 
     def _migrate_accounts_table(self, conn: sqlite3.Connection) -> None:
         """Add the jwk_thumbprint column to accounts if missing (dedup support)."""
@@ -542,34 +589,6 @@ class Store:
             return None
         return self._order_from_row(row)
 
-    def update_order_status(
-        self,
-        order_id: str,
-        status: str,
-        *,
-        certificate_url: str | None = None,
-    ) -> None:
-        updated_at = _now_iso()
-        with self._connect() as conn:
-            if certificate_url is not None:
-                conn.execute(
-                    """
-                    UPDATE orders
-                    SET status = ?, certificate_url = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (status, certificate_url, updated_at, order_id),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE orders
-                    SET status = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (status, updated_at, order_id),
-                )
-
     def transition_order_to_processing(self, order_id: str) -> bool:
         """Atomically transition an order from 'ready' to 'processing'.
 
@@ -636,7 +655,7 @@ class Store:
 
         Reconciliation for the case where enrollment succeeded and a certificate
         row was recorded, but the order's status flip was missed (e.g. a crash
-        between ``create_certificate`` and ``update_order_status``). CAS-guarded
+        between ``create_certificate`` and this transition). CAS-guarded
         on ``status = 'processing'``. Returns True if the transition was applied.
         """
         updated_at = _now_iso()
@@ -672,8 +691,8 @@ class Store:
     def transition_to_revoked(self, order_id: str) -> bool:
         """Atomically transition an order to 'revoked' (CAS-guarded).
 
-        WI-003: replaces the non-CAS ``update_order_status(order_id, "revoked")``
-        call in ``revoke_cert``. CAS-guarded on ``status IN ('valid', 'processing')``
+        WI-003: replaces the former non-CAS order-status UPDATE in
+        ``revoke_cert``. CAS-guarded on ``status IN ('valid', 'processing')``
         so it can never clobber an order a concurrent finalize has moved to
         ``invalid`` or that is still ``pending``/``ready`` (no cert to revoke).
         The ``valid``→``revoked`` path is the normal case; ``processing``→``revoked``
@@ -1097,16 +1116,22 @@ class Store:
         reason: int | None,
         *,
         revoked_at: str | None = None,
-    ) -> CertificateRecord | None:
+    ) -> RevocationUpdate:
         """Mark a certificate as revoked in the RA store (CAS-guarded).
 
         M-3: the UPDATE is guarded on ``status = 'valid'`` so concurrent
         revocations are idempotent — the first revocation wins and its
         reason/timestamp are preserved; a concurrent caller sees the existing
-        (now-revoked) record returned unchanged. If the cert was already
-        revoked, no row is updated and the existing revoked record is returned
-        (the caller treats this as idempotent success). Returns ``None`` only
-        when no certificate row exists for *cert_id*.
+        (now-revoked) record returned unchanged with ``won_cas=False``. If the
+        cert was already revoked, no row is updated and the existing revoked
+        record is returned with ``won_cas=False`` (idempotent success).
+
+        Returns a ``RevocationUpdate`` whose ``record`` is None only when no
+        certificate row exists for *cert_id*; ``won_cas`` is True exactly when
+        this caller's UPDATE flipped the row (so the caller owns the audit).
+        This lets the route decide whether to audit on a deterministic signal
+        rather than inferring a lost CAS from timestamp inequality (which has
+        a sub-second race).
         """
         timestamp = revoked_at or _now_iso()
         with self._connect() as conn:
@@ -1124,13 +1149,20 @@ class Store:
                     "SELECT * FROM certificates WHERE id = ?", (cert_id,)
                 ).fetchone()
                 if row is None:
-                    return None
-                return self._certificate_from_row(row)
+                    # The row vanished between the UPDATE and the SELECT (a
+                    # concurrent delete — certs are never deleted in normal
+                    # operation, so this is near-impossible). Report won_cas=False:
+                    # the caller did not end up owning a persisted revocation, so
+                    # it must not audit, and the route surfaces this as 404.
+                    return RevocationUpdate(record=None, won_cas=False)
+                return RevocationUpdate(
+                    record=self._certificate_from_row(row), won_cas=True
+                )
             # No row updated: either the cert doesn't exist, or it was already
             # revoked (a concurrent revocation won the CAS). Return the current
             # record so the caller can distinguish the two cases (None = not
-            # found; a revoked record = idempotent success).
-        return self.get_certificate(cert_id)
+            # found; a revoked record = idempotent success, won_cas=False).
+        return RevocationUpdate(record=self.get_certificate(cert_id), won_cas=False)
 
     # ------------------------------------------------------------------
     # Audit

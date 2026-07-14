@@ -81,10 +81,10 @@ class _RacingRevocationLeg:
     M-3 concurrent-revocation test. Does NOT audit (the winning revocation
     owns the audit, wherever it came from).
 
-    Uses a fixed old store timestamp so the route's lost-CAS detection
-    (``updated.revoked_at != revoked_at``) is deterministic — the route
-    computes its own current ``_now_iso()`` for ``revoked_at``, which is
-    always different from the fixed 2020 timestamp."""
+    M-3 follow-up: the route now uses the store's deterministic ``won_cas``
+    signal rather than inferring a lost CAS from timestamp inequality, so the
+    fixed 2020 timestamp is no longer required for detection — but it remains
+    harmless and keeps the test data stable."""
 
     _FIXED_OLD_TS = "2020-01-01T00:00:00Z"
 
@@ -417,12 +417,52 @@ class TestCasGuardedRevocation:
         assert first_revoked_at is not None
 
         # Second store-level revocation with reason=5 — must NOT clobber.
-        second = store.revoke_certificate(first.id, 5)
+        second_update = store.revoke_certificate(first.id, 5)
+        second = second_update.record
         assert second is not None
         assert second.status == "revoked"
         # The first revocation's reason + timestamp are preserved.
         assert second.revocation_reason == 1
         assert second.revoked_at == first_revoked_at
+        # M-3: the second call lost the CAS (cert was already revoked).
+        assert second_update.won_cas is False
+
+    def test_store_revoke_certificate_same_second_race_is_deterministic(
+        self,
+        client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """MED-2: the won_cas signal is deterministic even when both
+        revocations share the same sub-second timestamp. The former
+        route-level inference (``updated.revoked_at != revoked_at``) could
+        emit a duplicate audit when two revocations landed in the same
+        second; the store now returns won_cas=True for exactly one caller
+        regardless of timestamp equality."""
+        ac, cert_der = _issue_cert(client, test_config, account_key)
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial_hex = format(cert.serial_number, "x").upper()
+        store = Store(test_config.db_path)
+        cert_record = store.get_certificate_by_serial(serial_hex)
+        assert cert_record is not None
+
+        same_second = "2030-05-17T12:00:00Z"
+        first_update = store.revoke_certificate(
+            cert_record.id, 1, revoked_at=same_second
+        )
+        second_update = store.revoke_certificate(
+            cert_record.id, 5, revoked_at=same_second
+        )
+        # Exactly one caller wins the CAS, deterministically — even though
+        # both supplied the identical timestamp.
+        assert first_update.won_cas is True
+        assert second_update.won_cas is False
+        assert first_update.record is not None
+        assert second_update.record is not None
+        # Same preserved record, same preserved timestamp/reason.
+        assert first_update.record.revoked_at == same_second
+        assert second_update.record.revoked_at == same_second
+        assert second_update.record.revocation_reason == 1
 
     def test_concurrent_revocation_is_idempotent_no_duplicate_audit(
         self,
@@ -497,11 +537,13 @@ class TestCasGuardedRevocation:
     def test_store_revoke_certificate_returns_none_for_missing_cert(
         self, tmp_path: Any
     ) -> None:
-        """M-3: revoke_certificate returns None when no cert row exists (the
-        route surfaces this as 404, not 500)."""
+        """M-3: revoke_certificate returns a RevocationUpdate whose record is
+        None when no cert row exists (the route surfaces this as 404, not 500).
+        won_cas is False because no row was updated."""
         store = Store(tmp_path / "missing.db")
-        result = store.revoke_certificate("does-not-exist", reason=0)
-        assert result is None
+        update = store.revoke_certificate("does-not-exist", reason=0)
+        assert update.record is None
+        assert update.won_cas is False
 
     def test_route_revocation_missing_cert_returns_404_not_500(
         self,

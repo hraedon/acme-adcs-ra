@@ -72,14 +72,19 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**WI-010 closed; Phase 3 operator-enablement artifacts complete for 1.0.**
-WI-001–WI-010 are complete (ACME server, EAB/policy, enrollment, SIEM audit,
-out-of-band revocation). WI-011–WI-014 (EAB lifecycle tooling, deployment-
-hardening snippets, scheduled maintenance units, operations runbook) are in
-place for 1.0 — see `docs/operations.md`. **WI-015** (live lab re-proof against
-the exact commit to be piloted) is the remaining pilot gate. Three post-review
-security fixes landed alongside 1.0: M-1 (reason 7 rejected), M-2 (CAS-guarded
-pending→ready), M-3 (CAS-guarded cert revocation).
+**Plans 001–003 complete (WI-001–WI-020); at the production-pilot bar.**
+WI-001–WI-010 (ACME server, EAB/policy, enrollment, SIEM audit, out-of-band
+revocation) and WI-011–WI-014 (operator-enablement artifacts) shipped for 1.0.
+**WI-015** (live lab re-proof against the exact piloted commit) **PASSED**
+2026-07-13 on `mvmcitest01` against `7d5c5b9` — all 12 cases (issue, policy
+denial, revocation, reason-7 rejection, chain off the existing CA). **Plan 003**
+(WI-016–WI-020) is complete: in-app per-account order rate limiting, RA-vs-CA
+revocation reconciliation (read-only), EAB scope audit view, `keyChange`
+(RFC 8555 §7.3.5), and locale-robust `certfnsh.asp` parsing. See `docs/operations.md`.
+Post-review security fixes: M-1 (reason 7 rejected), M-2 (CAS-guarded
+pending→ready), M-3 (CAS-guarded cert revocation, now with a deterministic
+`won_cas` signal), and MED-1 (post-issuance SAN verification — the issued
+cert's SANs are checked against the order, not just the CSR).
 
 Auth is SPNEGO + channel binding
 (`negotiate_auth.NegotiateAuth` over `pyspnego`) against `/certsrv/` **EPA=Require**.

@@ -65,7 +65,7 @@ from acme_adcs_ra.server_jws import (
     verify_existing_account_jws,
     verify_new_account_jws,
 )
-from acme_adcs_ra.store import CertStatus, OrderStatus, _now_iso
+from acme_adcs_ra.store import CertStatus, OrderStatus, _now_iso, is_expired
 
 
 router = APIRouter()
@@ -367,6 +367,14 @@ def _maybe_ready_order(ctx: ServerContext, order_id: str) -> None:
     # issue, but the regression is still wrong).
     if order.status != OrderStatus.PENDING:
         return
+    # LOW-2: do not advance an already-expired order to 'ready'. The sweep and
+    # the finalize path both handle expired orders (finalize rejects with 410
+    # and flips to 'invalid'), so a transient 'ready' for an order whose
+    # 'expires' is already past serves no client and could only confuse a
+    # polling client into a finalize that would correctly reject. Defense in
+    # depth, not a state-machine correctness fix.
+    if is_expired(order.expires):
+        return
     for authz_url in order.authorizations:
         authz_id = authz_url.rsplit("/", 1)[-1]
         authz = ctx.store.get_authorization(authz_id)
@@ -597,7 +605,7 @@ async def revoke_cert(
         raise server_internal(f"revocation failed: {exc}") from exc
 
     revoked_at = revocation_result.revoked_at or _now_iso()
-    updated = ctx.store.revoke_certificate(
+    updated, won_cas = ctx.store.revoke_certificate(
         cert_record.id,
         revocation_result.reason if revocation_result.reason is not None else reason,
         revoked_at=revoked_at,
@@ -607,14 +615,14 @@ async def revoke_cert(
         # surface as 404 (no information leak; same outcome as not-found above).
         raise not_found("certificate not found in RA store")
 
-    # M-3: the CAS-guarded revoke_certificate returns the existing (already-
-    # revoked) record when a concurrent revocation won the race. Treat this
-    # as idempotent success (RFC 8555 §7.6) and DO NOT emit a duplicate
-    # audit event — the winning revocation already recorded one with its
-    # own reason/timestamp. Return 200 with an empty body (the
-    # out_of_band_revocation hint is NOT re-emitted on the idempotent second
-    # call; the first call's audit already recorded it).
-    if updated.status == CertStatus.REVOKED and updated.revoked_at != revoked_at:
+    # M-3: the store signals deterministically whether this caller won the CAS.
+    # If a concurrent revocation won (won_cas=False), treat it as idempotent
+    # success (RFC 8555 §7.6) and DO NOT emit a duplicate audit event — the
+    # winning revocation already recorded one with its own reason/timestamp.
+    # Return 200 with an empty body (the out_of_band_revocation hint is NOT
+    # re-emitted on the idempotent second call; the first call's audit already
+    # recorded it). Deterministic signal — no timestamp-inference race.
+    if not won_cas:
         return JSONResponse(status_code=200, content={})
 
     # H-1: flip the order to a revoked state so order and cert are consistent.
