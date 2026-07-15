@@ -184,3 +184,11 @@ engineered to. Until then it has not — regardless of a green local test run.
         commit (`4942178` and subsequent fixes) adds only non-issuance
         artifacts (CHANGELOG, SECURITY, CI, checklist). The issuance-path
         source is unchanged between the proof and the RC tag.
+
+- **2026-07-15 — parked at v1.0.0; lab deployment stopped.** The project is
+  parked (feature-complete, no active development; see `AGENTS.md` ## Status).
+  The lab RA's IIS app pool was **stopped** (verified: pool state `Stopped`,
+  ACME directory endpoint unreachable) so no standing enrollment-capable
+  identity runs unattended while parked. The deployment remains installed and
+  configured — re-enabling for a pilot is `Start-WebAppPool` plus a fresh run
+  through this checklist (§A first: re-proof on the deployed commit).
