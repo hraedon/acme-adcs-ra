@@ -19,14 +19,14 @@ Found a security issue in acme-adcs-ra itself (e.g. a SAN-scope bypass, an
 EAB forgery, a signing-key introduction in the issuance path, or a revocation
 CAS race that double-issues)?
 
-Please report it **privately** rather than as a public issue:
-
-- Email: **plm@hraedon.com**
-- Or open a private vulnerability report via GitHub's
-  [Security Advisories](https://github.com/hraedon/acme-adcs-ra/security/advisories/new).
+Please report it **privately** rather than as a public issue: open a private
+vulnerability report via GitHub's
+[Security Advisories](https://github.com/hraedon/acme-adcs-ra/security/advisories/new)
+(private vulnerability reporting is enabled on this repository).
 
 Please include the affected version, a reproduction, and the expected vs. actual
-behavior. Acknowledgement within 72 hours is the target.
+behavior. The project is stable and passively maintained; reports are read and
+acknowledged best-effort, with no committed response time.
 
 ## Scope
 

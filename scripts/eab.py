@@ -47,7 +47,7 @@ from acme_adcs_ra.config import RAConfig
 # A warning banner prepended to every block of output so an operator cannot
 # accidentally paste it into a committed file without seeing the warning.
 _WARNING_BANNER = (
-    "# !!! TREAT LIKE A PASSWORD — never commit, never paste into chat/tickets. !!!\n"
+    "# !!! TREAT LIKE A PASSWORD -- never commit, never paste into chat/tickets. !!!\n"
     "# !!! ACL the env file to the gMSA + Administrators only.                  !!!"
 )
 
@@ -99,7 +99,7 @@ _ROTATE_CHECKLIST = """\
 # Rotation checklist (retiring kid {old_kid}):
 #   1. Mint the new credential above and merge it into ACME_RA_EAB_ALLOWLIST
 #      in acme-ra.env as a JSON array (do not remove the old kid until the
-#      cutover is complete — both must be valid during the cutover).
+#      cutover is complete -- both must be valid during the cutover).
 #   2. Add ACME_RA_SAN_SCOPES__<NEW_KID>__DNS_PATTERNS for the new account
 #      (replace the placeholder).
 #   3. Restart the RA app pool so the new env vars take effect.
@@ -198,7 +198,7 @@ def _print_audit(env_file: str | None, db_path_override: str | None) -> int:
         if patterns:
             scope_disp = ", ".join(patterns)
         else:
-            scope_disp = "(no scope — fail-closed)"
+            scope_disp = "(no scope -- fail-closed)"
         has_wildcard = any(p.startswith("*.") for p in patterns)
         last = _last_used(db_path, kid)
         last_disp = last if last is not None else "never"
@@ -220,7 +220,10 @@ def _print_audit(env_file: str | None, db_path_override: str | None) -> int:
     ]
 
     sys.stdout.write(
-        "EAB scope audit — kid → SAN scope → last-used (no MAC keys shown)\n\n"
+        # ASCII-only: on Windows a piped/redirected child process encodes
+        # stdout with the ANSI code page (e.g. cp1252), where non-ASCII
+        # arrows raise UnicodeEncodeError and kill the audit with exit 1.
+        "EAB scope audit -- kid -> SAN scope -> last-used (no MAC keys shown)\n\n"
     )
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     sys.stdout.write(fmt.format(*headers) + "\n")
@@ -239,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Mint an EAB credential (kid + MAC key) for acme-adcs-ra. "
-            "Output is stdout-only — paste it into the locked-down acme-ra.env. "
+            "Output is stdout-only -- paste it into the locked-down acme-ra.env. "
             "Never commit the output; treat it like a password. "
             "Use the 'audit' subcommand for a read-only scope view."
         ),
@@ -249,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="OLD_KID",
         help=(
             "Rotate: mint a new credential and print a checklist for retiring "
-            "OLD_KID. The old kid is NOT modified — you update acme-ra.env by "
+            "OLD_KID. The old kid is NOT modified -- you update acme-ra.env by "
             "hand per the checklist."
         ),
     )
