@@ -85,6 +85,13 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
+> **Project status:** stable at v1.0.0 and feature-complete for its charter.
+> Not under active development; maintained passively — security reports (see
+> `SECURITY.md`) and bug reports are welcome, but there is no feature roadmap
+> or response-time commitment. Deploying this is issuance-path infrastructure:
+> work through [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md)
+> before running it anywhere that matters.
+
 **At the production-pilot bar — Plans 001–003 complete (WI-001–WI-020).** The
 full pipeline — ACME server (RFC 8555 subset: directory, EAB-gated accounts,
 orders, finalize, cert retrieval, revokeCert, keyChange), deterministic
