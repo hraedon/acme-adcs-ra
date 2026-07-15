@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Parked-project rot canary: a monthly run surfaces dependency, Python, or
+    # runner drift (pip-audit CVEs especially) as a failed-run email instead
+    # of a re-entry surprise.
+    - cron: "43 6 3 * *"
 
 permissions:
   contents: read

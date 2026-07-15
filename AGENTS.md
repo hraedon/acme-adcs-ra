@@ -72,6 +72,24 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**PARKED at v1.0.0 (2026-07-15) — feature-complete for the charter; no active
+development planned.** The repo is public, released, and CI-gated (including a
+monthly scheduled run as a rot canary). Re-entry rules:
+
+- **Any change to the issuance leg earns a live lab re-proof** (the standing
+  project rule — see the validation log in `docs/pre-pilot-checklist.md` for
+  the proven procedure). The parked release `v1.0.0` shares its issuance-path
+  source with the proven commit `c283d81`.
+- The parked backlog is in the work-item store: **WI-021** (post-issuance EKU
+  verification — MED-1 covers SANs but not EKU; the serverAuth-only guarantee
+  rests on template config). Note the store's WI numbering: WI-011..015 exist
+  only in plan documents, not the store — file new items with an explicit
+  identifier ≥ WI-022.
+- A production pilot is gated on the operator-owned sections (§B–E) of
+  `docs/pre-pilot-checklist.md`; those are per-deployment, not code debt.
+- If the scheduled CI run has gone red since the park date, fix CI first —
+  it is dependency/runner rot (pip-audit especially), not a code regression.
+
 **Plans 001–003 complete (WI-001–WI-020); at the production-pilot bar.**
 WI-001–WI-010 (ACME server, EAB/policy, enrollment, SIEM audit, out-of-band
 revocation) and WI-011–WI-014 (operator-enablement artifacts) shipped for 1.0.

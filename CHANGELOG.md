@@ -4,6 +4,28 @@ All notable changes to acme-adcs-ra are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] — 2026-07-15
+
+Promotion of 1.0.0-rc1 to final. **No issuance-path source changes** since the
+lab-proven commit `c283d81` (15/15 E2E cases green, CA database confirms gMSA
+requester) — everything between rc1 and this release is documentation, CI, and
+release mechanics. The re-proof that gated rc1 gates this release identically.
+
+### Added
+- Monthly scheduled CI run — a rot canary for a parked project (dependency
+  CVEs via `pip-audit`, Python/runner drift) so decay surfaces as a failed-run
+  email rather than at re-entry.
+
+### Changed
+- Project status: **parked at 1.0** — feature-complete for its charter, no
+  active development planned. `README.md` / `AGENTS.md` document the
+  maintenance posture and re-entry pointers. A production pilot remains gated
+  on the operator-owned sections of `docs/pre-pilot-checklist.md`, which is
+  unchanged.
+- The known MED-1 limitation (post-issuance verification covers SANs but not
+  EKU; the serverAuth-only guarantee rests on template configuration) is now
+  tracked as work item **WI-021** instead of living only in a reflection.
+
 ## [1.0.0-rc1] — 2026-07-14
 
 First release candidate. An ACME Registration Authority for ADCS: speaks ACME
