@@ -345,6 +345,54 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   worst case (domain-takeover via clientAuth/PKINIT mis-issuance) is now
   bounded by the RA itself, not assumed from the CA config.
 
+- **Single-identity deployment (explicit, recorded option — WI-033).**
+  An opt-in variant in which the **same** gMSA used for enrollment
+  (`gMSA-acme-ra$`) is also granted the template-scoped OfficerRights and
+  runs `Sync-Revocations.ps1` on the RA host in `-LocalMode`. This collapses
+  the two-identity design into one identity, one host, and one provisioning
+  path.
+
+  **What the scoping preserves (same as two-identity):**
+  - **Template boundary.** OfficerRights still restricts revocation to the
+    `ACME-ServerAuth` template only; revoking any other template yields
+    `CERTSRV_E_RESTRICTEDOFFICER`.
+  - **Requester boundary.** `Revoke-Cert.ps1` still asserts
+    `Request.RequesterName` matches the enrollment gMSA. In single-identity
+    mode this passes trivially — the revoker is the enrollment gMSA — but it
+    continues to reject certs the RA did not issue (e.g., another principal's
+    `ACME-ServerAuth` cert; validation-matrix C2).
+  - **Dry-run default, audit on both sides, one-directional loop (RA→CA only).**
+    Every auto-revoke is still CA-DB-recorded under the gMSA identity and
+    confirmed back to the RA audit (`revocation-ca-confirmed`,
+    `ca_crl_updated=true`).
+
+  **What it loses (the honest trade-off):**
+  - **Compromise independence.** In the two-identity design, stealing the
+    enrollment credential grants issue-only; stealing the revoker grants
+    revoke-only (template-bounded). In single-identity, one credential
+    compromise grants **both**. This enables a **mint-and-swap attack**:
+    revoke the legitimate cert, issue a spoof under the same SAN, and
+    redirect traffic — a combined attack that no single compromise enables
+    in the two-identity design.
+  - **Co-residence with the internet-facing enrollment path.** In the
+    two-identity design, the revoker is an isolated batch job on a utility
+    host. In single-identity, any flaw in the ACME surface that lets an
+    attacker act as the enrollment gMSA also lets them revoke.
+  - **Audit granularity.** Issuance and revocation share the same CA-DB
+    requester (`gMSA-acme-ra$`). The reconciliation cross-check
+    (`Reconcile-Revocation.ps1`) matters more because the CA DB alone cannot
+    distinguish issuance from revocation by identity.
+
+  **The explicit decision requirement:** this is a *defensible but weaker*
+  posture, chosen for operational simplicity (one identity to provision,
+  rotate, and monitor; one host). It must be an **explicit, recorded operator
+  decision**, not a default. This subsection is that record. The two-identity
+  design remains the **recommended default** for any deployment where the
+  additional gMSA is operationally feasible.
+
+  **The two hard provisioning constraints still apply** (union semantics;
+  DCOM access) — same as the two-identity design; see `docs/operations.md`.
+
 ### F. Audit / SIEM
 - **Every** issuance, policy-denial, enrollment-failure, account creation
   (success **and** denied), and revocation is recorded in the RA SQLite store

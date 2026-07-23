@@ -663,6 +663,113 @@ Alert on:
   not keeping up or is failing silently. This is the independent
   cross-check (it reads the CA DB directly, not the agent's self-report).
 
+#### Deployment variant: single-identity (enrollment gMSA as its own revoker)
+
+**WI-033 / WI-034.** An opt-in variant in which the **same** gMSA used for
+enrollment is also granted the template-scoped OfficerRights and runs the
+revocation pull agent on the RA host in `-LocalMode`. Choose this only when
+the RA runs on a single host, the operator accepts the compromise-correlation
+risk, and operational simplicity outweighs the independence guarantee. The
+two-identity design (`gMSA-acme-revoker$` on a utility host) remains the
+**recommended default**; see threat-model §E for the full trade-off analysis.
+
+**The explicit trade-off.** One credential compromise grants both issue and
+revoke capability, enabling a mint-and-swap attack that the two-identity
+design prevents. The template boundary and requester boundary are preserved;
+compromise independence is not. Full analysis: threat-model §E.
+
+##### Provisioning the enrollment gMSA as its own revoker
+
+Apply the same steps as for the dedicated revoker, but target
+`WORK-DOMAIN\gMSA-acme-ra$` instead of `WORK-DOMAIN\gMSA-acme-revoker$`:
+
+```powershell
+# 1. Grant the enrollment gMSA ManageCertificates on the CA Security descriptor
+#    (the coarse role grant; the template-scoped OfficerRights below is the
+#    actual restriction):
+Add-CAAccessControlEntry -User "WORK-DOMAIN\gMSA-acme-ra$" `
+    -AccessType Allow -AccessMask ManageCertificates
+
+# 2. Add the enrollment gMSA to Certificate Service DCOM Access (constraint 2):
+net localgroup "Certificate Service DCOM Access" "WORK-DOMAIN\gMSA-acme-ra$" /add
+
+# 3. Scope the enrollment gMSA to the ACME-ServerAuth template only
+#    (constraint 1 is enforced by this restriction; confirm the gMSA is in no
+#    broader cert-manager group before proceeding):
+powershell -ExecutionPolicy Bypass -File .\scripts\Set-OfficerRights.ps1 `
+    -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -OfficerSid 'S-1-5-21-<enrollment-gMSA-sid>' `
+    -TemplateOid '<ACME-ServerAuth-template-OID>'
+
+# 4. Verify by readback:
+powershell -File .\scripts\Get-OfficerRights.ps1 -CaConfig 'CA01\WORK-DOMAIN-CA'
+```
+
+**The two hard provisioning constraints still apply** (union semantics; DCOM
+access) — same as the two-identity design; see `### Two hard provisioning
+constraints for gMSA-acme-revoker$` above.
+
+##### Scheduling the agent on the RA host
+
+Use `Register-MaintenanceTasks.ps1` to register the revocation sync task
+alongside the nonce-sweep and expired-order-sweep tasks. The task runs as the
+enrollment gMSA on the RA host, with `-LocalMode` (so `Sync-Revocations.ps1`
+calls `Revoke-Cert.ps1` locally on the RA host, against the CA configured in
+`-CaConfig`). Register in dry-run mode first (report-only), then re-register
+without `-DryRun` to arm it:
+
+```powershell
+# Step 1: register in dry-run mode (report-only — no revocations applied):
+powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
+    -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
+    -AdminToken "<admin-token>" `
+    -IntervalMinutes 5 `
+    -TaskUser "WORK-DOMAIN\gMSA-acme-ra$" `
+    -RegisterRevocationSync `
+    -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -LocalMode -DryRun
+
+# Step 2: after dry-run review, re-register without -DryRun to arm the task:
+powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
+    -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
+    -AdminToken "<admin-token>" `
+    -IntervalMinutes 5 `
+    -TaskUser "WORK-DOMAIN\gMSA-acme-ra$" `
+    -RegisterRevocationSync `
+    -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -LocalMode
+```
+
+This registers the `acme-adcs-ra-sync-revocations` task. With `-DryRun` the
+task action passes `-DryRun` to `Sync-Revocations.ps1` (report-only); without
+it the task action passes `-Execute` (live). Rotate the admin token by
+re-registering the tasks (see the admin-token runbook).
+
+##### Monitoring differences
+
+- The CA-DB requester for **both issuance and revocation** is
+  `gMSA-acme-ra$` — the reconciliation cross-check
+  (`Reconcile-Revocation.ps1`) is the primary way to distinguish issuance from
+  revocation in the CA DB, because the CA DB alone cannot tell them apart by
+  identity.
+- The `revoked_in_ra_active_at_ca` bucket still works as the independent
+  cross-check (it reads the CA DB directly, not the agent's self-report).
+- Agent exit codes are the same as the two-identity design (0/1/2/5).
+
+##### Dry-run → execute promotion
+
+`Register-MaintenanceTasks.ps1` supports `-DryRun` for the revocation-sync
+task: in that mode the task action passes `-DryRun` (not `-Execute`) to
+`Sync-Revocations.ps1`, so it fetches the pending set and prints what it would
+do without making any change.
+
+1. Register the task with `-DryRun` (see the scheduling example above).
+2. Review the dry-run output and `Reconcile-Revocation.ps1` (the pending set
+   should match the `revoked_in_ra_active_at_ca` bucket).
+3. Re-register without `-DryRun` to arm the task. The first cycle after arming
+   should revoke the pending serials and confirm them back to the RA
+   (`ca_crl_updated=true` in the audit).
+
 ## Backup and restore
 
 ### What to back up
