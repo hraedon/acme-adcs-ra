@@ -393,6 +393,23 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   **The two hard provisioning constraints still apply** (union semantics;
   DCOM access) — same as the two-identity design; see `docs/operations.md`.
 
+  **CRL freshness vs. Manage-CA (the `-PublishCrl` trade-off).** By default the
+  automated loop revokes the cert (recorded immediately in the CA DB) but does
+  **not** republish the CRL — `certutil -CRL republish` requires the
+  **Manage-CA** role, which the template-scoped officer identity deliberately
+  does not hold, so the revocation appears at the next *scheduled* CRL
+  publication. `Sync-Revocations.ps1 -PublishCrl` (and
+  `Register-MaintenanceTasks.ps1 -PublishCrl`) can force an immediate republish,
+  but only if the identity is granted Manage-CA. In **single-identity** that is
+  especially dangerous: Manage-CA lets the identity edit CA configuration —
+  including lifting its **own** `OfficerRights` restriction — which **collapses
+  the escalation bound** described above (the restriction can no longer be
+  trusted to survive a compromise). It is more defensible for the **dedicated
+  two-identity revoker**, where a revoke-only account holding Manage-CA has a
+  much narrower blast radius. Treat `-PublishCrl` as a second explicit, recorded
+  decision on top of the single-identity choice; the least-privilege default
+  (scheduled CRL) is recommended for both topologies.
+
 ### F. Audit / SIEM
 - **Every** issuance, policy-denial, enrollment-failure, account creation
   (success **and** denied), and revocation is recorded in the RA SQLite store

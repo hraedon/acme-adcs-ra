@@ -85,18 +85,23 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **Project status:** stable at v1.0.0 and feature-complete for its charter.
-> Not under active development; maintained passively — security reports (see
-> `SECURITY.md`) and bug reports are welcome, but there is no feature roadmap
-> or response-time commitment. Deploying this is issuance-path infrastructure:
-> work through [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md)
-> before running it anywhere that matters.
+> **Project status:** released version is **v1.0.0**; the **v1.5** line
+> (automated CA-side revocation + self-enforced serverAuth EKU, with an opt-in
+> single-identity deployment) is **feature-complete on `main` and live-reproven
+> (2026-07-23)** — the v1.5.0 release tag is the one remaining step. Otherwise
+> maintained passively: security reports (see `SECURITY.md`) and bug reports are
+> welcome, but there is no response-time commitment. Deploying this is
+> issuance-path infrastructure: work through
+> [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md) before running it
+> anywhere that matters.
 
-**At the production-pilot bar — Plans 001–003 complete (WI-001–WI-020).** The
+**At the production-pilot bar — Plans 001–006 complete (v1.5 on `main`).** The
 full pipeline — ACME server (RFC 8555 subset: directory, EAB-gated accounts,
 orders, finalize, cert retrieval, revokeCert, keyChange), deterministic
-issuance policy with **post-issuance SAN verification**, in-app per-account
-order rate limiting, SIEM audit, and the real ADCS **enrollment** leg — issues
+issuance policy with **post-issuance SAN + EKU verification**, **automated
+CA-side revocation** (template-scoped officer; two-identity default + opt-in
+single-identity), in-app per-account order rate limiting, SIEM audit, and the
+real ADCS **enrollment** leg — issues
 a real certificate: a deployed RA running as the gMSA behind IIS drives
 `/certsrv/` and returns a **serverAuth-only** cert with the **SAN from the
 CSR**, issued off the existing CA and **chaining to the existing root** (no new

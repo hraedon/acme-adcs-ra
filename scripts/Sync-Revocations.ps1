@@ -13,7 +13,7 @@
          a list of {serial, req_id, reason, revoked_at}.
       2. For each serial, call `Revoke-Cert.ps1` (which now self-checks the
          requester, WI-022) against the CA. `certutil -revoke -config` is
-         remote-capable, so the agent does NOT need to run on the CA — no
+         remote-capable, so the agent does NOT need to run on the CA -- no
          Kerberos double-hop.
       3. On success, POST <RaBaseUrl>/acme/admin/revocations/<serial>/confirm
          with {"ca_crl_updated": true} so the RA audit flips
@@ -26,15 +26,15 @@
         task on a UTILITY HOST (not the CA) under a dedicated
         `gMSA-acme-revoker$` whose CA-side officer power is template-scoped
         to `ACME-ServerAuth` by the CA's `OfficerRights` restriction
-        (WI-025). The enrollment gMSA holds no CA-officer rights — the
+        (WI-025). The enrollment gMSA holds no CA-officer rights -- the
         cardinal invariant holds.
 
       - Single-identity (opt-in, -LocalMode): the agent runs on the RA host
         under the enrollment gMSA, which is also the revoker. The enrollment
         gMSA must be granted template-scoped OfficerRights on the CA (see
         docs/operations.md ## Single-identity deployment). This is a weaker
-        posture (one credential compromise grants both issue and revoke —
-        see threat-model §E) but operationally simpler. The invocation
+        posture (one credential compromise grants both issue and revoke --
+        see threat-model section E) but operationally simpler. The invocation
         mechanism is unchanged; -LocalMode signals deployment intent and
         adjusts the mode banner/output.
 
@@ -61,7 +61,12 @@
 
 .PARAMETER AdminToken
     The RA admin Bearer token (ACME_RA_ADMIN_TOKEN). Gates the admin
-    endpoints. Treat like an EAB MAC key — do not commit, do not log.
+    endpoints. Treat like an EAB MAC key -- do not commit, do not log.
+    Optional: if omitted, the token is read from the ACME_ADMIN_TOKEN
+    environment variable. The scheduled-task registration
+    (Register-MaintenanceTasks.ps1 -RegisterRevocationSync) uses the
+    environment form so the token never appears on this script's process
+    command line.
 
 .PARAMETER CaConfig
     The CA configuration string ("CA01\WORK-DOMAIN-CA" form). Passed through
@@ -94,8 +99,22 @@
     since the revoker IS the enrollment gMSA. This flag adjusts the mode
     banner and output; the invocation mechanism is unchanged.
 
+.PARAMETER PublishCrl
+    Force an immediate CRL republish after each revocation (passes through by
+    NOT setting Revoke-Cert.ps1's -SkipPublishCrl). OFF by default: the default
+    is least-privilege -- the revoker/officer identity revokes the cert (which
+    the CA records immediately) but does NOT republish the CRL, so the
+    revocation becomes visible at the next scheduled CRL publication.
+    `certutil -CRL republish` requires the Manage-CA role, so -PublishCrl is
+    only usable when the identity has been granted CRL-publish rights. That is
+    an explicit operator trade-off: CRL freshness in exchange for a broader
+    grant (in the single-identity topology it means the internet-facing
+    enrollment identity also holds Manage-CA -- strongly discouraged; more
+    defensible for the dedicated two-identity revoker). See threat-model
+    section E and docs/operations.md.
+
 .EXAMPLE
-    # Dry run (default — report only, no changes):
+    # Dry run (default -- report only, no changes):
     powershell -File .\scripts\Sync-Revocations.ps1 `
         -RaBaseUrl "https://ra.WORK-DOMAIN.local" `
         -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
@@ -120,25 +139,26 @@
     Schedule as a Windows Scheduled Task running as `gMSA-acme-revoker$` on
     a utility host with line-of-sight to both the RA (HTTPS) and the CA
     (certutil -config RPC/DCOM). See docs/operations.md ## Automated
-    revocation. No signing key, no enrollment — this is an operator/revoker
+    revocation. No signing key, no enrollment -- this is an operator/revoker
     tool only.
 
     For single-identity deployments, pass -LocalMode and schedule the task
     on the RA host under the enrollment gMSA (which is also the revoker).
     See docs/operations.md ## Single-identity deployment and threat-model
-    §E for the explicit trade-off. The invocation mechanism is the same
+    section E for the explicit trade-off. The invocation mechanism is the same
     either way; -LocalMode signals the deployment topology.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$RaBaseUrl,
-    [Parameter(Mandatory = $true)][string]$AdminToken,
+    [string]$AdminToken = "",
     [Parameter(Mandatory = $true)][string]$CaConfig,
     [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
     [switch]$DryRun,
     [switch]$Execute,
     [string]$ScriptDir = "",
-    [switch]$LocalMode
+    [switch]$LocalMode,
+    [switch]$PublishCrl
 )
 
 $ErrorActionPreference = "Stop"
@@ -154,6 +174,17 @@ if ($Execute -and $DryRun) {
     Die "-Execute and -DryRun are mutually exclusive. Use -Execute to revoke, or neither for a dry run (default)." 3
 }
 $liveMode = [bool]$Execute
+
+# Admin token: prefer the -AdminToken parameter; fall back to the
+# ACME_ADMIN_TOKEN environment variable. The scheduled-task registration
+# passes it via the environment so the token never lands on this script's
+# process command line (visible in a process listing during the run window).
+if ([string]::IsNullOrWhiteSpace($AdminToken)) {
+    $AdminToken = $env:ACME_ADMIN_TOKEN
+}
+if ([string]::IsNullOrWhiteSpace($AdminToken)) {
+    Die "No admin token supplied: pass -AdminToken or set the ACME_ADMIN_TOKEN environment variable." 3
+}
 
 # Resolve the Revoke-Cert.ps1 path.
 if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
@@ -180,16 +211,16 @@ $headers = @{ 'Authorization' = "Bearer $AdminToken" }
 
 if ($liveMode) {
     if ($LocalMode) {
-        Write-Output "MODE: EXECUTE (live, single-identity — revoking as the enrollment gMSA)."
+        Write-Output "MODE: EXECUTE (live, single-identity -- revoking as the enrollment gMSA)."
     } else {
-        Write-Output "MODE: EXECUTE (live — revocations WILL be applied at the CA)."
+        Write-Output "MODE: EXECUTE (live -- revocations WILL be applied at the CA)."
     }
 } else {
     if ($LocalMode) {
         Write-Output "MODE: DRY-RUN (report only, single-identity). Pass -Execute to apply."
-        Write-Output "NOTE: -LocalMode in dry-run is still report-only — no revocations are applied."
+        Write-Output "NOTE: -LocalMode in dry-run is still report-only -- no revocations are applied."
     } else {
-        Write-Output "MODE: DRY-RUN (report only — no changes). Pass -Execute to apply."
+        Write-Output "MODE: DRY-RUN (report only -- no changes). Pass -Execute to apply."
     }
 }
 Write-Output ""
@@ -200,7 +231,7 @@ Write-Output "Fetching pending revocations from: $pendingUrl"
 try {
     $response = Invoke-RestMethod -Method Get -Uri $pendingUrl -Headers $headers -TimeoutSec 60
 } catch {
-    Die ("RA unreachable — GET {0} failed: {1}" -f $pendingUrl, $_.Exception.Message) 1
+    Die ("RA unreachable -- GET {0} failed: {1}" -f $pendingUrl, $_.Exception.Message) 1
 }
 
 # Invoke-RestMethod may unwrap a single-element array into a scalar, and an
@@ -216,7 +247,7 @@ Write-Output ("Pending revocations: {0}" -f $total)
 Write-Output ""
 
 if ($total -eq 0) {
-    Write-Output "Nothing to do — RA has no pending CA-side revocations."
+    Write-Output "Nothing to do -- RA has no pending CA-side revocations."
     Write-Output "SYNC COMPLETE: 0 pending, 0 revoked, 0 failed, 0 dry-run"
     exit 0
 }
@@ -249,19 +280,31 @@ foreach ($entry in $pending) {
     # captured via $LASTEXITCODE (not propagated as our own). Redirect stderr
     # to stdout (2>&1) so the child's Die() messages display as output without
     # triggering the parent's $ErrorActionPreference=Stop as a native error.
-    $revokeOutput = & $pwshExe -NoProfile -ExecutionPolicy Bypass -File "$revokeScript" `
-        -CaConfig $CaConfig -Serial $serial -Reason $reason -RequesterName $RequesterName 2>&1
+    # By default, skip the CRL republish (certutil -CRL republish requires the
+    # Manage-CA role, which a least-privilege revoker/officer identity does NOT
+    # hold -- the revocation is recorded at the CA and appears at the next
+    # scheduled CRL publication). Pass -PublishCrl to force an immediate
+    # republish, which requires the identity to hold CRL-publish (Manage-CA)
+    # rights -- an explicit operator trade-off (CRL freshness vs. a broader
+    # grant). See docs/operations.md and threat-model section E.
+    $revokeArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $revokeScript,
+        '-CaConfig', $CaConfig, '-Serial', $serial, '-Reason', "$reason",
+        '-RequesterName', $RequesterName
+    )
+    if (-not $PublishCrl) { $revokeArgs += '-SkipPublishCrl' }
+    $revokeOutput = & $pwshExe @revokeArgs 2>&1
     $revokeExit = $LASTEXITCODE
     $revokeOutput | ForEach-Object { Write-Output $_ }
 
     if ($revokeExit -eq 5) {
         $failed++
-        [Console]::Error.WriteLine(("CRITICAL: Revoke-Cert.ps1 exited 5 (requester mismatch) for serial {0} — the cert was NOT issued by the expected enrollment gMSA. This is a policy violation. Aborting the batch." -f $serial))
+        [Console]::Error.WriteLine(("CRITICAL: Revoke-Cert.ps1 exited 5 (requester mismatch) for serial {0} -- the cert was NOT issued by the expected enrollment gMSA. This is a policy violation. Aborting the batch." -f $serial))
         exit 5
     }
     if ($revokeExit -ne 0) {
         $failed++
-        [Console]::Error.WriteLine(("WARNING: Revoke-Cert.ps1 exited {0} for serial {1} — logged, continuing to next serial." -f $revokeExit, $serial))
+        [Console]::Error.WriteLine(("WARNING: Revoke-Cert.ps1 exited {0} for serial {1} -- logged, continuing to next serial." -f $revokeExit, $serial))
         continue
     }
 
@@ -269,7 +312,7 @@ foreach ($entry in $pending) {
 
     # 3. Confirm with the RA so the audit flips ca_crl_updated=true and the
     #    serial drops out of the pending set. A confirm failure does NOT undo
-    #    the CA-side revocation (which already happened) — it means the RA
+    #    the CA-side revocation (which already happened) -- it means the RA
     #    audit still shows ca_crl_updated=false and the serial will reappear
     #    on the next pull. Log visibly and keep counting it as revoked.
     $confirmUrl = "$base/acme/admin/revocations/$serial/confirm"

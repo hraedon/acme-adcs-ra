@@ -12,12 +12,12 @@
 
     Both endpoints require the admin Bearer token (ACME_RA_ADMIN_TOKEN). The
     token is passed as a SecureString parameter and embedded in the task
-    action's Invoke-RestMethod headers — it is NOT written to a file the
+    action's Invoke-RestMethod headers -- it is NOT written to a file the
     task reads, and it is NOT logged. Treat the token like an EAB MAC key
     (see docs/operations.md ## Admin token and reclaim runbook).
 
-    Optionally (-RegisterRevocationSync), a third task —
-    acme-adcs-ra-sync-revocations — runs the CA-side revocation pull agent
+    Optionally (-RegisterRevocationSync), a third task --
+    acme-adcs-ra-sync-revocations -- runs the CA-side revocation pull agent
     (Sync-Revocations.ps1, WI-024) on the same cadence. Unlike the
     nonce/sweep tasks (which call Invoke-RestMethod against an admin
     endpoint), the sync task runs Sync-Revocations.ps1 as a PowerShell
@@ -30,12 +30,16 @@
 
 .PARAMETER BaseUrl
     The RA's public base URL (e.g. "https://acme-ra.WORK-DOMAIN.local/").
-    Must match ACME_RA_BASE_URL — the admin endpoints are under /acme/admin/.
+    Must match ACME_RA_BASE_URL -- the admin endpoints are under /acme/admin/.
 
 .PARAMETER AdminToken
     The admin Bearer token (high-entropy, >=256 bits). Passed as a plain
-    string or SecureString; embedded in the task action's headers. Do NOT
-    commit this value — supply it at install time.
+    string or SecureString. For the nonce/sweep tasks it is embedded in the
+    task action's Invoke-RestMethod headers; for the revocation-sync task
+    (-RegisterRevocationSync) it is set as the ACME_ADMIN_TOKEN environment
+    variable in the task action (so it never lands on Sync-Revocations.ps1's
+    process command line). Either way it lives in the registered task, not in
+    a file the task reads. Do NOT commit this value -- supply it at install time.
 
 .PARAMETER IntervalMinutes
     Cadence in minutes for both tasks (default 15).
@@ -63,6 +67,24 @@
     (and onward to Revoke-Cert.ps1 / certutil -revoke -config). Ignored
     when -RegisterRevocationSync is not set.
 
+.PARAMETER RequesterName
+    The expected enrollment identity, passed through to Sync-Revocations.ps1's
+    -RequesterName (the WI-022 requester check in Revoke-Cert.ps1). Must be the
+    real DOMAIN\account under which the RA enrolls (as recorded in the CA DB
+    Requester column), e.g. "CONTOSO\gMSA-acme-ra$". Defaults to the committed
+    placeholder "WORK-DOMAIN\gMSA-acme-ra$" -- override it, or the requester
+    check refuses every revoke ("Requester mismatch"). Only meaningful with
+    -RegisterRevocationSync.
+
+.PARAMETER PublishCrl
+    Passed through to Sync-Revocations.ps1 as -PublishCrl: force an immediate
+    CRL republish after each revocation. OFF by default (least-privilege: the
+    revocation is recorded at the CA and appears at the next scheduled CRL
+    publication). Enabling it requires the task identity to hold Manage-CA
+    (CRL-publish) rights -- an explicit operator trade-off. See
+    Sync-Revocations.ps1 .PARAMETER PublishCrl and threat-model section E.
+    Only meaningful with -RegisterRevocationSync.
+
 .PARAMETER LocalMode
     Passed through to Sync-Revocations.ps1 as -LocalMode, signalling
     single-identity deployment (agent on the RA host under the enrollment
@@ -74,8 +96,8 @@
     Register the revocation-sync task in report-only mode: the task action
     passes -DryRun (not -Execute) to Sync-Revocations.ps1, so it fetches the
     pending set and prints what it would do without making any change. Use
-    this for the dry-run → execute promotion path (see docs/operations.md
-    ## Dry-run → execute promotion). Re-register without -DryRun to arm the
+    this for the dry-run -> execute promotion path (see docs/operations.md
+    ## Dry-run -> execute promotion). Re-register without -DryRun to arm the
     task. Only meaningful with -RegisterRevocationSync.
 
 .PARAMETER WhatIf
@@ -109,7 +131,7 @@
 .NOTES
     Run elevated (local Administrator). Requires the ScheduledTasks module
     (built into Windows Server). See docs/operations.md ## Scheduled
-    maintenance tasks. No signing key, no enrollment — this is an operator
+    maintenance tasks. No signing key, no enrollment -- this is an operator
     admin tool only.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -121,8 +143,10 @@ param(
     [string]$TaskFolder = "\acme-adcs-ra\",
     [switch]$RegisterRevocationSync,
     [string]$CaConfig = "",
+    [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
     [switch]$LocalMode,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$PublishCrl
 )
 
 $ErrorActionPreference = "Stop"
@@ -151,7 +175,7 @@ $base = $BaseUrl.TrimEnd('/')
 # Two maintenance tasks: (name, endpoint path). Both are DELETE with the
 # admin Bearer token. The task action is a PowerShell one-liner that invokes
 # Invoke-RestMethod with the header. The token is embedded in the action's
-# script block — it is not written to a separate file the task reads.
+# script block -- it is not written to a separate file the task reads.
 $tasks = @(
     @{
         Name = "acme-adcs-ra-nonce-cleanup"
@@ -166,7 +190,7 @@ $tasks = @(
 )
 
 # The action script block. The token is interpolated here at registration
-# time — it lives in the registered task action, not in a file the task reads.
+# time -- it lives in the registered task action, not in a file the task reads.
 # Using -Headers to avoid logging the token to the task's command-line history.
 function Build-ActionScriptBlock([string]$EndpointUrl, [string]$Token) {
     # Single-quoted the token inside the double-quoted here-string so PS
@@ -187,19 +211,40 @@ try {
 
 # Action builder for the revocation-sync task. Unlike Build-ActionScriptBlock
 # (which calls Invoke-RestMethod against an admin endpoint), this runs
-# Sync-Revocations.ps1 as a PowerShell command with -Execute. The script path
-# is resolved at registration time ($PSScriptRoot of this registration script,
-# which is the same scripts/ directory). The token is interpolated into the
-# command line at registration time — same pattern as the manual scheduling
-# example in docs/operations.md ## Automated revocation.
-function Build-SyncActionScriptBlock([string]$BaseUrl, [string]$Token, [string]$CaConfigStr, [bool]$Local, [bool]$DryRunMode, [string]$ScriptPath) {
+# Sync-Revocations.ps1 with -Execute (or -DryRun). The script path is resolved
+# at registration time ($PSScriptRoot of this registration script, the same
+# scripts/ directory).
+#
+# Two invariants, both matching the nonce/sweep action (Build-ActionScriptBlock):
+#   1. The returned command contains NO double quotes -- only single-quoted
+#      literals -- so it is safe to wrap in -Command "..." at registration time.
+#      (An earlier version used -File "<path>", whose embedded double quotes
+#      collided with the outer -Command quotes; the script is invoked with the
+#      call operator & '<path>' instead, so a spaced path needs no double
+#      quotes, and it runs in-process -- no nested powershell.exe hop.)
+#   2. The admin token is passed via the environment ($env:ACME_ADMIN_TOKEN),
+#      NOT as a -AdminToken parameter, so it never lands on Sync-Revocations.ps1's
+#      process command line. Sync-Revocations.ps1 reads the env fallback.
+# The single-quoted literals assume the token / URL / CA config contain no
+# single quote -- the same assumption the nonce/sweep action already makes.
+function Build-SyncActionCommand([string]$BaseUrl, [string]$Token, [string]$CaConfigStr, [bool]$Local, [bool]$DryRunMode, [string]$ScriptPath, [string]$Requester, [bool]$PublishCrlMode) {
     $localFlag = if ($Local) { " -LocalMode" } else { "" }
     $modeFlag = if ($DryRunMode) { " -DryRun" } else { " -Execute" }
-    return @"
-`$ErrorActionPreference = 'Stop'
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ScriptPath" -RaBaseUrl '$BaseUrl' -AdminToken '$Token' -CaConfig '$CaConfigStr'$modeFlag$localFlag
-exit `$LASTEXITCODE
-"@
+    $crlFlag = if ($PublishCrlMode) { " -PublishCrl" } else { "" }
+    return "`$env:ACME_ADMIN_TOKEN = '$Token'; & '$ScriptPath' -RaBaseUrl '$BaseUrl' -CaConfig '$CaConfigStr' -RequesterName '$Requester'$modeFlag$localFlag$crlFlag; exit `$LASTEXITCODE"
+}
+
+# Build a ScheduledTask principal for the task user. A gMSA (or any non-well-
+# known service account) must use LogonType=Password so the host retrieves the
+# managed password. LogonType=Interactive (the Register-ScheduledTask -User
+# default) leaves the task unable to start -- a gMSA is never interactively
+# logged on, so the task registers but silently never runs. Well-known service
+# accounts (SYSTEM / LOCAL SERVICE / NETWORK SERVICE) use ServiceAccount.
+function Get-TaskPrincipal([string]$UserId) {
+    $u = $UserId.ToUpperInvariant()
+    $svc = ($u -eq 'SYSTEM' -or $u -eq 'NT AUTHORITY\SYSTEM' -or $u -like '*LOCAL SERVICE' -or $u -like '*NETWORK SERVICE')
+    $logon = if ($svc) { 'ServiceAccount' } else { 'Password' }
+    return New-ScheduledTaskPrincipal -UserId $UserId -LogonType $logon -RunLevel Limited
 }
 
 function Register-OrUpdate-Task([hashtable]$TaskDef) {
@@ -224,15 +269,15 @@ function Register-OrUpdate-Task([hashtable]$TaskDef) {
         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2)
 
-        # Register under the task user. The gMSA form
-        # ("WORK-DOMAIN\gMSA-acme-ra$") is a service account; SYSTEM needs no
-        # password. For a gMSA, do NOT pass -Password (the host retrieves it).
+        # Register under the task user via a principal with the correct
+        # LogonType (Password for a gMSA -- the host retrieves the managed
+        # password; a gMSA never logs on interactively). See Get-TaskPrincipal.
         $registerParams = @{
             TaskName  = $fullName
             Action    = $action
             Trigger   = $trigger
             Settings  = $settings
-            User      = $TaskUser
+            Principal = (Get-TaskPrincipal $TaskUser)
             Force     = $true
         }
         Register-ScheduledTask @registerParams | Out-Null
@@ -252,22 +297,22 @@ function Register-OrUpdate-Task([hashtable]$TaskDef) {
 # Registers the revocation-sync task (acme-adcs-ra-sync-revocations), which
 # runs Sync-Revocations.ps1 -Execute on the maintenance cadence. Unlike the
 # nonce/sweep tasks, the action calls Sync-Revocations.ps1 (not
-# Invoke-RestMethod). The admin token is embedded in the task action's
-# arguments (same pattern as the manual example in docs/operations.md).
+# Invoke-RestMethod). The admin token is delivered to the task via the
+# environment ($env:ACME_ADMIN_TOKEN in the action), not on a command line.
 function Register-RevocationSyncTask {
     $taskName = "acme-adcs-ra-sync-revocations"
     $fullName = "$TaskFolder$taskName"
 
     # Resolve Sync-Revocations.ps1 relative to this registration script
     # (same scripts/ directory). The path is embedded in the task action at
-    # registration time — $PSScriptRoot is NOT available when the task runs.
+    # registration time -- $PSScriptRoot is NOT available when the task runs.
     $syncScriptPath = Join-Path $PSScriptRoot 'Sync-Revocations.ps1'
     if (-not (Test-Path $syncScriptPath)) {
         Write-Error "Sync-Revocations.ps1 not found at '$syncScriptPath' (expected alongside this registration script in the same directory)."
         exit 1
     }
 
-    $actionScript = Build-SyncActionScriptBlock -BaseUrl $base -Token $AdminToken -CaConfigStr $CaConfig -Local $LocalMode -DryRunMode $DryRun -ScriptPath $syncScriptPath
+    $actionScript = Build-SyncActionCommand -BaseUrl $base -Token $AdminToken -CaConfigStr $CaConfig -Local $LocalMode -DryRunMode $DryRun -ScriptPath $syncScriptPath -Requester $RequesterName -PublishCrlMode $PublishCrl
 
     if ($PSCmdlet.ShouldProcess($fullName, "Register revocation-sync scheduled task")) {
         # Idempotent: unregister the existing task if present, then register.
@@ -285,13 +330,15 @@ function Register-RevocationSyncTask {
         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2)
 
-        # Register under the task user (same default as nonce/sweep tasks).
+        # Register under the task user via a principal with the correct
+        # LogonType (Password for a gMSA -- see Get-TaskPrincipal). Same default
+        # task user as the nonce/sweep tasks.
         $registerParams = @{
             TaskName  = $fullName
             Action    = $action
             Trigger   = $trigger
             Settings  = $settings
-            User      = $TaskUser
+            Principal = (Get-TaskPrincipal $TaskUser)
             Force     = $true
         }
         Register-ScheduledTask @registerParams | Out-Null
@@ -304,6 +351,15 @@ function Register-RevocationSyncTask {
         if ($LocalMode) {
             Write-Output ("  Mode:     single-identity (-LocalMode)")
         }
+        # Make the report-only-vs-armed distinction loud. -DryRun registers a
+        # REAL, scheduled task that will run on the cadence -- it just runs
+        # Sync-Revocations.ps1 in report-only mode. This is NOT the same as
+        # -WhatIf (which registers nothing). Re-register without -DryRun to arm.
+        if ($DryRun) {
+            Write-Warning ("Task '$taskName' is ARMED and will run every $IntervalMinutes min, but in REPORT-ONLY mode (-DryRun): it fetches the pending set and logs what it would do, applying NO revocations. Re-register WITHOUT -DryRun to apply revocations.")
+        } else {
+            Write-Warning ("Task '$taskName' is LIVE: it will apply revocations at the CA every $IntervalMinutes min as $TaskUser. Confirm you have completed the dry-run (-DryRun) validation first.")
+        }
     } else {
         Write-Output ("[WhatIf] Would register: $fullName")
         Write-Output ("[WhatIf]   User:     $TaskUser")
@@ -312,6 +368,11 @@ function Register-RevocationSyncTask {
         Write-Output ("[WhatIf]   CaConfig: $CaConfig")
         if ($LocalMode) {
             Write-Output ("[WhatIf]   Mode:     single-identity (-LocalMode)")
+        }
+        if ($DryRun) {
+            Write-Output ("[WhatIf]   Mode:     report-only (-DryRun); re-register without -DryRun to arm")
+        } else {
+            Write-Output ("[WhatIf]   Mode:     LIVE (will apply revocations)")
         }
     }
 }
@@ -330,26 +391,18 @@ if ($RegisterRevocationSync) {
 # Validation: list the tasks and print their NextRunTime (if not WhatIf).
 if (-not $WhatIfPreference) {
     Write-Output ""
-    Write-Output "Validation — registered tasks:"
-    foreach ($task in $tasks) {
-        $fullName = "$TaskFolder$($task.Name)"
-        $t = Get-ScheduledTask -TaskName $fullName -ErrorAction SilentlyContinue
+    Write-Output "Validation -- registered tasks:"
+    # Get-ScheduledTask matches the leaf name via -TaskName + the folder via
+    # -TaskPath; passing the full "\folder\name" as -TaskName does NOT match.
+    $names = @($tasks | ForEach-Object { $_.Name })
+    if ($RegisterRevocationSync) { $names += 'acme-adcs-ra-sync-revocations' }
+    foreach ($name in $names) {
+        $t = Get-ScheduledTask -TaskName $name -TaskPath $TaskFolder -ErrorAction SilentlyContinue
         if ($t) {
-            $info = Get-ScheduledTaskInfo -TaskName $fullName
-            Write-Output ("  {0}: State={1}, NextRunTime={2}" -f $fullName, $t.State, $info.NextRunTime)
+            $info = Get-ScheduledTaskInfo -TaskName $name -TaskPath $TaskFolder
+            Write-Output ("  {0}{1}: State={2}, NextRunTime={3}" -f $TaskFolder, $name, $t.State, $info.NextRunTime)
         } else {
-            Write-Output ("  {0}: NOT FOUND (registration failed)" -f $fullName)
-            exit 1
-        }
-    }
-    if ($RegisterRevocationSync) {
-        $syncFullName = "${TaskFolder}acme-adcs-ra-sync-revocations"
-        $t = Get-ScheduledTask -TaskName $syncFullName -ErrorAction SilentlyContinue
-        if ($t) {
-            $info = Get-ScheduledTaskInfo -TaskName $syncFullName
-            Write-Output ("  {0}: State={1}, NextRunTime={2}" -f $syncFullName, $t.State, $info.NextRunTime)
-        } else {
-            Write-Output ("  {0}: NOT FOUND (registration failed)" -f $syncFullName)
+            Write-Output ("  {0}{1}: NOT FOUND (registration failed)" -f $TaskFolder, $name)
             exit 1
         }
     }

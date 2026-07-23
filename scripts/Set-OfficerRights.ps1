@@ -6,7 +6,7 @@
     Productionizes the Plan-004 OfficerRights builder: a CA-enforced
     "Restrict Certificate Managers" restriction that scopes a certificate
     officer's power (issue + revoke) to a SINGLE certificate template. This is
-    the boundary that makes automated revocation safe — a compromised
+    the boundary that makes automated revocation safe -- a compromised
     `gMSA-acme-revoker$` can revoke only `ACME-ServerAuth` certs, not DC /
     Machine / code-signing certs (proven live in Plan 004 / WI-021).
 
@@ -17,7 +17,7 @@
     captures in Plan 004's live spike and is reproduced here:
 
       SD control 0x8004 (SE_SELF_RELATIVE | SE_DACL_PRESENT)
-      Owner SID  S-1-5-32-544 (BUILTIN\Administrators) — mandatory; an SD
+      Owner SID  S-1-5-32-544 (BUILTIN\Administrators) -- mandatory; an SD
                  with no owner is rejected by the CA (0x80070057).
       No group, no SACL.
       ACL revision 2.
@@ -28,7 +28,7 @@
         Trustee    the officer's SID
         Opaque     [SidCount=1 u32 LE][Everyone S-1-1-0][template OID as
                    UTF-16LE + 2-byte null terminator]
-      "All subjects" = SidCount 1 + Everyone S-1-1-0 (NOT SidCount 0 —
+      "All subjects" = SidCount 1 + Everyone S-1-1-0 (NOT SidCount 0 --
       that was one of the two bugs in the rejected Plan-004 blob).
       "All templates" = an Everyone entry with no template bytes (not used
       here; -TemplateOid is mandatory).
@@ -42,10 +42,10 @@
     take effect) and verifies the value by readback. Run
     `Get-OfficerRights.ps1` to confirm the ACE landed before trusting it.
 
-    Two hard provisioning constraints (from the live spike — see
+    Two hard provisioning constraints (from the live spike -- see
     docs/operations.md ## Automated revocation):
       1. The officer must NOT be a member of any broader certificate-manager
-         group (officer rights are a union over the token — a broader-manager
+         group (officer rights are a union over the token -- a broader-manager
          membership silently defeats the restriction).
       2. The officer must be a member of `Certificate Service DCOM Access`
          (else revoke fails 0x8007000d INVALID_DATA).
@@ -63,7 +63,7 @@
 .PARAMETER Remove
     Remove the OfficerRights ACE for this officer instead of adding it. If the
     officer was the last ACE, the OfficerRights value is deleted entirely
-    (reverting to unrestricted — logged visibly).
+    (reverting to unrestricted -- logged visibly).
 
 .EXAMPLE
     # Add the revoker gMSA scoped to the ACME-ServerAuth template:
@@ -81,7 +81,7 @@
 
 .NOTES
     This is a one-time provisioning step (not the revoke loop). It touches
-    CA configuration — review carefully. No signing key, no enrollment —
+    CA configuration -- review carefully. No signing key, no enrollment --
     this is an operator CA-configuration tool only.
 #>
 [CmdletBinding()]
@@ -154,11 +154,11 @@ function Build-CallbackAce([string]$OfficerSidString, [string]$TemplateOidString
 }
 
 # Build a self-relative SECURITY_DESCRIPTOR with the given ACE byte arrays.
-#   Owner   = S-1-5-32-544 (BUILTIN\Administrators) — mandatory.
+#   Owner   = S-1-5-32-544 (BUILTIN\Administrators) -- mandatory.
 #   Control = 0x8004 (SE_SELF_RELATIVE | SE_DACL_PRESENT).
 #   DACL    = revision 2, the supplied ACEs.
 # AceBytesList is a list/collection of byte[] (one per ACE). Note: no
-# [byte[][]] type annotation — PowerShell's array += flattens nested arrays,
+# [byte[][]] type annotation -- PowerShell's array += flattens nested arrays,
 # so callers use [System.Collections.Generic.List[byte[]]] to preserve each
 # ACE as a single element.
 function Build-OfficerRightsSD($AceBytesList) {
@@ -229,48 +229,41 @@ function Get-OfficerRightsBytes([string]$Config) {
     return $null
 }
 
-# Write the OfficerRights REG_BINARY. Tries certutil -setreg with a continuous
-# hex string; verifies by readback; falls back to the registry provider if the
-# readback does not match (certutil's binary-value handling is not reliable
-# across versions).
+# Write the OfficerRights REG_BINARY via the registry provider, then verify by
+# readback. We deliberately do NOT use `certutil -setreg CA\OfficerRights <hex>`:
+# on some builds (observed on Server 2025) it stores the hex as a REG_SZ *string*
+# rather than a REG_BINARY value, producing a malformed OfficerRights that the CA
+# rejects fail-closed (ERROR_INVALID_PARAMETER) -- breaking officer operations
+# for everyone. The registry provider writes the correct REG_BINARY type
+# unambiguously (New-ItemProperty -Force creates or overwrites), and we read the
+# raw bytes straight back to confirm the exact value landed.
 function Set-OfficerRightsBytes([string]$Config, [byte[]]$Bytes) {
     $caName = $Config.Split('\')[-1]
     $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName"
+    if (-not (Test-Path $regPath)) {
+        Die ("CA configuration registry key not found: {0} (is the CA name in -CaConfig correct?)." -f $regPath) 1
+    }
 
     if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
-        # Delete the value entirely (reverts to unrestricted).
-        $out = & certutil -delreg CA\OfficerRights 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            if (Test-Path $regPath) {
-                Remove-ItemProperty -Path $regPath -Name 'OfficerRights' -ErrorAction SilentlyContinue
-            }
-        }
+        # Delete the value entirely (reverts to unrestricted, logged by caller).
+        Remove-ItemProperty -Path $regPath -Name 'OfficerRights' -ErrorAction SilentlyContinue
         return
     }
 
-    $hex = Convert-BytesToHex $Bytes
-    $out = & certutil -setreg CA\OfficerRights $hex 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("certutil -setreg exited {0}; falling back to the registry provider." -f $LASTEXITCODE)
-        Set-ItemProperty -Path $regPath -Name 'OfficerRights' -Value $Bytes -Type Binary
-        return
-    }
+    New-ItemProperty -Path $regPath -Name 'OfficerRights' -PropertyType Binary -Value $Bytes -Force | Out-Null
 
-    # Verify by readback. If certutil wrote the wrong type/length, use the
-    # registry provider to guarantee correctness.
-    $readback = Get-OfficerRightsBytes $Config
+    # Verify by raw-bytes readback from the registry provider (authoritative --
+    # not the certutil -getreg text parse).
+    $readback = $null
+    try { $readback = [byte[]](Get-ItemProperty -Path $regPath -Name 'OfficerRights' -ErrorAction Stop).OfficerRights } catch {}
     if ($null -eq $readback -or $readback.Length -ne $Bytes.Length) {
-        Write-Warning "certutil -setreg readback mismatch; falling back to the registry provider."
-        Set-ItemProperty -Path $regPath -Name 'OfficerRights' -Value $Bytes -Type Binary
-        return
+        $got = if ($null -eq $readback) { 0 } else { $readback.Length }
+        Die ("OfficerRights readback mismatch after write: expected {0} bytes, got {1}." -f $Bytes.Length, $got) 1
     }
-    $match = $true
     for ($i = 0; $i -lt $Bytes.Length; $i++) {
-        if ($readback[$i] -ne $Bytes[$i]) { $match = $false; break }
-    }
-    if (-not $match) {
-        Write-Warning "certutil -setreg readback byte mismatch; falling back to the registry provider."
-        Set-ItemProperty -Path $regPath -Name 'OfficerRights' -Value $Bytes -Type Binary
+        if ($readback[$i] -ne $Bytes[$i]) {
+            Die ("OfficerRights readback byte mismatch at offset {0} after write." -f $i) 1
+        }
     }
 }
 
@@ -278,7 +271,7 @@ function Set-OfficerRightsBytes([string]$Config, [byte[]]$Bytes) {
 
 # Parse the current OfficerRights SD and return, for each ACE, the trustee SID
 # and the raw ACE bytes. This lets us filter by officer without re-parsing the
-# opaque ApplicationData — non-matching ACEs are preserved verbatim.
+# opaque ApplicationData -- non-matching ACEs are preserved verbatim.
 function Get-ExistingAces([byte[]]$Bytes) {
     $result = @()
     if ($null -eq $Bytes -or $Bytes.Length -lt 20) { return $result }
@@ -328,14 +321,14 @@ if ($existingAces.Count -gt 0) {
         Write-Output ("  officer={0}" -f $a.OfficerSid)
     }
 } else {
-    Write-Output "Current OfficerRights: (absent — unrestricted, the default)."
+    Write-Output "Current OfficerRights: (absent -- unrestricted, the default)."
 }
 Write-Output ""
 
 # Filter: keep ACEs whose trustee SID does NOT match the target officer.
-# (For add: this implements replace semantics — an existing ACE for this
+# (For add: this implements replace semantics -- an existing ACE for this
 # officer is removed and the new one added. For remove: it drops the
-# officer's ACE.) Use List[byte[]] — PowerShell's array += flattens nested
+# officer's ACE.) Use List[byte[]] -- PowerShell's array += flattens nested
 # byte arrays, which would corrupt the ACE structure.
 $keptAces = [System.Collections.Generic.List[byte[]]]::new()
 $removedCount = 0
@@ -350,11 +343,11 @@ foreach ($a in $existingAces) {
 
 if ($Remove) {
     if ($removedCount -eq 0) {
-        Write-Output "No ACE found for officer $OfficerSid — nothing to remove."
+        Write-Output "No ACE found for officer $OfficerSid -- nothing to remove."
         exit 0
     }
     if ($keptAces.Count -eq 0) {
-        Write-Output "Removing the last ACE — deleting OfficerRights (reverts to unrestricted)."
+        Write-Output "Removing the last ACE -- deleting OfficerRights (reverts to unrestricted)."
         Set-OfficerRightsBytes $CaConfig $null
     } else {
         Write-Output ("Rebuilding OfficerRights with {0} remaining ACE(s)." -f $keptAces.Count)
@@ -392,7 +385,7 @@ if ($null -eq $verifyBytes) {
     if ($Remove -and $keptAces.Count -eq 0) {
         Write-Output "PASS: OfficerRights deleted (unrestricted)."
     } else {
-        Die "Readback: OfficerRights absent after write — the set did not take effect." 1
+        Die "Readback: OfficerRights absent after write -- the set did not take effect." 1
     }
 } else {
     $verifyAces = Get-ExistingAces $verifyBytes
@@ -405,6 +398,6 @@ if ($null -eq $verifyBytes) {
 Write-Output ""
 Write-Output "Done. Run scripts/Get-OfficerRights.ps1 for the full human-readable view."
 Write-Output "NOTE: confirm the two provisioning constraints (no broader cert-manager"
-Write-Output "      group membership; Certificate Service DCOM Access) — see"
+Write-Output "      group membership; Certificate Service DCOM Access) -- see"
 Write-Output "      docs/operations.md ## Automated revocation."
 exit 0

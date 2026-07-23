@@ -1,7 +1,11 @@
 # Plan 006 — Single-identity revocation deployment option
 
-**Status:** PROPOSED → IN PROGRESS. Authored 2026-07-23 by qwen3.8-max-preview.
-Successor to [Plan 005](005-v1.5-feature-complete.md) (automated revocation via a
+**Status:** DONE — implemented and live-reproven end-to-end (2026-07-23): the
+enrollment gMSA, granted template-scoped officer rights, revokes an
+`ACME-ServerAuth` cert at the CA through the `-LocalMode` agent, with the
+least-privilege bound intact (CRL republish denied, needs Manage-CA) and the
+RA-confirm loop closing (`ca_crl_updated=true`). Authored 2026-07-23 by
+qwen3.8-max-preview. Successor to [Plan 005](005-v1.5-feature-complete.md) (automated revocation via a
 **separate** `gMSA-acme-revoker$`). **No target version bump** — this is an
 additional *deployment configuration* for the v1.5 revocation automation, not a
 new feature surface. The RA's issuance path and ACME surface are unchanged.

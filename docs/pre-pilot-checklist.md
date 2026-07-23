@@ -192,3 +192,30 @@ engineered to. Until then it has not — regardless of a green local test run.
   identity runs unattended while parked. The deployment remains installed and
   configured — re-enabling for a pilot is `Start-WebAppPool` plus a fresh run
   through this checklist (§A first: re-proof on the deployed commit).
+
+- **WI-028 — v1.5 automated-revocation re-proof — PASSED (2026-07-23):**
+  Live E2E re-proof of the v1.5 build (automated revocation + WI-026 EKU
+  self-enforcement) on the lab RA host, plus the **single-identity** deployment
+  option (Plan 006). Base issuance re-proof went 12/12 (issuance, serverAuth-only
+  EKU verified live, chain off the existing CA, out-of-scope SAN denied, revoke →
+  410, reason-7 rejected). For revocation, the enrollment gMSA was provisioned as
+  a **template-scoped officer** (Certificate-Manager only — no Manage-CA) and the
+  `Sync-Revocations.ps1 -LocalMode` agent, scheduled as that gMSA, **revoked
+  `ACME-ServerAuth` certs at the CA and confirmed them back to the RA**
+  (`ca_crl_updated=true`; pending set drained to empty; CA DB Disposition =
+  Revoked). The least-privilege bound held live: `certutil -CRL republish` was
+  **denied** for the officer identity (needs Manage-CA), so the default loop skips
+  it and relies on scheduled CRL publication (`-PublishCrl` is the opt-in for
+  immediate freshness, gated on granting Manage-CA — see threat-model §E). The
+  pass found and fixed six PowerShell defects (see `CHANGELOG.md` [Unreleased]
+  Fixed); all fixes were re-validated live. CA returned to a pristine baseline
+  (no OfficerRights, CA-Security restored) and the RA re-parked (tasks removed,
+  app pool stopped) afterward.
+  - [x] §A issuance-leg re-proof on the v1.5 build (issuance + WI-026 EKU).
+  - [x] Automated revocation round-trip proven (RA `revokeCert` → agent →
+        CA revoke → RA confirm) with WI-022 requester check + WI-025 officer
+        restriction both active.
+  - [ ] **Still open before pilot:** the operator-owned §B–E items, the
+        Finding E-1 remediation (enrollment gMSA's Domain Computers membership
+        confers `Machine`-template enroll; see `docs/revocation-scope-validation.md`),
+        and cutting the v1.5.0 release (WI-029).
