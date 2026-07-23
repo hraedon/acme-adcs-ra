@@ -8,7 +8,7 @@
     acme-adcs-ra's `revokeCert` endpoint records the revocation in the RA store
     only -- it does NOT write the CA CRL, because the RA's gMSA intentionally
     holds no CA-officer ("Manage CA") rights (the project's tightest security
-    tenet; see docs/threat-model.md §E). This script is the operator-run,
+    tenet; see docs/threat-model.md section E). This script is the operator-run,
     CA-officer credential that performs the actual `certutil -revoke` against
     the CA, closing the loop the RA started.
 
@@ -115,7 +115,7 @@ $ErrorActionPreference = "Stop"
 # Write an error message to stderr and exit with a specific code. Using
 # [Console]::Error.WriteLine (not Write-Error) so $ErrorActionPreference=Stop
 # does not turn the message into a terminating exception that swallows the
-# exit code — the documented exit-code contract (3=validation, 4=not-found,
+# exit code -- the documented exit-code contract (3=validation, 4=not-found,
 # 5=requester mismatch, certutil-code=transport) must be reachable by wrapping
 # automation.
 function Die([string]$Message, [int]$Code) {
@@ -123,7 +123,7 @@ function Die([string]$Message, [int]$Code) {
     exit $Code
 }
 
-# RFC 5280 §5.3.1 reason codes. certutil -revoke uses the same numeric codes,
+# RFC 5280 section 5.3.1 reason codes. certutil -revoke uses the same numeric codes,
 # EXCEPT reason 7 is "unused" in RFC 5280 (not an RFC 8555 reason) and is
 # rejected here. Reason 6 is certificateHold; reason 8 is removeFromCRL (the
 # un-hold operation, accepted for completeness).
@@ -160,7 +160,7 @@ function Confirm-SerialAtCa([string]$CaConfig, [string]$SerialHex, [string]$Expe
     $viewOut | ForEach-Object { Write-Output $_ }
     # The hex serial value is locale-independent; match it case-insensitively
     # in the joined output. If certutil -view found no matching row, the
-    # serial value will not appear. Join the array first — -notmatch on an
+    # serial value will not appear. Join the array first -- -notmatch on an
     # array filters (returns non-matching elements, always truthy), not a
     # boolean test.
     $joined = $viewOut -join "`n"
@@ -231,9 +231,13 @@ if ($PSCmdlet.ParameterSetName -eq "Serial") {
 }
 
 # 2. Revoke by serial. certutil -revoke accepts serials only (not ReqIDs).
-#    Syntax: certutil -revoke <SerialNumber> [Reason] -config <CA>
+#    Syntax: certutil -config <CA> -revoke <SerialNumber> [Reason]
+#    NOTE: -config must precede the -revoke verb. certutil's -revoke collects
+#    every following token as a positional arg, so a trailing "-config <CA>"
+#    is mis-parsed ("Expected no more than 2 args, received 4") rather than
+#    consumed as the config option.
 Write-Output ("Revoking serial {0}, reason = {1}..." -f $targetSerial, $Reason)
-$revokeOut = Invoke-CertUtil @('-revoke', $targetSerial, "$Reason", '-config', $CaConfig)
+$revokeOut = Invoke-CertUtil @('-config', $CaConfig, '-revoke', $targetSerial, "$Reason")
 $revokeOut | ForEach-Object { Write-Output $_ }
 Write-Output ("PASS: certutil -revoke reported success for serial {0} (reason {1})." -f $targetSerial, $Reason)
 
@@ -245,7 +249,7 @@ if ($SkipPublishCrl) {
     Write-Output "Skipping CRL publication (-SkipPublishCrl). The revocation will appear at the next scheduled publication."
 } else {
     Write-Output ("Publishing CRL at CA '{0}'..." -f $CaConfig)
-    $publishOut = Invoke-CertUtil @('-CRL', 'republish', '-config', $CaConfig)
+    $publishOut = Invoke-CertUtil @('-config', $CaConfig, '-CRL', 'republish')
     $publishOut | ForEach-Object { Write-Output $_ }
     Write-Output "PASS: CRL republished."
 }

@@ -5,10 +5,10 @@
 .DESCRIPTION
     Reads the CA's `OfficerRights` registry value (a self-relative security
     descriptor containing callback ACEs that scope certificate officers to
-    specific templates — the ADCS "Restrict Certificate Managers" feature
+    specific templates -- the ADCS "Restrict Certificate Managers" feature
     proven live in Plan 004 / WI-021) and prints each OfficerRights ACE in
     human-readable form: officer SID, access mask, ACE type (allow/deny),
-    subject SIDs (the "for whom" scope — Everyone = all subjects), and the
+    subject SIDs (the "for whom" scope -- Everyone = all subjects), and the
     template OID (the "which template" scope).
 
     This is the verify-by-readback tool: after running `Set-OfficerRights.ps1`
@@ -22,7 +22,7 @@
 
     Exit codes:
       0 = at least one OfficerRights ACE was found and printed
-      1 = no OfficerRights value present (officer rights unrestricted — the
+      1 = no OfficerRights value present (officer rights unrestricted -- the
           default CA state)
 
 .PARAMETER CaConfig
@@ -178,7 +178,7 @@ function Parse-OfficerRightsSD([byte[]]$Bytes) {
 # Main
 $bytes = Get-OfficerRightsBytes $CaConfig
 if ($null -eq $bytes) {
-    Write-Output "OfficerRights: (absent — officer operations unrestricted, the default CA state)."
+    Write-Output "OfficerRights: (absent -- officer operations unrestricted, the default CA state)."
     exit 1
 }
 

@@ -1,6 +1,8 @@
 # Plan 004 — Automated revocation without gMSA privilege growth (officer-restriction spike)
 
-**Status:** PROPOSED — WI-021 (spike) gates everything downstream. Authored
+**Status:** DONE — WI-021 spike PASSED (template-scoped officer restriction proven
+live); the mechanism ships as part of v1.5 (see [Plan 005](005-v1.5-feature-complete.md)),
+and the automated loop was live-reproven end-to-end on 2026-07-23. Authored
 2026-07-22 by Claude (Opus 4.8) after a live mechanism investigation on the lab
 CA (`WORK-DOMAIN-CA`). **WI-021 PASSED 2026-07-22/23** — template-scoped revocation
 proven live end-to-end: a cleanly-provisioned restricted officer revokes its

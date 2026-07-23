@@ -72,27 +72,34 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**PARKED at v1.0.0 (2026-07-15) — feature-complete for the charter; no active
-development planned.** The repo is public, released, and CI-gated (including a
-monthly scheduled run as a rot canary). Re-entry rules:
+**Released: v1.0.0. On `main`: v1.5 — feature-complete and live-reproven
+(2026-07-23), release tag pending.** v1.5 adds automated CA-side revocation
+(template-scoped officer restriction; two-identity default + opt-in
+single-identity `-LocalMode`) and self-enforced serverAuth EKU verification
+(WI-026), all landed via Plans 004–006. The repo is public and CI-gated
+(including a monthly rot-canary run). Re-entry rules:
 
 - **Any change to the issuance leg earns a live lab re-proof** (the standing
-  project rule — see the validation log in `docs/pre-pilot-checklist.md` for
-  the proven procedure). The parked release `v1.0.0` shares its issuance-path
-  source with the proven commit `c283d81`.
-- The parked backlog is in the work-item store: **WI-021** (post-issuance EKU
-  verification — MED-1 covers SANs but not EKU; the serverAuth-only guarantee
-  rests on template config). Note the store's WI numbering: WI-011..015 exist
-  only in plan documents, not the store — file new items with an explicit
-  identifier ≥ WI-022.
+  project rule — see the validation log in `docs/pre-pilot-checklist.md`). The
+  latest is the **WI-028 v1.5 re-proof (2026-07-23)**: base issuance + EKU +
+  the automated revocation round-trip (incl. single-identity) all PASSED.
+- **Remaining before pilot:** cut the **v1.5.0 release** (WI-029: version bump
+  + tag + GitHub release); the operator-owned §B–E items in the checklist; and
+  the **Finding E-1** remediation (the enrollment gMSA's Domain Computers
+  membership confers `Machine`-template enroll — see
+  `docs/revocation-scope-validation.md`). WI numbering: WI-011..015 exist only
+  in plan documents, not the store — file new items with an explicit
+  identifier ≥ WI-031.
 - A production pilot is gated on the operator-owned sections (§B–E) of
   `docs/pre-pilot-checklist.md`; those are per-deployment, not code debt.
-- If the scheduled CI run has gone red since the park date, fix CI first —
-  it is dependency/runner rot (pip-audit especially), not a code regression.
+- If the scheduled CI run has gone red, fix CI first — it is
+  dependency/runner rot (pip-audit especially), not a code regression.
 
-**Plans 001–003 complete (WI-001–WI-020); at the production-pilot bar.**
+**Plans 001–006 complete; at the production-pilot bar (v1.5 on `main`).**
 WI-001–WI-010 (ACME server, EAB/policy, enrollment, SIEM audit, out-of-band
-revocation) and WI-011–WI-014 (operator-enablement artifacts) shipped for 1.0.
+revocation) and WI-011–WI-014 (operator-enablement artifacts) shipped for 1.0;
+Plans 004–006 (WI-021–WI-034) add the automated CA-side revocation loop, EKU
+self-enforcement, and the single-identity option for v1.5.
 **WI-015** (live lab re-proof against the exact piloted commit) **PASSED**
 2026-07-13 on the lab host against `7d5c5b9` — all 12 cases (issue, policy
 denial, revocation, reason-7 rejection, chain off the existing CA). **Plan 003**

@@ -713,10 +713,15 @@ constraints for gMSA-acme-revoker$` above.
 
 Use `Register-MaintenanceTasks.ps1` to register the revocation sync task
 alongside the nonce-sweep and expired-order-sweep tasks. The task runs as the
-enrollment gMSA on the RA host, with `-LocalMode` (so `Sync-Revocations.ps1`
-calls `Revoke-Cert.ps1` locally on the RA host, against the CA configured in
-`-CaConfig`). Register in dry-run mode first (report-only), then re-register
-without `-DryRun` to arm it:
+enrollment gMSA on the RA host and passes `-LocalMode` to
+`Sync-Revocations.ps1`. `-LocalMode` does **not** change how revocation
+happens — `Sync-Revocations.ps1` invokes `Revoke-Cert.ps1` (and
+`certutil -revoke -config <CaConfig>`) identically in both topologies; the CA
+is always reached over RPC/DCOM per `-CaConfig`, whether the agent sits on a
+utility host or on the RA host. The flag is a deployment-intent signal: it
+records that the agent is running under the enrollment gMSA (which is also the
+revoker) and adjusts the run banner accordingly. Register in dry-run mode
+first (report-only), then re-register without `-DryRun` to arm it:
 
 ```powershell
 # Step 1: register in dry-run mode (report-only — no revocations applied):
@@ -727,6 +732,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1
     -TaskUser "WORK-DOMAIN\gMSA-acme-ra$" `
     -RegisterRevocationSync `
     -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -RequesterName "WORK-DOMAIN\gMSA-acme-ra$" `
     -LocalMode -DryRun
 
 # Step 2: after dry-run review, re-register without -DryRun to arm the task:
@@ -737,6 +743,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1
     -TaskUser "WORK-DOMAIN\gMSA-acme-ra$" `
     -RegisterRevocationSync `
     -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -RequesterName "WORK-DOMAIN\gMSA-acme-ra$" `
     -LocalMode
 ```
 
@@ -744,6 +751,36 @@ This registers the `acme-adcs-ra-sync-revocations` task. With `-DryRun` the
 task action passes `-DryRun` to `Sync-Revocations.ps1` (report-only); without
 it the task action passes `-Execute` (live). Rotate the admin token by
 re-registering the tasks (see the admin-token runbook).
+
+**`-RequesterName` is required in practice.** Replace `WORK-DOMAIN\...` with the
+**real** `DOMAIN\account` under which the RA enrolls, exactly as it appears in
+the CA database `Requester` column (e.g. `CONTOSO\gMSA-acme-ra$`). The WI-022
+requester check in `Revoke-Cert.ps1` refuses to revoke any cert whose CA-DB
+requester does not match this value; if you leave the committed placeholder,
+**every** revoke is rejected with "Requester mismatch". `Register-MaintenanceTasks.ps1`
+forwards `-RequesterName` into the scheduled-task action.
+
+**gMSA task logon type.** The revocation-sync task runs as a gMSA, which is
+never interactively logged on. `Register-MaintenanceTasks.ps1` registers it (and
+the nonce/sweep tasks) with `LogonType=Password` so the host retrieves the
+managed password — do not change the principal to Interactive or the task will
+register but silently never run.
+
+**CRL freshness (`-PublishCrl`, off by default).** By default the sync agent
+revokes each cert at the CA but does **not** republish the CRL: the revocation
+is recorded immediately in the CA database and becomes visible on the next
+**scheduled** CRL publication. This is deliberate least-privilege — `certutil
+-CRL republish` requires the **Manage-CA** role, which the template-scoped
+officer identity does not (and should not) hold. Pass `-PublishCrl` to force an
+immediate republish, but only if you have granted the identity CRL-publish
+rights. In the **single-identity** topology that means the internet-facing
+enrollment identity also holds Manage-CA (able to edit CA configuration,
+including its own `OfficerRights`) — **strongly discouraged**; it collapses the
+escalation bound. `-PublishCrl` is more defensible for the **dedicated
+two-identity revoker**, where CRL freshness may be worth the narrower blast
+radius of a revoke-only account holding Manage-CA. Choose it deliberately and
+record the decision (see threat-model §E). Default (scheduled CRL) is the
+recommended posture for both topologies.
 
 ##### Monitoring differences
 

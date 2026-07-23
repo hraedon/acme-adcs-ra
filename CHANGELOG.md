@@ -20,6 +20,44 @@ Targeting **1.5.0** — feature-complete (see `plans/005-v1.5-feature-complete.m
   against a real lab ACME-ServerAuth cert (EKU = serverAuth only → passes) plus
   unit coverage for clientAuth/anyEKU/no-EKU rejection; the dev/CI `fake_cert.pem`
   fixture is regenerated as serverAuth-only to match.
+- **`-PublishCrl` opt-in for the automated revocation loop.**
+  `Sync-Revocations.ps1` / `Register-MaintenanceTasks.ps1` now default to
+  least-privilege (revoke at the CA; let the CRL refresh on its scheduled
+  publication — the officer identity holds no Manage-CA/CRL-publish right) and
+  expose `-PublishCrl` to force an immediate republish where CRL freshness is
+  worth granting the identity Manage-CA (an explicit, recorded trade-off — see
+  threat-model §E; strongly discouraged in single-identity).
+
+### Fixed
+- **Live re-proof of the single-identity revocation path (2026-07-23, on the lab CA).** Provisioned the enrollment gMSA as a template-scoped officer
+  and drove the full loop as that identity; confirmed it revokes an
+  `ACME-ServerAuth` cert at the CA while the least-privilege bound holds (CRL
+  republish denied — needs Manage-CA). The pass surfaced and fixed the defects
+  below; CA returned to a pristine baseline afterward.
+- **`Revoke-Cert.ps1`: `certutil` argument order.** `-config` was placed *after*
+  the `-revoke`/`-CRL` verb, so `certutil` mis-parsed it as positional
+  ("Expected no more than 2 args, received 4") and no revoke could complete.
+  `-config` now precedes the verb.
+- **`Register-MaintenanceTasks.ps1`: gMSA task logon type.** Tasks were
+  registered with the default `LogonType=Interactive`; a gMSA never logs on
+  interactively, so the task registered but never ran. Now uses
+  `LogonType=Password` (or `ServiceAccount` for well-known SIDs).
+- **`Register-MaintenanceTasks.ps1`: `-RequesterName` pass-through.** The
+  revocation-sync task did not forward `-RequesterName`, so the committed
+  `WORK-DOMAIN\…` placeholder made the WI-022 requester check reject every
+  revoke. It is now a parameter, forwarded into the task action.
+- **`Register-MaintenanceTasks.ps1`: validation false-negative.** The
+  post-registration check queried `Get-ScheduledTask -TaskName "\folder\name"`
+  (a form that never matches), reporting "registration failed" and exiting 1
+  after a successful registration. Now queries by `-TaskName` + `-TaskPath`.
+- **`Set-OfficerRights.ps1`: OfficerRights written as REG_SZ.** The primary
+  `certutil -setreg <hex>` path stored the blob as a *string* on some builds
+  (observed on Server 2025), yielding a malformed, fail-closed value that breaks
+  all officer operations. The blob is now written as `REG_BINARY` via the
+  registry provider with a raw-bytes readback verify.
+- **All `.ps1` scripts: encoding.** Em-dashes/`§`/`→` in the (UTF-8, no-BOM)
+  scripts broke Windows PowerShell 5.1 parsing when a non-ASCII char landed in a
+  string literal. Normalised to ASCII (`--`, `section`, `->`).
 
 ## [1.0.0] — 2026-07-15
 
