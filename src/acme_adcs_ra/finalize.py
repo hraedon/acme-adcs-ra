@@ -391,7 +391,9 @@ _EKU_OID_LABELS: dict[str, str] = {
     "1.3.6.1.5.5.7.3.4": "emailProtection",
     "1.3.6.1.5.5.7.3.8": "timeStamping",
     "1.3.6.1.4.1.311.20.2.2": "smartcardLogon",
+    "1.3.6.1.5.2.3.3": "pkinitKDC",
     "1.3.6.1.5.2.3.4": "pkinitClientAuth",
+    "1.3.6.1.5.2.3.5": "pkinitServerAuth",
 }
 
 

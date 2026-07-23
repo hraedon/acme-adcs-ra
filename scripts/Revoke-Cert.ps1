@@ -1,6 +1,8 @@
 <#
 .SYNOPSIS
-    Revoke a certificate at the ADCS CA out-of-band (WI-010).
+    Revoke a certificate at the ADCS CA out-of-band (WI-010), with a
+    requester check (WI-022) that refuses to revoke certs not issued by the
+    expected enrollment identity.
 
 .DESCRIPTION
     acme-adcs-ra's `revokeCert` endpoint records the revocation in the RA store
@@ -20,7 +22,12 @@
       1. Confirms the cert exists at the CA (by serial or ReqID) before
          revoking, so a typo cannot silently no-op. Confirmation is
          locale-independent: it matches the hex serial value (which is always
-         hex regardless of OS locale), not a localized column header.
+         hex regardless of OS locale), not a localized column header. It then
+         asserts the CA-DB `Request.RequesterName` equals -RequesterName
+         (default the enrollment gMSA), refusing to revoke a cert not issued by
+         the expected identity (WI-022 -- defense-in-depth before the CA-side
+         officer restriction; the requester value is a SID/name string, not a
+         localized header, so the check is locale-independent).
       2. Maps the RFC 8555 reason code (0-10) to the `certutil -revoke`
          reason code (0=unspecified, 1=compromised, 2=CA compromise,
          3=affiliation changed, 4=superseded, 5=cessation of operation,
@@ -35,6 +42,14 @@
     records `revocation_scope=ra-store-only, ca_crl_updated=false` and this
     script's invocation (with the operator identity in the CA database) is the
     matching out-of-band half. Keep both records together in incident review.
+
+    Exit codes:
+      0  = success
+      3  = validation error (bad params, invalid reason)
+      4  = cert not found at the CA (serial or ReqID does not resolve)
+      5  = requester mismatch (cert was not issued by the expected enrollment
+           identity -- WI-022)
+      N  = certutil exit code (transport / CA-side failure)
 
 .PARAMETER Serial
     The certificate serial number (uppercase hex, no `0x` prefix) as the RA
@@ -55,6 +70,17 @@
 
 .PARAMETER Reason
     RFC 8555 revocation reason code (0-10). Default 0 (unspecified).
+
+.PARAMETER RequesterName
+    The expected enrollment identity (the gMSA that enrolls via the RA), in
+    `DOMAIN\account` form. The script asserts the CA-DB
+    `Request.RequesterName` of the target cert matches this value before
+    revoking (WI-022 -- defense-in-depth, bounds any operator typo or
+    automation to the RA's own issuance). Default:
+    `WORK-DOMAIN\gMSA-acme-ra$` (placeholder form -- the real value lives in
+    gitignored local config). The comparison is case-insensitive and
+    locale-independent (the requester value is a SID/name string, not a
+    localized column header).
 
 .PARAMETER SkipPublishCrl
     Skip the `certutil -CRL republish` step (use if a scheduled publication is
@@ -80,6 +106,7 @@ param(
 
     [Parameter(Mandatory = $true)][string]$CaConfig,
     [int]$Reason = 0,
+    [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
     [switch]$SkipPublishCrl
 )
 
@@ -89,7 +116,8 @@ $ErrorActionPreference = "Stop"
 # [Console]::Error.WriteLine (not Write-Error) so $ErrorActionPreference=Stop
 # does not turn the message into a terminating exception that swallows the
 # exit code — the documented exit-code contract (3=validation, 4=not-found,
-# certutil-code=transport) must be reachable by wrapping automation.
+# 5=requester mismatch, certutil-code=transport) must be reachable by wrapping
+# automation.
 function Die([string]$Message, [int]$Code) {
     [Console]::Error.WriteLine("ERROR: $Message")
     exit $Code
@@ -104,6 +132,13 @@ if ($Reason -notin $validReasons) {
     Die ("Reason {0} is not a valid RFC 8555 revocation reason (0-6, 8-10). Reason 7 is unused in RFC 5280." -f $Reason) 3
 }
 
+# WI-022: the requester check is a defense-in-depth gate -- an empty value
+# would match trivially, so require it non-empty. The default is the gMSA
+# placeholder; an operator may override it per deployment.
+if ([string]::IsNullOrWhiteSpace($RequesterName)) {
+    Die "-RequesterName is empty or whitespace. Pass the expected enrollment identity (e.g. WORK-DOMAIN\gMSA-acme-ra$)." 3
+}
+
 function Invoke-CertUtil([string[]]$CertutilArgs) {
     $out = & certutil @CertutilArgs 2>&1
     $code = $LASTEXITCODE
@@ -115,8 +150,11 @@ function Invoke-CertUtil([string[]]$CertutilArgs) {
 
 # Locale-independent confirmation: match the hex serial value itself (always
 # hex regardless of OS locale), not a localized column header. This avoids
-# the WI-007 class of bug (locale-dependent string parsing).
-function Confirm-SerialAtCa([string]$CaConfig, [string]$SerialHex) {
+# the WI-007 class of bug (locale-dependent string parsing). Also asserts the
+# CA-DB RequesterName matches the expected enrollment identity (WI-022):
+# the requester value is a SID/name string (locale-independent), so the check
+# matches the value, not a localized column header.
+function Confirm-SerialAtCa([string]$CaConfig, [string]$SerialHex, [string]$ExpectedRequester) {
     Write-Output ("Confirming cert with serial {0} at CA '{1}'..." -f $SerialHex, $CaConfig)
     $viewOut = Invoke-CertUtil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex", '-out', 'SerialNumber')
     $viewOut | ForEach-Object { Write-Output $_ }
@@ -129,6 +167,30 @@ function Confirm-SerialAtCa([string]$CaConfig, [string]$SerialHex) {
     if ($joined -notmatch [regex]::Escape($SerialHex)) {
         Die ("No certificate with serial {0} found at CA '{1}' -- refusing to revoke." -f $SerialHex, $CaConfig) 4
     }
+
+    # WI-022: assert the cert was requested by the expected enrollment
+    # identity (defense-in-depth before the CA-side officer restriction).
+    Write-Output ("Confirming requester for serial {0} is '{1}'..." -f $SerialHex, $ExpectedRequester)
+    $reqOut = Invoke-CertUtil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex", '-out', 'Request.RequesterName')
+    $reqOut | ForEach-Object { Write-Output $_ }
+    $reqJoined = $reqOut -join "`n"
+    # The requester value is a DOMAIN\account string (locale-independent);
+    # extract it with a regex rather than matching a localized header. The
+    # first DOMAIN\account token in the output is the requester -- certutil
+    # -view -out Request.RequesterName emits only that column, so no other
+    # backslash-bearing token appears.
+    $actualRequester = $null
+    $reqMatch = [regex]::Match($reqJoined, '([A-Za-z0-9][A-Za-z0-9._-]*\\[A-Za-z0-9][A-Za-z0-9._$-]*)')
+    if ($reqMatch.Success) {
+        $actualRequester = $reqMatch.Groups[1].Value
+    }
+    if ($null -eq $actualRequester) {
+        Die ("Could not parse Request.RequesterName for serial {0} at CA '{1}' -- refusing to revoke (unable to confirm requester)." -f $SerialHex, $CaConfig) 5
+    }
+    if (-not $actualRequester.Equals($ExpectedRequester, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Die ("Requester mismatch for serial {0}: expected '{1}', got '{2}' -- refusing to revoke (cert was not issued by the expected enrollment identity)." -f $SerialHex, $ExpectedRequester, $actualRequester) 5
+    }
+    Write-Output ("PASS: requester confirmed: {0}" -f $actualRequester)
 }
 
 # Look up the serial from a ReqID via certutil -view, locale-independently.
@@ -158,14 +220,14 @@ if ($PSCmdlet.ParameterSetName -eq "Serial") {
         Die "-Serial is empty or whitespace." 3
     }
     $targetSerial = $Serial.Trim().ToUpperInvariant() -replace '^0x', ''
-    Confirm-SerialAtCa $CaConfig $targetSerial
+    Confirm-SerialAtCa $CaConfig $targetSerial $RequesterName
 } else {
     $rid = $ReqID.Trim()
     if ($rid -notmatch '^\d+$') {
         Die ("ReqID '{0}' is not a decimal integer." -f $rid) 3
     }
     $targetSerial = Get-SerialFromReqId $CaConfig $rid
-    Confirm-SerialAtCa $CaConfig $targetSerial
+    Confirm-SerialAtCa $CaConfig $targetSerial $RequesterName
 }
 
 # 2. Revoke by serial. certutil -revoke accepts serials only (not ReqIDs).

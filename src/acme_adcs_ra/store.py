@@ -167,6 +167,7 @@ class CertificateRecord:
     status: str = "valid"
     revocation_reason: int | None = None
     revoked_at: str | None = None
+    ca_crl_updated: bool = False
 
 
 class RevocationUpdate(NamedTuple):
@@ -255,7 +256,8 @@ CREATE TABLE IF NOT EXISTS certificates (
     serial_number TEXT,
     status TEXT NOT NULL DEFAULT 'valid',
     revocation_reason TEXT,
-    revoked_at TEXT
+    revoked_at TEXT,
+    ca_crl_updated INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -371,6 +373,7 @@ class Store:
             ("status", "TEXT NOT NULL DEFAULT 'valid'"),
             ("revocation_reason", "TEXT"),
             ("revoked_at", "TEXT"),
+            ("ca_crl_updated", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE certificates ADD COLUMN {column} {ddl}")
@@ -423,6 +426,7 @@ class Store:
             status=row["status"],
             revocation_reason=revocation_reason,
             revoked_at=row["revoked_at"],
+            ca_crl_updated=bool(row["ca_crl_updated"]),
         )
 
     def _account_from_row(self, row: sqlite3.Row) -> AccountRecord:
@@ -1163,6 +1167,29 @@ class Store:
             # record so the caller can distinguish the two cases (None = not
             # found; a revoked record = idempotent success, won_cas=False).
         return RevocationUpdate(record=self.get_certificate(cert_id), won_cas=False)
+
+    def list_revoked_certificates(self, *, limit: int = 500) -> list[CertificateRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM certificates WHERE status = ? AND ca_crl_updated = 0 "
+                "ORDER BY revoked_at DESC LIMIT ?",
+                (CertStatus.REVOKED, limit),
+            ).fetchall()
+        return [self._certificate_from_row(row) for row in rows]
+
+    def confirm_ca_revocation(self, serial_hex: str) -> bool:
+        """Flip ca_crl_updated=1 for a revoked cert (WI-024 confirm callback).
+
+        Returns True if a row was updated, False if no matching revoked cert
+        was found (already confirmed, not revoked, or unknown serial).
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE certificates SET ca_crl_updated = 1 "
+                "WHERE serial_number = ? AND status = ? AND ca_crl_updated = 0",
+                (serial_hex.upper(), CertStatus.REVOKED),
+            )
+            return cursor.rowcount == 1
 
     # ------------------------------------------------------------------
     # Audit

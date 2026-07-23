@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 from acme_adcs_ra.config import EABEntry, RAConfig
 from acme_adcs_ra.enrollment import EnrollmentResult, FakeEnrollmentLeg
 from acme_adcs_ra.finalize import _issued_cert_eku_violations
+from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import Store
@@ -90,6 +91,11 @@ class TestIssuedCertEkuVerifier:
         violations = _issued_cert_eku_violations(_make_cert_pem([_CLIENT_AUTH]))
         assert any("clientAuth" in v for v in violations)
         assert any("serverAuth" in v and "absent" in v for v in violations)
+
+    def test_unknown_eku_oid_rejected(self) -> None:
+        unknown_oid = x509.ObjectIdentifier("1.2.3.4.5.6.7.8.9")
+        violations = _issued_cert_eku_violations(_make_cert_pem([_SERVER_AUTH, unknown_oid]))
+        assert any("1.2.3.4.5.6.7.8.9" in v for v in violations)
 
 
 class _EkuMisconfigEnrollmentLeg:
@@ -177,7 +183,7 @@ def _context_with_leg(config: RAConfig, leg: Any) -> ServerContext:
         store=store,
         policy=policy,
         enrollment=leg,
-        revocation=None,  # type: ignore[arg-type]
+        revocation=FakeRevocationLeg(),
     )
 
 

@@ -522,6 +522,147 @@ The tool is **read-only**: it never revokes, reactivates, or writes to
 either store. Exit code: `0` = all in-sync, `1` = drift found, `2` = error.
 Use `--json` for machine-readable output (e.g. for SIEM ingestion).
 
+### Automated revocation (WI-022/023/024/025)
+
+The out-of-band revocation loop (above) is **automated** in v1.5, closing the
+functional gap without granting the enrollment gMSA any CA-officer rights.
+The loop:
+
+1. **RA `revokeCert`** records the revocation in the RA store
+   (`revocation_scope=ra-store-only`, `ca_crl_updated=false`) — unchanged.
+2. **Pull agent** (`scripts/Sync-Revocations.ps1`, WI-024) runs as a
+   scheduled task on a **utility host** (not the CA) under a dedicated
+   `gMSA-acme-revoker$`. Each cycle it `GET`s the RA's pending set
+   (`GET /acme/admin/revocations/pending`, WI-023 — admin-token-gated),
+   then for each serial calls `Revoke-Cert.ps1` (which self-checks the
+   requester, WI-022) against the CA via remote-capable
+   `certutil -revoke -config` (no Kerberos double-hop).
+3. **Confirm callback**: on success the agent `POST`s to
+   `/acme/admin/revocations/<serial>/confirm` so the RA audit flips
+   `ca_crl_updated=true` and the serial drops out of the pending set
+   (idempotent — the agent is safe to run repeatedly).
+
+The authority to revoke lives **on the CA side**, under a separate
+template-bounded principal (`gMSA-acme-revoker$`), never on the RA host.
+The enrollment gMSA holds no CA-officer rights — the cardinal invariant
+holds (threat-model §E).
+
+#### Two hard provisioning constraints for `gMSA-acme-revoker$`
+
+Both were proven load-bearing in the Plan-004 live spike; skipping either
+silently defeats or breaks the restriction:
+
+1. **NOT a member of any broader certificate-manager group.** Officer
+   rights are evaluated across the caller's *entire* token (union
+   semantics). A restricted officer that is *also* a member of an
+   unrestricted certificate-manager group can revoke anything — the
+   restriction is silently defeated. Provision the revoker as a plain
+   domain principal with *only* its `ManageCertificates` grant and the
+   `OfficerRights` restriction; do not nest it in any broader role group.
+2. **Member of `Certificate Service DCOM Access`.** Without it the
+   revoke fails `0x8007000d ERROR_INVALID_DATA` — a visible failure, not
+   a silent bypass, but the loop will not complete. Add the gMSA to the
+   `Certificate Service DCOM Access` built-in group on the CA.
+
+#### Provisioning the officer restriction
+
+`scripts/Set-OfficerRights.ps1` (WI-025) productionizes the Plan-004
+builder — it writes the CA's `OfficerRights` registry value (a
+self-relative security descriptor with one callback ACE per officer) that
+scopes the revoker to `ACME-ServerAuth` only. Run **on the CA host**:
+
+```powershell
+# 1. Grant the revoker ManageCertificates on the CA Security descriptor
+#    (use certsrv.msc or PSPKI; this is the coarse role grant, distinct
+#    from the template-scoped OfficerRights below):
+Add-CAAccessControlEntry -User "WORK-DOMAIN\gMSA-acme-revoker$" `
+    -AccessType Allow -AccessMask ManageCertificates
+
+# 2. Add the revoker to Certificate Service DCOM Access (constraint 2):
+net localgroup "Certificate Service DCOM Access" "WORK-DOMAIN\gMSA-acme-revoker$" /add
+
+# 3. Scope the revoker to the ACME-ServerAuth template only (constraint 1
+#    is enforced by this restriction; confirm the gMSA is in no broader
+#    cert-manager group before proceeding):
+powershell -ExecutionPolicy Bypass -File .\scripts\Set-OfficerRights.ps1 `
+    -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -OfficerSid 'S-1-5-21-<revoker-gMSA-sid>' `
+    -TemplateOid '<ACME-ServerAuth-template-OID>'
+
+# 4. Verify by readback:
+powershell -File .\scripts\Get-OfficerRights.ps1 -CaConfig 'CA01\WORK-DOMAIN-CA'
+```
+
+`Set-OfficerRights.ps1` restarts `certsvc` (required for the change to
+take effect) and verifies the value by readback. To remove the restriction
+later: re-run with `-Remove` (if it was the last ACE, the `OfficerRights`
+value is deleted and the CA reverts to unrestricted — logged visibly).
+
+The GUI alternative (`certsrv.msc` → Certificate Managers tab) is correct
+by construction and is the reference path; the script reproduces the same
+byte-level ACE the GUI produces (proven in Plan 004).
+
+#### Scheduling the agent
+
+Register `Sync-Revocations.ps1` as a Windows Scheduled Task on the utility
+host, running as `gMSA-acme-revoker$`:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\acme-adcs-ra\scripts\Sync-Revocations.ps1 -RaBaseUrl 'https://ra.WORK-DOMAIN.local' -AdminToken '<admin-token>' -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute"
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5)
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2)
+Register-ScheduledTask -TaskName "acme-adcs-ra-sync-revocations" `
+    -Action $action -Trigger $trigger -Settings $settings `
+    -User "WORK-DOMAIN\gMSA-acme-revoker$" -Force
+```
+
+The admin token is embedded in the task action's arguments (not written to
+a file the task reads); rotate it by re-registering (see the admin-token
+runbook). Tune the interval to your latency requirement (default 5 minutes
+shown; the RA audit records `ca_crl_updated` lag so you can measure the
+actual cadence).
+
+#### Dry-run → execute promotion
+
+`Sync-Revocations.ps1` is **dry-run by default** (fail-visible). Without
+`-Execute` it fetches the pending set and prints what it would do, making
+no change. Promotion path:
+
+1. Deploy the script and the scheduled task **without** `-Execute`
+   (report-only). Confirm the dry-run output shows the expected pending
+   serials and the correct `Revoke-Cert.ps1` invocation.
+2. Review the first few cycles' dry-run logs against
+   `Reconcile-Revocation.ps1` (the `revoked_in_ra_active_at_ca` bucket
+   should match the dry-run pending set).
+3. Arm the task by re-registering with `-Execute`. The first cycle after
+   arming should revoke the pending serials and confirm them back to the RA
+   (`ca_crl_updated=true` in the audit).
+
+#### Monitoring
+
+Alert on:
+
+- **Agent exit codes** (the scheduled task's last result):
+  - `0` = success (all pending revoked, or dry-run completed, or nothing
+    pending).
+  - `1` = RA unreachable — the agent could not fetch the pending set.
+    Investigate network / RA health.
+  - `2` = partial failure — one or more serials failed to revoke. The
+    per-serial log lines name the failing serial and the `Revoke-Cert.ps1`
+    exit code; investigate (common causes: requester mismatch = exit 5 =
+    the serial was not issued by the RA's gMSA; certutil error = CA-side
+    issue).
+- **RA audit events**: `certificate-revoked` with
+  `ca_crl_updated=false` lingering longer than the agent interval × 2
+  means the loop is stuck (the agent is not closing the confirm callback).
+- **The `revoked_in_ra_active_at_ca` reconciliation bucket** (run
+  `Reconcile-Revocation.ps1` periodically) — if it grows, the agent is
+  not keeping up or is failing silently. This is the independent
+  cross-check (it reads the CA DB directly, not the agent's self-report).
+
 ## Backup and restore
 
 ### What to back up

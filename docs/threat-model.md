@@ -289,6 +289,62 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   is still valid against the CA's CRL until the operator runs
   `Revoke-Cert.ps1`.**
 
+- **Automated CA-side revocation (v1.5, WI-022/023/024/025).** v1.5 adds an
+  **automated, template-bounded** CA-side revocation loop that closes the
+  functional gap without widening the *enrollment* gMSA's rights. A separate
+  **`gMSA-acme-revoker$`** identity — distinct from the enrollment gMSA — runs
+  `scripts/Sync-Revocations.ps1` as a scheduled task on a utility host. The
+  loop: `GET /acme/admin/revocations/pending` (WI-023) → `Revoke-Cert.ps1`
+  (WI-022, with requester-check) → `POST /acme/admin/revocations/{serial}/confirm`
+  (WI-024 callback, flips `ca_crl_updated=true` in the RA audit). The revoker
+  is **not** the enrollment gMSA; the enrollment gMSA still holds no CA-officer
+  rights.
+
+  **Blast radius of `gMSA-acme-revoker$`:** the revoker's CA-officer rights are
+  **template-scoped** via an `OfficerRights` callback ACE (Plan 004, proven live
+  in WI-021): it can revoke certs issued under `ACME-ServerAuth` only. Revoking
+  any other template yields `CERTSRV_E_RESTRICTEDOFFICER`. This bounds a
+  compromised revoker to **denial-of-availability for the RA's own TLS certs** —
+  the same blast radius as a compromised issuing account (which can already
+  revoke its own certs via `revokeCert`). It cannot revoke DomainController,
+  CAExchange, or any other template; it cannot issue certs; it cannot read
+  private keys.
+
+  **Two hard provisioning constraints** (violating either silently defeats the
+  restriction or breaks it visibly):
+  1. **Not a member of any broader certificate-manager group.** Officer rights
+     are a union over the token — a broader-manager membership (e.g. Certificate
+     Administrators) silently grants unrestricted revoke, defeating the
+     `OfficerRights` ACE. The revoker must belong to no such group.
+  2. **Member of `Certificate Service DCOM Access`.** Without this, `certutil
+     -revoke` fails with `ERROR_INVALID_DATA` (0x8007000d) — a visible failure,
+     not a silent bypass, but it breaks the automation.
+
+  **Defense-in-depth layers:**
+  - `Revoke-Cert.ps1` (WI-022) asserts `Request.RequesterName` matches the
+    enrollment gMSA before revoking — the CA-side restriction is template-scoped,
+    not requester-scoped (C2 in the validation matrix), so this check prevents
+    the agent from revoking certs the RA did not issue even if they share the
+    `ACME-ServerAuth` template.
+  - The agent ships in **dry-run default** (`-Execute` required to arm); every
+    auto-revoke lands in both the CA DB (under the revoker identity) and the RA
+    audit (`revocation-ca-confirmed`, `ca_crl_updated=true`).
+  - The loop is **one-directional** (RA→CA only). CA-initiated revocations
+    (the reverse bucket) remain a human review item surfaced by
+    `Reconcile-Revocation.ps1`.
+
+- **serverAuth guarantee is now self-enforced (WI-026, v1.5).** The
+  "blast radius bounded to spoofing internal TLS" property no longer rests
+  solely on ADCS template config. `finalize.py::_issued_cert_eku_violations`
+  inspects the issued cert's EKU and **rejects** any cert whose EKU is not
+  exactly `{serverAuth}` (1.3.6.1.5.5.7.3.1) — absent EKU (all-purpose),
+  `clientAuth`, `anyExtendedKeyUsage`, PKINIT, or any other OID all fail
+  closed (audit `finalize-issued-cert-eku-mismatch` + `server_internal`, cert
+  not recorded or served). A template that ever gained clientAuth/PKINIT would
+  be caught at finalize, not silently passed through. The threat-model §E
+  worst case (domain-takeover via clientAuth/PKINIT mis-issuance) is now
+  bounded by the RA itself, not assumed from the CA config.
+
 ### F. Audit / SIEM
 - **Every** issuance, policy-denial, enrollment-failure, account creation
   (success **and** denied), and revocation is recorded in the RA SQLite store

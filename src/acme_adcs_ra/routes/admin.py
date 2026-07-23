@@ -16,7 +16,7 @@ from acme_adcs_ra.app_state import (
 )
 from acme_adcs_ra.finalize import _refresh_order_or_500
 from acme_adcs_ra.serializers import _order_to_admin_json, _order_to_json
-from acme_adcs_ra.store import OrderStatus
+from acme_adcs_ra.store import CertStatus, OrderStatus
 
 
 router = APIRouter()
@@ -171,3 +171,82 @@ async def list_orders(
     return JSONResponse(
         content={"orders": [_order_to_admin_json(o) for o in orders]}
     )
+
+
+# Administrative: list certificates the RA has marked revoked, for the
+# out-of-band CA-side revocation loop (WI-024). Read-only; the CA agent
+# pulls this view and runs certutil -revoke against the CA itself.
+@router.get("/acme/admin/revocations/pending")
+async def list_pending_revocations(
+    request: Request,
+    ctx: ServerContext = Depends(get_context),
+    limit: int = 500,
+) -> JSONResponse:
+    _require_admin_token(request, ctx)
+    if not 1 <= limit <= 500:
+        raise malformed("limit must be between 1 and 500")
+    certs = ctx.store.list_revoked_certificates(limit=limit)
+    pending_revocations = []
+    for cert in certs:
+        if cert.serial_number is None:
+            continue
+        pending_revocations.append({
+            "serial": cert.serial_number,
+            "req_id": cert.metadata.get("req_id", ""),
+            "reason": cert.revocation_reason,
+            "revoked_at": cert.revoked_at,
+        })
+    _audit(ctx,
+        event_type="admin-list-pending-revocations",
+        outcome="success",
+        details={"returned": len(pending_revocations)},
+    )
+    return JSONResponse(content={"pending_revocations": pending_revocations})
+
+
+# Administrative: confirm that the CA-side CRL was written for a serial the
+# RA had marked revoked (WI-024 callback). The pull agent calls this after a
+# successful certutil -revoke so the RA flips ca_crl_updated=1 and the serial
+# drops out of the pending set on the next pull. Idempotent: a repeat call for
+# an already-confirmed serial returns 200 without a new audit event.
+@router.post("/acme/admin/revocations/{serial}/confirm")
+async def confirm_ca_revocation(
+    serial: str,
+    request: Request,
+    ctx: ServerContext = Depends(get_context),
+) -> JSONResponse:
+    _require_admin_token(request, ctx)
+    serial_upper = serial.strip().upper().removeprefix("0X").removeprefix("0x")
+    if not serial_upper:
+        raise malformed("serial must not be empty")
+    cert = ctx.store.get_certificate_by_serial(serial_upper)
+    if cert is None:
+        _audit(ctx,
+            event_type="admin-revocation-confirm-denied",
+            outcome="failed",
+            details={"serial": serial_upper, "reason": "not-found"},
+        )
+        raise not_found("certificate not found in RA store")
+    if cert.status != CertStatus.REVOKED:
+        _audit(ctx,
+            event_type="admin-revocation-confirm-denied",
+            outcome="failed",
+            details={"serial": serial_upper, "reason": "not-revoked", "cert_status": cert.status},
+        )
+        raise malformed("certificate is not revoked in the RA store")
+    flipped = ctx.store.confirm_ca_revocation(serial_upper)
+    if not flipped:
+        return JSONResponse(content={"serial": serial_upper, "ca_crl_updated": True})
+    _audit(ctx,
+        event_type="revocation-ca-confirmed",
+        account_id=cert.account_id,
+        order_id=cert.order_id,
+        outcome="success",
+        details={
+            "serial": serial_upper,
+            "certificate_id": cert.id,
+            "ca_crl_updated": True,
+            "revocation_scope": "ca-crl",
+        },
+    )
+    return JSONResponse(content={"serial": serial_upper, "ca_crl_updated": True})
