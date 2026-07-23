@@ -20,10 +20,23 @@
          `ca_crl_updated` to true and the serial drops out of the pending
          set on the next pull (idempotent).
 
-    Run as a scheduled task on a UTILITY HOST (not the CA) under a dedicated
-    `gMSA-acme-revoker$` whose CA-side officer power is template-scoped to
-    `ACME-ServerAuth` by the CA's `OfficerRights` restriction (WI-025). The
-    enrollment gMSA holds no CA-officer rights — the cardinal invariant holds.
+    Two deployment topologies are supported:
+
+      - Two-identity (default, recommended): the agent runs as a scheduled
+        task on a UTILITY HOST (not the CA) under a dedicated
+        `gMSA-acme-revoker$` whose CA-side officer power is template-scoped
+        to `ACME-ServerAuth` by the CA's `OfficerRights` restriction
+        (WI-025). The enrollment gMSA holds no CA-officer rights — the
+        cardinal invariant holds.
+
+      - Single-identity (opt-in, -LocalMode): the agent runs on the RA host
+        under the enrollment gMSA, which is also the revoker. The enrollment
+        gMSA must be granted template-scoped OfficerRights on the CA (see
+        docs/operations.md ## Single-identity deployment). This is a weaker
+        posture (one credential compromise grants both issue and revoke —
+        see threat-model §E) but operationally simpler. The invocation
+        mechanism is unchanged; -LocalMode signals deployment intent and
+        adjusts the mode banner/output.
 
     Fail-visible, dry-run default. Without -Execute the script is report-only:
     it fetches the pending set and prints what it WOULD do, making no change.
@@ -73,6 +86,14 @@
     Directory containing `Revoke-Cert.ps1`. Default: the same directory as
     this script ($PSScriptRoot).
 
+.PARAMETER LocalMode
+    Single-identity deployment: the agent runs on the RA host under the
+    enrollment gMSA (which is also the revoker). The enrollment gMSA must
+    have template-scoped OfficerRights on the CA (see docs/operations.md
+    ## Single-identity deployment). The requester check passes trivially
+    since the revoker IS the enrollment gMSA. This flag adjusts the mode
+    banner and output; the invocation mechanism is unchanged.
+
 .EXAMPLE
     # Dry run (default — report only, no changes):
     powershell -File .\scripts\Sync-Revocations.ps1 `
@@ -87,12 +108,26 @@
         -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
         -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute
 
+.EXAMPLE
+    # Single-identity deployment (agent on the RA host under the enrollment
+    # gMSA, which is also the revoker):
+    powershell -File .\scripts\Sync-Revocations.ps1 `
+        -RaBaseUrl "https://ra.WORK-DOMAIN.local" `
+        -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
+        -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute -LocalMode
+
 .NOTES
     Schedule as a Windows Scheduled Task running as `gMSA-acme-revoker$` on
     a utility host with line-of-sight to both the RA (HTTPS) and the CA
     (certutil -config RPC/DCOM). See docs/operations.md ## Automated
     revocation. No signing key, no enrollment — this is an operator/revoker
     tool only.
+
+    For single-identity deployments, pass -LocalMode and schedule the task
+    on the RA host under the enrollment gMSA (which is also the revoker).
+    See docs/operations.md ## Single-identity deployment and threat-model
+    §E for the explicit trade-off. The invocation mechanism is the same
+    either way; -LocalMode signals the deployment topology.
 #>
 [CmdletBinding()]
 param(
@@ -102,7 +137,8 @@ param(
     [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
     [switch]$DryRun,
     [switch]$Execute,
-    [string]$ScriptDir = ""
+    [string]$ScriptDir = "",
+    [switch]$LocalMode
 )
 
 $ErrorActionPreference = "Stop"
@@ -143,9 +179,18 @@ $base = $RaBaseUrl.TrimEnd('/')
 $headers = @{ 'Authorization' = "Bearer $AdminToken" }
 
 if ($liveMode) {
-    Write-Output "MODE: EXECUTE (live — revocations WILL be applied at the CA)."
+    if ($LocalMode) {
+        Write-Output "MODE: EXECUTE (live, single-identity — revoking as the enrollment gMSA)."
+    } else {
+        Write-Output "MODE: EXECUTE (live — revocations WILL be applied at the CA)."
+    }
 } else {
-    Write-Output "MODE: DRY-RUN (report only — no changes). Pass -Execute to apply."
+    if ($LocalMode) {
+        Write-Output "MODE: DRY-RUN (report only, single-identity). Pass -Execute to apply."
+        Write-Output "NOTE: -LocalMode in dry-run is still report-only — no revocations are applied."
+    } else {
+        Write-Output "MODE: DRY-RUN (report only — no changes). Pass -Execute to apply."
+    }
 }
 Write-Output ""
 
