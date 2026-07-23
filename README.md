@@ -85,13 +85,33 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **Project status:** released version is **v1.0.0**; the **v1.5** line
-> (automated CA-side revocation + self-enforced serverAuth EKU, with an opt-in
-> single-identity deployment) is **feature-complete on `main` and live-reproven
-> (2026-07-23)** — the v1.5.0 release tag is the one remaining step. Otherwise
-> maintained passively: security reports (see `SECURITY.md`) and bug reports are
-> welcome, but there is no response-time commitment. Deploying this is
-> issuance-path infrastructure: work through
+> **Project status:** **released at v1.5.0** (2026-07-23) — feature-complete for
+> its charter. v1.5 adds **automated CA-side revocation** (template-scoped officer
+> restriction; recommended two-identity topology + an opt-in single-identity
+> `-LocalMode` deployment) and **self-enforced serverAuth EKU verification**, on
+> top of the v1.0 issuance path. The automated revocation loop was **live-reproven
+> end-to-end on the lab** (WI-028). Maintained deliberately, not passively:
+> security reports (see `SECURITY.md`) and bug reports are welcome, but there is no
+> response-time commitment.
+>
+> **Known limitations before a production pilot** (a **v1.6 hardening sweep** is
+> planned — see [`plans/007-v1.6-hardening-sweep.md`](plans/007-v1.6-hardening-sweep.md)):
+>
+> - **Enrollment-side bound (Finding E-1):** the serverAuth-only guarantee is
+>   enforced on the RA path, but the enrollment gMSA can, by ADCS default (Domain
+>   Computers → `Machine` template enroll), request non-serverAuth certs if it
+>   *bypasses* the RA. Remediate per your estate before relying on the bound; see
+>   [`docs/revocation-scope-validation.md`](docs/revocation-scope-validation.md).
+> - **Recommended topology proof:** the two-identity (dedicated-revoker) design is
+>   documented as the default but has so far been proven live only in the
+>   single-identity form.
+> - **PowerShell test coverage:** the operator scripts have no automated tests yet
+>   (v1.6 WI-037); changes to them warrant a live lab re-proof.
+> - **CI ≠ ADCS-verified:** cloud CI cannot reach a CA, so a green build does not
+>   confirm the enrollment/revocation legs still work — those rest on periodic live
+>   re-proofs (see the validation log in the checklist).
+>
+> Deploying this is issuance-path infrastructure: work through
 > [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md) before running it
 > anywhere that matters.
 
