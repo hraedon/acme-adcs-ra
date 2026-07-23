@@ -6,7 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Targeting **1.5.0** — feature-complete (see `plans/005-v1.5-feature-complete.md`).
+## [1.5.0] — 2026-07-23
+
+**Automated CA-side revocation + self-enforced serverAuth.** Builds on 1.0.0's
+issuance path (behaviourally unchanged) by closing the revocation loop the RA
+previously left to a manual operator step, and by making the serverAuth-only
+guarantee self-enforcing at finalize. Landed via Plans 004–006. The automated
+revocation loop — both the recommended two-identity topology and the opt-in
+single-identity (`-LocalMode`) topology — was **live-reproven end-to-end on the
+lab (2026-07-23, WI-028)**: base issuance + EKU verification, and the full
+round-trip (RA `revokeCert` → CA-side pull agent → CA revoke → RA confirm) with
+the WI-022 requester check and the WI-025 template-scoped officer restriction
+both active, the least-privilege bound intact (CRL republish denied to the
+officer identity), and the confirm loop closing (`ca_crl_updated=true`).
 
 ### Added
 - **WI-026 — post-issuance EKU verification.** Finalize now inspects the *issued*
