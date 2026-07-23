@@ -376,6 +376,56 @@ def _issued_cert_san_violations(
     return issued_dns, unauthorized, non_dns
 
 
+# WI-026: serverAuth is the ONLY EKU a server-authentication template may issue.
+# A cert with NO EKU extension is all-purpose; anyExtendedKeyUsage is likewise
+# unbounded; clientAuth/PKINIT would enable authenticating *as* a principal — the
+# domain-takeover escalation the threat model names as the worst case short of a
+# signing key. The "blast radius bounded to spoofing internal TLS" guarantee
+# otherwise rests entirely on ADCS template config; this enforces it on the
+# *result* so a misconfigured/swapped template cannot silently break it.
+_SERVER_AUTH_EKU_OID = "1.3.6.1.5.5.7.3.1"
+_EKU_OID_LABELS: dict[str, str] = {
+    "1.3.6.1.5.5.7.3.2": "clientAuth",
+    "2.5.29.37.0": "anyExtendedKeyUsage",
+    "1.3.6.1.5.5.7.3.3": "codeSigning",
+    "1.3.6.1.5.5.7.3.4": "emailProtection",
+    "1.3.6.1.5.5.7.3.8": "timeStamping",
+    "1.3.6.1.4.1.311.20.2.2": "smartcardLogon",
+    "1.3.6.1.5.2.3.4": "pkinitClientAuth",
+}
+
+
+def _issued_cert_eku_violations(cert_pem: str) -> list[str]:
+    """WI-026: verify the *issued* cert's Extended Key Usage is exactly serverAuth.
+
+    Returns a list of human-readable violations (empty = serverAuth-only). The
+    caller fails closed (audit + 500, no cert recorded/served) on any violation,
+    exactly as MED-1's SAN check does. Rejects: a missing EKU extension (a
+    no-EKU cert is all-purpose), anyExtendedKeyUsage, and any EKU OID other than
+    serverAuth (clientAuth, PKINIT, code-signing, …).
+    """
+    try:
+        issued = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive; enrollment parsed it
+        raise server_internal(f"issued cert unparseable: {exc}") from exc
+    try:
+        eku_ext = issued.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE)
+    except x509.ExtensionNotFound:
+        return ["no Extended Key Usage extension (certificate is all-purpose)"]
+    eku_value = cast(x509.ExtendedKeyUsage, eku_ext.value)
+    oids = [oid.dotted_string for oid in eku_value]
+    violations: list[str] = []
+    non_server = [o for o in oids if o != _SERVER_AUTH_EKU_OID]
+    if non_server:
+        labelled = [
+            f"{_EKU_OID_LABELS[o]} ({o})" if o in _EKU_OID_LABELS else o for o in non_server
+        ]
+        violations.append(f"EKU beyond serverAuth: {labelled}")
+    if _SERVER_AUTH_EKU_OID not in oids:
+        violations.append("serverAuth EKU (1.3.6.1.5.5.7.3.1) absent")
+    return violations
+
+
 def _finalize_complete(
     ctx: ServerContext,
     order_id: str,
@@ -432,6 +482,36 @@ def _finalize_complete(
         raise server_internal(
             f"issued certificate fails SAN verification — {'; '.join(violations)}; "
             "the ADCS template is likely misconfigured"
+        )
+
+    # WI-026: verify the issued cert is serverAuth-only. The cardinal blast-radius
+    # bound rests on the template issuing serverAuth EKU only; a template that ever
+    # gained clientAuth/PKINIT/anyEKU (or a no-EKU all-purpose cert) would silently
+    # break it — the domain-takeover escalation the threat model calls the worst
+    # case short of a signing key. Enforce on the result; fail closed like MED-1.
+    eku_violations = _issued_cert_eku_violations(enrollment_result.cert_pem)
+    if eku_violations:
+        _audit(
+            ctx,
+            event_type="finalize-issued-cert-eku-mismatch",
+            account_id=account_id,
+            order_id=order_id,
+            sans=requested_sans,
+            template=enrollment_result.template,
+            requester=enrollment_result.requester,
+            outcome="failed",
+            details={
+                "certificate_id_order": order_id,
+                "eku_violations": eku_violations,
+                "reason": (
+                    "issued cert is not serverAuth-only — the ADCS template must "
+                    "issue the serverAuth EKU and nothing else"
+                ),
+            },
+        )
+        raise server_internal(
+            f"issued certificate fails EKU verification — {'; '.join(eku_violations)}; "
+            "the ADCS template is likely misconfigured (serverAuth-only required)"
         )
 
     existing_cert = ctx.store.get_certificate_by_order(order_id)

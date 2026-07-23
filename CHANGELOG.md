@@ -4,6 +4,23 @@ All notable changes to acme-adcs-ra are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Targeting **1.5.0** — feature-complete (see `plans/005-v1.5-feature-complete.md`).
+
+### Added
+- **WI-026 — post-issuance EKU verification.** Finalize now inspects the *issued*
+  certificate's Extended Key Usage and fails closed (500, audited as
+  `finalize-issued-cert-eku-mismatch`, no cert recorded or served) unless it is
+  exactly `serverAuth`. This self-enforces the cardinal "blast radius bounded to
+  spoofing internal TLS" guarantee, which previously rested solely on ADCS
+  template configuration — a template that ever gained clientAuth/PKINIT/anyEKU
+  (or issued a no-EKU all-purpose cert) would otherwise silently break it. Sibling
+  to the MED-1 SAN check (`finalize.py::_issued_cert_eku_violations`). Validated
+  against a real lab ACME-ServerAuth cert (EKU = serverAuth only → passes) plus
+  unit coverage for clientAuth/anyEKU/no-EKU rejection; the dev/CI `fake_cert.pem`
+  fixture is regenerated as serverAuth-only to match.
+
 ## [1.0.0] — 2026-07-15
 
 Promotion of 1.0.0-rc1 to final. **No issuance-path source changes** since the
