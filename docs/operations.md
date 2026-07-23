@@ -526,6 +526,14 @@ Use `--json` for machine-readable output (e.g. for SIEM ingestion).
 
 The out-of-band revocation loop (above) is **automated** in v1.5, closing the
 functional gap without granting the enrollment gMSA any CA-officer rights.
+
+> **Deploying the operator scripts:** copy the **entire `scripts/` directory,
+> including `scripts/lib/`** — do not cherry-pick individual `.ps1` files.
+> `Set-OfficerRights.ps1` and `Register-MaintenanceTasks.ps1` dot-source
+> `scripts/lib/*.ps1` at runtime (the shared byte/SD and task-action builders,
+> also exercised by the Pester suite); without `scripts/lib/` alongside them they
+> fail at load with a "cannot find lib/..." error.
+
 The loop:
 
 1. **RA `revokeCert`** records the revocation in the RA store
