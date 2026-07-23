@@ -20,10 +20,10 @@ dependencies = [
 acme-adcs-ra = "acme_adcs_ra.__main__:main"
 
 [project.optional-dependencies]
-# ruff and mypy are pinned: CI installs dev deps unlocked (`uv pip install -e
-# ".[dev]"`), so an unpinned linter drifts to whatever version published most
-# recently and can fail CI on unchanged code. Bump these deliberately (the
-# monthly rot-canary run surfaces when a bump is due).
+# ruff and mypy are pinned in pyproject.toml AND locked in uv.lock: CI
+# installs via `uv sync --locked`, so the lockfile is the single source of
+# truth at install time. The pins here keep `uv lock` deterministic; bump
+# them deliberately (the monthly rot-canary surfaces when a bump is due).
 dev = ["pytest", "httpx", "ruff==0.15.17", "mypy==2.1.0", "types-requests"]
 
 [build-system]
