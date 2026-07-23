@@ -152,6 +152,21 @@ def _walk_to_ready(acme_client: HandRolledAcmeClient, identifiers: list[str]) ->
     return order
 
 
+def _issue_cert_record(
+    acme_client: HandRolledAcmeClient,
+    test_config: RAConfig,
+) -> Any:
+    """Issue a certificate through the ACME flow and return its store record."""
+    acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
+    order = _walk_to_ready(acme_client, ["srv01.WORK-DOMAIN.local"])
+    csr_der = _make_csr(["srv01.WORK-DOMAIN.local"])
+    finalize_resp = acme_client.finalize_order(order["finalize"], csr_der)
+    assert finalize_resp.status_code == 200
+    cert_url = finalize_resp.json()["certificate"]
+    cert_id = cert_url.rsplit("/", 1)[-1]
+    return Store(test_config.db_path).get_certificate(cert_id)
+
+
 class _CountingEnrollmentLeg:
     """Wraps FakeEnrollmentLeg and counts submit_csr calls.
 
@@ -2077,3 +2092,260 @@ class TestAdminOrderListing:
         assert stuck["status"] == "processing"
         assert "processing_started_at" in stuck
         assert "account_id" in stuck
+
+
+# ---------------------------------------------------------------------------
+# WI-023: pending revocations admin view
+# ---------------------------------------------------------------------------
+
+
+class TestAdminPendingRevocations:
+    """GET /acme/admin/revocations/pending — RA-side revocation pull feed."""
+
+    def test_pending_revocations_requires_token(self, client: TestClient) -> None:
+        resp = client.get("/acme/admin/revocations/pending")
+        assert resp.status_code == 401
+
+    def test_pending_revocations_rejects_wrong_token(self, client: TestClient) -> None:
+        resp = client.get(
+            "/acme/admin/revocations/pending",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+
+    def test_pending_revocations_empty_when_none(
+        self, client: TestClient
+    ) -> None:
+        resp = client.get(
+            "/acme/admin/revocations/pending",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"pending_revocations": []}
+
+    def test_pending_revocations_returns_revoked_cert(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        cert = _issue_cert_record(acme_client, test_config)
+        assert cert is not None
+        store = Store(test_config.db_path)
+        store.revoke_certificate(cert.id, reason=1)
+
+        resp = client.get(
+            "/acme/admin/revocations/pending",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["pending_revocations"]) == 1
+        entry = body["pending_revocations"][0]
+        assert entry["serial"] == cert.serial_number
+        assert entry["reason"] == 1
+        assert entry["revoked_at"] is not None
+        assert entry["req_id"] == ""
+
+    def test_pending_revocations_does_not_return_valid_cert(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        cert = _issue_cert_record(acme_client, test_config)
+        assert cert is not None
+
+        resp = client.get(
+            "/acme/admin/revocations/pending",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["pending_revocations"] == []
+
+    def test_pending_revocations_limit_validation(
+        self, client: TestClient
+    ) -> None:
+        resp = client.get(
+            "/acme/admin/revocations/pending?limit=0",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 400
+
+        resp = client.get(
+            "/acme/admin/revocations/pending?limit=501",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 400
+
+    def test_pending_revocations_is_audited(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        cert = _issue_cert_record(acme_client, test_config)
+        assert cert is not None
+        store = Store(test_config.db_path)
+        store.revoke_certificate(cert.id, reason=1)
+
+        client.get(
+            "/acme/admin/revocations/pending",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+        events = store.list_audit_events(event_type="admin-list-pending-revocations")
+        assert any(
+            e["outcome"] == "success"
+            and e["details"].get("returned") == 1
+            for e in events
+        )
+
+
+class TestAdminConfirmRevocation:
+    """POST /acme/admin/revocations/{serial}/confirm — WI-024 callback."""
+
+    def test_confirm_requires_token(self, client: TestClient) -> None:
+        resp = client.post("/acme/admin/revocations/ABC123/confirm")
+        assert resp.status_code == 401
+
+    def test_confirm_rejects_wrong_token(self, client: TestClient) -> None:
+        resp = client.post(
+            "/acme/admin/revocations/ABC123/confirm",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+
+    def test_confirm_unknown_serial_404(self, client: TestClient) -> None:
+        resp = client.post(
+            "/acme/admin/revocations/DEADBEEF/confirm",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 404
+
+    def test_confirm_valid_cert_is_rejected(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        cert = _issue_cert_record(acme_client, test_config)
+        assert cert is not None
+        resp = client.post(
+            f"/acme/admin/revocations/{cert.serial_number}/confirm",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 400
+
+    def test_confirm_revoked_cert_succeeds(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        cert = _issue_cert_record(acme_client, test_config)
+        assert cert is not None
+        store = Store(test_config.db_path)
+        store.revoke_certificate(cert.id, reason=1)
+
+        resp = client.post(
+            f"/acme/admin/revocations/{cert.serial_number}/confirm",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["serial"] == cert.serial_number
+        assert body["ca_crl_updated"] is True
+
+    def test_confirm_is_audited(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        cert = _issue_cert_record(acme_client, test_config)
+        assert cert is not None
+        store = Store(test_config.db_path)
+        store.revoke_certificate(cert.id, reason=1)
+
+        client.post(
+            f"/acme/admin/revocations/{cert.serial_number}/confirm",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+        events = store.list_audit_events(event_type="revocation-ca-confirmed")
+        assert any(
+            e["outcome"] == "success"
+            and e["details"].get("serial") == cert.serial_number
+            and e["details"].get("ca_crl_updated") is True
+            for e in events
+        )
+
+    def test_confirm_denied_is_audited(
+        self,
+        client: TestClient,
+        test_config: RAConfig,
+    ) -> None:
+        client.post(
+            "/acme/admin/revocations/DEADBEEF/confirm",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        store = Store(test_config.db_path)
+        events = store.list_audit_events(event_type="admin-revocation-confirm-denied")
+        assert any(e["details"].get("reason") == "not-found" for e in events)
+
+    def test_confirm_drops_serial_from_pending(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        cert = _issue_cert_record(acme_client, test_config)
+        assert cert is not None
+        store = Store(test_config.db_path)
+        store.revoke_certificate(cert.id, reason=1)
+
+        resp = client.get(
+            "/acme/admin/revocations/pending",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert len(resp.json()["pending_revocations"]) == 1
+
+        client.post(
+            f"/acme/admin/revocations/{cert.serial_number}/confirm",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+        resp = client.get(
+            "/acme/admin/revocations/pending",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp.json()["pending_revocations"] == []
+
+    def test_confirm_is_idempotent(
+        self,
+        acme_client: HandRolledAcmeClient,
+        test_config: RAConfig,
+        client: TestClient,
+    ) -> None:
+        cert = _issue_cert_record(acme_client, test_config)
+        assert cert is not None
+        store = Store(test_config.db_path)
+        store.revoke_certificate(cert.id, reason=1)
+
+        resp1 = client.post(
+            f"/acme/admin/revocations/{cert.serial_number}/confirm",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp1.status_code == 200
+
+        resp2 = client.post(
+            f"/acme/admin/revocations/{cert.serial_number}/confirm",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["ca_crl_updated"] is True
+
+        events = store.list_audit_events(event_type="revocation-ca-confirmed")
+        assert len(events) == 1
