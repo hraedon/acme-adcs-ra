@@ -97,19 +97,20 @@ warning: get the template scope right (see `AGENTS.md`).
 > **Known limitations before a production pilot** (a **v1.6 hardening sweep** is
 > planned — see [`plans/007-v1.6-hardening-sweep.md`](plans/007-v1.6-hardening-sweep.md)):
 >
-> - **Enrollment-side bound (Finding E-1):** the serverAuth-only guarantee is
->   enforced on the RA path, but the enrollment gMSA can, by ADCS default (Domain
->   Computers → `Machine` template enroll), request non-serverAuth certs if it
->   *bypasses* the RA. Remediate per your estate before relying on the bound; see
->   [`docs/revocation-scope-validation.md`](docs/revocation-scope-validation.md).
-> - **Recommended topology proof:** the two-identity (dedicated-revoker) design is
->   documented as the default but has so far been proven live only in the
->   single-identity form.
-> - **PowerShell test coverage:** the operator scripts have no automated tests yet
->   (v1.6 WI-037); changes to them warrant a live lab re-proof.
+> - **Enrollment-side bound (Finding E-1) — remediated on `main` (WI-035).** The
+>   enrollment gMSA was moved off the Domain Computers `Machine`-enroll path and
+>   verified to enroll only `ACME-ServerAuth`; apply the equivalent change per your
+>   estate. See [`docs/revocation-scope-validation.md`](docs/revocation-scope-validation.md).
+> - **Recommended topology proof — partial.** The two-identity (dedicated-revoker)
+>   design's *compromise-independence* property is now proven live (WI-036); the
+>   final revoke-*by*-revoker round-trip is deferred behind a lab DC-time/KDS fix.
+> - **PowerShell test coverage — added on `main` (WI-037):** a Pester pure-logic
+>   suite (golden-bytes OfficerRights blob, action-string builder, reason/requester
+>   logic) runs in CI. Deploy the whole `scripts/` dir including `scripts/lib/`.
 > - **CI ≠ ADCS-verified:** cloud CI cannot reach a CA, so a green build does not
 >   confirm the enrollment/revocation legs still work — those rest on periodic live
->   re-proofs (see the validation log in the checklist).
+>   re-proofs. See [`docs/live-reproof-runbook.md`](docs/live-reproof-runbook.md)
+>   and the validation log in the checklist.
 >
 > Deploying this is issuance-path infrastructure: work through
 > [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md) before running it

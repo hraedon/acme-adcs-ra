@@ -117,8 +117,29 @@ attempt was not completed in this pass); the *permission* to attempt it exists.
 Domain Computers enrollment path — e.g. set its `primaryGroupID` to a group with
 no template-enroll rights, or scope the `Machine`/other templates' enrollment ACLs
 so Domain Computers membership does not confer them on this account — then re-run
-this section to confirm the gMSA can enroll **only** `ACME-ServerAuth`. Track as a
-follow-up work item.
+this section to confirm the gMSA can enroll **only** `ACME-ServerAuth`.
+
+### Finding E-1 — REMEDIATED + VERIFIED (2026-07-23, Plan 007 WI-035)
+
+Remediated via the `primaryGroupID` approach: a dedicated global security group
+(no certificate-template enroll rights) was created, the enrollment gMSA added to
+it, and its `primaryGroupID` set to that group — which **removes the Domain
+Computers membership** (changing `primaryGroupID` converts the old primary group
+to an ordinary membership, which was then removed). Verified three ways:
+
+1. **Template ACLs** — the `Machine` template grants Enroll to exactly
+   {Domain Admins, Domain Computers, Enterprise Admins}; `ACME-ServerAuth` grants
+   Enroll **explicitly** to the enrollment gMSA (so the change cannot break
+   issuance).
+2. **The gMSA's live Kerberos token** (read via a scheduled task running *as* the
+   gMSA) — `Domain Computers` is **absent**; the gMSA is a member of none of the
+   three `Machine`-enroll principals.
+3. **Issuance regression** — a full ACME round-trip still issues a serverAuth-only
+   cert after the change (no false-reject).
+
+**Result:** the enrollment gMSA can now enroll **only** `ACME-ServerAuth`. The
+"one template" bound holds for this account, closing the enrollment-side gap. The
+change is reversible (`primaryGroupID` → 515, re-add to Domain Computers).
 
 ## Summary
 
@@ -126,6 +147,8 @@ follow-up work item.
   template, `CERTSRV_E_RESTRICTEDOFFICER` on all others (incl. DomainController),
   no self-escalation (Officer role only), fail-closed provisioning — subject to
   the union-membership and DCOM-access constraints.
-- **Enrollment-gMSA compromise → NOT strictly bounded (Finding E-1).** The gMSA's
-  Domain Computers membership confers `Machine`-template enroll rights; remediate
-  before relying on the "one template" bound for this account.
+- **Enrollment-gMSA compromise → bounded to `ACME-ServerAuth` (Finding E-1
+  REMEDIATED, WI-035).** The gMSA's Domain Computers membership (which conferred
+  `Machine`-template enroll) was removed via a `primaryGroupID` change; verified
+  by template ACLs, the gMSA's live token (no Domain Computers), and an issuance
+  regression pass. The "one template" bound now holds for this account too.

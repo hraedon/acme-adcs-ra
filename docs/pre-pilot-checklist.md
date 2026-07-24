@@ -219,3 +219,24 @@ engineered to. Until then it has not — regardless of a green local test run.
         Finding E-1 remediation (enrollment gMSA's Domain Computers membership
         confers `Machine`-template enroll; see `docs/revocation-scope-validation.md`),
         and cutting the v1.5.0 release (WI-029).
+
+- **Plan 007 v1.6 hardening sweep (2026-07-23/24):**
+  - **WI-035 (Finding E-1) — REMEDIATED + VERIFIED.** Enrollment gMSA moved off
+    the Domain Computers enroll path (`primaryGroupID` change); verified by
+    template ACLs, the gMSA's live token (no Domain Computers), and an issuance
+    regression pass. It can now enroll only `ACME-ServerAuth`. See
+    `docs/revocation-scope-validation.md` Finding E-1.
+  - **WI-036 (two-identity topology) — PARTIAL.** Compromise independence proven
+    live at the CA: a dedicated revoker gMSA held template-scoped officer rights
+    while the enrollment gMSA held none. The physical revoke-by-revoker round-trip
+    is **deferred** — blocked by a homelab **DC time / KDS defect** (DC clocks
+    disagree ~55s because the Hyper-V VMIC provider syncs each DC to its host, and
+    inter-DC NTP is not flowing from the PDC; a newly-created gMSA's managed
+    password is then uncomputable). This is a lab-infrastructure issue outside
+    acme-adcs-ra — fix DC time (disable VMIC on DCs, repair the PDC's NTP source
+    and the domain time hierarchy) before completing the round-trip.
+  - **WI-037/038/039 — DONE.** Pester pure-logic suite (CI); the live re-proof
+    runbook (`docs/live-reproof-runbook.md`) + cadence; deterministic CI
+    (`uv sync --locked`, pinned linters/Pester).
+  - [ ] **Open:** complete WI-036's round-trip after the DC-time fix, then cut
+        v1.6.0 (release held until then).
