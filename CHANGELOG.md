@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-07-24
+
+**Hardening + validation sweep (Plan 007), no new feature surface.** The
+issuance path is behaviourally unchanged.
+
+### Fixed
+- **Finding E-1 (enrollment-side blast radius) — remediated (WI-035).** The
+  enrollment gMSA held `Machine`-template enroll rights via Domain Computers
+  membership, so a compromised gMSA that *bypassed* the RA was not ACL-bounded to
+  `ACME-ServerAuth`. Remediated by moving the gMSA off the Domain Computers enroll
+  path (`primaryGroupID` change); verified live three ways (template ACLs, the
+  gMSA's Kerberos token, an issuance regression). It now enrolls only
+  `ACME-ServerAuth`. See `docs/revocation-scope-validation.md`.
+
+### Added
+- **PowerShell test coverage (WI-037).** The pure logic of the operator scripts
+  is extracted into dot-sourceable `scripts/lib/*.ps1` and covered by a Pester
+  suite (61 tests) that runs on the Linux CI runner under `pwsh` — including a
+  **golden-bytes** regression test for the `OfficerRights` SD/ACE builder and the
+  scheduled-task action-string builder. **Deploy the whole `scripts/` directory
+  including `scripts/lib/`** (the officer/registration scripts dot-source it).
+- **Live re-proof runbook (WI-038)** — `docs/live-reproof-runbook.md`: the
+  repeatable ADCS-integration re-proof (issuance + EKU + both revocation
+  topologies), its cadence, and the standing note that **green CI ≠ ADCS-verified**
+  (cloud CI cannot reach a CA).
+- **Two-identity compromise-independence — proven live (WI-036).** A dedicated
+  revoker gMSA held template-scoped officer rights while the enrollment gMSA held
+  none. The literal revoke-*by*-revoker demonstration is deferred behind an
+  unrelated lab AD/KDS defect (a Windows/AD-infra issue, not a code gap; the
+  revoke mechanism is already proven live in the single-identity run).
+
+### Changed
+- **Deterministic CI (WI-039).** CI installs via `uv sync --locked` (respects
+  `uv.lock` for all deps); `ruff`, `mypy`, and Pester are pinned. A dependency
+  bump is now a deliberate, reviewed `uv lock` change, not a surprise drift.
+
 ## [1.5.0] — 2026-07-23
 
 **Automated CA-side revocation + self-enforced serverAuth.** Builds on 1.0.0's

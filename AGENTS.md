@@ -72,24 +72,26 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**Released: v1.0.0. On `main`: v1.5 — feature-complete and live-reproven
-(2026-07-23), release tag pending.** v1.5 adds automated CA-side revocation
-(template-scoped officer restriction; two-identity default + opt-in
-single-identity `-LocalMode`) and self-enforced serverAuth EKU verification
-(WI-026), all landed via Plans 004–006. The repo is public and CI-gated
-(including a monthly rot-canary run). Re-entry rules:
+**Released: v1.6.0 (2026-07-24) — feature-complete for the charter.** v1.5 added
+automated CA-side revocation (template-scoped officer restriction; two-identity
+default + opt-in single-identity `-LocalMode`) + self-enforced serverAuth EKU
+(Plans 004–006); the **v1.6 hardening sweep** (Plan 007) closed Finding E-1,
+added a Pester suite + deterministic CI (`uv sync --locked`), proved the
+two-identity compromise-independence property live, and added the live-re-proof
+runbook. The repo is public and CI-gated (incl. a monthly rot-canary). Re-entry
+rules:
 
 - **Any change to the issuance leg earns a live lab re-proof** (the standing
-  project rule — see the validation log in `docs/pre-pilot-checklist.md`). The
-  latest is the **WI-028 v1.5 re-proof (2026-07-23)**: base issuance + EKU +
-  the automated revocation round-trip (incl. single-identity) all PASSED.
-- **Remaining before pilot:** cut the **v1.5.0 release** (WI-029: version bump
-  + tag + GitHub release); the operator-owned §B–E items in the checklist; and
-  the **Finding E-1** remediation (the enrollment gMSA's Domain Computers
-  membership confers `Machine`-template enroll — see
-  `docs/revocation-scope-validation.md`). WI numbering: WI-011..015 exist only
-  in plan documents, not the store — file new items with an explicit
-  identifier ≥ WI-031.
+  project rule — see the validation log in `docs/pre-pilot-checklist.md` and the
+  procedure in `docs/live-reproof-runbook.md`). Latest: WI-028 (v1.5, 2026-07-23)
+  + WI-035/036 (v1.6, 2026-07-23/24).
+- **Remaining before pilot (not code debt):** the operator-owned §B–E items; and
+  completing WI-036's literal revoke-by-revoker round-trip, which is blocked by an
+  **out-of-project homelab AD/KDS defect** (newly-created gMSAs can't obtain a
+  usable managed password — NOT clock skew, that was ruled out). The two-identity
+  *compromise-independence* property is already proven live. WI numbering:
+  WI-011..015 exist only in plan documents, not the store — file new items with an
+  explicit identifier ≥ WI-040.
 - A production pilot is gated on the operator-owned sections (§B–E) of
   `docs/pre-pilot-checklist.md`; those are per-deployment, not code debt.
 - If the scheduled CI run has gone red, fix CI first — it is

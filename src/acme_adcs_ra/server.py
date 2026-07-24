@@ -41,7 +41,7 @@ def create_app(context: ServerContext) -> FastAPI:
         if _siem_emitter is not None:
             _siem_emitter.close()
 
-    app = FastAPI(title="acme-adcs-ra", version="1.5.0", lifespan=_lifespan)
+    app = FastAPI(title="acme-adcs-ra", version="1.6.0", lifespan=_lifespan)
     app.state.context = context
 
     @app.exception_handler(AcmeError)
