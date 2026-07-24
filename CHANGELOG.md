@@ -31,11 +31,13 @@ issuance path is behaviourally unchanged.
   repeatable ADCS-integration re-proof (issuance + EKU + both revocation
   topologies), its cadence, and the standing note that **green CI ≠ ADCS-verified**
   (cloud CI cannot reach a CA).
-- **Two-identity compromise-independence — proven live (WI-036).** A dedicated
-  revoker gMSA held template-scoped officer rights while the enrollment gMSA held
-  none. The literal revoke-*by*-revoker demonstration is deferred behind an
-  unrelated lab AD/KDS defect (a Windows/AD-infra issue, not a code gap; the
-  revoke mechanism is already proven live in the single-identity run).
+- **Two-identity topology — proven live end-to-end (WI-036).** A dedicated
+  revoker gMSA (a *separate* identity from the enrollment gMSA) revoked an
+  `ACME-ServerAuth` cert at the CA and confirmed it back to the RA, with the WI-022
+  requester check active and the enrollment gMSA holding **no** officer rights
+  throughout (compromise independence). *Operator note:* create the revoker gMSA
+  with explicit AES Kerberos etypes (`-KerberosEncryptionType AES128,AES256`) —
+  without them RC4 is added and, if blocked on the DCs, the account is unusable.
 
 ### Changed
 - **Deterministic CI (WI-039).** CI installs via `uv sync --locked` (respects

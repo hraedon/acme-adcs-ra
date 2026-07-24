@@ -226,18 +226,17 @@ engineered to. Until then it has not — regardless of a green local test run.
     template ACLs, the gMSA's live token (no Domain Computers), and an issuance
     regression pass. It can now enroll only `ACME-ServerAuth`. See
     `docs/revocation-scope-validation.md` Finding E-1.
-  - **WI-036 (two-identity topology) — compromise independence PROVEN LIVE; one
-    sub-step deferred.** A dedicated revoker gMSA held template-scoped officer
-    rights while the enrollment gMSA held none (proven at the CA). The revoke
-    *mechanism* is proven live in the single-identity run. The one deferred
-    sub-step — the revoker gMSA *physically* running the revoke — is blocked by a
-    homelab **AD/KDS defect**: newly-created gMSAs cannot obtain a usable managed
-    password (`Test-ADServiceAccount` = False; "context did not match the
-    target"), while the existing enrollment gMSA works. **NOT clock skew** — DC +
-    member clocks were brought to sub-second and the failure persisted; KDS root
-    keys are present on all DCs and `KdsSvc` is running. This is a lab-infra issue
-    outside acme-adcs-ra; complete the literal round-trip once the domain's
-    gMSA-provisioning is fixed (a live re-proof, per `docs/live-reproof-runbook.md`).
+  - **WI-036 (two-identity topology) — PROVEN LIVE (2026-07-24).** A dedicated
+    revoker gMSA (`gMSA-acme-rev`, separate identity) held template-scoped officer
+    rights while the enrollment gMSA held **none**, and ran the full round-trip: RA
+    `revokeCert` → pull agent as the revoker → `certutil -revoke` at the CA → RA
+    confirm. Verified: WI-022 requester check passed, CA-DB disposition =
+    **Revoked**, RA pending drained to empty, compromise independence held,
+    least-privilege CRL skip applied. **The earlier block was an unrelated homelab
+    AD defect, NOT clock skew (that was ruled out):** a gMSA created without an
+    explicit `msDS-SupportedEncryptionTypes` gets RC4 added, which the DCs block,
+    so its Kerberos fails and its managed password is unusable — create revoker
+    gMSAs with **AES128,AES256** (see `docs/live-reproof-runbook.md`).
   - **WI-037/038/039 — DONE.** Pester pure-logic suite (CI); the live re-proof
     runbook (`docs/live-reproof-runbook.md`) + cadence; deterministic CI
     (`uv sync --locked`, pinned linters/Pester).
