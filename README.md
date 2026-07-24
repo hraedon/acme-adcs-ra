@@ -85,26 +85,30 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **Project status:** **released at v1.5.0** (2026-07-23) — feature-complete for
-> its charter. v1.5 adds **automated CA-side revocation** (template-scoped officer
+> **Project status:** **released at v1.6.0** (2026-07-24) — feature-complete for
+> its charter. v1.5 added **automated CA-side revocation** (template-scoped officer
 > restriction; recommended two-identity topology + an opt-in single-identity
-> `-LocalMode` deployment) and **self-enforced serverAuth EKU verification**, on
-> top of the v1.0 issuance path. The automated revocation loop was **live-reproven
-> end-to-end on the lab** (WI-028). Maintained deliberately, not passively:
-> security reports (see `SECURITY.md`) and bug reports are welcome, but there is no
-> response-time commitment.
+> `-LocalMode` deployment) and **self-enforced serverAuth EKU verification**; the
+> **v1.6 hardening sweep** closes the enrollment-side bound (Finding E-1), adds a
+> Pester test suite + deterministic CI, proves the two-identity design's
+> compromise-independence property live, and adds a live-re-proof runbook.
+> Maintained deliberately, not passively: security reports (see `SECURITY.md`) and
+> bug reports are welcome, but there is no response-time commitment.
 >
-> **Known limitations before a production pilot** (a **v1.6 hardening sweep** is
-> planned — see [`plans/007-v1.6-hardening-sweep.md`](plans/007-v1.6-hardening-sweep.md)):
+> **Known limitations before a production pilot** (see
+> [`plans/007-v1.6-hardening-sweep.md`](plans/007-v1.6-hardening-sweep.md)):
 >
-> - **Enrollment-side bound (Finding E-1) — remediated on `main` (WI-035).** The
+> - **Enrollment-side bound (Finding E-1) — remediated in v1.6 (WI-035).** The
 >   enrollment gMSA was moved off the Domain Computers `Machine`-enroll path and
 >   verified to enroll only `ACME-ServerAuth`; apply the equivalent change per your
 >   estate. See [`docs/revocation-scope-validation.md`](docs/revocation-scope-validation.md).
-> - **Recommended topology proof — partial.** The two-identity (dedicated-revoker)
->   design's *compromise-independence* property is now proven live (WI-036); the
->   final revoke-*by*-revoker round-trip is deferred behind a lab DC-time/KDS fix.
-> - **PowerShell test coverage — added on `main` (WI-037):** a Pester pure-logic
+> - **Recommended topology proof — independence proven; one sub-step deferred.**
+>   The two-identity (dedicated-revoker) design's *compromise-independence* property
+>   is proven live (WI-036), and the revoke mechanism is proven live in the
+>   single-identity run. The final revoke-*by*-revoker demonstration is deferred
+>   behind an unrelated lab AD/KDS defect (a Windows plumbing issue, not a code
+>   gap) — complete it via a live re-proof once the domain is fixed.
+> - **PowerShell test coverage — added in v1.6 (WI-037):** a Pester pure-logic
 >   suite (golden-bytes OfficerRights blob, action-string builder, reason/requester
 >   logic) runs in CI. Deploy the whole `scripts/` dir including `scripts/lib/`.
 > - **CI ≠ ADCS-verified:** cloud CI cannot reach a CA, so a green build does not
