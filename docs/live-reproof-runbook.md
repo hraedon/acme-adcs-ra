@@ -93,8 +93,16 @@ artifact).
   interactively). `Register-MaintenanceTasks.ps1` sets this.
 - **`certutil` argument order:** `-config` must precede the `-revoke`/`-CRL` verb.
 - **CA-side officer provisioning** must ship `scripts/lib/` alongside the scripts.
-- **Newly-created gMSAs** require the domain's KDS + DC time to be healthy: if DC
-  clocks disagree (e.g. Hyper-V VMIC syncing each DC to a skewed host clock), a
-  new gMSA can be stamped with a KDS key index that other DCs treat as *future*,
-  making its managed password unretrievable until the clocks converge. A working
-  domain (synced DCs) is a prerequisite for provisioning a new revoker identity.
+- **Create the revoker gMSA with explicit AES Kerberos etypes.** A gMSA created
+  without `msDS-SupportedEncryptionTypes` set gets **RC4** added to its supported
+  etypes; if the DCs block RC4 (common hardening), the account's Kerberos context
+  fails (`Install`/`Test-ADServiceAccount` → *"the provided context did not match
+  the target"*) and its managed password is unusable on members. Create it with
+  `New-ADServiceAccount … -KerberosEncryptionType AES128,AES256` (or set
+  `msDS-SupportedEncryptionTypes = 24` after the fact). Symptom is easy to
+  misread as a KDS/time-sync problem — it is not.
+- **The revoker needs its own readable copy of the scripts.** In the two-identity
+  topology the revoker runs on a separate utility host with its own
+  `scripts/` (+ `scripts/lib/`); if you co-locate it on the RA host for a test,
+  the revoker gMSA has no ACL on the RA's locked-down `C:\ProgramData\acme-adcs-ra\`
+  — stage a copy it can read/execute and point `-ScriptDir` at it.

@@ -102,12 +102,12 @@ warning: get the template scope right (see `AGENTS.md`).
 >   enrollment gMSA was moved off the Domain Computers `Machine`-enroll path and
 >   verified to enroll only `ACME-ServerAuth`; apply the equivalent change per your
 >   estate. See [`docs/revocation-scope-validation.md`](docs/revocation-scope-validation.md).
-> - **Recommended topology proof — independence proven; one sub-step deferred.**
->   The two-identity (dedicated-revoker) design's *compromise-independence* property
->   is proven live (WI-036), and the revoke mechanism is proven live in the
->   single-identity run. The final revoke-*by*-revoker demonstration is deferred
->   behind an unrelated lab AD/KDS defect (a Windows plumbing issue, not a code
->   gap) — complete it via a live re-proof once the domain is fixed.
+> - **Recommended topology — proven live (WI-036).** The two-identity
+>   (dedicated-revoker) design was proven end-to-end: a separate revoker gMSA
+>   revoked an `ACME-ServerAuth` cert at the CA and confirmed it back, with the
+>   enrollment gMSA holding no officer rights (compromise independence).
+>   *Operator note:* create the revoker gMSA with AES Kerberos etypes
+>   (`-KerberosEncryptionType AES128,AES256`) — see `docs/live-reproof-runbook.md`.
 > - **PowerShell test coverage — added in v1.6 (WI-037):** a Pester pure-logic
 >   suite (golden-bytes OfficerRights blob, action-string builder, reason/requester
 >   logic) runs in CI. Deploy the whole `scripts/` dir including `scripts/lib/`.

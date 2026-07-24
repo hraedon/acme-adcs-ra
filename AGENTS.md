@@ -85,13 +85,13 @@ rules:
   project rule — see the validation log in `docs/pre-pilot-checklist.md` and the
   procedure in `docs/live-reproof-runbook.md`). Latest: WI-028 (v1.5, 2026-07-23)
   + WI-035/036 (v1.6, 2026-07-23/24).
-- **Remaining before pilot (not code debt):** the operator-owned §B–E items; and
-  completing WI-036's literal revoke-by-revoker round-trip, which is blocked by an
-  **out-of-project homelab AD/KDS defect** (newly-created gMSAs can't obtain a
-  usable managed password — NOT clock skew, that was ruled out). The two-identity
-  *compromise-independence* property is already proven live. WI numbering:
-  WI-011..015 exist only in plan documents, not the store — file new items with an
-  explicit identifier ≥ WI-040.
+- **Remaining before pilot (not code debt):** the operator-owned §B–E items. The
+  two-identity round-trip (WI-036) is now **fully proven live** (2026-07-24) — a
+  separate revoker gMSA revoked at the CA and confirmed back, enrollment gMSA held
+  no officer rights. (RCA of the earlier block, an out-of-project homelab AD issue
+  — NOT clocks: new gMSAs need explicit AES etypes, else RC4 is added and blocked.)
+  WI numbering: WI-011..015 exist only in plan documents, not the store — file new
+  items with an explicit identifier ≥ WI-040.
 - A production pilot is gated on the operator-owned sections (§B–E) of
   `docs/pre-pilot-checklist.md`; those are per-deployment, not code debt.
 - If the scheduled CI run has gone red, fix CI first — it is
