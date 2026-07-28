@@ -243,6 +243,15 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   reason 7 is "unused" and `certutil` rejects it) — the valid set is
   `{0,1,2,3,4,5,6,8,9,10}`, consistent with `scripts/Revoke-Cert.ps1`, so an
   accepted reason can never silently break the out-of-band revocation loop.
+  **Scope decision:** the RFC 8555 §7.6 *second* authorization path — a
+  revokeCert JWS signed with the certificate's own key pair — is **not
+  implemented**; revocation requires the issuing account's key. Certify the
+  Web only ever uses the account-key path, and the operator out-of-band path
+  (`Revoke-Cert.ps1` / the v1.5 automated loop) already covers revocation
+  when the ACME account is unavailable (e.g. a stolen cert key). Adding a
+  second crypto authorization path to a security endpoint for a client that
+  never uses it would widen surface for no operational gain — recorded here
+  as a deliberate non-goal, reversible if a future client needs it.
 - **Cert-URL discoverability (acknowledged):** the cert URL remains in the order
   JSON after revocation (the URL is 128-bit unguessable); the *body* is 410.
   This is RFC-shaped and intentional. `GET /acme/cert/{id}` and
@@ -586,6 +595,10 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 - Public-DV trust model.
 - CES/WSTEP (Mode C2) transport — documented only.
 - Auto-recovery of a stuck `processing` order (near-term follow-up, §7).
+- **Account deactivation** (RFC 8555 §7.3.6, `POST status=deactivated`). The
+  account lifecycle here is EAB rotation (kid + MAC key + SAN scope) plus
+  `keyChange` key rollover; a self-service deactivate endpoint adds surface no
+  chartered client uses. Reversible if a future client needs it.
 - **In-band** CA-side revocation (CRL write from the RA) — deferred behind an
   explicit, recorded privilege decision to grant the gMSA CA-officer rights
   (§4.E). The out-of-band path (`scripts/Revoke-Cert.ps1`, operator-run) is
