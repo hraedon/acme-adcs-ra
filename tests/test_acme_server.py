@@ -712,6 +712,103 @@ class TestNonceGarbageCollection:
             assert row["c"] == 1
 
 
+class TestNonceConsumeTtl:
+    """TTL is enforced at consume time, not just by the cleanup sweep."""
+
+    def test_fresh_nonce_consumes(self, tmp_path: Path) -> None:
+        store = Store(tmp_path / "test_consume_fresh.db")
+        nonce = store.create_nonce()
+        assert store.consume_nonce(nonce) is True
+        # Single-use: a second consume of the same nonce is a replay.
+        assert store.consume_nonce(nonce) is False
+
+    def test_expired_nonce_rejected_at_consume(self, tmp_path: Path) -> None:
+        """An unused nonce older than the TTL is rejected even if neither the
+        probabilistic GC nor the admin cron has swept it yet."""
+        store = Store(tmp_path / "test_consume_expired.db")
+        old_ts = (
+            datetime.now(timezone.utc) - timedelta(seconds=NONCE_TTL_SECONDS + 60)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with store._connect() as conn:
+            conn.execute(
+                "INSERT INTO nonces (nonce, created_at) VALUES (?, ?)", ("stale-nonce", old_ts)
+            )
+        assert store.consume_nonce("stale-nonce") is False
+        # A retry fails identically (no oracle between expired and unknown).
+        assert store.consume_nonce("stale-nonce") is False
+        assert store.consume_nonce("never-existed") is False
+
+    def test_consume_ttl_boundary(self, tmp_path: Path) -> None:
+        """The cutoff is inclusive: a nonce within the TTL window is consumable,
+        one just past it is rejected (created_at >= now-TTL)."""
+        store = Store(tmp_path / "test_consume_boundary.db")
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        now = datetime.now(timezone.utc)
+        just_inside = (now - timedelta(seconds=NONCE_TTL_SECONDS - 5)).strftime(fmt)
+        just_outside = (now - timedelta(seconds=NONCE_TTL_SECONDS + 5)).strftime(fmt)
+        with store._connect() as conn:
+            conn.execute(
+                "INSERT INTO nonces (nonce, created_at) VALUES (?, ?)", ("in-nonce", just_inside)
+            )
+            conn.execute(
+                "INSERT INTO nonces (nonce, created_at) VALUES (?, ?)",
+                ("out-nonce", just_outside),
+            )
+        assert store.consume_nonce("in-nonce") is True
+        assert store.consume_nonce("out-nonce") is False
+
+    def test_concurrent_consume_is_single_use(self, tmp_path: Path) -> None:
+        """Racing many consumers of one fresh nonce yields exactly one winner
+        (single-statement DELETE is atomic; busy_timeout serializes writers)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        store = Store(tmp_path / "test_consume_race.db")
+        nonce = store.create_nonce()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: store.consume_nonce(nonce), range(16)))
+        assert results.count(True) == 1
+        assert results.count(False) == 15
+
+    def test_expired_nonce_rejected_via_endpoint(
+        self, acme_client: HandRolledAcmeClient, test_config: RAConfig
+    ) -> None:
+        """End-to-end: an issued nonce aged past the TTL is rejected with
+        badNonce when presented to the ACME endpoint (consume-time enforcement
+        is wired into the request path, not just the store)."""
+        url = f"{acme_client.base_url}/acme/new-acct"
+        from .hand_rolled_acme_client import make_eab_jws, sign_jws
+
+        nonce = acme_client._fresh_nonce()
+        # Age the issued nonce past the TTL in the backing store.
+        old_ts = (
+            datetime.now(timezone.utc) - timedelta(seconds=NONCE_TTL_SECONDS + 60)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        backing = Store(test_config.db_path)
+        with backing._connect() as conn:
+            conn.execute("UPDATE nonces SET created_at = ? WHERE nonce = ?", (old_ts, nonce))
+
+        eab_jws = make_eab_jws(
+            acme_client.account_jwk,
+            "kid-001",
+            _eab_mac_key(test_config, "kid-001"),
+            url=url,
+        )
+        protected = {
+            "alg": "RS256",
+            "nonce": nonce,
+            "url": url,
+            "jwk": acme_client.account_jwk,
+        }
+        body = sign_jws(
+            {"externalAccountBinding": eab_jws, "termsOfServiceAgreed": True},
+            acme_client.account_key,
+            protected,
+        )
+        resp = acme_client.http.post(url, json=body)
+        assert resp.status_code == 400
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:badNonce"
+
+
 # ---------------------------------------------------------------------------
 # H2: Full-URL binding (scheme + host + path + query)
 # ---------------------------------------------------------------------------

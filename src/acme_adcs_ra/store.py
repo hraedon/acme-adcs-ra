@@ -568,9 +568,22 @@ class Store:
         return nonce
 
     def consume_nonce(self, nonce: str) -> bool:
-        """Return True if the nonce existed and was removed (not replayed)."""
+        """Return True if the nonce existed, was within TTL, and was removed.
+
+        TTL is enforced *at consume time*, not just by the cleanup sweep: an
+        unused nonce older than NONCE_TTL_SECONDS is rejected even if the
+        probabilistic GC and the admin cron have both missed it. An expired
+        nonce is left in the table for the sweep (a retry of the same nonce
+        fails identically — badNonce either way, no oracle).
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=NONCE_TTL_SECONDS)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         with self._connect() as conn:
-            cursor = conn.execute("DELETE FROM nonces WHERE nonce = ?", (nonce,))
+            cursor = conn.execute(
+                "DELETE FROM nonces WHERE nonce = ? AND created_at >= ?",
+                (nonce, cutoff),
+            )
             return cursor.rowcount == 1
 
     def cleanup_expired_nonces(self) -> int:

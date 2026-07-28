@@ -454,6 +454,9 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   nonce-table size (GC is a probabilistic 1% cleanup on `create_nonce` as a
   safety net, bounded by `LIMIT 5000` and indexed on `created_at`, + the public
   `DELETE /acme/admin/nonces` for an external cron — wire the cron at pilot).
+  Independent of both sweeps, the 30-minute nonce TTL is enforced **at consume
+  time** (`consume_nonce` rejects an expired nonce even if GC never ran), so
+  an unused nonce's replay window is bounded by TTL, not by cleanup cadence.
   `scripts/Register-MaintenanceTasks.ps1` (WI-013) ships the two scheduled
   tasks (nonce GC + expired-order sweep) ready-to-install; see
   `docs/operations.md` ## Scheduled maintenance tasks.
