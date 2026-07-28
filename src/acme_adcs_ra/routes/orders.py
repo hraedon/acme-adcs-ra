@@ -13,8 +13,8 @@ from acme_adcs_ra.acme_errors import (
     unsupported_identifier,
 )
 from acme_adcs_ra.app_state import (
-    ServerContext,
     _ACME_PATHS,
+    ServerContext,
     _audit,
     _authz_url,
     _challenge_url,
@@ -104,7 +104,7 @@ async def new_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+    _header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
 
     # WI-016: in-app per-account rate limiting (defense-in-depth inside the
     # trust model). The window is computed from order-creation timestamps
@@ -178,7 +178,7 @@ async def finalize_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+    _header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
 
     order = ctx.store.get_order(order_id)
     if order is None or order.account_id != account_id:

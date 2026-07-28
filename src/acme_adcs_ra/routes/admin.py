@@ -18,7 +18,6 @@ from acme_adcs_ra.finalize import _refresh_order_or_500
 from acme_adcs_ra.serializers import _order_to_admin_json, _order_to_json
 from acme_adcs_ra.store import CertStatus, OrderStatus
 
-
 router = APIRouter()
 
 

@@ -101,9 +101,11 @@ class NegotiateAuth(requests.auth.AuthBase):
             if self._ca_bundle
             else ssl.create_default_context()
         )
-        with socket.create_connection((self._host, self._port), timeout=30) as sock:
-            with ctx.wrap_socket(sock, server_hostname=self._host) as tls:
-                der = tls.getpeercert(binary_form=True)
+        with (
+            socket.create_connection((self._host, self._port), timeout=30) as sock,
+            ctx.wrap_socket(sock, server_hostname=self._host) as tls,
+        ):
+            der = tls.getpeercert(binary_form=True)
         if der is None:  # pragma: no cover - defensive
             raise RuntimeError(f"no server certificate from {self._host}:{self._port}")
         return der
@@ -146,7 +148,7 @@ class NegotiateAuth(requests.auth.AuthBase):
             out_token = client.step(in_token)
             if not out_token:
                 return current
-            current.content  # drain so the underlying connection can be reused
+            current.content  # noqa: B018 - drain so the underlying connection can be reused
             request = current.request.copy()
             request.headers["Authorization"] = (
                 "Negotiate " + base64.b64encode(out_token).decode("ascii")

@@ -6,7 +6,7 @@ import json
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,7 @@ def _jwk(idx: int) -> dict[str, Any]:
 def _make_cert_pem(serial_hex: str) -> str:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "srv.WORK-DOMAIN.local")])
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
@@ -105,6 +105,7 @@ def _run_reconcile(
         capture_output=True,
         text=True,
         cwd=str(_SCRIPT.parent.parent),
+        check=False,
     )
 
 

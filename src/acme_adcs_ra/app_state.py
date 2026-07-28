@@ -18,7 +18,6 @@ from acme_adcs_ra.revocation import RevocationLeg
 from acme_adcs_ra.siem import SiemEmitter, build_siem_config
 from acme_adcs_ra.store import Store
 
-
 logger = logging.getLogger("acme_adcs_ra.server")
 
 

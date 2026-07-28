@@ -11,7 +11,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _ISSUED_DISPOSITION = 3
 _REVOKED_DISPOSITION = 21
 
@@ -51,8 +50,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _canonical_serial(value: str) -> str:
     """Normalize a serial-number string to uppercase hex without leading zeros."""
     serial = "".join(value.split()).upper()
-    if serial.startswith("0X"):
-        serial = serial[2:]
+    serial = serial.removeprefix("0X")
     serial = serial.lstrip("0")
     if not serial:
         serial = "0"
@@ -225,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         report, exit_code = _run(args.db, args.ca_export, json_output=args.json)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - CLI top-level: clean error + exit code, not a traceback
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

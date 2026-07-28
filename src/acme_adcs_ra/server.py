@@ -17,8 +17,8 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from acme_adcs_ra.app_state import ServerContext, _default_siem_emitter
 from acme_adcs_ra.acme_errors import AcmeError
+from acme_adcs_ra.app_state import ServerContext, _default_siem_emitter
 from acme_adcs_ra.routes.acme import router as acme_router
 from acme_adcs_ra.routes.admin import router as admin_router
 from acme_adcs_ra.siem import SiemEmitter
@@ -36,7 +36,7 @@ def create_app(context: ServerContext) -> FastAPI:
 
     # H-3: shut down the SIEM emitter pool on app shutdown via lifespan.
     @asynccontextmanager
-    async def _lifespan(app: FastAPI) -> Any:  # noqa: ARG001
+    async def _lifespan(app: FastAPI) -> Any:
         yield
         if _siem_emitter is not None:
             _siem_emitter.close()
@@ -45,7 +45,7 @@ def create_app(context: ServerContext) -> FastAPI:
     app.state.context = context
 
     @app.exception_handler(AcmeError)
-    async def acme_exception_handler(request: Request, exc: AcmeError) -> JSONResponse:  # noqa: ARG001
+    async def acme_exception_handler(request: Request, exc: AcmeError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status,
             content=exc.to_problem(),

@@ -156,7 +156,7 @@ class RAConfig(BaseSettings):
     admin_token: SecretStr = Field(default_factory=lambda: SecretStr(""))
 
     @model_validator(mode="after")
-    def _no_duplicate_eab_kids(self) -> "RAConfig":
+    def _no_duplicate_eab_kids(self) -> RAConfig:
         """Duplicate kids would silently overwrite EAB credentials — reject them."""
         seen: set[str] = set()
         for entry in self.eab_allowlist:
@@ -166,7 +166,7 @@ class RAConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _tls_cert_key_paired(self) -> "RAConfig":
+    def _tls_cert_key_paired(self) -> RAConfig:
         """TLS needs both halves or neither — a lone cert/key is a misconfig
         that would silently fall back to plain HTTP."""
         if bool(self.tls_certfile) != bool(self.tls_keyfile):

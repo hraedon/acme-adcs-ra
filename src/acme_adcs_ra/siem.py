@@ -125,11 +125,10 @@ class SiemEmitter:
             self._enabled = True
         except Exception:
             self._enabled = False
-            logger.error(
+            logger.exception(
                 "SIEM jsonl startup probe failed for %s; disabling SIEM emission. "
                 "Issuance will continue but events will NOT be written to this sink.",
                 path,
-                exc_info=True,
             )
 
     @property

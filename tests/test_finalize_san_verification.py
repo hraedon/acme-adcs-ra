@@ -15,7 +15,7 @@ verifier against realistic cert objects.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -45,8 +45,8 @@ def _make_cert_pem(dns_sans: list[str]) -> str:
         .issuer_name(subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.now(timezone.utc))
-        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+        .not_valid_before(datetime.now(UTC))
+        .not_valid_after(datetime.now(UTC) + timedelta(days=1))
     )
     if dns_sans:
         builder = builder.add_extension(
@@ -72,7 +72,7 @@ class TestIssuedCertSanVerifier:
         issued, unauthorized, non_dns = _issued_cert_san_violations(
             pem, ["foo.example.com", "BAR.example.com"]
         )
-        assert set(s.lower() for s in issued) == {"foo.example.com", "bar.example.com"}
+        assert {s.lower() for s in issued} == {"foo.example.com", "bar.example.com"}
         assert unauthorized == []
         assert non_dns == []
 
@@ -120,13 +120,13 @@ class TestIssuedCertSanVerifier:
             .issuer_name(subject)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=1))
             .add_extension(san, critical=False)
             .sign(key, hashes.SHA256())
         )
         pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
-        issued, unauthorized, non_dns = _issued_cert_san_violations(
+        _issued, unauthorized, non_dns = _issued_cert_san_violations(
             pem, ["ok.example.com"]
         )
         # The DNS SAN is authorized, but the non-DNS SANs are a violation.

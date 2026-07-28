@@ -11,10 +11,10 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from acme_adcs_ra.jws import (
     JWSValidationError,
     UnsupportedAlgorithmError,
-    verify_eab_jws,
-    verify_flattened_jws,
     _base64url_encode,
     _public_key_from_jwk,
+    verify_eab_jws,
+    verify_flattened_jws,
 )
 
 

@@ -6,7 +6,6 @@ import pytest
 
 from acme_adcs_ra.policy import IssuancePolicy, _match_dns_pattern, validate_dns_name
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -357,21 +356,21 @@ class TestPolicyWildcardSemantics:
 class TestPolicyDeterminism:
     def test_same_inputs_same_decision(self, policy: IssuancePolicy) -> None:
         """Repeated calls with identical inputs must produce identical decisions."""
-        kwargs = dict(
-            eab_kid="acct-001",
-            csr_subject="CN=srv01",
-            requested_sans=["srv01.WORK-DOMAIN.local"],
-        )
+        kwargs = {
+            "eab_kid": "acct-001",
+            "csr_subject": "CN=srv01",
+            "requested_sans": ["srv01.WORK-DOMAIN.local"],
+        }
         d1 = policy.evaluate(**kwargs)
         d2 = policy.evaluate(**kwargs)
         assert d1 == d2
 
     def test_deny_deterministic(self, policy: IssuancePolicy) -> None:
-        kwargs = dict(
-            eab_kid="acct-999",
-            csr_subject="CN=any",
-            requested_sans=["any.example.com"],
-        )
+        kwargs = {
+            "eab_kid": "acct-999",
+            "csr_subject": "CN=any",
+            "requested_sans": ["any.example.com"],
+        }
         d1 = policy.evaluate(**kwargs)
         d2 = policy.evaluate(**kwargs)
         assert d1 == d2

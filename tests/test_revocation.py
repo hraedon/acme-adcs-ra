@@ -26,7 +26,6 @@ from acme_adcs_ra.store import Store
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
 
-
 # The package-shipped fixture cert (pre-generated, non-sensitive) is reused for
 # the CertsrvRevocationLeg unit tests so they don't need a live CA or a freshly
 # minted cert (the architecture test forbids cert-minting primitives in src/,
@@ -204,7 +203,7 @@ class TestRevokeCertAuthorization:
     ) -> None:
         """C-1: a different account gets 404 (not 401) when trying to revoke
         a cert it doesn't own — no information leak about ownership."""
-        ac1, cert_der = _issue_cert(client, test_config, account_key, kid="kid-001")
+        _ac1, cert_der = _issue_cert(client, test_config, account_key, kid="kid-001")
 
         # Create a second account on the same server.
         account_key2 = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -439,7 +438,7 @@ class TestCasGuardedRevocation:
         emit a duplicate audit when two revocations landed in the same
         second; the store now returns won_cas=True for exactly one caller
         regardless of timestamp equality."""
-        ac, cert_der = _issue_cert(client, test_config, account_key)
+        _ac, cert_der = _issue_cert(client, test_config, account_key)
         cert = x509.load_der_x509_certificate(cert_der)
         serial_hex = format(cert.serial_number, "x").upper()
         store = Store(test_config.db_path)
@@ -687,7 +686,7 @@ class TestOutOfBandRevocation:
         cert_record.metadata["req_id"] = "77"
         # Persist the updated metadata directly (the store doesn't expose a
         # metadata-only updater; replicate the minimal UPDATE).
-        with store._connect() as conn:  # noqa: SLF001 — test-only metadata poke
+        with store._connect() as conn:
             conn.execute(
                 "UPDATE certificates SET metadata = ? WHERE id = ?",
                 (json.dumps(cert_record.metadata), cert_record.id),
@@ -1082,8 +1081,8 @@ class TestRevokedCertNotServed:
 
 
 # Helper imports placed at the bottom to avoid shadowing module-level imports.
-from datetime import datetime, timedelta, timezone  # noqa: E402
+from datetime import UTC, datetime, timedelta
 
 
 def datetime_now(*, days: int = 0) -> datetime:
-    return datetime.now(timezone.utc) + timedelta(days=days)
+    return datetime.now(UTC) + timedelta(days=days)

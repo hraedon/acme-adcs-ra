@@ -91,7 +91,7 @@ class TestEabGenerate:
 
     def test_no_files_written(self, tmp_path: Path) -> None:
         """The helper must never write to disk — output is stdout-only."""
-        before = set(p for p in tmp_path.rglob("*") if p.is_file())
+        before = {p for p in tmp_path.rglob("*") if p.is_file()}
         # Run from tmp_path so the CWD is observable (the script doesn't write,
         # but this guards against a future regression that does).
         subprocess.run(
@@ -101,7 +101,7 @@ class TestEabGenerate:
             check=True,
             cwd=str(tmp_path),
         )
-        after = set(p for p in tmp_path.rglob("*") if p.is_file())
+        after = {p for p in tmp_path.rglob("*") if p.is_file()}
         assert before == after, "helper wrote files to disk (must be stdout-only)"
 
     def test_env_block_loads_into_raconfig(self, tmp_path: Path) -> None:

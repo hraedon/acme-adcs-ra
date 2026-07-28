@@ -19,7 +19,7 @@ from acme_adcs_ra.negotiate_auth import NegotiateAuth, tls_server_end_point_dige
 def _self_signed(hash_alg: hashes.HashAlgorithm) -> bytes:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "example.test")])
-    now = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    now = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
@@ -46,7 +46,7 @@ def test_cbt_sha384_signed_hashes_with_sha384() -> None:
 def test_cbt_sha1_signed_upgrades_to_sha256() -> None:
     try:
         der = _self_signed(hashes.SHA1())
-    except Exception:  # pragma: no cover - some cryptography builds refuse SHA1
+    except Exception:  # noqa: BLE001 - pragma: no cover, some cryptography builds refuse SHA1
         pytest.skip("SHA1 signing unavailable in this cryptography build")
     # RFC 5929: SHA-1/MD5 signature algorithms are upgraded to SHA-256.
     assert tls_server_end_point_digest(der) == b"tls-server-end-point:" + hashlib.sha256(der).digest()

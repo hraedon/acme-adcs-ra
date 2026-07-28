@@ -14,8 +14,8 @@ from acme_adcs_ra.acme_errors import (
     malformed,
 )
 from acme_adcs_ra.app_state import (
-    ServerContext,
     _ACME_PATHS,
+    ServerContext,
     _account_url,
     _audit,
     _dummy_hmac,
@@ -37,7 +37,7 @@ async def new_account(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    header, payload, account_jwk = await verify_new_account_jws(request, ctx.store)
+    _header, payload, account_jwk = await verify_new_account_jws(request, ctx.store)
 
     # RFC 8555 §7.3: newAccount is idempotent on the account key. If an
     # account already exists for this key, return it (200) rather than

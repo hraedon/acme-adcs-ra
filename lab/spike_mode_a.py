@@ -41,7 +41,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from cryptography import x509
@@ -175,7 +175,7 @@ def main() -> int:
         body = resp.text
         m = re.search(r"certnew\.cer\?ReqID=(\d+)&", body)
         if not m:
-            if re.search(r"Certificate Pending", body, re.I):
+            if re.search(r"Certificate Pending", body, re.IGNORECASE):
                 rid = re.search(r"Your Request Id is (\d+)", body)
                 raise RuntimeError(
                     f"Request pending CA-manager approval (ReqID={rid.group(1) if rid else '?'}). "
@@ -243,7 +243,7 @@ def main() -> int:
     log.info("  issuer = %s", cert.issuer.rfc4514_string())
     log.info("  valid  -> %s", not_after.isoformat())
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if not_after < now:
         log.warning("issued cert is ALREADY EXPIRED (clock/template issue)")
     if sans != [SAN]:
@@ -255,7 +255,7 @@ def main() -> int:
         chain_bytes = (OUT / "spike.chain.p7b").read_bytes()
         try:
             chain_certs = pkcs7.load_der_pkcs7_certificates(chain_bytes)
-        except Exception:
+        except Exception:  # noqa: BLE001 - lab script, DER→PEM fallback
             chain_certs = pkcs7.load_pem_pkcs7_certificates(chain_bytes)
         log.info("CA chain (%d cert(s)) - confirm these are the EXISTING chain:", len(chain_certs))
         for i, c in enumerate(chain_certs):

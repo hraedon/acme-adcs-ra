@@ -10,16 +10,16 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Sequence
+from typing import Any, NamedTuple
 
 from cryptography import x509
 
 from acme_adcs_ra.jws import jwk_thumbprint
-
 
 # ---------------------------------------------------------------------------
 # Status enums — replace bare string literals throughout the codebase
@@ -47,12 +47,12 @@ class CertStatus(StrEnum):
 
 def _now_iso() -> str:
     """Return a UTC RFC 3339 / ISO 8601 timestamp."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _now_iso_plus(seconds: int) -> str:
     """Return a UTC RFC 3339 timestamp ``seconds`` in the future."""
-    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime(
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
 
@@ -67,7 +67,7 @@ def _parse_iso(ts: str) -> datetime:
     Returns a timezone-aware datetime (UTC). Raises ``ValueError`` if *ts*
     does not match.
     """
-    return datetime.strptime(ts, _ISO_FORMAT).replace(tzinfo=timezone.utc)
+    return datetime.strptime(ts, _ISO_FORMAT).replace(tzinfo=UTC)
 
 
 def is_expired(expires: str, *, now: datetime | None = None) -> bool:
@@ -76,7 +76,7 @@ def is_expired(expires: str, *, now: datetime | None = None) -> bool:
     Used to enforce RFC 8555 §7.1.6: an order whose ``expires`` is in the past
     MUST NOT be finalized, and the server SHOULD transition it to ``invalid``.
     """
-    return _parse_iso(expires) <= (now or datetime.now(timezone.utc))
+    return _parse_iso(expires) <= (now or datetime.now(UTC))
 
 
 def _dump_json(obj: Any) -> str:
@@ -544,7 +544,7 @@ class Store:
 
     def create_nonce(self) -> str:
         nonce = uuid.uuid4().hex + uuid.uuid4().hex
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._connect() as conn:
             conn.execute(
@@ -576,7 +576,7 @@ class Store:
         nonce is left in the table for the sweep (a retry of the same nonce
         fails identically — badNonce either way, no oracle).
         """
-        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=NONCE_TTL_SECONDS)).strftime(
+        cutoff = (datetime.now(UTC) - timedelta(seconds=NONCE_TTL_SECONDS)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         with self._connect() as conn:
@@ -588,7 +588,7 @@ class Store:
 
     def cleanup_expired_nonces(self) -> int:
         """Delete all nonces older than NONCE_TTL_SECONDS. Returns count deleted."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=NONCE_TTL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cutoff = (datetime.now(UTC) - timedelta(seconds=NONCE_TTL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._connect() as conn:
             cursor = conn.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
             return cursor.rowcount
@@ -758,7 +758,7 @@ class Store:
         ``created_at`` timestamps in the store. Pass ``now`` for deterministic
         testing; production callers omit it (uses wall-clock UTC).
         """
-        current = now or datetime.now(timezone.utc)
+        current = now or datetime.now(UTC)
         cutoff = (current - timedelta(seconds=window_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
@@ -782,7 +782,7 @@ class Store:
         WI-016: a global ceiling that bounds total order creation across all
         accounts, independent of the per-kid limit.
         """
-        current = now or datetime.now(timezone.utc)
+        current = now or datetime.now(UTC)
         cutoff = (current - timedelta(seconds=window_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
@@ -810,7 +810,7 @@ class Store:
         enforced lazily at finalize so issuance can never proceed past expiry
         even between sweeps.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         now_str = _now_iso()
         with self._connect() as conn:
             rows = conn.execute(

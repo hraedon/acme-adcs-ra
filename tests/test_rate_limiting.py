@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -266,7 +266,7 @@ class TestStoreCounting:
             eab_kid="kid-001",
         )
 
-        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         for i in range(5):
             store.create_order_with_authz(
@@ -291,7 +291,7 @@ class TestStoreCounting:
         config = _make_rate_limit_config(tmp_path, per_kid=100)
         _, store, _ = _make_app(config)
 
-        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         a1 = store.create_account(
             jwk={"kty": "RSA", "n": "x1", "e": "AQAB"}, eab_kid="kid-001",
@@ -322,7 +322,7 @@ class TestStoreCounting:
         config = _make_rate_limit_config(tmp_path, per_kid=100)
         _, store, _ = _make_app(config)
 
-        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         for i in range(3):
             acct = store.create_account(

@@ -27,6 +27,14 @@ Approach
    code is NOT flagged.
 """
 
+# ruff: noqa: SIM102, SIM101
+# This is an AST-walking guardrail (see module docstring). The nested `if`
+# checks and repeated `isinstance` calls mirror the control flow of the tree
+# traversal they assert on; collapsing them (SIM102) or merging the isinstance
+# calls (SIM101) would make the guard's logic harder to audit. The readability
+# of this hard-rule guard outweighs the style rules, so they are suppressed for
+# this file only.
+
 from __future__ import annotations
 
 import ast
@@ -205,9 +213,7 @@ def _enclosing_qualname(tree: ast.AST, node: ast.AST) -> str:
     parts: list[str] = []
     current: ast.AST | None = node
     while current is not None:
-        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            parts.append(current.name)
-        elif isinstance(current, ast.ClassDef):
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)) or isinstance(current, ast.ClassDef):
             parts.append(current.name)
         current = parent.get(current)
     return ".".join(reversed(parts))

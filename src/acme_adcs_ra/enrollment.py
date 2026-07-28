@@ -17,10 +17,10 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, Sequence, cast
+from typing import Protocol, cast
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -449,8 +449,10 @@ def _parse_certfnsh_disposition(
         return ("unknown", f"unrecognized certfnsh.asp response (HTTP {status_code}); body: {snippet}")
     return (
         "unknown",
-        f"unrecognized certfnsh.asp response (HTTP {status_code}, locale={locale!r}); "
-        f"no locale-independent signal matched — check CA locale setting. body: {snippet}"
+        (
+            f"unrecognized certfnsh.asp response (HTTP {status_code}, locale={locale!r}); "
+            f"no locale-independent signal matched — check CA locale setting. body: {snippet}"
+        ),
     )
 
 

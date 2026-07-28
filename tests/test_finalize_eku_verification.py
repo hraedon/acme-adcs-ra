@@ -15,7 +15,7 @@ Cert-minting primitives are forbidden in ``src/`` (the architecture test), not i
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -28,8 +28,8 @@ from fastapi.testclient import TestClient
 from acme_adcs_ra.config import EABEntry, RAConfig
 from acme_adcs_ra.enrollment import EnrollmentResult, FakeEnrollmentLeg
 from acme_adcs_ra.finalize import _issued_cert_eku_violations
-from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.policy import IssuancePolicy
+from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import Store
 
@@ -55,8 +55,8 @@ def _make_cert_pem(
         .issuer_name(subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.now(timezone.utc))
-        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1))
+        .not_valid_before(datetime.now(UTC))
+        .not_valid_after(datetime.now(UTC) + timedelta(days=1))
     )
     if ekus is not None:
         builder = builder.add_extension(x509.ExtendedKeyUsage(ekus), critical=False)

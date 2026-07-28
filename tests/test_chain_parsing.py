@@ -12,7 +12,6 @@ import base64
 import datetime
 
 import pytest
-
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -25,7 +24,7 @@ from acme_adcs_ra.enrollment import EnrollmentTransportError, _parse_pkcs7_chain
 def _cert(cn: str) -> x509.Certificate:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-    now = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    now = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
     return (
         x509.CertificateBuilder()
         .subject_name(name)

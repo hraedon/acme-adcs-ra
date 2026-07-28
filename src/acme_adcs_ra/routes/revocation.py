@@ -17,8 +17,8 @@ from acme_adcs_ra.acme_errors import (
     server_internal,
 )
 from acme_adcs_ra.app_state import (
-    ServerContext,
     _ACME_PATHS,
+    ServerContext,
     _audit,
     get_context,
     logger,
@@ -35,7 +35,7 @@ async def revoke_cert(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+    _header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
 
     cert_b64 = payload.get("cert")
     if not isinstance(cert_b64, str) or not cert_b64:
@@ -60,12 +60,15 @@ async def revoke_cert(
     # {0,1,2,3,4,5,6,8,9,10} (7 excluded); the error uses bad_revocation_reason.
     _VALID_REVOCATION_REASONS = frozenset({0, 1, 2, 3, 4, 5, 6, 8, 9, 10})
     reason = payload.get("reason")
-    if reason is not None:
-        if not isinstance(reason, int) or isinstance(reason, bool) or reason not in _VALID_REVOCATION_REASONS:
-            raise bad_revocation_reason(
-                "reason code must be an integer in the set 0-6, 8-10 "
-                "(reason 7 is unused in RFC 5280 and rejected by certutil)"
-            )
+    if reason is not None and (
+        not isinstance(reason, int)
+        or isinstance(reason, bool)
+        or reason not in _VALID_REVOCATION_REASONS
+    ):
+        raise bad_revocation_reason(
+            "reason code must be an integer in the set 0-6, 8-10 "
+            "(reason 7 is unused in RFC 5280 and rejected by certutil)"
+        )
 
     serial_hex = format(cert.serial_number, "x").upper()
 

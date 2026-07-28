@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,6 @@ from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import NONCE_TTL_SECONDS, Store, _now_iso, is_expired
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
-
 
 # ---------------------------------------------------------------------------
 # Test config and fixtures
@@ -122,7 +121,7 @@ def _order_id_from_finalize_url(finalize_url: str) -> str:
 
 def _backdate_order(store: Store, order_id: str, seconds_ago: int = 60) -> None:
     """Set an order's `expires` into the past so it is expired."""
-    past = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime(
+    past = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
     with store._connect() as conn:
@@ -132,7 +131,7 @@ def _backdate_order(store: Store, order_id: str, seconds_ago: int = 60) -> None:
 def _force_order_status(store: Store, order_id: str, status: str) -> None:
     """Test-only direct write of an order status (simulates a crash mid-flight)."""
     ts = (
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         if status == "processing"
         else None
     )
@@ -596,10 +595,10 @@ class TestOrderExpiry:
         acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
         resp = acme_client.new_order(["web.WORK-DOMAIN.local"])
         expires_str = resp.json()["expires"]
-        expires = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
-        assert expires > datetime.now(timezone.utc)
+        expires = datetime.fromisoformat(expires_str)
+        assert expires > datetime.now(UTC)
         # Default lifetime is 1h; allow slack for test runtime.
-        assert (expires - datetime.now(timezone.utc)).total_seconds() > 3000
+        assert (expires - datetime.now(UTC)).total_seconds() > 3000
 
 
 class TestFullRoundTrip:
@@ -699,7 +698,7 @@ class TestNonceGarbageCollection:
     def test_cleanup_expired_nonces(self, tmp_path: Path) -> None:
         """Expired nonces are removed by cleanup_expired_nonces."""
         store = Store(tmp_path / "test_gc.db")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         old_ts = (now - timedelta(seconds=NONCE_TTL_SECONDS + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         with store._connect() as conn:
             conn.execute("INSERT INTO nonces (nonce, created_at) VALUES (?, ?)", ("old-nonce-1", old_ts))
@@ -726,13 +725,11 @@ class TestNonceConsumeTtl:
         """An unused nonce older than the TTL is rejected even if neither the
         probabilistic GC nor the admin cron has swept it yet."""
         store = Store(tmp_path / "test_consume_expired.db")
-        old_ts = (
-            datetime.now(timezone.utc) - timedelta(seconds=NONCE_TTL_SECONDS + 60)
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old_ts = (datetime.now(UTC) - timedelta(seconds=NONCE_TTL_SECONDS + 60)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         with store._connect() as conn:
-            conn.execute(
-                "INSERT INTO nonces (nonce, created_at) VALUES (?, ?)", ("stale-nonce", old_ts)
-            )
+            conn.execute("INSERT INTO nonces (nonce, created_at) VALUES (?, ?)", ("stale-nonce", old_ts))
         assert store.consume_nonce("stale-nonce") is False
         # A retry fails identically (no oracle between expired and unknown).
         assert store.consume_nonce("stale-nonce") is False
@@ -743,7 +740,7 @@ class TestNonceConsumeTtl:
         one just past it is rejected (created_at >= now-TTL)."""
         store = Store(tmp_path / "test_consume_boundary.db")
         fmt = "%Y-%m-%dT%H:%M:%SZ"
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         just_inside = (now - timedelta(seconds=NONCE_TTL_SECONDS - 5)).strftime(fmt)
         just_outside = (now - timedelta(seconds=NONCE_TTL_SECONDS + 5)).strftime(fmt)
         with store._connect() as conn:
@@ -780,9 +777,9 @@ class TestNonceConsumeTtl:
 
         nonce = acme_client._fresh_nonce()
         # Age the issued nonce past the TTL in the backing store.
-        old_ts = (
-            datetime.now(timezone.utc) - timedelta(seconds=NONCE_TTL_SECONDS + 60)
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old_ts = (datetime.now(UTC) - timedelta(seconds=NONCE_TTL_SECONDS + 60)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         backing = Store(test_config.db_path)
         with backing._connect() as conn:
             conn.execute("UPDATE nonces SET created_at = ? WHERE nonce = ?", (old_ts, nonce))
@@ -1808,7 +1805,7 @@ class TestAdminSweeps:
         self, test_config: RAConfig, client: TestClient
     ) -> None:
         store = Store(test_config.db_path)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         old = (now - timedelta(seconds=NONCE_TTL_SECONDS + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         with store._connect() as conn:
             conn.execute("INSERT INTO nonces (nonce, created_at) VALUES (?, ?)", ("stale-nonce", old))

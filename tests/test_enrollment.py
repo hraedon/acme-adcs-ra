@@ -5,9 +5,9 @@ from __future__ import annotations
 import base64
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Mapping
 
 import pytest
 from cryptography import x509
@@ -25,7 +25,6 @@ from acme_adcs_ra.enrollment import (
     FakeEnrollmentLeg,
     _parse_certfnsh_disposition,
 )
-
 
 # ---------------------------------------------------------------------------
 # EnrollmentResult shape
@@ -183,7 +182,7 @@ def _build_leaf_cert_and_chain() -> tuple[str, bytes, str]:
     signing here is permitted (precedent: tests/hand_rolled_acme_client.py).
     Returns (leaf_pem, leaf_der, p7b_base64).
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "CA01-CA")])
     ca_cert = (
@@ -239,7 +238,7 @@ class TestCertsrvEnrollmentLeg:
         assert CertsrvEnrollmentLeg is not None
 
     def test_success_returns_cert_and_chain(self) -> None:
-        leaf_pem, leaf_der, p7b_b64 = _build_leaf_cert_and_chain()
+        _leaf_pem, leaf_der, p7b_b64 = _build_leaf_cert_and_chain()
         cert_b64 = base64.b64encode(leaf_der).decode("ascii")
         fake = _FakeSession(
             routes={
@@ -315,7 +314,7 @@ class TestCertsrvEnrollmentLeg:
             leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
 
     def test_certfnsh_payload_correctness(self) -> None:
-        leaf_pem, leaf_der, p7b_b64 = _build_leaf_cert_and_chain()
+        _leaf_pem, leaf_der, p7b_b64 = _build_leaf_cert_and_chain()
         cert_b64 = base64.b64encode(leaf_der).decode("ascii")
         fake = _FakeSession(
             routes={
@@ -359,7 +358,7 @@ class TestCertsrvEnrollmentLeg:
             leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
 
     def test_malformed_p7b_raises_transport_error(self) -> None:
-        leaf_pem, leaf_der, _p7b_b64 = _build_leaf_cert_and_chain()
+        _leaf_pem, leaf_der, _p7b_b64 = _build_leaf_cert_and_chain()
         cert_b64 = base64.b64encode(leaf_der).decode("ascii")
         fake = _FakeSession(
             routes={
@@ -382,7 +381,7 @@ class TestCertsrvEnrollmentLeg:
             leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
 
     def test_multi_cert_chain_propagates(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Root-CA")])
         root_cert = (

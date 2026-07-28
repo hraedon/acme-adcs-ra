@@ -7,8 +7,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, Response
 
 from acme_adcs_ra.app_state import (
-    ServerContext,
     _ACME_PATHS,
+    ServerContext,
     _url,
     get_context,
 )
