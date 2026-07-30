@@ -8,7 +8,7 @@ Two complementary checks:
    ``samples/`` directory holds real environment data (hostnames, service
    accounts, principal handles) that must never be committed (AGENTS.md).
 
-2. Secret-driven: when ``ACME_ADCS_RA_FORBIDDEN_IDENTIFIERS`` is set (a
+2. Secret-driven: when ``ACME_RA_FORBIDDEN_IDENTIFIERS`` is set (a
    whitespace-separated list of real identifiers — hostnames, emails, service
    accounts, principal handles, personal names), every tracked text file
    outside ``samples/`` is scanned for those identifiers. This catches real
@@ -33,7 +33,6 @@ import argparse
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -255,19 +254,6 @@ def scan_files(
     return violations
 
 
-def _resolve_git() -> str:
-    """Absolute path to git, or raise GateError.
-
-    A bare name resolves through PATH — a lint finding (ruff S607, selected by
-    several repos in this estate) and a real ambiguity for a gate that is meant to
-    be deterministic.
-    """
-    path = shutil.which("git")
-    if path is None:
-        raise GateError("git is not available on PATH")
-    return path
-
-
 def _run_git(args: list[str]) -> str:
     """Run a git command and return stdout.
 
@@ -275,10 +261,17 @@ def _run_git(args: list[str]) -> str:
     (WI-027): a CI gate must fail clean, not emit a CalledProcessError traceback
     that reads as an infrastructure crash rather than a blocked publication.
     """
-    resolved = [_resolve_git(), *args[1:]] if args and args[0] == "git" else args
+    # argv is passed through verbatim, bare "git" included. Resolving it to an
+    # absolute path via shutil.which is arguably better hygiene, but this script is
+    # COPIED into every repo and several of them assert on the exact argv
+    # (`== ["git", "diff", "--cached"]`), so absolute paths broke three test
+    # suites. The S607 partial-path finding that motivated it only ever applied to
+    # check_publication_plumbing.py, whose literal argv ruff can see statically;
+    # here the list is a parameter, so the rule does not fire. Respect the
+    # fleet-wide contract.
     try:
         result = subprocess.run(
-            resolved,
+            args,
             capture_output=True,
             text=True,
             check=True,
@@ -379,17 +372,17 @@ def _resolve_identifiers() -> frozenset[str] | None:
     Shared by the message-scanning modes so they honor exactly the same
     configured/unconfigured semantics as the tracked-tree scan.
     """
-    raw = os.environ.get("ACME_ADCS_RA_FORBIDDEN_IDENTIFIERS", "")
+    raw = os.environ.get("ACME_RA_FORBIDDEN_IDENTIFIERS", "")
     if not raw.strip():
         print(
-            "ACME_ADCS_RA_FORBIDDEN_IDENTIFIERS is empty or unset; skipping identifier gate.",
+            "ACME_RA_FORBIDDEN_IDENTIFIERS is empty or unset; skipping identifier gate.",
             file=sys.stderr,
         )
         return None
     identifiers = parse_identifier_set(raw)
     if not identifiers:
         print(
-            "ACME_ADCS_RA_FORBIDDEN_IDENTIFIERS contained no usable identifiers (minimum "
+            "ACME_RA_FORBIDDEN_IDENTIFIERS contained no usable identifiers (minimum "
             f"length is {MIN_IDENTIFIER_LENGTH} characters); skipping gate.",
             file=sys.stderr,
         )
@@ -468,10 +461,10 @@ def _run(args: argparse.Namespace) -> int:
 
     # 2. Secret-driven: scan tracked text files (outside guarded dirs) for
     #    forbidden identifiers. No-op until the secret is configured.
-    raw = os.environ.get("ACME_ADCS_RA_FORBIDDEN_IDENTIFIERS", "")
+    raw = os.environ.get("ACME_RA_FORBIDDEN_IDENTIFIERS", "")
     if not raw.strip():
         print(
-            "ACME_ADCS_RA_FORBIDDEN_IDENTIFIERS is empty or unset; skipping identifier gate.",
+            "ACME_RA_FORBIDDEN_IDENTIFIERS is empty or unset; skipping identifier gate.",
             file=sys.stderr,
         )
         return 0
@@ -479,7 +472,7 @@ def _run(args: argparse.Namespace) -> int:
     identifiers = parse_identifier_set(raw)
     if not identifiers:
         print(
-            "ACME_ADCS_RA_FORBIDDEN_IDENTIFIERS contained no usable identifiers (minimum "
+            "ACME_RA_FORBIDDEN_IDENTIFIERS contained no usable identifiers (minimum "
             f"length is {MIN_IDENTIFIER_LENGTH} characters); skipping gate.",
             file=sys.stderr,
         )
