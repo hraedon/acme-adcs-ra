@@ -31,3 +31,6 @@ secrets/
 
 # Harness
 .claude/
+
+# never commit the local denylist (identifier gate)
+.identifiers-denylist.local
