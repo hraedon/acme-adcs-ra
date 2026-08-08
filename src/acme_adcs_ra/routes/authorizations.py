@@ -66,7 +66,11 @@ async def post_challenge(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+    _header, payload, account_id = await verify_existing_account_jws(
+        request,
+        ctx.store,
+        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    )
 
     challenge = ctx.store.get_challenge(challenge_id)
     if challenge is None:

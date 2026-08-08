@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.x509.oid import ExtensionOID, NameOID
 
 from acme_adcs_ra.acme_errors import bad_csr
 from acme_adcs_ra.policy import validate_dns_name
@@ -80,3 +81,51 @@ def _validate_csr_key_strength(csr: x509.CertificateSigningRequest) -> None:
             f"unsupported key type {type(pub).__name__}; "
             f"only RSA and EC keys are accepted"
         )
+
+
+def _reject_unrequested_common_names(
+    csr: x509.CertificateSigningRequest, requested_sans: list[str]
+) -> None:
+    """Keep the CSR subject from becoming a second, unscoped identity path.
+
+    The ADCS template is configured to take the subject from the request.  A
+    client must therefore not be able to pair an allowed SAN with an
+    out-of-scope Common Name and rely on legacy CN name matching.
+    """
+    authorized = {name.rstrip(".").lower() for name in requested_sans}
+    for attribute in csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
+        common_name = attribute.value
+        if not isinstance(common_name, str):
+            raise bad_csr("CSR Common Name must be a text DNS name")
+        try:
+            validate_dns_name(common_name)
+        except ValueError as exc:
+            raise bad_csr(
+                f"CSR Common Name is not a valid DNS name: {common_name!r}: {exc}"
+            ) from exc
+        if common_name.rstrip(".").lower() not in authorized:
+            raise bad_csr(
+                f"CSR Common Name {common_name!r} is not one of the requested DNS SANs"
+            )
+
+
+def _reject_ca_capable_csr_extensions(csr: x509.CertificateSigningRequest) -> None:
+    """Reject CSR requests that ask the issuing template for CA capability."""
+    try:
+        basic_constraints = csr.extensions.get_extension_for_oid(
+            ExtensionOID.BASIC_CONSTRAINTS
+        ).value
+    except x509.ExtensionNotFound:
+        pass
+    else:
+        if isinstance(basic_constraints, x509.BasicConstraints) and basic_constraints.ca:
+            raise bad_csr("CSR requests BasicConstraints CA=true")
+
+    try:
+        key_usage = csr.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
+    except x509.ExtensionNotFound:
+        return
+    if isinstance(key_usage, x509.KeyUsage) and (
+        key_usage.key_cert_sign or key_usage.crl_sign
+    ):
+        raise bad_csr("CSR requests certificate/CRL signing key usage")

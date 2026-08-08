@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from acme_adcs_ra.enrollment import FakeEnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
-from acme_adcs_ra.store import Store
+from acme_adcs_ra.store import OrderRateLimitExceeded, Store
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
 
@@ -255,6 +256,38 @@ class TestGlobalBackstop:
 
 
 class TestStoreCounting:
+    def test_atomic_limit_blocks_parallel_burst(self, tmp_path: Path) -> None:
+        """The count and insert are one serialized decision, not a TOCTOU pair."""
+        config = _make_rate_limit_config(tmp_path, per_kid=1)
+        _, store, _ = _make_app(config)
+        account = store.create_account(
+            jwk={"kty": "RSA", "n": "parallel", "e": "AQAB"},
+            eab_kid="kid-001",
+        )
+
+        def create(index: int) -> bool:
+            try:
+                store.create_order_with_authz(
+                    account_id=account.id,
+                    identifiers=[{
+                        "type": "dns",
+                        "value": f"srv{index}.WORK-DOMAIN.local",
+                    }],
+                    challenge_url_fn=lambda cid: f"http://t/c/{cid}",
+                    authz_url_fn=lambda aid: f"http://t/a/{aid}",
+                    finalize_url_fn=lambda oid: f"http://t/f/{oid}",
+                    rate_limit_window_seconds=3600,
+                    rate_limit_per_kid=1,
+                )
+            except OrderRateLimitExceeded:
+                return False
+            return True
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            outcomes = list(pool.map(create, range(8)))
+        assert outcomes.count(True) == 1
+        assert outcomes.count(False) == 7
+
     def test_count_recent_orders_by_kid_with_injected_now(
         self, tmp_path: Path
     ) -> None:

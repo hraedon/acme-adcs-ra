@@ -45,7 +45,9 @@ async def key_change(
     replaced; the old key is no longer accepted.
     """
     outer_header, outer_payload, account_id = await verify_existing_account_jws(
-        request, ctx.store
+        request,
+        ctx.store,
+        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
     )
 
     account = ctx.store.get_account(account_id)
@@ -61,8 +63,11 @@ async def key_change(
     except Exception as exc:
         raise malformed(f"invalid inner JWS protected header: {exc}") from exc
 
+    if not isinstance(inner_header, dict):
+        raise malformed("inner JWS protected header must be a JSON object")
+
     new_jwk = inner_header.get("jwk")
-    if not new_jwk:
+    if not isinstance(new_jwk, dict):
         raise malformed("inner JWS protected header missing jwk")
 
     inner_url = inner_header.get("url")
@@ -89,8 +94,11 @@ async def key_change(
 
     try:
         inner_payload = json.loads(inner_payload_bytes)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise malformed(f"inner JWS payload is not valid JSON: {exc}") from exc
+
+    if not isinstance(inner_payload, dict):
+        raise malformed("inner JWS payload must be a JSON object")
 
     inner_account = inner_payload.get("account")
     if inner_account != outer_header.get("kid"):

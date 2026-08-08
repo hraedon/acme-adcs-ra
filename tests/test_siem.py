@@ -300,6 +300,18 @@ class TestSiemStartupProbe:
         assert emitter.enabled is False
         emitter.close()
 
+    def test_hec_plain_http_disables_to_protect_token(self, caplog: Any) -> None:
+        with caplog.at_level(logging.ERROR, logger="acme_adcs_ra.siem"):
+            emitter = SiemEmitter(
+                SiemConfig(
+                    sink="hec",
+                    hec_url="http://splunk.example/services/collector",
+                    hec_token="secret-token",
+                )
+            )
+        assert emitter.enabled is False
+        emitter.close()
+
     def test_syslog_missing_host_disables(self, caplog: Any) -> None:
         """C-2: syslog sink with empty syslog_host is disabled at init."""
         with caplog.at_level(logging.ERROR, logger="acme_adcs_ra.siem"):

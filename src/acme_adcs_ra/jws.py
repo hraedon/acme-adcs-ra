@@ -1,7 +1,7 @@
 """JWS verification helpers (RFC 7515 + RFC 8555 §6.2).
 
 This module only **verifies** signatures; it never signs anything.
-Supported account-key algorithms: RS256, RS384, RS512, ES256, ES384, ES521.
+Supported account-key algorithms: RS256, RS384, RS512, ES256, ES384, ES512.
 Supported EAB algorithms: HS256, HS384, HS512.
 """
 
@@ -93,11 +93,21 @@ def jwk_thumbprint(jwk: dict[str, Any]) -> str:
 
 def _public_key_from_jwk(jwk: dict[str, Any]) -> rsa.RSAPublicKey | ec.EllipticCurvePublicKey:
     """Build a cryptography public key from a JWK dictionary."""
+    if not isinstance(jwk, dict):
+        raise JWSValidationError("JWK must be a JSON object")
     kty = jwk.get("kty")
     if kty == "RSA":
         n = int.from_bytes(_base64url_decode(cast(str, jwk["n"])), "big")
         e = int.from_bytes(_base64url_decode(cast(str, jwk["e"])), "big")
-        return rsa.RSAPublicNumbers(e=e, n=n).public_key()
+        key = rsa.RSAPublicNumbers(e=e, n=n).public_key()
+        # Account keys authorize issuance and revocation for their full
+        # lifetime.  Accepting a factorable legacy RSA key turns possession of
+        # the public JWK into eventual account takeover.
+        if key.key_size < 2048:
+            raise JWSValidationError(
+                f"RSA account key size {key.key_size} is below the 2048-bit minimum"
+            )
+        return key
     if kty == "EC":
         crv = cast(str, jwk.get("crv"))
         curve_map: dict[str, ec.EllipticCurve] = {
@@ -185,8 +195,11 @@ def verify_flattened_jws(
 
     try:
         header = json.loads(protected_bytes)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise JWSValidationError(f"protected header is not valid JSON: {exc}") from exc
+
+    if not isinstance(header, dict):
+        raise JWSValidationError("protected header must be a JSON object")
 
     alg = header.get("alg")
     if not isinstance(alg, str):
@@ -195,7 +208,7 @@ def verify_flattened_jws(
     signing_input = f"{protected_b64}.{payload_b64}".encode("ascii")
 
     try:
-        if alg.startswith("RS"):
+        if alg in ("RS256", "RS384", "RS512"):
             if not isinstance(public_key, rsa.RSAPublicKey):
                 raise JWSValidationError("RS* algorithm requires an RSA public key")
             public_key.verify(
@@ -204,9 +217,19 @@ def verify_flattened_jws(
                 padding.PKCS1v15(),
                 _hash_for_alg(alg),
             )
-        elif alg.startswith("ES"):
+        elif alg in ("ES256", "ES384", "ES512"):
             if not isinstance(public_key, ec.EllipticCurvePublicKey):
                 raise JWSValidationError("ES* algorithm requires an EC public key")
+            expected_alg = {
+                "secp256r1": "ES256",
+                "secp384r1": "ES384",
+                "secp521r1": "ES512",
+            }.get(public_key.curve.name)
+            if alg != expected_alg:
+                raise JWSValidationError(
+                    f"{alg} is not valid for EC curve {public_key.curve.name} "
+                    f"(expected {expected_alg})"
+                )
             coordinate_len = _coordinate_length_for_curve(public_key.curve)
             der_signature = _raw_ecdsa_to_der(signature, coordinate_len)
             public_key.verify(der_signature, signing_input, ec.ECDSA(_hash_for_alg(alg)))
@@ -226,6 +249,8 @@ def verify_eab_jws(
     eab_jws: dict[str, Any],
     account_jwk: dict[str, Any],
     mac_key: bytes,
+    *,
+    expected_url: str | None = None,
 ) -> str:
     """Verify an externalAccountBinding JWS and return the EAB kid.
 
@@ -247,6 +272,9 @@ def verify_eab_jws(
     except Exception as exc:
         raise JWSValidationError(f"invalid EAB protected header: {exc}") from exc
 
+    if not isinstance(header, dict):
+        raise JWSValidationError("EAB protected header must be a JSON object")
+
     alg = header.get("alg")
     if alg not in ("HS256", "HS384", "HS512"):
         raise JWSValidationError(f"unsupported EAB algorithm: {alg}")
@@ -257,6 +285,11 @@ def verify_eab_jws(
         raise JWSValidationError("EAB protected header missing kid")
     kid = cast(str, kid)
 
+    if expected_url is not None and header.get("url") != expected_url:
+        raise JWSValidationError(
+            "EAB protected-header url does not match the newAccount endpoint"
+        )
+
     try:
         eab_payload = _base64url_decode(payload_b64)
     except Exception as exc:
@@ -264,8 +297,11 @@ def verify_eab_jws(
 
     try:
         decoded_jwk = json.loads(eab_payload)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise JWSValidationError(f"EAB payload is not valid JSON: {exc}") from exc
+
+    if not isinstance(decoded_jwk, dict):
+        raise JWSValidationError("EAB payload JWK must be a JSON object")
 
     # Canonical JWK comparison: drop the optional 'alg' field per ACME §7.1.3
     # and compare sorted key-value pairs, so a present/absent 'alg' does not

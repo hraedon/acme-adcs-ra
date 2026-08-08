@@ -37,7 +37,11 @@ async def new_account(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_jwk = await verify_new_account_jws(request, ctx.store)
+    _header, payload, account_jwk = await verify_new_account_jws(
+        request,
+        ctx.store,
+        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    )
 
     # RFC 8555 §7.3: newAccount is idempotent on the account key. If an
     # account already exists for this key, return it (200) rather than
@@ -96,7 +100,12 @@ async def new_account(
         raise bad_external_account_binding("unknown external account kid")
 
     try:
-        verified_kid = verify_eab_jws(eab_jws, account_jwk, mac_key)
+        verified_kid = verify_eab_jws(
+            eab_jws,
+            account_jwk,
+            mac_key,
+            expected_url=str(request.url),
+        )
     except JWSValidationError as exc:
         _audit(ctx,
             event_type="account-creation-denied",

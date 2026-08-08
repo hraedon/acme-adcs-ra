@@ -24,8 +24,10 @@ from acme_adcs_ra.app_state import (
     logger,
 )
 from acme_adcs_ra.csr_validation import (
+    _reject_ca_capable_csr_extensions,
     _reject_invalid_dns_sans,
     _reject_non_dns_sans,
+    _reject_unrequested_common_names,
     _reject_wildcard_sans,
     _validate_csr_key_strength,
 )
@@ -177,6 +179,11 @@ def _finalize_parse_and_validate_csr(
 
     requested_sans = san_values
 
+    # The template takes the subject and extensions from the request.  Scope
+    # the legacy CN identity path and reject any attempt to request a CA-capable
+    # certificate before the CSR reaches ADCS.
+    _reject_ca_capable_csr_extensions(csr)
+
     order_dns = {
         i["value"].lower()
         for i in order.identifiers
@@ -222,6 +229,8 @@ def _finalize_parse_and_validate_csr(
         if "out of scope" in decision.reason or "no SANs" in decision.reason:
             raise rejected_identifier(decision.reason)
         raise bad_csr(decision.reason)
+
+    _reject_unrequested_common_names(csr, requested_sans)
 
     return csr, csr_subject, requested_sans, decision
 
@@ -428,6 +437,36 @@ def _issued_cert_eku_violations(cert_pem: str) -> list[str]:
     return violations
 
 
+def _issued_cert_ca_capability_violations(cert_pem: str) -> list[str]:
+    """Reject an issued certificate that could act as a subordinate CA."""
+    try:
+        issued = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive; enrollment parsed it
+        raise server_internal(f"issued cert unparseable: {exc}") from exc
+
+    violations: list[str] = []
+    try:
+        basic_constraints = issued.extensions.get_extension_for_oid(
+            ExtensionOID.BASIC_CONSTRAINTS
+        ).value
+    except x509.ExtensionNotFound:
+        pass
+    else:
+        if isinstance(basic_constraints, x509.BasicConstraints) and basic_constraints.ca:
+            violations.append("BasicConstraints CA=true")
+
+    try:
+        key_usage = issued.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
+    except x509.ExtensionNotFound:
+        return violations
+    if isinstance(key_usage, x509.KeyUsage):
+        if key_usage.key_cert_sign:
+            violations.append("KeyUsage keyCertSign=true")
+        if key_usage.crl_sign:
+            violations.append("KeyUsage cRLSign=true")
+    return violations
+
+
 def _finalize_complete(
     ctx: ServerContext,
     order_id: str,
@@ -514,6 +553,27 @@ def _finalize_complete(
         raise server_internal(
             f"issued certificate fails EKU verification — {'; '.join(eku_violations)}; "
             "the ADCS template is likely misconfigured (serverAuth-only required)"
+        )
+
+    ca_capability_violations = _issued_cert_ca_capability_violations(
+        enrollment_result.cert_pem
+    )
+    if ca_capability_violations:
+        _audit(
+            ctx,
+            event_type="finalize-issued-cert-ca-capability",
+            account_id=account_id,
+            order_id=order_id,
+            sans=requested_sans,
+            template=enrollment_result.template,
+            requester=enrollment_result.requester,
+            outcome="failed",
+            details={"violations": ca_capability_violations},
+        )
+        raise server_internal(
+            "issued certificate is CA-capable — "
+            f"{'; '.join(ca_capability_violations)}; "
+            "the ADCS template is dangerously misconfigured"
         )
 
     existing_cert = ctx.store.get_certificate_by_order(order_id)

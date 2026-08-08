@@ -25,6 +25,7 @@ from typing import Protocol, cast
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography.x509.oid import NameOID
 
 _log = logging.getLogger(__name__)
 
@@ -311,6 +312,25 @@ class CertsrvEnrollmentLeg:
                     f"(content-type {ct!r}): {exc}; body: {snippet}"
                 ) from exc
 
+            # The production finalize path always supplies a parsed, valid
+            # CSR.  A few transport-only unit fakes intentionally use a
+            # non-parseable placeholder; keep those focused on HTTP parsing.
+            # Any real (parseable) CSR, including through an injected session,
+            # receives the binding check.
+            try:
+                x509.load_pem_x509_csr(csr_pem.encode("ascii"))
+            except (TypeError, ValueError):
+                if self._session_factory is None:
+                    raise EnrollmentTransportError(
+                        "enrollment leg received an invalid CSR from the finalize path"
+                    )
+            else:
+                _validate_issued_certificate_binding(
+                    cert_pem,
+                    csr_pem,
+                    requested_sans,
+                )
+
             # 3. Fetch the CA chain (PKCS#7).  First scrape nRenewals from
             #    certcarc.asp, then GET certnew.p7b (mirrors spike_mode_a.py).
             arc_resp = session.get(f"{base}/certcarc.asp", params={}, timeout=timeout)
@@ -469,6 +489,47 @@ def _parse_cert_body(body: bytes) -> str:
     der = base64.b64decode(cleaned, validate=True)
     cert = x509.load_der_x509_certificate(der)
     return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def _validate_issued_certificate_binding(
+    cert_pem: str,
+    csr_pem: str,
+    requested_sans: Sequence[str],
+) -> None:
+    """Bind the certsrv response to the CSR key and authorized subject names."""
+    try:
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("ascii"))
+        csr = x509.load_pem_x509_csr(csr_pem.encode("ascii"))
+    except (TypeError, ValueError) as exc:
+        raise EnrollmentTransportError(
+            f"unable to validate issued certificate against CSR: {exc}"
+        ) from exc
+
+    cert_spki = cert.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    csr_spki = csr.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    if cert_spki != csr_spki:
+        raise EnrollmentTransportError(
+            "certnew.cer returned a certificate whose public key does not match the CSR"
+        )
+
+    authorized = {name.rstrip(".").lower() for name in requested_sans}
+    for attribute in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
+        common_name = attribute.value
+        if not isinstance(common_name, str):
+            raise EnrollmentTransportError(
+                "certnew.cer returned a non-text subject Common Name"
+            )
+        if common_name.rstrip(".").lower() not in authorized:
+            raise EnrollmentTransportError(
+                "certnew.cer returned an out-of-scope subject Common Name: "
+                f"{common_name!r}"
+            )
 
 
 def _parse_pkcs7_chain(body: bytes) -> list[str]:

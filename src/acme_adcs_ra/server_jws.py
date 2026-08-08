@@ -95,13 +95,37 @@ def _consume_nonce(store: Store, header: dict[str, Any], request_url: str) -> No
         raise bad_nonce(f"invalid or replayed Replay-Nonce for {request_url}")
 
 
-async def _parse_jws_body(request: Request) -> dict[str, Any]:
-    body = await request.body()
+async def _parse_jws_body(
+    request: Request, *, max_body_size_bytes: int = 65536
+) -> dict[str, Any]:
+    if max_body_size_bytes < 1:
+        raise malformed("server JWS body-size limit is invalid")
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise malformed("invalid Content-Length header") from exc
+        if declared_length < 0 or declared_length > max_body_size_bytes:
+            raise malformed(
+                f"JWS request body too large (max {max_body_size_bytes} bytes)"
+            )
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_body_size_bytes:
+            raise malformed(
+                f"JWS request body too large (max {max_body_size_bytes} bytes)"
+            )
+        chunks.append(chunk)
+    body = b"".join(chunks)
     if not body:
         raise malformed("empty request body")
     try:
         data = json.loads(body)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise malformed(f"request body is not valid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise malformed("request body must be a JSON object")
@@ -111,13 +135,17 @@ async def _parse_jws_body(request: Request) -> dict[str, Any]:
 async def _parse_jws_header(
     request: Request,
     store: Store,
+    *,
+    max_body_size_bytes: int = 65536,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Parse the JWS body, decode the protected header, consume the nonce,
     and verify the URL binding.
 
     Returns (header, jws_dict).
     """
-    jws = await _parse_jws_body(request)
+    jws = await _parse_jws_body(
+        request, max_body_size_bytes=max_body_size_bytes
+    )
     protected_b64 = jws.get("protected")
     if not isinstance(protected_b64, str):
         raise malformed("JWS missing protected header")
@@ -125,6 +153,9 @@ async def _parse_jws_header(
         header = json.loads(_base64url_decode(protected_b64))
     except Exception as exc:
         raise malformed(f"invalid protected header: {exc}") from exc
+
+    if not isinstance(header, dict):
+        raise malformed("JWS protected header must be a JSON object")
 
     # Consume nonce BEFORE verifying URL so that a bad-URL probe still
     # burns the nonce, limiting replay probing (M6).
@@ -145,26 +176,34 @@ def _verify_jws_signature(
         raise unauthorized(f"JWS verification failed: {exc}") from exc
 
     try:
-        payload_dict: dict[str, Any] = json.loads(payload)
-    except json.JSONDecodeError as exc:
+        decoded_payload = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise malformed(f"JWS payload is not valid JSON: {exc}") from exc
 
-    return payload_dict
+    if not isinstance(decoded_payload, dict):
+        raise malformed("JWS payload must be a JSON object")
+    return decoded_payload
 
 
 async def verify_existing_account_jws(
     request: Request,
     store: Store,
+    *,
+    max_body_size_bytes: int = 65536,
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
     """Verify a JWS signed by an existing account (kid lookup).
 
     Returns (protected_header, payload_dict, account_id).
     """
-    header, jws = await _parse_jws_header(request, store)
+    header, jws = await _parse_jws_header(
+        request, store, max_body_size_bytes=max_body_size_bytes
+    )
 
     kid = header.get("kid")
     if not kid:
         raise malformed("protected header missing kid")
+    if "jwk" in header:
+        raise malformed("existing-account JWS must use kid, not jwk")
     account_id = _kid_to_account_id(kid)
     account = store.get_account(account_id)
     if account is None:
@@ -183,16 +222,22 @@ async def verify_existing_account_jws(
 async def verify_new_account_jws(
     request: Request,
     store: Store,
+    *,
+    max_body_size_bytes: int = 65536,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Verify a JWS signed by the new account key (jwk in header).
 
     Returns (protected_header, payload_dict, account_jwk).
     """
-    header, jws = await _parse_jws_header(request, store)
+    header, jws = await _parse_jws_header(
+        request, store, max_body_size_bytes=max_body_size_bytes
+    )
 
     account_jwk = header.get("jwk")
-    if not account_jwk:
+    if not isinstance(account_jwk, dict):
         raise malformed("newAccount JWS protected header missing jwk")
+    if "kid" in header:
+        raise malformed("newAccount JWS must use jwk, not kid")
 
     try:
         public_key = _public_key_from_jwk(account_jwk)

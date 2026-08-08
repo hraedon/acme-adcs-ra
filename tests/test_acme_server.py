@@ -302,6 +302,18 @@ class TestNonce:
 
 
 class TestNewAccount:
+    def test_oversized_jws_body_rejected_before_buffering(
+        self, client: TestClient, test_config: RAConfig
+    ) -> None:
+        body = b"{" + (b"x" * test_config.max_jws_body_size_bytes) + b"}"
+        resp = client.post(
+            "/acme/new-acct",
+            content=body,
+            headers={"Content-Type": "application/jose+json"},
+        )
+        assert resp.status_code == 400
+        assert "JWS request body too large" in resp.json()["detail"]
+
     def test_new_account_success(self, acme_client: HandRolledAcmeClient, test_config: RAConfig) -> None:
         resp = acme_client.new_account("kid-001", _eab_mac_key(test_config, "kid-001"))
         assert resp.status_code == 201

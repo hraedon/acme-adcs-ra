@@ -123,6 +123,10 @@ class RAConfig(BaseSettings):
     max_identifiers_per_order: int = 50
     # Maximum CSR body size in bytes (bounds memory + parsing work)
     max_csr_size_bytes: int = 8192
+    # Maximum complete flattened-JWS request body.  This is enforced while
+    # streaming, before JSON/base64 decoding, so an unauthenticated peer cannot
+    # make the worker buffer an arbitrarily large body.
+    max_jws_body_size_bytes: int = 65536
 
     # --- In-app rate limiting (WI-016) --------------------------------------
     # Per-account (per-kid) order creation ceiling per rolling window.

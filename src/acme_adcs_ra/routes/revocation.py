@@ -35,7 +35,11 @@ async def revoke_cert(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+    _header, payload, account_id = await verify_existing_account_jws(
+        request,
+        ctx.store,
+        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    )
 
     cert_b64 = payload.get("cert")
     if not isinstance(cert_b64, str) or not cert_b64:

@@ -171,7 +171,10 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 - **CSR hardening:** CSR signature verified; minimum key strength (RSA≥2048, EC
   P-256/384/521); **non-DNSName SANs rejected** (IPAddress/otherName/URI/
   RFC822Name/RegisteredID) — prevents scope expansion via SAN type. CSR
-  identifiers must be ⊆ the order's identifiers (RFC).
+  identifiers must be ⊆ the order's identifiers (RFC). Subject Common Names
+  must be one of those DNS SANs, closing the legacy-CN second identity path.
+  CSR requests for `BasicConstraints CA=true`, `keyCertSign`, or `cRLSign`
+  are rejected before they reach ADCS.
 - **Post-issuance SAN verification (MED-1):** the policy above gates the
   *request*, but the ADCS template decides what SANs land on the cert. After
   enrollment the RA inspects the *result*: every DNS SAN on the issued cert
@@ -181,13 +184,22 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   is fail-closed — 500 + `finalize-issued-cert-san-mismatch` audit, the cert is
   neither recorded nor served — catching a template that pulls SANs from AD or
   appends extras instead of taking them from the CSR.
+- **Result binding and CA-capability rejection (2026-08-07 hardening):** the
+  real `/certsrv/` response public key must equal the CSR public key, and every
+  issued subject Common Name must remain within the requested DNS SAN set.
+  Independently, the finalize path rejects an issued certificate with
+  `BasicConstraints CA=true`, `keyCertSign`, or `cRLSign`. This keeps template
+  drift from turning the server-auth enrollment identity into a subordinate-CA
+  issuance path.
 - **Residual:** none beyond the configured SAN scope (the intended policy).
 
 ### D. ACME protocol attacks (replay, cross-endpoint, IDOR, alg confusion)
 - **JWS:** **full-URL binding** (RFC 8555 §6.4 — relative/cross-host URLs
   rejected); nonce consumed **before** the URL check (bad-URL probes burn the
-  nonce); **RS/ES-only** for account keys, **HS-only** for EAB (no alg
-  confusion / no "HS256 with the server's public key"); ES raw R‖S→DER validated.
+  nonce); **exact RS256/384/512 or curve-matched ES256/384/512 only** for
+  account keys, with RSA account keys ≥2048 bits; **HS-only** for EAB (no alg
+  confusion / no "HS256 with the server's public key"); ES raw R‖S→DER
+  validated. EAB JWS objects are bound to this RA's `newAccount` URL.
 - **CSRF / cross-protocol:** ACME POSTs are `application/jose+json` (RFC 8555
   §6.1) and the body is a key-bound JWS signature. There is no browser-rendered
   surface; a same-origin attacker would still need the account key. CSRF is a
@@ -425,8 +437,9 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   **unconditionally** — the store write cannot be skipped by a SIEM-hook
   exception (fail-open applies to *emission*, not to the local record).
 - **SIEM startup probe:** jsonl writability verified at init; a broken sink →
-  `enabled=False` + **ERROR** log; HEC/syslog config validated. Fail-open: a
-  broken sink never aborts issuance.
+  `enabled=False` + **ERROR** log; HEC/syslog config validated. HEC requires
+  HTTPS and rejects embedded URL credentials so its bearer token cannot be
+  sent in plaintext. Fail-open: a broken sink never aborts issuance.
 - **Runtime SIEM failures log at WARNING, not ERROR.** Therefore: **the
   production monitoring stack MUST alert on the RA logger at WARNING+** (not
   ERROR-only) — this is a pilot condition, not a runbook footnote.
@@ -444,7 +457,9 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
 - **In-app per-account order rate limiting (WI-016):** order creation is
   capped per `kid` over a rolling window plus a global backstop, returning
   RFC 8555 `rateLimited` + `Retry-After`, with denials SIEM-audited as
-  `order-rate-limited`. This bounds order creation even if the deployment
+  `order-rate-limited`. The count-and-create decision runs under one SQLite
+  `BEGIN IMMEDIATE` transaction, so a parallel burst cannot race past the
+  limit. This bounds order creation even if the deployment
   fronts the RA directly or the proxy rule is misconfigured. See the
   `### In-app rate limit (WI-016)` section of `docs/operations.md`.
 - **Per-account / per-IP rate limiting** at the reverse proxy complements the
@@ -454,8 +469,9 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   `docs/operations.md` ## Network allowlist and in-app rate limiting for
   copy-paste-ready snippets.
 - **Caps in code:** `max_identifiers_per_order` (default 50, 1 identifier = 1
-  authz) and `max_csr_size_bytes` (default 8192) are enforced on the request
-  path. Order/authz lifetime is bounded by `order_expiry_seconds` (default
+  authz), `max_csr_size_bytes` (default 8192), and the streaming pre-parse
+  `max_jws_body_size_bytes` (default 65536) are enforced on the request path.
+  Order/authz lifetime is bounded by `order_expiry_seconds` (default
   3600) and enforced at `finalize` (expired → `invalid` + audited as
   `finalize-expired-order`) and via the `DELETE /acme/admin/expired-orders`
   sweep for cron (RFC 8555 §7.1.6).
@@ -579,8 +595,9 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   the known/unknown-kid timing. Residual: high-entropy kids remain the primary
   control.
 - **Per-request DoS caps are in code** (§4.G) — CLOSED:
-  `max_identifiers_per_order` + `max_csr_size_bytes` are enforced on the
-  request path. Still operator: proxy rate-limiting and retention/archival.
+  `max_identifiers_per_order` + `max_csr_size_bytes` + the streaming
+  `max_jws_body_size_bytes` limit are enforced on the request path. Still
+  operator: proxy rate-limiting and retention/archival.
 - **Order expiry is enforced** (RFC 8555 §7.1.6) — CLOSED: an expired
   pending/ready order cannot be finalized (flipped to `invalid` + audited as
   `finalize-expired-order`) and expired pending/ready orders are swept by

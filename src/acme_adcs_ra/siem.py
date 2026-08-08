@@ -24,6 +24,7 @@ from logging.handlers import SysLogHandler
 from pathlib import Path
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from acme_adcs_ra.config import RAConfig
@@ -91,11 +92,19 @@ class SiemEmitter:
                 )
             self._enabled = self._syslog is not None
         elif config.sink == "hec":
-            if config.hec_url and config.hec_token:
+            parsed_hec = urlparse(config.hec_url)
+            hec_url_is_safe = (
+                parsed_hec.scheme == "https"
+                and parsed_hec.hostname is not None
+                and parsed_hec.username is None
+                and parsed_hec.password is None
+            )
+            if hec_url_is_safe and config.hec_token:
                 self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ra-siem-hec")
             else:
                 logger.error(
-                    "SIEM HEC sink enabled but hec_url or hec_token is empty; disabling"
+                    "SIEM HEC sink requires an https URL without embedded credentials "
+                    "and a non-empty token; disabling"
                 )
             self._enabled = self._pool is not None
         elif config.sink == "jsonl":

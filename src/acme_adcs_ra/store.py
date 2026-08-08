@@ -184,6 +184,26 @@ class RevocationUpdate(NamedTuple):
     won_cas: bool
 
 
+class OrderRateLimitExceeded(Exception):
+    """Raised when atomic order creation would exceed a configured ceiling."""
+
+    def __init__(
+        self,
+        *,
+        scope: str,
+        limit: int,
+        count: int,
+        window_seconds: int,
+        eab_kid: str | None = None,
+    ) -> None:
+        super().__init__(f"{scope} order rate limit exceeded")
+        self.scope = scope
+        self.limit = limit
+        self.count = count
+        self.window_seconds = window_seconds
+        self.eab_kid = eab_kid
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -845,6 +865,9 @@ class Store:
         challenge_url_fn: Callable[[str], str],
         authz_url_fn: Callable[[str], str],
         finalize_url_fn: Callable[[str], str],
+        rate_limit_window_seconds: int | None = None,
+        rate_limit_per_kid: int = 0,
+        rate_limit_global: int = 0,
     ) -> OrderRecord:
         """Create an order with authorizations and challenge URLs atomically.
 
@@ -859,6 +882,58 @@ class Store:
         authz_urls: list[str] = []
 
         with self._connect() as conn:
+            if rate_limit_per_kid > 0 or rate_limit_global > 0:
+                if rate_limit_window_seconds is None or rate_limit_window_seconds < 1:
+                    raise ValueError(
+                        "rate_limit_window_seconds must be positive when a limit is enabled"
+                    )
+                # Serialize the count-and-insert decision with every other
+                # rate-limited writer.  A separate SELECT followed by INSERT
+                # lets a parallel burst have every request observe the same
+                # below-limit count and all proceed.
+                conn.execute("BEGIN IMMEDIATE")
+                cutoff = (
+                    datetime.now(UTC)
+                    - timedelta(seconds=rate_limit_window_seconds)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                account_row = conn.execute(
+                    "SELECT eab_kid FROM accounts WHERE id = ?", (account_id,)
+                ).fetchone()
+                if account_row is None:
+                    raise ValueError("account does not exist")
+                eab_kid = str(account_row["eab_kid"])
+
+                if rate_limit_per_kid > 0:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM orders o "
+                        "JOIN accounts a ON o.account_id = a.id "
+                        "WHERE a.eab_kid = ? AND o.created_at >= ?",
+                        (eab_kid, cutoff),
+                    ).fetchone()
+                    count = int(row[0])
+                    if count >= rate_limit_per_kid:
+                        raise OrderRateLimitExceeded(
+                            scope="per-account",
+                            limit=rate_limit_per_kid,
+                            count=count,
+                            window_seconds=rate_limit_window_seconds,
+                            eab_kid=eab_kid,
+                        )
+
+                if rate_limit_global > 0:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM orders WHERE created_at >= ?",
+                        (cutoff,),
+                    ).fetchone()
+                    count = int(row[0])
+                    if count >= rate_limit_global:
+                        raise OrderRateLimitExceeded(
+                            scope="global",
+                            limit=rate_limit_global,
+                            count=count,
+                            window_seconds=rate_limit_window_seconds,
+                        )
+
             # Create the order row with placeholder authorizations — will be
             # updated in the same transaction below.
             conn.execute(

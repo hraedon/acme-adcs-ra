@@ -33,7 +33,7 @@ from acme_adcs_ra.finalize import (
 from acme_adcs_ra.policy import validate_dns_name
 from acme_adcs_ra.serializers import _order_to_json
 from acme_adcs_ra.server_jws import verify_existing_account_jws
-from acme_adcs_ra.store import OrderStatus
+from acme_adcs_ra.store import OrderRateLimitExceeded, OrderStatus
 
 router = APIRouter()
 
@@ -104,7 +104,11 @@ async def new_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+    _header, payload, account_id = await verify_existing_account_jws(
+        request,
+        ctx.store,
+        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    )
 
     # WI-016: in-app per-account rate limiting (defense-in-depth inside the
     # trust model). The window is computed from order-creation timestamps
@@ -148,13 +152,44 @@ async def new_order(
 
     # H5: atomic order creation — all order/authz/challenge rows and URLs
     # are written in a single transaction via Store.create_order_with_authz.
-    refreshed_order = ctx.store.create_order_with_authz(
-        account_id=account_id,
-        identifiers=identifiers,
-        challenge_url_fn=lambda cid: _challenge_url(ctx, cid),
-        authz_url_fn=lambda aid: _authz_url(ctx, aid),
-        finalize_url_fn=lambda oid: _finalize_url(ctx, oid),
+    account = ctx.store.get_account(account_id)
+    if account is None:  # Defensive: JWS verification already checked this.
+        raise unauthorized("account not found")
+    per_kid_limit = ctx.config.rate_limit_overrides.get(
+        account.eab_kid, ctx.config.rate_limit_orders_per_window
     )
+    try:
+        refreshed_order = ctx.store.create_order_with_authz(
+            account_id=account_id,
+            identifiers=identifiers,
+            challenge_url_fn=lambda cid: _challenge_url(ctx, cid),
+            authz_url_fn=lambda aid: _authz_url(ctx, aid),
+            finalize_url_fn=lambda oid: _finalize_url(ctx, oid),
+            rate_limit_window_seconds=ctx.config.rate_limit_window_seconds,
+            rate_limit_per_kid=per_kid_limit,
+            rate_limit_global=ctx.config.rate_limit_global_per_window,
+        )
+    except OrderRateLimitExceeded as exc:
+        details = {
+            "limit": exc.limit,
+            "window_seconds": exc.window_seconds,
+            "count": exc.count,
+            "scope": exc.scope,
+        }
+        if exc.eab_kid is not None:
+            details["kid"] = exc.eab_kid
+        _audit(
+            ctx,
+            event_type="order-rate-limited",
+            account_id=account_id,
+            outcome="denied",
+            details=details,
+        )
+        raise rate_limited(
+            f"{exc.scope} order rate limit exceeded: {exc.count} orders in "
+            f"the last {exc.window_seconds}s (limit: {exc.limit})",
+            retry_after=exc.window_seconds,
+        ) from exc
 
     _audit(ctx,
         event_type="order-created",
@@ -178,7 +213,11 @@ async def finalize_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_id = await verify_existing_account_jws(request, ctx.store)
+    _header, payload, account_id = await verify_existing_account_jws(
+        request,
+        ctx.store,
+        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    )
 
     order = ctx.store.get_order(order_id)
     if order is None or order.account_id != account_id:

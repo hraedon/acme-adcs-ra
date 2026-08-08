@@ -110,6 +110,61 @@ class TestJWSVerify:
         with pytest.raises(UnsupportedAlgorithmError):
             verify_flattened_jws(jws, rsa_key.public_key())
 
+    def test_non_utf8_protected_header_rejected(
+        self, rsa_key: rsa.RSAPrivateKey
+    ) -> None:
+        jws = {
+            "protected": _base64url_encode(b"\xff"),
+            "payload": _make_jws_payload({"hello": "world"}),
+            "signature": _base64url_encode(b"bogus"),
+        }
+        with pytest.raises(JWSValidationError, match="not valid JSON"):
+            verify_flattened_jws(jws, rsa_key.public_key())
+
+    def test_non_object_protected_header_rejected(
+        self, rsa_key: rsa.RSAPrivateKey
+    ) -> None:
+        jws = {
+            "protected": _base64url_encode(b"[]"),
+            "payload": _make_jws_payload({"hello": "world"}),
+            "signature": _base64url_encode(b"bogus"),
+        }
+        with pytest.raises(JWSValidationError, match="must be a JSON object"):
+            verify_flattened_jws(jws, rsa_key.public_key())
+
+    def test_algorithm_name_must_be_exact(self, rsa_key: rsa.RSAPrivateKey) -> None:
+        """A made-up RS* name must not inherit SHA-256 by suffix."""
+        protected_b64 = _b64url_encode_dict({"alg": "RSanything256"})
+        payload_b64 = _make_jws_payload({"hello": "world"})
+        signing_input = f"{protected_b64}.{payload_b64}".encode("ascii")
+        signature = rsa_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+        jws = {
+            "protected": protected_b64,
+            "payload": payload_b64,
+            "signature": _base64url_encode(signature),
+        }
+        with pytest.raises(UnsupportedAlgorithmError):
+            verify_flattened_jws(jws, rsa_key.public_key())
+
+    def test_es_algorithm_must_match_curve(self) -> None:
+        key = ec.generate_private_key(ec.SECP384R1())
+        protected_b64 = _b64url_encode_dict({"alg": "ES256"})
+        payload_b64 = _make_jws_payload({"hello": "world"})
+        signing_input = f"{protected_b64}.{payload_b64}".encode("ascii")
+        der_sig = key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+        jws = {
+            "protected": protected_b64,
+            "payload": payload_b64,
+            "signature": _base64url_encode(_der_to_raw(der_sig, 48)),
+        }
+        with pytest.raises(JWSValidationError, match="not valid for EC curve"):
+            verify_flattened_jws(jws, key.public_key())
+
+    def test_weak_rsa_account_key_rejected(self) -> None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+        with pytest.raises(JWSValidationError, match="2048-bit minimum"):
+            _public_key_from_jwk(_jwk(key))
+
     def test_public_key_from_jwk_rsa(self, rsa_key: rsa.RSAPrivateKey) -> None:
         pub = rsa_key.public_key()
         numbers = pub.public_numbers()
@@ -175,6 +230,37 @@ class TestEABVerify:
         other_jwk["n"] = other_jwk["n"][:-1] + "X"
         with pytest.raises(JWSValidationError, match="does not match"):
             verify_eab_jws(eab_jws, other_jwk, mac_key)
+
+    def test_url_binding_mismatch_rejected(self, rsa_key: rsa.RSAPrivateKey) -> None:
+        account_jwk = _jwk(rsa_key)
+        mac_key = b"super-secret-key-32-bytes-long!!"
+        eab_jws = _make_eab_jws(account_jwk, "kid-001", mac_key)
+        protected = json.loads(
+            __import__("base64").urlsafe_b64decode(
+                eab_jws["protected"] + "=" * (-len(eab_jws["protected"]) % 4)
+            )
+        )
+        protected["url"] = "https://other.example/acme/new-acct"
+        protected_b64 = _b64url_encode_dict(protected)
+        payload_b64 = eab_jws["payload"]
+        import hmac
+        signature = hmac.new(
+            mac_key,
+            f"{protected_b64}.{payload_b64}".encode("ascii"),
+            "sha256",
+        ).digest()
+        eab_jws = {
+            "protected": protected_b64,
+            "payload": payload_b64,
+            "signature": _base64url_encode(signature),
+        }
+        with pytest.raises(JWSValidationError, match="url does not match"):
+            verify_eab_jws(
+                eab_jws,
+                account_jwk,
+                mac_key,
+                expected_url="https://ra.example/acme/new-acct",
+            )
 
     def test_jwks_differing_only_in_alg_are_equal(self, rsa_key: rsa.RSAPrivateKey) -> None:
         """M1: JWKs that differ only in the optional 'alg' field must be treated as equal.

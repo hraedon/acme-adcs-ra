@@ -7,7 +7,7 @@ license = { text = "MIT" }
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
-    "cryptography",       # CSR parsing, JWS verification
+    "cryptography>=50.0.0",  # CSR parsing, JWS verification; security floor
     "pydantic",
     "pydantic-settings",  # env-var / config-file loading
     "requests",           # ADCS /certsrv/ HTTP client + the Negotiate auth handler
