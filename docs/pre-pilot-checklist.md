@@ -240,3 +240,46 @@ engineered to. Until then it has not — regardless of a green local test run.
   - **WI-037/038/039 — DONE.** Pester pure-logic suite (CI); the live re-proof
     runbook (`docs/live-reproof-runbook.md`) + cadence; deterministic CI
     (`uv sync --locked`, pinned linters/Pester).
+
+- **2026-08-07 security-hardening re-proof — PASSED (2026-08-08):**
+  Live re-proof of commit `5d30937` (the 2026-08-07 security review: CA-capable
+  CSR/cert rejection, CN→SAN binding, certsrv key binding, rate-limit TOCTOU
+  fix, JWS streaming cap, algorithm exactness, EAB URL binding, HEC HTTPS
+  enforcement, cryptography ≥50.0.0) on the lab RA host (the lab Windows
+  host, IIS app pool as the gMSA, ADCS CA `CA01` in Mode A). Deployed the
+  1.6.0 wheel + cryptography 50.0.0 into the app-pool venv; app pool started;
+  `/directory` → 200.
+
+  **Core 12 cases (all PASS):** account creation (EAB) → order (in-scope SAN)
+  → challenge → finalize (CSR→real cert) → download → SAN matches CSR →
+  serverAuth EKU only (no clientAuth) → chain off existing CA (leaf → issuing
+  CA → existing root, no new intermediate) → out-of-scope SAN denied at
+  finalize → revoke (reason=1, RA store) → revoked cert 410 Gone → reason 7
+  rejected (`badRevocationReason`). Serial `6C00…006C`, RequestID 108.
+
+  **New security-hardening checks (3/3 PASS):** CSR with
+  `BasicConstraints CA=true` → rejected at finalize; CSR with `keyCertSign`
+  KeyUsage → rejected; CSR with out-of-scope CN (not in SAN set) → rejected.
+  All three exercise the new `csr_validation` rejection paths before the CSR
+  reaches ADCS.
+
+  **CA-side verification (via domain admin on the CA host):** CA DB RequestID
+  108 confirms **Requester = `WORK-DOMAIN\gMSA-acme-ra$`** (the enrollment
+  gMSA), **Template = `ACME-ServerAuth`**, **Disposition = Issued**. The
+  w3wp.exe + python.exe process owners are both the gMSA (confirmed via
+  `Win32_Process`). The RA audit-log `requester` field shows the RA host's
+  machine account — this is a known artifact of the `_requester()` best-effort
+  env-var capture (`USERNAME` resolves to the machine account for gMSAs, not
+  the gMSA name); the authoritative CA DB shows the gMSA.
+
+  **Teardown:** app pool stopped (re-parked); DB restored from backup; test
+  scripts removed. The test cert (serial `6C00…006C`, RequestID 108) is
+  serverAuth-only, for a test hostname, and expires in 90 days; CA-side
+  revocation via `certutil -revoke` / `ICertAdmin::RevokeCertificate` returns
+  `ERROR_INVALID_PARAMETER` on this lab CA (a CA-level quirk, not code-related)
+  — left as a harmless test artifact.
+
+  - [x] §A issuance-leg re-proof on the security-hardening commit (core 12 +
+        3 new CSR-rejection checks).
+  - [x] cryptography 50.0.0 verified on Windows Server 2025 / Python 3.14.
+  - [ ] **Still open before pilot:** the operator-owned §B–E items (unchanged).

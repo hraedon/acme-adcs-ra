@@ -56,3 +56,14 @@ available in this workspace. Operator-owned controls in
 `docs/pre-pilot-checklist.md` remain mandatory, especially the network
 allowlist, host hardening, token/EAB rotation, SIEM monitoring, and revocation
 reconciliation.
+
+## Live re-proof — PASSED (2026-08-08)
+
+The live re-proof was performed against commit `5d30937` on the lab RA host
+(the lab Windows host, ADCS CA `CA01`, Mode A). Core 12 cases passed (issuance,
+serverAuth-only EKU, chain off the existing CA, out-of-scope SAN denial,
+revoke→410, reason-7 rejection) plus 3 new security-hardening checks (CA-capable
+CSR rejected, keyCertSign CSR rejected, out-of-scope CN rejected). CA DB
+confirmed requester = `WORK-DOMAIN\gMSA-acme-ra$`, template = `ACME-ServerAuth`.
+cryptography 50.0.0 verified on Windows Server 2025 / Python 3.14. See the
+validation log in `docs/pre-pilot-checklist.md`.

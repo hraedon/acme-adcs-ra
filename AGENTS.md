@@ -84,7 +84,7 @@ rules:
 - **Any change to the issuance leg earns a live lab re-proof** (the standing
   project rule — see the validation log in `docs/pre-pilot-checklist.md` and the
   procedure in `docs/live-reproof-runbook.md`). Latest: WI-028 (v1.5, 2026-07-23)
-  + WI-035/036 (v1.6, 2026-07-23/24).
+  + WI-035/036 (v1.6, 2026-07-23/24) + 2026-08-07 security-hardening (2026-08-08).
 - **Remaining before pilot (not code debt):** the operator-owned §B–E items. The
   two-identity round-trip (WI-036) is now **fully proven live** (2026-07-24) — a
   separate revoker gMSA revoked at the CA and confirmed back, enrollment gMSA held
