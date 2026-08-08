@@ -85,13 +85,16 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **Project status:** **released at v1.6.0** (2026-07-24) — feature-complete for
-> its charter. v1.5 added **automated CA-side revocation** (template-scoped officer
-> restriction; recommended two-identity topology + an opt-in single-identity
-> `-LocalMode` deployment) and **self-enforced serverAuth EKU verification**; the
-> **v1.6 hardening sweep** closes the enrollment-side bound (Finding E-1), adds a
-> Pester test suite + deterministic CI, proves the two-identity design's
-> compromise-independence property live, and adds a live-re-proof runbook.
+> **Project status:** **released at v1.7.0** (2026-08-08) — feature-complete for
+> its charter. v1.7 is a **security hardening** release (CA-capable CSR/cert
+> rejection, CN→SAN binding, certsrv key binding, rate-limit TOCTOU fix, JWS
+> streaming cap, algorithm exactness, EAB URL binding, HEC HTTPS enforcement,
+> cryptography ≥50.0.0) — live re-proven against ADCS. v1.5–v1.6 added
+> **automated CA-side revocation** and **self-enforced serverAuth EKU
+> verification**; the **v1.6 hardening sweep** closed the enrollment-side bound
+> (Finding E-1), added a Pester test suite + deterministic CI, proved the
+> two-identity design's compromise-independence property live, and added a
+> live-re-proof runbook.
 > Maintained deliberately, not passively: security reports (see `SECURITY.md`) and
 > bug reports are welcome, but there is no response-time commitment.
 >

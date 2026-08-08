@@ -72,7 +72,11 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**Released: v1.6.0 (2026-07-24) — feature-complete for the charter.** v1.5 added
+**Released: v1.7.0 (2026-08-08) — security hardening release.** v1.7 closes
+nine findings from the 2026-08-07 security review (CA-capable CSR/cert
+rejection, CN→SAN binding, certsrv key binding, rate-limit TOCTOU fix, JWS
+streaming cap, algorithm exactness, EAB URL binding, HEC HTTPS enforcement,
+cryptography ≥50.0.0) — live re-proven against ADCS. v1.5–v1.6 added
 automated CA-side revocation (template-scoped officer restriction; two-identity
 default + opt-in single-identity `-LocalMode`) + self-enforced serverAuth EKU
 (Plans 004–006); the **v1.6 hardening sweep** (Plan 007) closed Finding E-1,

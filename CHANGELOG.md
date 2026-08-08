@@ -6,6 +6,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-08-08
+
+**Security hardening (2026-08-07 review), no new feature surface.** Closes
+nine findings across the issuance leg, the ACME/JWS front, rate limiting,
+and the dependency closure. Live re-proven against ADCS on the lab. The
+issuance path is behaviourally unchanged for legitimate requests.
+
+### Security
+- **CA-capable CSR/cert rejection (HIGH).** A dangerously drifted template
+  returning `CA=true` or signing key usage while carrying serverAuth EKU is
+  now rejected at CSR intake (`_reject_ca_capable_csr_extensions`) **and**
+  independently on the issued certificate (`_issued_cert_ca_capability_violations`)
+  before it is recorded or served. Reinforces the no-signing-key-ever invariant.
+- **CN bound to SAN set.** The template takes the subject from the CSR, so a
+  CSR/issued-cert Common Name must be a member of the requested DNS SANs,
+  closing the legacy-CN second identity path (`_reject_unrequested_common_names`).
+- **certsrv response bound to CSR key.** The production enrollment leg now
+  compares `SubjectPublicKeyInfo` bytes and the subject CN against the
+  authorized SAN set, failing closed on a mismatch
+  (`_validate_issued_certificate_binding`).
+- **Algorithm exactness.** RS/ES alg names are exact-matched (no `startswith`),
+  EC algorithms are curve-matched to their key, and RSA account keys require
+  ≥2048 bits. Eliminates algorithm-confusion and weak-key acceptance.
+- **EAB URL binding.** The EAB protected-header `url` must equal this RA's
+  `newAccount` endpoint, preventing cross-endpoint/environment replay.
+- **HEC HTTPS enforcement.** The SIEM HEC sink enables only for HTTPS URLs
+  without embedded credentials, so its bearer token cannot be sent in plaintext.
+
+### Fixed
+- **Rate-limit TOCTOU.** Order count-and-insert is now one `BEGIN IMMEDIATE`
+  transaction (`create_order_with_authz`), so a parallel burst cannot all
+  observe a below-limit count and race past the ceiling.
+- **JWS body streaming cap.** Unauthenticated request bodies are bounded by
+  `max_jws_body_size_bytes` (default 64 KiB), enforced on declared
+  `Content-Length` and while streaming, before JSON/base64 decoding.
+- **Type-confusion hardening.** Every JSON-decoded protected header, payload,
+  and JWK is now checked to be a JSON object.
+- **Dependency:** `cryptography` floor raised to ≥50.0.0 (PYSEC-2026-3552).
+
+### Added
+- `docs/security-review-2026-08-07.md` — the review itself.
+- `tests/test_issuance_security_bindings.py` — regression tests for the
+  CA-capable, CN-binding, and key-binding checks.
+
+### Changed
+- `max_jws_body_size_bytes` config knob (default 65536) added to `RAConfig`.
+
+### Live re-proof
+- **PASSED (2026-08-08)** against commit `5d30937` on the lab RA host (ADCS
+  CA, Mode A). Core 12 cases + 3 new CSR-rejection checks. CA DB confirmed
+  requester = the enrollment gMSA, template = `ACME-ServerAuth`. See
+  `docs/pre-pilot-checklist.md` validation log.
+
 ## [1.6.0] — 2026-07-24
 
 **Hardening + validation sweep (Plan 007), no new feature surface.** The
