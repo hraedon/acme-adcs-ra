@@ -72,6 +72,20 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**Unreleased on `main`: the 2026-08-11 security review** (13 findings; see
+`docs/security-review-2026-08-11.md`). The load-bearing two: the JWS **and** EAB
+URL bindings were derived from `str(request.url)` — i.e. the client's `Host`
+header — so they only proved a client was self-consistent and an EAB minted for
+another deployment verified here (which meant the 2026-08-07 EAB-replay fix was
+never actually closed); and `account.status` was never read while the EAB kid was
+re-checked only at finalize, so pulling a kid stopped issuance but left the
+account able to **revoke its own live certificates**. Both are fixed and
+live-proven (26/26 checks, 2026-08-11). Also: nonce token bucket, `/docs`
+disabled, off-box audit gate, the previously-404 order/account resource
+endpoints, and the PKCS#7 chain now bound to the leaf.
+**Consequence for operators: `ACME_RA_BASE_URL` is now security configuration** —
+wrong value ⇒ everything fail-closes.
+
 **Released: v1.7.0 (2026-08-08) — security hardening release.** v1.7 closes
 nine findings from the 2026-08-07 security review (CA-capable CSR/cert
 rejection, CN→SAN binding, certsrv key binding, rate-limit TOCTOU fix, JWS
@@ -88,7 +102,18 @@ rules:
 - **Any change to the issuance leg earns a live lab re-proof** (the standing
   project rule — see the validation log in `docs/pre-pilot-checklist.md` and the
   procedure in `docs/live-reproof-runbook.md`). Latest: WI-028 (v1.5, 2026-07-23)
-  + WI-035/036 (v1.6, 2026-07-23/24) + 2026-08-07 security-hardening (2026-08-08).
+  + WI-035/036 (v1.6, 2026-07-23/24) + 2026-08-07 security-hardening (2026-08-08)
+  + **2026-08-11 security review (26/26, incl. the new §A.1 front-control checks)**.
+- **Two review lessons worth carrying forward.** (1) Every finding in the
+  2026-08-11 review was in an *inherited framework default* — FastAPI's docs
+  endpoints, Starlette's `request.url`, uvicorn's proxy-header trust, the
+  `jsonl` sink path — never in hand-written security logic. Audit the defaults
+  you did not choose. (2) The 480-test suite would not have caught any of them,
+  and the missing order endpoint survived three "proven end-to-end" milestones
+  because every proof used a hand-rolled client sharing the server's
+  assumptions. **Mutation-verify new security tests** (three of the review's own
+  tests initially passed against both vulnerable and fixed code), and prefer a
+  client nobody here wrote for the next interop proof.
 - **Remaining before pilot (not code debt):** the operator-owned §B–E items. The
   two-identity round-trip (WI-036) is now **fully proven live** (2026-07-24) — a
   separate revoker gMSA revoked at the CA and confirmed back, enrollment gMSA held

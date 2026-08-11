@@ -424,6 +424,25 @@ tasks above). Monitor:
   is no such event today — a failure surfaces as `finalize-enrollment-denied`
   or `finalize-enrollment-race`; alert on those categories at ERROR+).
 
+### Events that mean someone is using a credential you cut off
+
+Added 2026-08-11. These fire *after* a valid signature, so they mean the holder
+of a real key is still trying — treat them as security events, not noise:
+
+- **`account-request-denied`** with `details.reason = eab-kid-not-allowlisted` —
+  an account whose EAB credential you removed is still making requests. Expect a
+  short tail after a planned rotation as the client is reconfigured; a sustained
+  or *unexpected* stream means a key you revoked is still in someone's hands.
+- **`account-request-denied`** with `details.reason = account-not-valid` —
+  requests from a deactivated account. Same reading.
+- **`account-deactivated`** — a client disabled its own account. Expected during
+  incident response; unexpected otherwise, and worth correlating with who holds
+  that account key.
+
+Alert on the first two at WARNING+ and route them to the same place as
+`account-creation-denied` (EAB kid probing) — together they are the picture of
+someone attempting to use credentials they should not have.
+
 ### Request / error rate SLOs
 
 - Monitor the ACME endpoint request rate and error rate (4xx/5xx) at the
