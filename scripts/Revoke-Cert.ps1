@@ -112,6 +112,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Shared pure logic (serial normalization, reason/requester rules), covered by
+# tests/pester/Revocation.Tests.ps1. Deploy scripts/lib/ alongside this script
+# -- see docs/operations.md; copying individual .ps1 files breaks provisioning.
+. "$PSScriptRoot/lib/RevocationLib.ps1"
+
 # Write an error message to stderr and exit with a specific code. Using
 # [Console]::Error.WriteLine (not Write-Error) so $ErrorActionPreference=Stop
 # does not turn the message into a terminating exception that swallows the
@@ -219,7 +224,11 @@ if ($PSCmdlet.ParameterSetName -eq "Serial") {
     if ([string]::IsNullOrWhiteSpace($Serial)) {
         Die "-Serial is empty or whitespace." 3
     }
-    $targetSerial = $Serial.Trim().ToUpperInvariant() -replace '^0x', ''
+    # Re-pad to the CA database's stored form before any -restrict lookup: the
+    # RA emits serials without a leading zero (Python format(n,'x')), while
+    # ADCS stores the full byte string, and -restrict is an exact string match.
+    # See Get-CaSerialForm in scripts/lib/RevocationLib.ps1.
+    $targetSerial = (Get-CaSerialForm ($Serial.Trim())).ToUpperInvariant()
     Confirm-SerialAtCa $CaConfig $targetSerial $RequesterName
 } else {
     $rid = $ReqID.Trim()

@@ -128,14 +128,43 @@ IMMEDIATE` rate-limit transaction — was re-read and holds up.
   never needs the unauthenticated path. Retiring the plain `GET`s is a breaking
   change gated on confirming no deployed client uses them.
 
-## Verification item carried to the live re-proof
+## Verification item — resolved live, NOT a defect
 
 `Confirm-SerialAtCa` in `scripts/Revoke-Cert.ps1` decides "this certificate
 exists at the CA" by testing whether the serial string appears anywhere in
 `certutil -view -restrict "SerialNumber=<hex>" -out SerialNumber` output. If
-`certutil` echoes the restriction clause in its own output, that check — and the
-`Request.RequesterName` regex below it — pass vacuously and the WI-022 guard is
-a no-op. This cannot be determined off-Windows; see the live-proof log below.
+`certutil` echoed the restriction clause in its own output, that check — and the
+`Request.RequesterName` regex below it — would pass vacuously and the WI-022
+guard would be a no-op.
+
+**Checked live on the lab CA (2026-08-11): `certutil` does not echo the
+restriction.** A non-existent serial returns the schema header, `Maximum Row
+Index: 0` and `0 Rows`, with the serial string absent from the output — so the
+existence check correctly fails and the script exits 4. The control (a real
+serial) returns `Row 1: Serial Number: "<hex>"`. The guard is sound as written.
+
+## Finding 13 (found during the live re-proof) — serial form vs the CA database
+
+Reading real `certutil` output surfaced a latent mismatch the offline review had
+not: **ADCS stores the full byte string, so a certificate whose high-order byte
+is `0x0N` is recorded with a leading zero that the RA's serial form never has.**
+The RA emits `format(n, 'x')`, which cannot produce a leading zero, and
+`-restrict "SerialNumber=..."` is an exact string match — so for such a
+certificate the lookup finds 0 rows and `Revoke-Cert.ps1` exits 4. Fail-safe
+(nothing is wrongly revoked), but the automated revocation loop would silently
+stop for that certificate.
+
+This is pre-existing behaviour, not something the canonicalisation fix
+introduced — but the fix is the natural place to close it. A hex serial derived
+from bytes always has an even digit count, so re-padding an odd-length value to
+even reconstructs the CA's form exactly (`Get-CaSerialForm` in
+`scripts/lib/RevocationLib.ps1`, with Pester coverage). `Revoke-Cert.ps1` now
+dot-sources that library, which also removes the drift risk previously noted
+against the test-only copy.
+
+Evidence: 61 issued serials on the lab CA, hex lengths 32 and 38, distinct
+leading characters `5`, `6`, `e` — no leading-zero case present today, so this
+is latent rather than observed.
 
 ## Test strategy note
 
@@ -157,5 +186,79 @@ same string and the test cannot distinguish the two implementations at all.
 
 ## Local validation
 
-See the CHANGELOG entry and the checklist validation log for the recorded
-results.
+524 Python tests pass (1 platform skip), 66 Pester tests pass, Ruff clean, strict
+mypy clean on `src`, `uv.lock` consistent, `pip-audit` reports no known
+vulnerabilities.
+
+## Live re-proof — PASSED (2026-08-11)
+
+Run against commit `db06c6f` deployed to the lab RA host (IIS app pool as the
+enrollment gMSA, ADCS CA, Mode A). **26 checks, 26 passed.**
+
+**Section A — the standing issuance proof (unchanged behaviour for legitimate
+requests):** directory reachable; EAB account creation; finalize issued a real
+certificate; EKU exactly `1.3.6.1.5.5.7.3.1`; SAN taken from the CSR; issuer
+`CN=CONTOSO-CA01-CA` (the existing CA, no new intermediate); out-of-scope SAN denied
+with `rejectedIdentifier`; revocation reason 7 rejected.
+
+- **A7 is the one that mattered most:** the new chain-binding check had to
+  accept the *real* CA's `certnew.p7b` response. It did — 3 certificates
+  returned and bound to the leaf. A validator that was subtly wrong would have
+  broken every issuance, and no unit test could have shown that.
+
+**Section S — the new controls, live:**
+
+| Check | Result |
+|---|---|
+| EAB minted for another deployment | rejected, `badExternalAccountBinding` |
+| `Host:` header spoof | rejected, `url host mismatch … expected acme-ra.WORK-DOMAIN.local` |
+| `kid` naming another deployment | rejected, `not an account URL on this server` |
+| order `Location` POST-as-GET | 200, status `valid` |
+| account URL + orders list | both 200 |
+| cert POST-as-GET account scoping | owner 200, other account 401 |
+| `/docs`, `/redoc`, `/openapi.json` | all 404 |
+| nonce flood (220 requests) | 162 × 204, 58 × 429 |
+| account deactivation | 200, then 401 on the next request |
+| revoke → cert not served | revoke 200, `GET` cert 410 |
+| admin pending list | shows the canonical serial |
+
+The `Host:`-spoof result is worth noting explicitly: the lab site binding is
+`*:9443:` (no hostname), i.e. catch-all, so the spoofed request genuinely
+reached the application and was rejected by the new check rather than by IIS.
+
+**Eviction (E-series), with a control:** an account created under an
+allowlisted kid was left in place while the kid was renamed in the dotenv and
+the pool recycled.
+
+- **E0 control** — a *new* account under the renamed kid succeeds (201). This
+  proves the configuration actually loaded and the allowlist is non-empty;
+  without it, E1/E2 would pass trivially if the dotenv had failed to parse.
+  (It nearly did: PowerShell 5.1's `Set-Content -Encoding utf8` wrote a BOM that
+  broke the first attempt.)
+- **E1** — `newOrder` from the old account: 401, "the external account
+  credential this account was created under is no longer authorized".
+- **E2** — `revokeCert` from the old account: 401. **This is the case the
+  pre-fix code returned 200 for** — an attacker holding a stolen account key
+  could still revoke the victim's live certificates after the operator believed
+  the credential was cut off.
+
+**Revocation round-trip (R-series):** the RA's canonical serial was carried
+through the real `scripts/Revoke-Cert.ps1` against the CA — `Confirm-SerialAtCa`
+found the row, the WI-022 requester check confirmed
+`WORK-DOMAIN\gMSA-acme-ra$`, and `certutil -revoke` succeeded. The confirm callback
+was then POSTed back **using the lowercase form `certutil` prints**, exercising
+the canonicalisation path: 200, and the serial dropped out of the pending set
+(no re-revoke loop).
+
+**Lab left as found.** RA app pool stopped and endpoint unreachable (parked);
+dotenv, database and `web.config` restored from backup, so the throwaway EAB and
+admin token are gone. CA pristine — no `OfficerRights` value was ever written
+(the revoke ran under the operator's existing rights, so no CA security
+descriptor was modified) and `certsvc` is running. All certificates this session
+issued are revoked at the CA. Temp directories cleared on both hosts.
+
+**Carried forward:** the RA host's venv now holds this build (1.7.0 + the
+security changes) rather than the 1.6.0 that was parked there, and the pre-existing
+unconfirmed serial `6C…5E` (`wi015-reproof`, already Revoked at the CA) remains
+in the restored database's pending set — a leftover from an earlier session that
+a sync run will drain.

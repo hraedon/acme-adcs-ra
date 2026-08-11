@@ -55,6 +55,26 @@ enrollment leg's chain handling, and the deployment artifacts. See
   the revocation-confirm callback cannot 404 into an endless re-revoke loop.
 - **App version** is read from installed distribution metadata (it had drifted
   to `1.6.0` against a `1.7.0` release).
+- **Serial form vs the ADCS database (found during the live re-proof).** ADCS
+  stores the full byte string, so a certificate whose high-order byte is `0x0N`
+  is recorded with a leading zero the RA's `format(n, 'x')` form never has, and
+  `-restrict "SerialNumber=…"` is an exact match — the lookup would find 0 rows
+  and `Revoke-Cert.ps1` would exit 4, silently stopping the automated revocation
+  loop for that certificate. `Get-CaSerialForm` re-pads to even length;
+  `Revoke-Cert.ps1` now dot-sources `scripts/lib/RevocationLib.ps1` (removing the
+  test-only-copy drift risk noted in v1.6.0).
+
+### Live re-proof
+- **PASSED (2026-08-11)** against commit `db06c6f` on the lab RA host (ADCS CA,
+  Mode A). 26 checks, 26 passed: the standing issuance proof (serverAuth-only
+  EKU, SAN from the CSR, chain off the existing CA, policy denial, reason-7
+  rejection) plus every new control — EAB/Host/kid rebinding, POST-as-GET
+  resources, docs 404, nonce flood capped, account deactivation, and the
+  revocation round-trip through `Revoke-Cert.ps1` and the confirm callback.
+  The chain-binding check accepted the real CA's `certnew.p7b` (the check that
+  no unit test could validate). Account eviction was proven with a control
+  confirming the allowlist had actually reloaded. See
+  `docs/security-review-2026-08-11.md`.
 
 ### Changed
 - `deploy/iis/web.config` sets the off-box audit sink and an explicit global
