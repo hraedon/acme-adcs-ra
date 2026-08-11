@@ -6,10 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-**Security hardening (2026-08-11 pre-deployment review).** Twelve findings
+## [1.8.0] — 2026-08-11
+
+**Security hardening (2026-08-11 pre-deployment review).** Thirteen findings
 across the ACME front, the account lifecycle, the unauthenticated surface, the
-enrollment leg's chain handling, and the deployment artifacts. See
-`docs/security-review-2026-08-11.md`.
+enrollment leg's chain handling, and the deployment artifacts — twelve from the
+review itself and one more found while reading real `certutil` output during the
+live re-proof. See `docs/security-review-2026-08-11.md`.
+
+> ### ⚠️ Upgrade requirement — read before deploying
+>
+> **`ACME_RA_BASE_URL` is now security configuration, not a display value.**
+> Every JWS and EAB binding is validated against the URL derived from it rather
+> than against the URL the request arrived on. Set it to the *exact* public
+> origin clients use — scheme, host **and port**. If it does not match, every
+> legitimate request is refused (fail-closed) from the first request after
+> upgrade.
+>
+> A deployment where `base_url` was merely approximately right — the loopback
+> host, the wrong port, `http` where clients use `https` — worked before this
+> release and will not after it. That is the intended behaviour: the old
+> permissiveness *was* the vulnerability.
+>
+> Two operator controls also move from recommended to **required**: an off-box
+> audit sink (`ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with syslog or HEC) and the
+> network allowlist in front of the unauthenticated nonce endpoint. See
+> `docs/pre-pilot-checklist.md` §C/§E.
 
 ### Security
 - **JWS and EAB URL bindings now pin to `base_url` (MEDIUM).** Both were
