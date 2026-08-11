@@ -42,8 +42,45 @@ Record each run in the validation log in
    cert). Confirm: serverAuth-only EKU (WI-026 passes on a real cert),
    `clientAuth` absent, chain off the existing CA (no new intermediate), SAN from
    the CSR, requester = the enrollment gMSA in the CA DB.
+   **Also confirm the chain check did not false-reject** (2026-08-11): the RA now
+   requires a certificate in `certnew.p7b` to both match the leaf's issuer *and*
+   verify its signature. A successful issuance is the proof — a validator that is
+   subtly wrong breaks *every* issuance, and no unit test can show that because
+   only the real CA produces the real chain.
 3. Provoke a policy denial (out-of-scope SAN) → rejected at finalize.
 4. Confirm reason-7 revocation is rejected (`badRevocationReason`).
+
+### A.1 ACME front controls (added 2026-08-11)
+
+These are cheap (no CA involvement) and belong in every run — they are the
+controls a *deployment* mistake silently disables, which unit tests cannot see.
+
+1. **URL binding pins to `base_url`, not the request.** With the site binding
+   left catch-all (the installer default), send a `newAccount` whose JWS `url`
+   and `Host:` header both name some other hostname → **rejected**, `url host
+   mismatch … expected <base_url host>`. Then send a well-formed request whose
+   *EAB only* names another deployment → **rejected**,
+   `badExternalAccountBinding`. Then a `kid` naming another deployment →
+   **rejected**, `not an account URL on this server`.
+   *Why here:* a proxy or binding change can make `request.url` and `base_url`
+   disagree; this is where that shows up.
+2. **Account eviction — with the control first.** Rename the allowlisted kid in
+   the dotenv, recycle the pool, then:
+   - **control:** a *new* account under the renamed kid must **succeed** (201).
+     Without this the next two steps pass trivially if the dotenv failed to
+     parse. (PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM that
+     breaks it — write UTF-8 without BOM via
+     `[System.IO.File]::WriteAllText($p, $txt, (New-Object System.Text.UTF8Encoding($false)))`.)
+   - the pre-existing account: `newOrder` → **401**, and `revokeCert` → **401**.
+     The revoke case is the one that regressed silently before.
+3. **Deactivation** (RFC 8555 §7.3.6): POST `{"status":"deactivated"}` to the
+   account URL → 200; the next request from that account → **401**.
+4. **Resource URLs resolve:** POST-as-GET the order `Location`, the account URL
+   and the account's `orders` link → all 200. POST-as-GET another account's
+   certificate → **401**.
+5. **Nothing extra is published:** `/docs`, `/redoc`, `/openapi.json` → **404**.
+6. **Nonce ceiling:** ~220 rapid `HEAD /acme/new-nonce` → a mix of 204 and
+   **429** with `Retry-After`.
 
 ### B. Automated revocation — two-identity (recommended topology)
 
@@ -101,6 +138,17 @@ artifact).
   `New-ADServiceAccount … -KerberosEncryptionType AES128,AES256` (or set
   `msDS-SupportedEncryptionTypes = 24` after the fact). Symptom is easy to
   misread as a KDS/time-sync problem — it is not.
+- **`certutil` does not echo the `-restrict` clause** (verified 2026-08-11). A
+  serial with no matching row returns `Maximum Row Index: 0` / `0 Rows` with the
+  serial *absent* from the output, so `Confirm-SerialAtCa`'s "does this serial
+  exist" grep is sound rather than vacuous. Re-check this if the CA's OS or
+  locale ever changes — the whole WI-022 requester guard sits behind it.
+- **Serial form: the CA stores the padded byte string.** The RA emits
+  `format(n,'x')`, which never has a leading zero, so a certificate whose
+  high-order byte is `0x0N` would not match an exact `-restrict` lookup.
+  `Get-CaSerialForm` re-pads to even length; `Revoke-Cert.ps1` dot-sources
+  `scripts/lib/RevocationLib.ps1` for it. If a revoke exits 4 on a serial the RA
+  says is pending, check this first.
 - **The revoker needs its own readable copy of the scripts.** In the two-identity
   topology the revoker runs on a separate utility host with its own
   `scripts/` (+ `scripts/lib/`); if you co-locate it on the RA host for a test,

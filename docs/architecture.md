@@ -29,11 +29,27 @@ Certify the Web ──ACME (RFC 8555)──▶ acme-adcs-ra ──/certsrv/ POST
 The minimum to serve an enterprise client:
 - `directory`, `newNonce`, `newAccount` (JWS account-key verification) **with EAB**,
   `newOrder`, authorizations + challenge handling, `finalize` (accept the CSR),
-  `certificate` retrieval, `revokeCert`.
+  `certificate` retrieval, `revokeCert`, `keyChange`.
+- **Resource reads (added 2026-08-11).** Account-scoped `POST`-as-`GET`
+  (RFC 8555 §6.3, empty-string payload) for the order (`/acme/order/{id}` — the
+  `Location` newOrder returns and the URL a conforming client polls), the
+  account (`/acme/acct/{id}`), the account's order list, the authorization and
+  the certificate. Account deactivation (§7.3.6) is a `status` change POSTed to
+  the account URL. Unauthenticated `GET` remains available for the certificate
+  and authorization for compatibility with the clients this RA was proven
+  against; conforming clients should use the POST forms, which are
+  account-scoped and therefore not an existence oracle.
+- **URL binding is against configuration.** Every JWS — and the EAB binding —
+  must name the URL derived from the configured `base_url`, never the URL the
+  request happened to arrive on. `base_url` is therefore load-bearing security
+  configuration, not a display value.
 - Trust model is **enterprise identity, not public domain control**: EAB binds the
   ACME account to an enterprise-issued credential; the network allowlist bounds
   who can reach the endpoint. (Challenge handling still runs per the RFC; EAB is
-  the *who-is-allowed* gate, not the challenge.)
+  the *who-is-allowed* gate, not the challenge.) An account is usable only while
+  its `status` is `valid` **and** its EAB kid is still in the allowlist — both
+  re-checked on every authenticated request, so pulling a kid is a complete
+  eviction rather than an issuance-only block.
 
 ## Enrollment leg (RA → ADCS)
 

@@ -118,6 +118,17 @@ warning: get the template scope right (see `AGENTS.md`).
 >   confirm the enrollment/revocation legs still work — those rest on periodic live
 >   re-proofs. See [`docs/live-reproof-runbook.md`](docs/live-reproof-runbook.md)
 >   and the validation log in the checklist.
+> - **`base_url` is security configuration (2026-08-11).** Since the
+>   [2026-08-11 review](docs/security-review-2026-08-11.md), every JWS and EAB
+>   binding is validated against the URL derived from `ACME_RA_BASE_URL` rather
+>   than the URL the request arrived on. Set it to the exact public origin —
+>   scheme, host and port — or every legitimate request fail-closes on day 1.
+>   Mint **separate EAB kids per environment**; a kid shared with a staging RA
+>   no longer verifies against production.
+> - **Two operator items are now required, not recommended:** an off-box audit
+>   sink (`ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with syslog or HEC — the default
+>   `jsonl` sink dies with the host it is auditing) and the network allowlist in
+>   front of the unauthenticated nonce endpoint. See the checklist §C/§E.
 >
 > Deploying this is issuance-path infrastructure: work through
 > [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md) before running it
@@ -125,7 +136,8 @@ warning: get the template scope right (see `AGENTS.md`).
 
 **At the production-pilot bar — Plans 001–006 complete (v1.5 on `main`).** The
 full pipeline — ACME server (RFC 8555 subset: directory, EAB-gated accounts,
-orders, finalize, cert retrieval, revokeCert, keyChange), deterministic
+orders, finalize, cert retrieval, revokeCert, keyChange, account-scoped
+POST-as-GET resource reads and §7.3.6 deactivation), deterministic
 issuance policy with **post-issuance SAN + EKU verification**, **automated
 CA-side revocation** (template-scoped officer; two-identity default + opt-in
 single-identity), in-app per-account order rate limiting, SIEM audit, and the
