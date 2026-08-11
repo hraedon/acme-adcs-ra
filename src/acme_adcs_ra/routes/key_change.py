@@ -17,6 +17,7 @@ from acme_adcs_ra.app_state import (
     _ACME_PATHS,
     ServerContext,
     _audit,
+    authenticate_account,
     get_context,
 )
 from acme_adcs_ra.jws import (
@@ -26,7 +27,6 @@ from acme_adcs_ra.jws import (
     jwk_thumbprint,
     verify_flattened_jws,
 )
-from acme_adcs_ra.server_jws import verify_existing_account_jws
 
 router = APIRouter()
 
@@ -44,15 +44,10 @@ async def key_change(
     URL and the old key JWK. After validation the account's stored key is
     replaced; the old key is no longer accepted.
     """
-    outer_header, outer_payload, account_id = await verify_existing_account_jws(
-        request,
-        ctx.store,
-        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    outer_header, outer_payload, account = await authenticate_account(
+        ctx, request, _ACME_PATHS["keyChange"]
     )
-
-    account = ctx.store.get_account(account_id)
-    if account is None:
-        raise unauthorized("account not found")
+    account_id = account.id
 
     inner_jws = outer_payload
     if not isinstance(inner_jws, dict) or "protected" not in inner_jws:
@@ -111,7 +106,15 @@ async def key_change(
     if not isinstance(old_key_jwk, dict):
         raise malformed("inner JWS payload missing oldKey")
 
-    old_key_thumbprint = jwk_thumbprint(old_key_jwk)
+    # ``oldKey`` is attacker-supplied and reaches jwk_thumbprint unvalidated —
+    # a JWK missing its required members (e.g. {"kty": "RSA"} with no n/e)
+    # raises KeyError, and an unknown kty raises UnsupportedAlgorithmError.
+    # Both are client errors; without this they surfaced as an unhandled 500
+    # with a stack trace instead of a 400.
+    try:
+        old_key_thumbprint = jwk_thumbprint(old_key_jwk)
+    except (KeyError, TypeError, JWSValidationError) as exc:
+        raise malformed(f"inner JWS oldKey is not a usable JWK: {exc}") from exc
     if old_key_thumbprint != jwk_thumbprint(json.loads(account.jwk_json)):
         raise unauthorized("oldKey in inner JWS does not match account key")
 

@@ -142,6 +142,22 @@ class RAConfig(BaseSettings):
     # rate_limit_orders_per_window applies.
     rate_limit_overrides: dict[str, int] = {}
 
+    # --- Unauthenticated nonce ceiling ---------------------------------------
+    # /acme/new-nonce is unauthenticated and each call is a SQLite write, so a
+    # flood contends for the single writer with the issuance path. This is an
+    # in-process token bucket applied BEFORE the write. 0 = disabled (rely on
+    # the reverse proxy only). Defaults are far above any legitimate ACME
+    # client's needs: a renewal issues a handful of nonces, not hundreds.
+    nonce_rate_limit_per_second: float = 20.0
+    nonce_rate_limit_burst: int = 100
+
+    # --- Audit durability ----------------------------------------------------
+    # The default jsonl sink writes next to the database, so a host compromise
+    # — the adversary the threat model calls load-bearing (§4.A) — destroys the
+    # audit table and its only mirror together. Set this in production to
+    # refuse startup unless audit events leave the box (syslog or HEC).
+    audit_offbox_required: bool = False
+
     # --- SIEM / audit emission -----------------------------------------------
     # Auditing every issuance is mandatory (hard rule). There is no toggle.
     # The default sink is JSON-lines next to the database; syslog and Splunk
@@ -167,6 +183,23 @@ class RAConfig(BaseSettings):
             if entry.kid in seen:
                 raise ValueError(f"duplicate EAB kid: {entry.kid}")
             seen.add(entry.kid)
+        return self
+
+    @model_validator(mode="after")
+    def _offbox_audit_when_required(self) -> RAConfig:
+        """Fail startup, loudly, rather than audit only to the box being attacked.
+
+        This is opt-in (``audit_offbox_required``) so lab and CI keep the
+        zero-config jsonl sink, but once an operator sets it the RA will not
+        start in a posture where the audit trail dies with the host.
+        """
+        if self.audit_offbox_required and self.siem_sink not in ("syslog", "hec"):
+            raise ValueError(
+                "audit_offbox_required is set, but siem_sink is "
+                f"{self.siem_sink!r}: the jsonl sink writes to the RA host "
+                "itself, so a host compromise takes the audit trail with it. "
+                "Configure the syslog or hec sink."
+            )
         return self
 
     @model_validator(mode="after")

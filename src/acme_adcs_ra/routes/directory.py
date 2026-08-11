@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Response
 
+from acme_adcs_ra.acme_errors import rate_limited
 from acme_adcs_ra.app_state import (
     _ACME_PATHS,
     ServerContext,
@@ -32,6 +33,15 @@ async def directory(ctx: ServerContext = Depends(get_context)) -> dict[str, Any]
 
 
 def _nonce_response(ctx: ServerContext) -> Response:
+    # Bounded BEFORE the SQLite write: an unauthenticated flood must not be
+    # able to hold the single writer against the issuance path. Cheap enough
+    # that a rejected request costs less than an accepted one.
+    bucket = ctx.nonce_bucket
+    if bucket is not None and not bucket.take():
+        raise rate_limited(
+            "nonce request rate limit exceeded",
+            retry_after=bucket.retry_after_seconds(),
+        )
     nonce = ctx.store.create_nonce()
     return Response(
         status_code=204,

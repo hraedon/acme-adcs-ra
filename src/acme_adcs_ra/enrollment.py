@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
@@ -234,7 +235,16 @@ class CertsrvEnrollmentLeg:
         return cast(HttpSession, session)
 
     def _requester(self) -> str:
-        """Best-effort capture of the ambient enrollment identity (the gMSA)."""
+        """Best-effort capture of the ambient enrollment identity (the gMSA).
+
+        **This is a hint, not an attestation.** It reads the process
+        environment, which is inherited from whatever launched the worker — it
+        is not derived from the Kerberos token that actually authenticated to
+        ``/certsrv/``. The authoritative record of who enrolled is the ADCS CA
+        database's ``Request.RequesterName``, which is what
+        ``scripts/Revoke-Cert.ps1`` checks. Audit events carry
+        ``requester_source`` so a reader can tell which one they are looking at.
+        """
         domain = os.environ.get("USERDOMAIN", "")
         user = os.environ.get("USERNAME", "?")
         return f"{domain}\\{user}" if domain else user
@@ -344,6 +354,7 @@ class CertsrvEnrollmentLeg:
             )
             chain_resp.raise_for_status()
             chain_pem = _parse_pkcs7_chain(chain_resp.content)
+            _validate_chain_binds_to_leaf(cert_pem, chain_pem)
         except EnrollmentDenied:
             raise
         except EnrollmentTransportError:
@@ -360,6 +371,9 @@ class CertsrvEnrollmentLeg:
             "req_id": req_id,
             "host": self._host,
             "source": "certsrv",
+            # See _requester(): the recorded requester is the worker's process
+            # identity, not a token-derived attestation. The CA DB is authoritative.
+            "requester_source": "process-environment",
         }
         if self._ca_name:
             metadata["ca_name"] = self._ca_name
@@ -443,7 +457,12 @@ def _parse_certfnsh_disposition(
 
     # 3. Pending: a ReqID assigned (locale-independent) or English pending
     #    chrome (English only) with no download link and no explicit denial.
-    rid = re.search(r"ReqID=(\d+)", body)
+    #    Matched against ``clean``, not the raw body, for the same reason as
+    #    steps 1/2/4: a ReqID inside a <script> literal or an HTML comment is
+    #    page chrome, not a disposition. (Raw-body matching here would read a
+    #    denial page carrying a commented-out ReqID as pending — the safe
+    #    direction, but inconsistent with every other signal in this parser.)
+    rid = re.search(r"ReqID=(\d+)", clean)
     if rid:
         return ("pending", rid.group(1))
     if is_english:
@@ -530,6 +549,47 @@ def _validate_issued_certificate_binding(
                 "certnew.cer returned an out-of-scope subject Common Name: "
                 f"{common_name!r}"
             )
+
+
+def _validate_chain_binds_to_leaf(cert_pem: str, chain_pem: Sequence[str]) -> None:
+    """Verify the fetched chain actually issued the leaf we are about to serve.
+
+    ``certnew.p7b`` is fetched with ``ReqID=CACert`` — a *separate* request from
+    the one that produced the leaf, and one whose response the RA previously
+    stored and served without checking any relationship to the certificate it
+    accompanies. The leaf itself gets three independent post-issuance verifiers
+    (SAN, EKU, CA-capability); the chain got none, so a CA that had been
+    re-keyed, or a ``certcarc.asp`` renewal-index scrape that picked the wrong
+    generation, would ship every client a chain that does not verify.
+
+    The check: some certificate in the chain must both match the leaf's issuer
+    name and actually verify the leaf's signature. Signature verification is
+    what makes this meaningful — issuer-name equality alone is forgeable and,
+    more to the point, does not distinguish CA generations after a re-key.
+    """
+    try:
+        leaf = x509.load_pem_x509_certificate(cert_pem.encode("ascii"))
+        chain = [x509.load_pem_x509_certificate(c.encode("ascii")) for c in chain_pem]
+    except (TypeError, ValueError) as exc:
+        raise EnrollmentTransportError(
+            f"unable to parse the issued certificate or its chain: {exc}"
+        ) from exc
+
+    for candidate in chain:
+        if candidate.subject != leaf.issuer:
+            continue
+        try:
+            leaf.verify_directly_issued_by(candidate)
+        except (ValueError, TypeError, InvalidSignature):
+            continue
+        return
+
+    raise EnrollmentTransportError(
+        "certnew.p7b returned a chain that does not issue the certificate just "
+        f"issued (leaf issuer {leaf.issuer.rfc4514_string()!r}; chain subjects "
+        f"{[c.subject.rfc4514_string() for c in chain]}). The CA may have been "
+        "re-keyed, or certcarc.asp reported the wrong renewal generation."
+    )
 
 
 def _parse_pkcs7_chain(body: bytes) -> list[str]:

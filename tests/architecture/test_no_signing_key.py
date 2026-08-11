@@ -83,7 +83,17 @@ FORBIDDEN_MODULE_DENYLIST: frozenset[str] = frozenset(
 )
 
 # Allowlist for importlib submodules — only data-loading is permitted.
-IMPORTLIB_ALLOWED: frozenset[str] = frozenset({"importlib.resources"})
+#
+# Both entries read *data* and cannot load or execute module code:
+#   - importlib.resources — reads package data files (the fixture PEMs).
+#   - importlib.metadata  — reads installed distribution metadata (the version
+#     string reported by the FastAPI app, so it cannot drift from pyproject).
+# The code-loading submodules (importlib.util, importlib.machinery) stay
+# forbidden, and the C1/C2 controls below assert that they still trip the
+# detector, so widening this set cannot silently disarm the guard.
+IMPORTLIB_ALLOWED: frozenset[str] = frozenset(
+    {"importlib.resources", "importlib.metadata"}
+)
 
 # Dynamic execution / reflection primitives that bypass static import scans.
 FORBIDDEN_DYNAMIC_EXECUTION: frozenset[str] = frozenset(
@@ -564,6 +574,20 @@ _BAD_SNIPPETS: list[tuple[str, str]] = [
         "importlib_import_module_call",
         textwrap.dedent("""\
             importlib.import_module("cryptography.x509")
+        """),
+    ),
+    # Guards the IMPORTLIB_ALLOWED widening: allowlisting the data-only
+    # submodules must not open the code-loading ones.
+    (
+        "import_importlib_machinery",
+        textwrap.dedent("""\
+            import importlib.machinery
+        """),
+    ),
+    (
+        "from_importlib_machinery_import",
+        textwrap.dedent("""\
+            from importlib.machinery import SourceFileLoader
         """),
     ),
     # --- C3: assignment-RHS bypass ---

@@ -20,6 +20,7 @@ from acme_adcs_ra.app_state import (
     _challenge_url,
     _finalize_url,
     _order_url,
+    authenticate_account,
     get_context,
 )
 from acme_adcs_ra.finalize import (
@@ -32,7 +33,6 @@ from acme_adcs_ra.finalize import (
 )
 from acme_adcs_ra.policy import validate_dns_name
 from acme_adcs_ra.serializers import _order_to_json
-from acme_adcs_ra.server_jws import verify_existing_account_jws
 from acme_adcs_ra.store import OrderRateLimitExceeded, OrderStatus
 
 router = APIRouter()
@@ -104,11 +104,10 @@ async def new_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_id = await verify_existing_account_jws(
-        request,
-        ctx.store,
-        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    _header, payload, account = await authenticate_account(
+        ctx, request, _ACME_PATHS["newOrder"]
     )
+    account_id = account.id
 
     # WI-016: in-app per-account rate limiting (defense-in-depth inside the
     # trust model). The window is computed from order-creation timestamps
@@ -152,9 +151,6 @@ async def new_order(
 
     # H5: atomic order creation — all order/authz/challenge rows and URLs
     # are written in a single transaction via Store.create_order_with_authz.
-    account = ctx.store.get_account(account_id)
-    if account is None:  # Defensive: JWS verification already checked this.
-        raise unauthorized("account not found")
     per_kid_limit = ctx.config.rate_limit_overrides.get(
         account.eab_kid, ctx.config.rate_limit_orders_per_window
     )
@@ -207,17 +203,43 @@ async def new_order(
     )
 
 
+@router.post("/acme/order/{order_id}")
+async def get_order(
+    order_id: str,
+    request: Request,
+    ctx: ServerContext = Depends(get_context),
+) -> JSONResponse:
+    """POST-as-GET the order resource (RFC 8555 §7.1.3, §6.3).
+
+    This is the URL handed to the client in newOrder's ``Location`` header and
+    the one a conforming client polls after finalize. It previously had no
+    handler at all — every poll 404'd, so any client that follows the RFC
+    state machine rather than reading finalize's inline response could not
+    complete. Account-scoped: another account's order is 404, not 403, so the
+    endpoint is not an order-ID oracle.
+    """
+    _header, payload, account = await authenticate_account(
+        ctx, request, f"/acme/order/{order_id}"
+    )
+    if payload != {}:
+        raise malformed("POST-as-GET requires an empty payload")
+
+    order = ctx.store.get_order(order_id)
+    if order is None or order.account_id != account.id:
+        raise unauthorized("order not found")
+    return JSONResponse(content=_order_to_json(order))
+
+
 @router.post("/acme/finalize/{order_id}")
 async def finalize_order(
     order_id: str,
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_id = await verify_existing_account_jws(
-        request,
-        ctx.store,
-        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    _header, payload, account = await authenticate_account(
+        ctx, request, f"/acme/finalize/{order_id}"
     )
+    account_id = account.id
 
     order = ctx.store.get_order(order_id)
     if order is None or order.account_id != account_id:

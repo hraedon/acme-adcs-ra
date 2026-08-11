@@ -12,6 +12,7 @@ from acme_adcs_ra.acme_errors import (
     account_does_not_exist,
     bad_external_account_binding,
     malformed,
+    unauthorized,
 )
 from acme_adcs_ra.app_state import (
     _ACME_PATHS,
@@ -19,6 +20,9 @@ from acme_adcs_ra.app_state import (
     _account_url,
     _audit,
     _dummy_hmac,
+    _order_url,
+    _url,
+    authenticate_account,
     get_context,
 )
 from acme_adcs_ra.jws import (
@@ -28,6 +32,7 @@ from acme_adcs_ra.jws import (
 )
 from acme_adcs_ra.serializers import _account_to_json
 from acme_adcs_ra.server_jws import verify_new_account_jws
+from acme_adcs_ra.store import AccountStatus
 
 router = APIRouter()
 
@@ -37,9 +42,11 @@ async def new_account(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
+    new_account_url = _url(ctx, _ACME_PATHS["newAccount"])
     _header, payload, account_jwk = await verify_new_account_jws(
         request,
         ctx.store,
+        expected_url=new_account_url,
         max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
     )
 
@@ -104,7 +111,10 @@ async def new_account(
             eab_jws,
             account_jwk,
             mac_key,
-            expected_url=str(request.url),
+            # The RA's OWN newAccount URL, from the configured base_url — never
+            # str(request.url), which is built from the client's Host header and
+            # so would let an EAB minted for another deployment verify here.
+            expected_url=new_account_url,
         )
     except JWSValidationError as exc:
         _audit(ctx,
@@ -143,4 +153,79 @@ async def new_account(
         status_code=201,
         content=body,
         headers={"Location": _account_url(ctx, account.id)},
+    )
+
+
+@router.post("/acme/acct/{account_id}")
+async def account_resource(
+    account_id: str,
+    request: Request,
+    ctx: ServerContext = Depends(get_context),
+) -> JSONResponse:
+    """POST-as-GET the account, or deactivate it (RFC 8555 §7.3.2, §7.3.6).
+
+    This is the URL newAccount returns in ``Location`` and the value clients
+    carry as ``kid``; it previously had no handler.
+
+    An empty payload reads the account. ``{"status": "deactivated"}`` is the
+    client-side kill switch for a compromised account key: once deactivated,
+    ``enforce_account_usable`` rejects every subsequent request from this
+    account — including revoking its own live certificates. It is one-way; RFC
+    8555 §7.3.6 says the server MUST NOT allow reactivation.
+    """
+    _header, payload, account = await authenticate_account(
+        ctx, request, f"/acme/acct/{account_id}"
+    )
+    # The kid already identified the account; a mismatch means the caller is
+    # POSTing to someone else's account URL with their own key.
+    if account.id != account_id:
+        raise unauthorized("account not found")
+
+    requested_status = payload.get("status")
+    if requested_status is not None:
+        if requested_status != AccountStatus.DEACTIVATED:
+            raise malformed(
+                "the only supported account status change is 'deactivated' "
+                "(RFC 8555 §7.3.6)"
+            )
+        applied = ctx.store.update_account_status(
+            account.id, AccountStatus.DEACTIVATED
+        )
+        _audit(
+            ctx,
+            event_type="account-deactivated",
+            account_id=account.id,
+            outcome="success",
+            details={"eab_kid": account.eab_kid, "applied": applied},
+        )
+        refreshed = ctx.store.get_account(account.id)
+        if refreshed is None:  # pragma: no cover - defensive
+            raise unauthorized("account not found")
+        return JSONResponse(content=_account_to_json(ctx, refreshed))
+
+    return JSONResponse(content=_account_to_json(ctx, account))
+
+
+@router.post("/acme/acct/{account_id}/orders")
+async def account_orders(
+    account_id: str,
+    request: Request,
+    ctx: ServerContext = Depends(get_context),
+) -> JSONResponse:
+    """POST-as-GET the account's order list (RFC 8555 §7.1.2.1).
+
+    The account object has always advertised this URL; it had no handler, so
+    a client that followed the link got a 404.
+    """
+    _header, payload, account = await authenticate_account(
+        ctx, request, f"/acme/acct/{account_id}/orders"
+    )
+    if account.id != account_id:
+        raise unauthorized("account not found")
+    if payload != {}:
+        raise malformed("POST-as-GET requires an empty payload")
+
+    orders = ctx.store.list_orders_by_account(account.id)
+    return JSONResponse(
+        content={"orders": [_order_url(ctx, o.id) for o in orders]}
     )

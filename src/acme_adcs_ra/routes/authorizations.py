@@ -9,10 +9,10 @@ from acme_adcs_ra.acme_errors import malformed, server_internal, unauthorized
 from acme_adcs_ra.app_state import (
     ServerContext,
     _audit,
+    authenticate_account,
     get_context,
 )
 from acme_adcs_ra.serializers import _authz_to_json, _challenge_to_json
-from acme_adcs_ra.server_jws import verify_existing_account_jws
 from acme_adcs_ra.store import OrderStatus, _now_iso, is_expired
 
 router = APIRouter()
@@ -23,8 +23,37 @@ async def get_authorization(
     authz_id: str,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
+    """Unauthenticated read of an authorization by its unguessable URL.
+
+    Retained for compatibility with the clients this RA was proven against.
+    Prefer the POST-as-GET form below, which is what RFC 8555 §6.3 specifies
+    and which is account-scoped.
+    """
     authz = ctx.store.get_authorization(authz_id)
     if authz is None:
+        raise unauthorized("authorization not found")
+    return JSONResponse(content=_authz_to_json(authz))
+
+
+@router.post("/acme/authz/{authz_id}")
+async def post_authorization(
+    authz_id: str,
+    request: Request,
+    ctx: ServerContext = Depends(get_context),
+) -> JSONResponse:
+    """POST-as-GET the authorization (RFC 8555 §6.3, §7.5).
+
+    Unlike the plain GET above, this is account-scoped: it closes the
+    existence oracle for callers who hold the URL but not the account key.
+    """
+    _header, payload, account = await authenticate_account(
+        ctx, request, f"/acme/authz/{authz_id}"
+    )
+    if payload != {}:
+        raise malformed("POST-as-GET requires an empty payload")
+
+    authz = ctx.store.get_authorization(authz_id)
+    if authz is None or authz.account_id != account.id:
         raise unauthorized("authorization not found")
     return JSONResponse(content=_authz_to_json(authz))
 
@@ -66,11 +95,10 @@ async def post_challenge(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_id = await verify_existing_account_jws(
-        request,
-        ctx.store,
-        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    _header, payload, account = await authenticate_account(
+        ctx, request, f"/acme/challenge/{challenge_id}"
     )
+    account_id = account.id
 
     challenge = ctx.store.get_challenge(challenge_id)
     if challenge is None:
