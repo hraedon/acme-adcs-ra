@@ -52,9 +52,18 @@ honest: check a box only when the thing is actually true, not when it's planned.
       blanket-firewall 443 if it is SNI-shared with cert-watch/gpo-lens. Snippet
       + caveats: `docs/operations.md` ## Network allowlist and reverse-proxy
       rate limiting.
-- [ ] **`base_url` is the public hostname.** A mismatch fail-closes every
-      legitimate JWS on day 1 (URL binding) — deployment prerequisite, not
-      optional (§4.D).
+- [ ] **`base_url` is the exact public origin (scheme + host + any port).** It is
+      the **authority** for the JWS and EAB URL bindings as of 2026-08-11, not a
+      display value: a JWS or EAB signed against any other URL is refused, and a
+      mismatch fail-closes every legitimate request on day 1 (§4.D).
+- [ ] **EAB credentials are per-deployment.** Because the EAB binding now pins to
+      this RA's `newAccount` URL, a kid+MAC pair shared with a test/staging RA no
+      longer verifies here — but sharing one is still a credential-hygiene
+      failure. Mint separate kids per environment.
+- [ ] **Account eviction path understood.** Removing a kid from `eab_allowlist`
+      now evicts every account created under it *completely* (orders, key
+      rollover, and revocation), not just issuance. Clients can also self-disable
+      via RFC 8555 §7.3.6 deactivation. Both are audited.
 
 ## D. Admin surface (§4.A, §4.D)
 
@@ -81,9 +90,19 @@ honest: check a box only when the thing is actually true, not when it's planned.
 - [ ] **Monitoring alerts on time-in-`processing` p99** (pilot condition);
       `GET /acme/admin/orders?status=processing` surfaces stuck orders. SLOs +
       alerting guidance: `docs/operations.md` ## Monitoring and SLOs.
-- [ ] **Audit/SIEM sink live** — every issuance is emitted; consider a
-      write-once/append-only sink for `audit_log` (§6). SIEM delivery monitoring:
-      `docs/operations.md` ## Monitoring and SLOs.
+- [ ] **Audit leaves the box — REQUIRED, not "consider" (§4.D.1).** The default
+      `jsonl` sink writes next to the database, so a compromise of the RA host —
+      the adversary §4.A calls load-bearing — destroys the audit table *and* its
+      only mirror. Set `ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with the syslog or
+      HEC sink; the RA then refuses to start in the same-host-only posture. A
+      write-once/append-only destination on the SIEM side remains desirable.
+      SIEM delivery monitoring: `docs/operations.md` ## Monitoring and SLOs.
+- [ ] **Nonce ceiling reviewed.** `/acme/new-nonce` is unauthenticated and each
+      call is a SQLite write; the in-app token bucket
+      (`nonce_rate_limit_per_second`, default 20/s burst 100) bounds it before
+      the write. Confirm the default is comfortably above real client volume and
+      that the network allowlist above is actually in place — the bucket is
+      defence in depth, not a substitute for it.
 - [ ] **Retention/archival** for `audit_log` and the cert table decided. Guidance:
       `docs/operations.md` ## Retention and archival.
 

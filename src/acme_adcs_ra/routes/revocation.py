@@ -20,12 +20,12 @@ from acme_adcs_ra.app_state import (
     _ACME_PATHS,
     ServerContext,
     _audit,
+    authenticate_account,
     get_context,
     logger,
 )
 from acme_adcs_ra.jws import _base64url_decode
-from acme_adcs_ra.server_jws import verify_existing_account_jws
-from acme_adcs_ra.store import CertStatus, _now_iso
+from acme_adcs_ra.store import CertStatus, _now_iso, canonical_serial
 
 router = APIRouter()
 
@@ -35,11 +35,10 @@ async def revoke_cert(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account_id = await verify_existing_account_jws(
-        request,
-        ctx.store,
-        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    _header, payload, account = await authenticate_account(
+        ctx, request, _ACME_PATHS["revokeCert"]
     )
+    account_id = account.id
 
     cert_b64 = payload.get("cert")
     if not isinstance(cert_b64, str) or not cert_b64:
@@ -74,7 +73,7 @@ async def revoke_cert(
             "(reason 7 is unused in RFC 5280 and rejected by certutil)"
         )
 
-    serial_hex = format(cert.serial_number, "x").upper()
+    serial_hex = canonical_serial(format(cert.serial_number, "x"))
 
     try:
         san_ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)

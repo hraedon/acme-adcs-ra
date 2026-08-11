@@ -40,6 +40,11 @@ class CertStatus(StrEnum):
     REVOKED = "revoked"
 
 
+class AccountStatus(StrEnum):
+    VALID = "valid"
+    DEACTIVATED = "deactivated"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -89,10 +94,27 @@ def _load_json(text: str | None) -> Any:
     return json.loads(text)
 
 
+def canonical_serial(serial_hex: str) -> str:
+    """Normalize a hex serial to the single form the store keys on.
+
+    Serials reach the RA from three directions that disagree on presentation:
+    ``format(n, 'x')`` (no padding), ``certutil`` output (lowercase,
+    zero-padded to an even length), and operator copy-paste (sometimes
+    ``0x``-prefixed). Storing one form and looking up another silently fails
+    to find the row — for the revocation-confirm callback that means the serial
+    never drops out of the pending set and is re-revoked on every sweep.
+
+    Canonical form: no ``0x`` prefix, no leading zeros, uppercase. ``"0"``
+    survives as ``"0"`` rather than becoming empty.
+    """
+    stripped = serial_hex.strip().upper().removeprefix("0X")
+    return stripped.lstrip("0") or "0"
+
+
 def _serial_from_pem(cert_pem: str) -> str:
-    """Return the certificate serial number as uppercase hex."""
+    """Return the certificate serial number in canonical uppercase hex."""
     cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
-    return format(cert.serial_number, "x").upper()
+    return canonical_serial(format(cert.serial_number, "x"))
 
 
 NONCE_TTL_SECONDS: int = 1800  # 30 minutes
@@ -541,6 +563,21 @@ class Store:
             return None
         return self._account_from_row(row)
 
+    def update_account_status(self, account_id: str, status: str) -> bool:
+        """Set an account's status (RFC 8555 §7.3.6 deactivation).
+
+        CAS-guarded on the account still being ``valid`` so a repeat
+        deactivation is an idempotent no-op rather than a second state change,
+        and so it can never resurrect an already-deactivated account. Returns
+        True if this call applied the transition.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE accounts SET status = ? WHERE id = ? AND status = ?",
+                (status, account_id, AccountStatus.VALID),
+            )
+            return cursor.rowcount == 1
+
     def update_account_key(
         self, account_id: str, new_jwk: dict[str, Any]
     ) -> None:
@@ -760,6 +797,18 @@ class Store:
                 "SELECT * FROM orders WHERE status = ? "
                 "ORDER BY created_at DESC LIMIT ?",
                 (status, limit),
+            ).fetchall()
+        return [self._order_from_row(row) for row in rows]
+
+    def list_orders_by_account(
+        self, account_id: str, *, limit: int = 500
+    ) -> list[OrderRecord]:
+        """Return an account's orders, newest first (RFC 8555 §7.1.2.1)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM orders WHERE account_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (account_id, limit),
             ).fetchall()
         return [self._order_from_row(row) for row in rows]
 
@@ -1187,16 +1236,17 @@ class Store:
         legacy serial-only behaviour is preserved for callers that
         do not have an account context.
         """
+        lookup = canonical_serial(serial_hex)
         with self._connect() as conn:
             if account_id is not None:
                 row = conn.execute(
                     "SELECT * FROM certificates WHERE serial_number = ? AND account_id = ?",
-                    (serial_hex.upper(), account_id),
+                    (lookup, account_id),
                 ).fetchone()
             else:
                 row = conn.execute(
                     "SELECT * FROM certificates WHERE serial_number = ?",
-                    (serial_hex.upper(),),
+                    (lookup,),
                 ).fetchone()
         if row is None:
             return None
@@ -1275,7 +1325,7 @@ class Store:
             cursor = conn.execute(
                 "UPDATE certificates SET ca_crl_updated = 1 "
                 "WHERE serial_number = ? AND status = ? AND ca_crl_updated = 0",
-                (serial_hex.upper(), CertStatus.REVOKED),
+                (canonical_serial(serial_hex), CertStatus.REVOKED),
             )
             return cursor.rowcount == 1
 

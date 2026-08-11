@@ -200,6 +200,29 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   account keys, with RSA account keys ≥2048 bits; **HS-only** for EAB (no alg
   confusion / no "HS256 with the server's public key"); ES raw R‖S→DER
   validated. EAB JWS objects are bound to this RA's `newAccount` URL.
+- **URL binding is computed from configuration, not from the request
+  (2026-08-11).** `_verify_url` and the EAB `expected_url` both previously
+  compared the protected-header `url` to `str(request.url)` — which is built
+  from the client-supplied `Host` header (and, behind a proxy, from
+  `X-Forwarded-Proto`). That only proved the client was self-consistent: with
+  `Host:` set to another deployment's name, a JWS *and* an EAB minted for that
+  deployment verified here, defeating the cross-endpoint replay control added on
+  2026-08-07. The expected URL is now built from `base_url`, and `kid` must
+  start with this RA's configured account-URL prefix. **Consequence for
+  operators:** `ACME_RA_BASE_URL` is now load-bearing, not cosmetic — it must be
+  the exact public origin clients use, or every request is refused (fail-closed).
+  Note also that `forwarded_allow_ips` cannot distinguish a proxy from a client
+  behind a same-host reverse proxy (the peer is always loopback), which is why
+  no security decision may depend on forwarded headers.
+- **Account eviction (2026-08-11).** `account.status` and the account's EAB kid
+  are re-checked on **every** authenticated request. Previously `status` was
+  never read and the kid was only re-checked inside `IssuancePolicy` at
+  finalize, so pulling a kid from `eab_allowlist` — the operator's
+  credential-revocation action — stopped issuance but left the account able to
+  create orders, roll its key, and **revoke its own live certificates**. RFC 8555
+  §7.3.6 deactivation is implemented as the client-side kill switch; removing
+  the kid is the operator-side one. Both are audited
+  (`account-deactivated`, `account-request-denied`).
 - **CSRF / cross-protocol:** ACME POSTs are `application/jose+json` (RFC 8555
   §6.1) and the body is a key-bound JWS signature. There is no browser-rendered
   surface; a same-origin attacker would still need the account key. CSRF is a
@@ -247,6 +270,30 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   (pilot condition); the audited `GET /acme/admin/orders?status=processing`
   endpoint surfaces stuck orders (minimal admin view — no SANs/cert URLs).
 
+### D.1 Availability of the unauthenticated surface (2026-08-11)
+
+- **`/acme/new-nonce` is unauthenticated and every call is a SQLite write.**
+  SQLite has a single writer, so a nonce flood does not merely grow a table — it
+  contends for the write lock with the issuance path, where a blocked write
+  surfaces as a 500 once `busy_timeout` (5s) expires. The WI-016 limiter cannot
+  help: it keys on an account that does not exist yet at nonce time.
+- **Controls:** an in-process token bucket (`nonce_rate_limit_per_second`,
+  default 20/s, burst 100) applied **before** the write, so a rejected request
+  costs less than an accepted one; plus the network allowlist, which is the
+  authoritative outer bound and a pilot condition.
+- **Residual:** the bucket is per worker process. Under IIS/HttpPlatformHandler
+  the RA is a single uvicorn process so one bucket sees all traffic; if that is
+  ever scaled out, the effective ceiling multiplies by worker count. The proxy
+  limit remains the real ceiling.
+- **Audit durability:** the default `jsonl` sink writes next to the database, so
+  a compromise of the RA host takes the audit table *and* its only mirror. Set
+  `audit_offbox_required` in production — the RA then refuses to start unless
+  the syslog or HEC sink is configured. There is no append-only or hash-chain
+  protection on `audit_log` itself; off-box emission is the control.
+- **Published surface:** FastAPI's `/docs`, `/redoc` and `/openapi.json` are
+  disabled. They previously enumerated every `/acme/admin/*` route to any
+  unauthenticated caller that could reach the RA.
+
 ### E. Revocation abuse
 - **Only the issuing account may revoke** its own cert (lookup scoped to
   `(serial, account_id)`); cross-account → 404 (no leak). Already-revoked →
@@ -264,15 +311,16 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   second crypto authorization path to a security endpoint for a client that
   never uses it would widen surface for no operational gain — recorded here
   as a deliberate non-goal, reversible if a future client needs it.
-- **Cert-URL discoverability (acknowledged):** the cert URL remains in the order
-  JSON after revocation (the URL is 128-bit unguessable); the *body* is 410.
-  This is RFC-shaped and intentional. `GET /acme/cert/{id}` and
-  `GET /acme/authz/{id}` are **plain GETs of unguessable URLs** per RFC 8555
-  §7.4.2 — they are **not** JWS-gated or account-scoped (account-scoping them
-  would break standard ACME clients). Consequence: anyone holding a cert/authz
-  URL can probe it, and **401 (not-found) vs 410 (revoked) vs 200 (valid) leaks
-  existence** to a holder of the URL. URLs are 128-bit; this is the RFC's
-  design, accepted here.
+- **Cert-URL discoverability (narrowed 2026-08-11):** the cert URL remains in
+  the order JSON after revocation (the URL is 128-bit unguessable); the *body*
+  is 410. `GET /acme/cert/{id}` and `GET /acme/authz/{id}` are still plain,
+  unauthenticated GETs of unguessable URLs, retained for the clients this RA was
+  proven against; for a holder of the URL, **401 vs 410 vs 200 leaks
+  existence**. **Account-scoped `POST`-as-`GET` forms now exist for both** (RFC
+  8555 §6.3), along with the order and account resources, so a conforming client
+  never needs the unauthenticated path and the oracle is avoidable rather than
+  inherent. Retiring the plain GETs is a future breaking change, gated on
+  confirming no deployed client uses them.
 - **Residual:** a compromised issuing account can revoke its own certs (denial
   of availability for that account's services). Bounded; audited.
 - **CA-side revocation is out-of-band, operator-runbook'd (WI-010, decided

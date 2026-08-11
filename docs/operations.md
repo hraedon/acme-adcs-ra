@@ -136,6 +136,34 @@ config is read from `ACME_RA_*` environment variables and the store from
 - A `never`-used kid that has been configured for a long time — may indicate
   a stale entry or a client that was never switched over after rotation.
 
+## Disabling a compromised account
+
+There are two independent kill switches, and both take effect on the **next
+request** — no restart, no cache to wait out.
+
+**Operator side — pull the EAB kid.** Remove the kid's entry from
+`eab_allowlist` in `acme-ra.env` and recycle the app pool. Every ACME account
+created under that kid is then refused entirely: new orders, key rollover, and
+`revokeCert` alike. Each refusal is audited as `account-request-denied` with
+`reason: eab-kid-not-allowlisted`, so a client still trying to use the
+credential is visible in SIEM.
+
+> Before 2026-08-11 this only stopped *issuance* — an attacker holding a stolen
+> account key could still revoke the victim's live certificates after the
+> credential was believed cut off. If you are running an older build, treat kid
+> removal as incomplete and revoke at the CA instead.
+
+**Client side — deactivate the account (RFC 8555 §7.3.6).** The client POSTs
+`{"status": "deactivated"}` to its own account URL. This is one-way: the RA
+does not allow reactivation, and every later request from that account is
+refused with `reason: account-not-valid`. Useful when the client knows its own
+key is compromised but the operator is not on hand.
+
+Neither switch revokes already-issued certificates. Certificates outstanding at
+the time of eviction remain valid until revoked — use the revocation runbook
+below, driven by an operator, since the evicted account can no longer revoke
+them itself.
+
 ## Network allowlist and in-app rate limiting
 
 The RA has an **in-app per-account rate limit** (WI-016) that bounds order
@@ -170,6 +198,32 @@ with the account, window, count, and scope (`per-account` or `global`).
 The in-app limit bounds order creation (the expensive path that reaches
 ADCS); the proxy limit bounds raw request rate (including polls and
 challenge POSTs). Both should be configured.
+
+### Nonce ceiling (unauthenticated)
+
+`GET`/`HEAD /acme/new-nonce` is unauthenticated by protocol design, and every
+call performs a SQLite `INSERT`. SQLite has a single writer, so a nonce flood
+does not merely grow a table — it contends for the write lock with the issuance
+path, where a blocked write surfaces as a 500 once the 5-second `busy_timeout`
+expires. The per-account limiter cannot help here: there is no account yet at
+nonce time.
+
+The RA therefore applies an **in-process token bucket before the write**:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ACME_RA_NONCE_RATE_LIMIT_PER_SECOND` | `20` | Sustained nonces/sec. `0` disables the bucket. |
+| `ACME_RA_NONCE_RATE_LIMIT_BURST` | `100` | Burst size. |
+
+Over the limit the RA returns `429` with `Retry-After` and does **not** touch
+the database. The defaults are far above real ACME client volume — a renewal
+consumes a handful of nonces, not hundreds — so raise them only if you have
+measured a legitimate need.
+
+**Caveat:** the bucket is per worker *process*. Under IIS/HttpPlatformHandler
+the RA runs as a single uvicorn process, so one bucket sees all traffic; if you
+ever scale to multiple workers the effective ceiling multiplies by worker count.
+The network allowlist below remains the authoritative outer bound.
 
 ### Network allowlist (`<ipSecurity>`)
 

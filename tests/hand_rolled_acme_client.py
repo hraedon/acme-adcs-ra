@@ -216,6 +216,20 @@ class HandRolledAcmeClient:
     def get_authorization(self, authz_url: str) -> Any:
         return self.http.get(authz_url)
 
+    def post_as_get(self, url: str) -> Any:
+        """RFC 8555 §6.3 POST-as-GET: a signed request with an EMPTY payload.
+
+        ``sign_jws(None, ...)`` produces ``payload: ""`` — the empty *string*
+        the RFC specifies, not an empty object.
+        """
+        return self._post_jws(url, None)
+
+    def deactivate_account(self) -> Any:
+        """RFC 8555 §7.3.6 account deactivation."""
+        if self.account_url is None:
+            raise RuntimeError("account URL not known; call new_account first")
+        return self._post_jws(self.account_url, {"status": "deactivated"})
+
     def validate_challenge(self, challenge_url: str) -> Any:
         return self._post_jws(challenge_url, {})
 

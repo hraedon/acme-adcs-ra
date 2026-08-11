@@ -26,33 +26,43 @@ from acme_adcs_ra.jws import (
 from acme_adcs_ra.store import Store
 
 
-def _kid_to_account_id(kid: str) -> str:
+def _kid_to_account_id(kid: str, account_url_prefix: str) -> str:
     """Extract the account UUID from a kid (account URL).
 
-    RFC 8555 §6.2.1 requires kid to be the account URL. A bare ID is a
-    protocol violation and is rejected.
+    RFC 8555 §6.2.1 requires kid to be the account URL *on this server*. The
+    kid must therefore start with this RA's configured account-URL prefix — a
+    bare ID, or an account URL naming some other host, is a protocol violation
+    and is rejected. Checking against the configured prefix (not whatever host
+    the request happened to arrive with) means a kid minted against a
+    different deployment cannot be presented here.
     """
-    marker = "/acme/acct/"
-    idx = kid.find(marker)
-    if idx == -1:
+    prefix = account_url_prefix.rstrip("/") + "/"
+    if not kid.startswith(prefix):
         raise malformed(
-            f"kid is not a valid account URL (missing {marker!r}): {kid!r}"
+            f"kid is not an account URL on this server (expected prefix "
+            f"{prefix!r}): {kid!r}"
         )
-    return kid[idx + len(marker):].split("/", 1)[0]
+    return kid[len(prefix):].split("/", 1)[0]
 
 
-def _verify_url(header: dict[str, Any], request_url: str) -> None:
-    """Ensure the JWS protected-header url matches the request URL.
+def _verify_url(header: dict[str, Any], expected_url: str) -> None:
+    """Ensure the JWS protected-header url matches this endpoint's canonical URL.
 
     RFC 8555 §6.4 requires full-URL binding (scheme + host + path + query).
-    A stolen JWS replayed against a different host with the same path must
-    be rejected.
+
+    *expected_url* is built from the configured ``base_url``, **not** from the
+    inbound request. That distinction is the control: ``request.url`` is
+    derived from the client-supplied ``Host`` header (and, behind a proxy, from
+    ``X-Forwarded-Proto``), so comparing the two only proves the client is
+    consistent with itself. Comparing against the configured URL pins the
+    signature to *this* RA, which is what makes a JWS — or an EAB binding —
+    minted for another deployment unusable here.
     """
     header_url = header.get("url")
     if not header_url:
         raise malformed("protected header missing url")
     header_parsed = urlparse(str(header_url))
-    request_parsed = urlparse(str(request_url))
+    expected_parsed = urlparse(str(expected_url))
 
     # The protected-header url MUST be absolute. A relative url would evade
     # the scheme/host comparison below and allow cross-host replay (a stolen
@@ -65,25 +75,25 @@ def _verify_url(header: dict[str, Any], request_url: str) -> None:
         )
 
     # Scheme + host + path + query must all match (RFC 8555 §6.4).
-    if header_parsed.scheme != request_parsed.scheme:
+    if header_parsed.scheme != expected_parsed.scheme:
         raise malformed(
             f"url scheme mismatch: protected header {header_parsed.scheme}, "
-            f"request {request_parsed.scheme}"
+            f"expected {expected_parsed.scheme}"
         )
-    if header_parsed.netloc != request_parsed.netloc:
+    if header_parsed.netloc != expected_parsed.netloc:
         raise malformed(
             f"url host mismatch: protected header {header_parsed.netloc}, "
-            f"request {request_parsed.netloc}"
+            f"expected {expected_parsed.netloc}"
         )
-    if header_parsed.path != request_parsed.path:
+    if header_parsed.path != expected_parsed.path:
         raise malformed(
             f"url path mismatch: protected header {header_parsed.path}, "
-            f"request {request_parsed.path}"
+            f"expected {expected_parsed.path}"
         )
-    if header_parsed.query != request_parsed.query:
+    if header_parsed.query != expected_parsed.query:
         raise malformed(
             f"url query mismatch: protected header {header_parsed.query!r}, "
-            f"request {request_parsed.query!r}"
+            f"expected {expected_parsed.query!r}"
         )
 
 
@@ -136,6 +146,7 @@ async def _parse_jws_header(
     request: Request,
     store: Store,
     *,
+    expected_url: str,
     max_body_size_bytes: int = 65536,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Parse the JWS body, decode the protected header, consume the nonce,
@@ -159,8 +170,8 @@ async def _parse_jws_header(
 
     # Consume nonce BEFORE verifying URL so that a bad-URL probe still
     # burns the nonce, limiting replay probing (M6).
-    _consume_nonce(store, header, str(request.url))
-    _verify_url(header, str(request.url))
+    _consume_nonce(store, header, expected_url)
+    _verify_url(header, expected_url)
 
     return header, jws
 
@@ -174,6 +185,14 @@ def _verify_jws_signature(
         payload = verify_flattened_jws(jws, public_key)
     except JWSValidationError as exc:
         raise unauthorized(f"JWS verification failed: {exc}") from exc
+
+    # RFC 8555 §6.3: a POST-as-GET request carries an *empty string* payload,
+    # not an empty object. Conforming clients use it for every read of a
+    # protected resource (order, authz, cert). Normalizing it to {} here lets
+    # routes treat "no payload" uniformly; no route is weakened by it, because
+    # every route that needs a payload field checks for that field explicitly.
+    if payload == b"":
+        return {}
 
     try:
         decoded_payload = json.loads(payload)
@@ -189,6 +208,8 @@ async def verify_existing_account_jws(
     request: Request,
     store: Store,
     *,
+    expected_url: str,
+    account_url_prefix: str,
     max_body_size_bytes: int = 65536,
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
     """Verify a JWS signed by an existing account (kid lookup).
@@ -196,15 +217,20 @@ async def verify_existing_account_jws(
     Returns (protected_header, payload_dict, account_id).
     """
     header, jws = await _parse_jws_header(
-        request, store, max_body_size_bytes=max_body_size_bytes
+        request,
+        store,
+        expected_url=expected_url,
+        max_body_size_bytes=max_body_size_bytes,
     )
 
     kid = header.get("kid")
     if not kid:
         raise malformed("protected header missing kid")
+    if not isinstance(kid, str):
+        raise malformed("protected header kid must be a string")
     if "jwk" in header:
         raise malformed("existing-account JWS must use kid, not jwk")
-    account_id = _kid_to_account_id(kid)
+    account_id = _kid_to_account_id(kid, account_url_prefix)
     account = store.get_account(account_id)
     if account is None:
         raise unauthorized("account not found")
@@ -223,6 +249,7 @@ async def verify_new_account_jws(
     request: Request,
     store: Store,
     *,
+    expected_url: str,
     max_body_size_bytes: int = 65536,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Verify a JWS signed by the new account key (jwk in header).
@@ -230,7 +257,10 @@ async def verify_new_account_jws(
     Returns (protected_header, payload_dict, account_jwk).
     """
     header, jws = await _parse_jws_header(
-        request, store, max_body_size_bytes=max_body_size_bytes
+        request,
+        store,
+        expected_url=expected_url,
+        max_body_size_bytes=max_body_size_bytes,
     )
 
     account_jwk = header.get("jwk")

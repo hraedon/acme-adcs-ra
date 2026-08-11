@@ -6,6 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+**Security hardening (2026-08-11 pre-deployment review).** Twelve findings
+across the ACME front, the account lifecycle, the unauthenticated surface, the
+enrollment leg's chain handling, and the deployment artifacts. See
+`docs/security-review-2026-08-11.md`.
+
+### Security
+- **JWS and EAB URL bindings now pin to `base_url` (MEDIUM).** Both were
+  previously derived from `str(request.url)` — i.e. from the client's `Host`
+  header — so they only proved the client was self-consistent. An EAB minted for
+  a different deployment verified here, which meant the 2026-08-07 "EAB
+  cross-endpoint replay" fix was not actually closed. `kid` must now also start
+  with this RA's configured account-URL prefix.
+  **Operator impact: `ACME_RA_BASE_URL` is now load-bearing** — it must be the
+  exact public origin, or every request fail-closes.
+- **Accounts can be disabled (MEDIUM).** `account.status` and the account's EAB
+  kid are re-checked on every authenticated request. Removing a kid from
+  `eab_allowlist` previously stopped issuance but still let the account create
+  orders, roll its key, and **revoke its own live certificates**. RFC 8555
+  §7.3.6 deactivation is implemented as the client-side kill switch. Both
+  rejections are audited (`account-deactivated`, `account-request-denied`).
+- **Interactive API docs disabled (MEDIUM).** `/docs`, `/redoc` and
+  `/openapi.json` published the full route inventory, including every
+  `/acme/admin/*` endpoint, to any unauthenticated caller.
+- **Off-box audit gate (MEDIUM).** New `audit_offbox_required` refuses startup
+  unless audit events leave the host. The default `jsonl` sink writes next to
+  the database, so a host compromise destroyed the audit trail and its only
+  mirror together.
+- **Issued chain bound to the issued certificate (LOW).** `certnew.p7b` is a
+  separate fetch that was stored and served unvalidated; a chain certificate
+  must now match the leaf's issuer *and* verify its signature.
+
+### Fixed
+- **Nonce-endpoint flood ceiling (MEDIUM).** `/acme/new-nonce` is
+  unauthenticated and each call is a SQLite write, so a flood contended for the
+  single writer with the issuance path. An in-process token bucket now bounds it
+  *before* the write (`nonce_rate_limit_per_second`, default 20/s, burst 100).
+- **Advertised resource URLs resolve (MEDIUM).** newOrder's `Location`,
+  newAccount's `Location` and the account `orders` link all returned 404, so a
+  conforming client that polls the order URL could not complete. Adds
+  account-scoped POST-as-GET for order, account, orders-list, authorization and
+  certificate resources, and RFC 8555 §6.3 empty-payload handling.
+- **`certfnsh.asp` pending detection** now scans the comment/script-stripped
+  body like every other step of the parser.
+- **`keyChange` malformed `oldKey`** returns 400 instead of an unhandled 500.
+- **Serial canonicalisation.** One `canonical_serial` helper on every path, so a
+  `certutil`-shaped (zero-padded, lowercase) serial matches the stored form and
+  the revocation-confirm callback cannot 404 into an endless re-revoke loop.
+- **App version** is read from installed distribution metadata (it had drifted
+  to `1.6.0` against a `1.7.0` release).
+
+### Changed
+- `deploy/iis/web.config` sets the off-box audit sink and an explicit global
+  order ceiling, and documents that the network allowlist is required rather
+  than recommended.
+- The no-signing-key guardrail's importlib allowlist admits
+  `importlib.metadata` (data-only, like `importlib.resources`), with two new
+  negative controls asserting `importlib.machinery` still trips the detector.
+
 ## [1.7.0] — 2026-08-08
 
 **Security hardening (2026-08-07 review), no new feature surface.** Closes

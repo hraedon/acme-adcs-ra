@@ -11,12 +11,15 @@ from typing import Any, cast
 
 from fastapi import Request
 
+from acme_adcs_ra.acme_errors import unauthorized
 from acme_adcs_ra.config import RAConfig
 from acme_adcs_ra.enrollment import EnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
+from acme_adcs_ra.rate_limit import TokenBucket
 from acme_adcs_ra.revocation import RevocationLeg
+from acme_adcs_ra.server_jws import verify_existing_account_jws
 from acme_adcs_ra.siem import SiemEmitter, build_siem_config
-from acme_adcs_ra.store import Store
+from acme_adcs_ra.store import AccountRecord, AccountStatus, Store
 
 logger = logging.getLogger("acme_adcs_ra.server")
 
@@ -56,6 +59,9 @@ class ServerContext:
     # audit row is persisted, unconditionally, for every issuance event.
     # When None, create_app wires the default SIEM emitter from config.
     audit_hook: Callable[[dict[str, Any]], None] | None = None
+    # Token bucket for the unauthenticated nonce endpoint. When None,
+    # create_app builds one from config (or leaves it None if disabled).
+    nonce_bucket: TokenBucket | None = None
 
 
 def _audit(ctx: ServerContext, **kwargs: Any) -> None:
@@ -107,5 +113,85 @@ def _default_siem_emitter(config: RAConfig) -> SiemEmitter:
     return SiemEmitter(build_siem_config(config))
 
 
+def _default_nonce_bucket(config: RAConfig) -> TokenBucket | None:
+    """Build the nonce token bucket from config, or None when disabled."""
+    if config.nonce_rate_limit_per_second <= 0 or config.nonce_rate_limit_burst < 1:
+        return None
+    return TokenBucket(
+        capacity=config.nonce_rate_limit_burst,
+        refill_per_second=config.nonce_rate_limit_per_second,
+    )
+
+
 def get_context(request: Request) -> ServerContext:
     return cast(ServerContext, request.app.state.context)
+
+
+def _account_url_prefix(context: ServerContext) -> str:
+    """The configured prefix every account URL (and therefore every kid) shares."""
+    return _url(context, "/acme/acct")
+
+
+def enforce_account_usable(ctx: ServerContext, account: AccountRecord) -> None:
+    """Reject a request from an account that is no longer authorized to act.
+
+    Two independent conditions, both re-evaluated on **every** authenticated
+    request rather than only at issuance time:
+
+    * ``status`` — an account deactivated per RFC 8555 §7.3.6 can do nothing
+      further, including revoking its own certificates.
+    * ``eab_kid`` — the external-account credential the account was created
+      under must still be in the live allowlist. Pulling a kid from
+      ``eab_allowlist`` is the operator's credential-revocation action; before
+      this check it stopped issuance at finalize but still left the account
+      able to create orders, roll its key, and revoke its own live certs. It is
+      now a complete eviction.
+
+    Both rejections are audited: they mean someone is still holding a key the
+    operator believes they have cut off, which is exactly the signal SIEM wants.
+    """
+    if account.status != AccountStatus.VALID:
+        _audit(
+            ctx,
+            event_type="account-request-denied",
+            account_id=account.id,
+            outcome="denied",
+            details={"reason": "account-not-valid", "account_status": account.status},
+        )
+        raise unauthorized(f"account is {account.status}")
+    if account.eab_kid not in ctx.config.eab_keys_by_kid():
+        _audit(
+            ctx,
+            event_type="account-request-denied",
+            account_id=account.id,
+            outcome="denied",
+            details={"reason": "eab-kid-not-allowlisted", "kid": account.eab_kid},
+        )
+        raise unauthorized(
+            "the external account credential this account was created under is "
+            "no longer authorized"
+        )
+
+
+async def authenticate_account(
+    ctx: ServerContext, request: Request, path: str
+) -> tuple[dict[str, Any], dict[str, Any], AccountRecord]:
+    """Verify an existing-account JWS and return (header, payload, account).
+
+    The single authenticated entry point for every account-scoped route. It
+    binds the JWS to *this* RA's canonical URL for ``path`` (built from the
+    configured ``base_url``, never from the inbound request) and enforces that
+    the account is still usable before the route does any work.
+    """
+    header, payload, account_id = await verify_existing_account_jws(
+        request,
+        ctx.store,
+        expected_url=_url(ctx, path),
+        account_url_prefix=_account_url_prefix(ctx),
+        max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+    )
+    account = ctx.store.get_account(account_id)
+    if account is None:
+        raise unauthorized("account not found")
+    enforce_account_usable(ctx, account)
+    return header, payload, account
