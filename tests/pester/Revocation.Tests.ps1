@@ -55,3 +55,28 @@ Describe 'Compare-RequesterName' {
         Compare-RequesterName '' 'WORK-DOMAIN\gMSA-acme-ra$' | Should -BeFalse
     }
 }
+
+Describe "Get-CaSerialForm" {
+    It "re-pads an odd-length serial to the CA's stored even-length form" {
+        # The RA emits format(n,'x') which drops a leading zero; ADCS stores the
+        # full byte string, and -restrict is an exact string match.
+        Get-CaSerialForm "6AB1C" | Should -Be "06AB1C"
+    }
+
+    It "leaves an even-length serial unchanged" {
+        Get-CaSerialForm "6C0000006E14EDCC" | Should -Be "6C0000006E14EDCC"
+    }
+
+    It "strips an 0x prefix before padding" {
+        Get-CaSerialForm "0x6AB1C" | Should -Be "06AB1C"
+        Get-CaSerialForm "0X6AB1C2" | Should -Be "6AB1C2"
+    }
+
+    It "trims surrounding whitespace" {
+        Get-CaSerialForm "  6AB1C2  " | Should -Be "6AB1C2"
+    }
+
+    It "returns empty or whitespace input unchanged" {
+        Get-CaSerialForm "" | Should -Be ""
+    }
+}

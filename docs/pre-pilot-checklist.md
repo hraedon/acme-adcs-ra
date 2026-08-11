@@ -302,3 +302,31 @@ engineered to. Until then it has not — regardless of a green local test run.
         3 new CSR-rejection checks).
   - [x] cryptography 50.0.0 verified on Windows Server 2025 / Python 3.14.
   - [ ] **Still open before pilot:** the operator-owned §B–E items (unchanged).
+
+- **2026-08-11 — security review + live re-proof, PASSED.** Twelve findings from
+  a pre-production-deployment review closed (`docs/security-review-2026-08-11.md`),
+  plus a thirteenth found while reading real `certutil` output. Re-proved live
+  against commit `db06c6f` on the lab RA (IIS app pool as the enrollment gMSA,
+  ADCS CA, Mode A): **26 checks, 26 passed.** Section A unchanged (serverAuth-only
+  EKU, SAN from the CSR, issuer `CONTOSO-CA01-CA`, out-of-scope SAN denied, reason-7
+  rejected), and the new chain-binding verifier accepted the real CA's
+  `certnew.p7b`. New controls proven live: EAB minted for another deployment
+  rejected; `Host:`-header spoof rejected against a **catch-all `*:9443:`
+  binding** (so the request genuinely reached the app); `kid` from another
+  deployment rejected; order/account/orders POST-as-GET resolve; cert POST-as-GET
+  is account-scoped; `/docs` `/redoc` `/openapi.json` all 404; a 220-request nonce
+  flood capped (162×204, 58×429); account deactivation refuses the next request.
+  **Account eviction proven with a control** (a new account under the renamed kid
+  must still succeed, ruling out a false pass from a dotenv that failed to load):
+  after the kid was pulled, both `newOrder` and — the case the pre-fix code
+  allowed — `revokeCert` returned 401. Revocation round-trip completed through
+  the real `Revoke-Cert.ps1` (`Confirm-SerialAtCa` found the row, WI-022 requester
+  check confirmed the gMSA, `certutil -revoke` succeeded) and the confirm callback
+  accepted the lowercase `certutil` serial form, draining the pending set.
+  Also verified: `certutil` does **not** echo the `-restrict` clause, so
+  `Confirm-SerialAtCa`'s existence test is sound (a flagged concern, cleared).
+  Lab left as found — RA parked (pool stopped, endpoint unreachable, dotenv/DB/
+  web.config restored), CA pristine (no `OfficerRights` ever written), all
+  session certificates revoked at the CA, temp cleared on both hosts.
+  - **Still open before pilot:** the operator-owned items in §B–§E, unchanged —
+    plus the two new required items (off-box audit sink, network allowlist).
