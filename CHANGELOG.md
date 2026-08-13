@@ -4,15 +4,21 @@ All notable changes to acme-adcs-ra are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.9.0] — 2026-08-13
+## [1.9.1] — 2026-08-14
 
-> **Live-proven 2026-08-14.** The full lab re-proof ran against `bef2022` —
-> `v1.9.0-rc2` plus the two fixes the run itself produced (a red `ruff` gate on
-> the rc2 tip, and the `Set-OfficerRights.ps1` defect below). Issuance, both
-> transport-orphan branches, the revocation round trip, the authority split and
-> CRL evidence against a real ADCS CRL all pass; three residuals are open and
-> none blocks the tag. See the
-> [validation log](docs/pre-pilot-checklist.md#validation-log).
+> **The release of the 1.9 line.** 1.9.0 never shipped: it existed only as
+> `v1.9.0-rc1` and `v1.9.0-rc2`, and the live re-proof that gates the tag found
+> two things wrong with rc2 — a red `ruff` gate on its tip, and a
+> `Set-OfficerRights.ps1` defect that stopped it provisioning a CA whose
+> `OfficerRights` value was absent (the default, so the first-provisioning
+> path). Both are fixed here, so the shipped version is **1.9.1** and there is
+> no 1.9.0 tag. Everything below is what 1.9.1 contains.
+>
+> **Live-proven 2026-08-14** against `bef2022`, the exact commit these fixes
+> landed on: issuance, both transport-orphan branches, the revocation round
+> trip, the confirm-authority split and CRL evidence verified against a real
+> ADCS CRL all pass. Three residuals are open and none blocks the release. See
+> the [validation log](docs/pre-pilot-checklist.md#validation-log).
 
 ### Security — 2026-08-14 external scan (seventeen findings)
 
@@ -204,7 +210,8 @@ release is worth reading past the security summary.
   automation treating a non-zero exit as failure, would conclude the CA-side
   least-privilege control had not been applied. The library now always returns an
   array and both call sites wrap defensively. Found by the live lab re-proof of
-  v1.9.0; the assertion itself shipped in v1.9.0 (2026-08-13 review, finding 8).
+  the 1.9 line; the assertion itself came from the 2026-08-13 review, finding 8.
+  See also the 2026-08-14 entry below: this fix was itself half wrong.
 
 - **`Sync-Revocations.ps1` aborted the whole batch on the first failed revoke.**
   `& $pwshExe @revokeArgs 2>&1` turns the child's stderr into ErrorRecords, and
@@ -214,7 +221,7 @@ release is worth reading past the security summary.
   all unreachable, and a single bad serial silently stranded every serial behind
   it while the script exited 1. The child invocation moved to
   `SyncLib.ps1::Invoke-ChildScript`, which suppresses `Stop` for the duration of
-  the call. Pre-existing (not introduced in v1.9.0); it only bites when a revoke
+  the call. Pre-existing (not introduced by the 2026-08-13 review); it only bites when a revoke
   fails, which no previous re-proof had provoked. **Note:** this cannot be
   regression-tested on Linux CI — pwsh defaults
   `$PSNativeCommandUseErrorActionPreference` to `$false`, so a "does not throw"

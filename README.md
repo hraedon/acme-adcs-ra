@@ -85,15 +85,19 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **v1.9.0 — release candidate, live-proven 2026-08-14.** The full lab re-proof
-> ran against `bef2022` (`v1.9.0-rc2` plus the two fixes that run produced) and
-> passed: issuance, both transport-orphan branches, the revocation round trip,
-> the confirm-authority split, and CRL evidence verified against a real ADCS
-> CRL. Three residuals are recorded in the
+> **v1.9.1 — current release, live-proven 2026-08-14.** The full lab re-proof
+> ran against `bef2022` and passed: issuance, both transport-orphan branches,
+> the revocation round trip, the confirm-authority split, and CRL evidence
+> verified against a real ADCS CRL. Three residuals are recorded in the
 > [validation log](docs/pre-pilot-checklist.md#validation-log); none blocks the
-> tag. **v1.8.0 is the latest full release.** Feature-complete for its charter and maintained deliberately rather
-> than passively: security reports (see `SECURITY.md`) and bug reports are
-> welcome, but there is no response-time commitment.
+> release. **There is no 1.9.0 release** — that line shipped only as `rc1` and
+> `rc2`, and the re-proof that gates a tag found two things wrong with rc2 (a
+> red lint gate, and a `Set-OfficerRights.ps1` defect on the
+> first-provisioning path), so the fixed build ships as 1.9.1.
+>
+> Feature-complete for its charter and maintained deliberately rather than
+> passively: security reports (see `SECURITY.md`) and bug reports are welcome,
+> but there is no response-time commitment.
 
 The full pipeline works and has been proven against a real CA: an RA running as
 the gMSA behind IIS drives `/certsrv/` and returns a **serverAuth-only**
@@ -122,13 +126,14 @@ CA-side revocation still work. Only the live re-proof
 required at every release, before any pilot, after any change to the issuance
 leg, and quarterly while deployed.
 
-That distinction is not theoretical, and it cuts both ways. The v1.9.0 re-proof
+That distinction is not theoretical, and it cuts both ways. The 2026-08-13 re-proof
 found two defects Linux CI **structurally could not see** — both Windows
 PowerShell 5.1 language semantics that `pwsh` 7 on Linux silently differs on,
 one of them inside the review's own fix. And a second static scan then found
 seventeen findings that a *green live re-proof* had not surfaced either, two of
-them serious. Neither kind of check substitutes for the other. See the v1.9.0
-entry in the validation log.
+them serious. Neither kind of check substitutes for the other. And the
+2026-08-14 re-proof of the fixes for *those* found one more, on the CA. See the
+2026-08-13 and 2026-08-14 entries in the validation log.
 
 ### Before you deploy
 

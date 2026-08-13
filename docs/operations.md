@@ -363,7 +363,7 @@ re-enroll — so the token is a high-value secret, treated like an EAB MAC key.
 
 ### Minimum strength (enforced at startup)
 
-Since v1.9.0 the RA **refuses to start** on a weak credential: EAB MAC keys
+Since v1.9.1 the RA **refuses to start** on a weak credential: EAB MAC keys
 must decode to at least 32 bytes and `ACME_RA_ADMIN_TOKEN` /
 `ACME_RA_REVOCATION_CONFIRM_TOKEN` must be at least 32 characters. Everything
 `python scripts/eab.py new` generates clears this. `allow_weak_credentials=true`
@@ -590,7 +590,7 @@ domain-wide. When one of them rejects, the RA refuses to serve the certificate
 (finalize returns 500, the order goes `invalid`) — but the certificate is still
 live at the CA.
 
-Before v1.9.0 the RA recorded *nothing* in this case, not even the serial, so
+Before the 1.9 line the RA recorded *nothing* in this case, not even the serial, so
 that certificate was invisible to this runbook. It is now recorded as a
 `quarantined` certificate row and queued for CA-side revocation through the
 **same** pull-agent loop as any other pending serial. No separate procedure:
@@ -801,7 +801,7 @@ without it every confirm returns 401 and serials never leave the pending list.
 (`ACME_ADMIN_TOKEN`, `ACME_CONFIRM_TOKEN`) so neither lands on the script's
 process command line, and warns if `-ConfirmToken` is omitted.
 
-**`-RaBaseUrl` must be https.** Since v1.9.0 both `Sync-Revocations.ps1` and
+**`-RaBaseUrl` must be https.** Since v1.9.1 both `Sync-Revocations.ps1` and
 `Register-MaintenanceTasks.ps1` validate it before attaching any token — https
 only, no embedded credentials, no query, fragment, or path. A scheduled task
 bakes the URL in, so a cleartext typo would have disclosed the maintenance

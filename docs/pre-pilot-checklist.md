@@ -132,9 +132,11 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
-- **v1.9.0 second live re-proof — PASSED (2026-08-14), one blocking defect
-  found and fixed, three residuals opened.** Run against commit `bef2022`,
-  which is `v1.9.0-rc2` plus the two fixes this run produced. This is the full
+- **v1.9.1 live re-proof — PASSED (2026-08-14), one blocking defect found and
+  fixed, three residuals opened.** Run against commit `bef2022`, which is
+  `v1.9.0-rc2` plus the two fixes this run produced — and the reason the shipped
+  version is **1.9.1**: 1.9.0 never released, because this run is what found the
+  two things wrong with rc2. This is the full
   pass the rc1 row below demanded: **§A, §A.1, §B/§C, §D, §E from a clean
   start**, plus every case the 2026-08-14 review added. The whole sequence is
   automated end to end, so it is repeatable rather than a one-off; the

@@ -72,8 +72,11 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**v1.9.0-rc2 (2026-08-13), live-proven on `bef2022` (2026-08-14) — two external
-security reviews.** The
+**Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
+security reviews.** There is **no 1.9.0 release**: that line shipped only as
+`rc1`/`rc2`, and the re-proof that gates a tag found a red lint gate on the rc2
+tip and a `Set-OfficerRights.ps1` defect on the first-provisioning path, so the
+fixed build ships as 1.9.1. The
 2026-08-14 scan of rc1 found seventeen further findings, two blocking: ACME
 **reason 8 (removeFromCRL) was accepted and reached `certutil`**, so a revokeCert
 carrying it recorded a successful revocation while asking the CA to *un-revoke*
@@ -123,7 +126,7 @@ rules:
   silently changed what three later steps proved, so the driver now asserts the
   default configuration before it measures anything.
 - **A green cross-platform Pester run is not evidence about the CA host.** The
-  two defects the v1.9.0 re-proof found were Windows PowerShell 5.1 *language*
+  two defects the 2026-08-13 re-proof found were Windows PowerShell 5.1 *language*
   semantics — a single-element array has no `.Count` under 5.1 but yields `1`
   under `pwsh` 7; `$PSNativeCommandUseErrorActionPreference` defaults differ —
   not Windows-only APIs, which is the gap everyone anticipates. Linux Pester was
