@@ -305,7 +305,7 @@ class TestOneAccountPerKey:
         from .hand_rolled_acme_client import HandRolledAcmeClient
         from .test_revocation import _eab_mac_key, _make_test_config
 
-        store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        _store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
         cfg = _make_test_config(tmp_path)
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         ac = HandRolledAcmeClient(client, "http://testserver", key)
@@ -450,7 +450,7 @@ class TestUnauthenticatedResourceGetIsControllable:
         self, tmp_path: Path
     ) -> None:
         """The negative control, and a record of the current default."""
-        store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        _store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
         url = self._issued_cert_url(client, tmp_path)
         assert client.get(url).status_code == 200
 
@@ -461,7 +461,7 @@ class TestUnauthenticatedResourceGetIsControllable:
         the status alone would not discriminate, because the disabled path and
         a genuine miss both answer 401; a mutation confirmed that. So this
         proves a *readable* certificate becomes unreadable."""
-        store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        _store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
         url = self._issued_cert_url(client, tmp_path)
         assert client.get(url).status_code == 200
 
