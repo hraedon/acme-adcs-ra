@@ -6,6 +6,7 @@ the fix was reverted in turn and the test confirmed to fail.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -314,6 +315,122 @@ class TestOneAccountPerKey:
         second = ac.new_account("kid-001", mac)
         assert second.status_code == 200
         assert second.headers["Location"] == first.headers["Location"]
+
+
+class TestRevocationAtomicity:
+    """F13 — revocation state and its mandatory audit row must commit together."""
+
+    def test_revocation_and_its_audit_row_are_atomic(self, tmp_path: Path) -> None:
+        """Fault-inject the audit write; the certificate must NOT come back
+        revoked. Otherwise a fault leaves a certificate served as 410 and
+        queued for CA-side revocation with no event in the authoritative
+        trail — and the local table, not the SIEM copy, is authoritative."""
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from .hand_rolled_acme_client import HandRolledAcmeClient
+        from .test_revocation import _eab_mac_key, _make_test_config
+
+        store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        cfg = _make_test_config(tmp_path)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ac = HandRolledAcmeClient(client, "http://testserver", key)
+        ac.new_account("kid-001", _eab_mac_key(cfg, "kid-001"))
+        cert_der = _issue_via(ac, client)
+
+        original = store._record_audit_in_conn
+
+        def _boom(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("event_type") == "certificate-revoked":
+                raise sqlite3.OperationalError("injected fault")
+            return original(*args, **kwargs)
+
+        store._record_audit_in_conn = _boom  # type: ignore[method-assign]
+        resp = ac.revoke_certificate(cert_der, reason=1)
+        assert resp.status_code == 500
+
+        # The transaction rolled back: still valid, and NOT queued for the CA.
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial = format(cert.serial_number, "x").upper()
+        record = store.get_certificate_by_serial(serial)
+        assert record is not None
+        assert record.status == CertStatus.VALID
+        assert store.list_revoked_certificates() == []
+
+
+class TestConfirmAuthoritySeparation:
+    """F9 — the confirm credential must not collapse into the admin one."""
+
+    def test_identical_admin_and_confirm_tokens_are_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """Every individual length check passes, so nothing else catches this;
+        the separation is silently gone and the revocation agent holds full
+        maintenance authority."""
+        from pydantic import SecretStr
+
+        from acme_adcs_ra.config import RAConfig
+
+        same = "identical-token-0123456789abcdef-32chars"
+        with pytest.raises(ValueError, match="identical"):
+            RAConfig(
+                base_url="http://testserver",
+                db_path=tmp_path / "ra.db",
+                admin_token=SecretStr(same),
+                revocation_confirm_token=SecretStr(same),
+            )
+
+    def test_distinct_tokens_are_accepted(self, tmp_path: Path) -> None:
+        """Negative control."""
+        from pydantic import SecretStr
+
+        from acme_adcs_ra.config import RAConfig
+
+        RAConfig(
+            base_url="http://testserver",
+            db_path=tmp_path / "ra.db",
+            admin_token=SecretStr("admin-token-0123456789abcdef-32chars!"),
+            revocation_confirm_token=SecretStr("confirm-token-0123456789abcdef-32c"),
+        )
+
+
+class TestHecQueueFloor:
+    """F15 — a non-positive queue bound silently voids the off-box audit gate."""
+
+    def test_a_nonpositive_queue_max_is_refused(self, tmp_path: Path) -> None:
+        """At 0, `inflight >= max` is true with nothing in flight, so every
+        event drops — while the emitter still reports itself enabled, so
+        audit_offbox_required passes and the operator believes events are
+        leaving the host. A typo defeats the whole control."""
+        from acme_adcs_ra.config import RAConfig
+
+        for bad in (0, -1):
+            with pytest.raises(ValueError):
+                RAConfig(
+                    base_url="http://testserver",
+                    db_path=tmp_path / "ra.db",
+                    siem_hec_queue_max=bad,
+                )
+
+
+def _issue_via(ac: Any, client: Any) -> bytes:
+    from cryptography.hazmat.primitives import serialization
+
+    from .test_revocation import _make_csr
+
+    resp = ac.new_order(["srv01.WORK-DOMAIN.local"])
+    order = resp.json()
+    for authz_url in order["authorizations"]:
+        authz = ac.get_authorization(authz_url).json()
+        for challenge in authz["challenges"]:
+            ac.validate_challenge(challenge["url"])
+    finalized = ac.finalize_order(
+        order["finalize"], _make_csr(["srv01.WORK-DOMAIN.local"])
+    ).json()
+    cert_text = ac.get_certificate(finalized["certificate"]).text
+    first = cert_text.split("-----END CERTIFICATE-----")[0] + "-----END CERTIFICATE-----"
+    return x509.load_pem_x509_certificate(first.encode()).public_bytes(
+        serialization.Encoding.DER
+    )
 
 
 def _backdate_processing(store: Store, order_id: str, seconds: int) -> None:

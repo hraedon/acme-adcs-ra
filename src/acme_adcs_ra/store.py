@@ -1630,6 +1630,85 @@ class Store:
             return None
         return self._certificate_from_row(row)
 
+    def record_revocation(
+        self,
+        *,
+        cert_id: str,
+        order_id: str,
+        account_id: str,
+        reason: int | None,
+        revoked_at: str | None,
+        sans: Sequence[str],
+        audit_details: dict[str, Any],
+    ) -> tuple[RevocationUpdate, dict[str, Any] | None]:
+        """Revoke a certificate, flip its order, and audit — in ONE transaction.
+
+        The same rule that forced ``record_issuance`` to be atomic applies here:
+        revocation is a security state change with a mandatory audit row, and
+        the three writes were three independent commits (the certificate CAS,
+        the order transition, then ``record_audit``). A fault between them left
+        a certificate revoked in the store — served as 410, queued for CA-side
+        revocation — with no ``certificate-revoked`` event anywhere. The local
+        audit table is the authoritative trail, so a gap in it is not
+        recoverable from the SIEM copy.
+
+        Returns ``(update, event)``. *event* is None when this caller lost the
+        CAS, in which case the winning revocation already wrote the audit row
+        and this caller must not write a second one.
+        """
+        timestamp = revoked_at or _now_iso()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE certificates "
+                "SET status = ?, revocation_reason = ?, revoked_at = ? "
+                "WHERE id = ? AND status = ?",
+                (CertStatus.REVOKED, reason, timestamp, cert_id, CertStatus.VALID),
+            )
+            won = cursor.rowcount == 1
+            row = conn.execute(
+                "SELECT * FROM certificates WHERE id = ?", (cert_id,)
+            ).fetchone()
+            if row is None:
+                return RevocationUpdate(record=None, won_cas=False), None
+            if not won:
+                return (
+                    RevocationUpdate(
+                        record=self._certificate_from_row(row), won_cas=False
+                    ),
+                    None,
+                )
+
+            # Same transaction: the order must not be left inconsistent with a
+            # revoked certificate, and the audit row must not be able to go
+            # missing.
+            conn.execute(
+                "UPDATE orders SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status IN (?, ?)",
+                (
+                    OrderStatus.REVOKED,
+                    _now_iso(),
+                    order_id,
+                    OrderStatus.VALID,
+                    OrderStatus.PROCESSING,
+                ),
+            )
+            event = self._record_audit_in_conn(
+                conn,
+                event_type="certificate-revoked",
+                account_id=account_id,
+                order_id=order_id,
+                sans=sans,
+                outcome="success",
+                details=audit_details,
+            )
+            return (
+                RevocationUpdate(
+                    record=self._certificate_from_row(row), won_cas=True
+                ),
+                event,
+            )
+
     def revoke_certificate(
         self,
         cert_id: str,

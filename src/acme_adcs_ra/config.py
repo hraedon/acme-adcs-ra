@@ -186,7 +186,12 @@ class RAConfig(BaseSettings):
     # endpoint must not let request-driven audit events accumulate without
     # limit on an issuance-path host; beyond this depth events are dropped
     # from the HEC sink (never from the local audit table) and counted.
-    siem_hec_queue_max: int = 1000
+    # Must be >= 1. At 0 or below, `_hec_inflight >= hec_queue_max` is already
+    # true at startup with nothing in flight, so EVERY event is dropped — while
+    # the emitter still reports itself enabled, so the audit_offbox_required
+    # gate passes and the operator believes events are leaving the host. That
+    # is the exact failure the gate was added to prevent, reachable by a typo.
+    siem_hec_queue_max: int = Field(default=1000, ge=1)
 
     # Admin API token for maintenance endpoints (e.g., nonce cleanup)
     admin_token: SecretStr = Field(default_factory=lambda: SecretStr(""))
@@ -220,6 +225,10 @@ class RAConfig(BaseSettings):
     # Bound the CRL fetch so a slow/hostile endpoint cannot pin a worker.
     revocation_confirm_crl_timeout_seconds: float = 10.0
     revocation_confirm_crl_max_bytes: int = 10 * 1024 * 1024
+    # An absolute ceiling on how stale a CRL the RA will act on. A signed CRL
+    # never stops verifying, and `nextUpdate` is chosen by the CA, so neither
+    # bounds replay of a pre-revocation view on its own.
+    revocation_confirm_crl_max_age_seconds: int = 7 * 24 * 3600
 
     # --- Credential strength -------------------------------------------------
     # EAB MAC keys and the admin token had no strength validation at all: a
@@ -285,6 +294,20 @@ class RAConfig(BaseSettings):
             problems.append(
                 f"revocation_confirm_token is {len(confirm_token)} characters; at "
                 f"least {MIN_ADMIN_TOKEN_CHARS} are required"
+            )
+
+        # Separating the confirm authority is the whole point of having a
+        # second credential: the sync agent needs to confirm revocations, and
+        # must NOT thereby hold the maintenance authority that can reclaim a
+        # processing order or drain the nonce table. Setting both to the same
+        # string silently collapses that separation back into one credential
+        # while every individual check still passes.
+        if admin_token and confirm_token and admin_token == confirm_token:
+            problems.append(
+                "admin_token and revocation_confirm_token are identical, which "
+                "defeats the separation they exist to create — the revocation "
+                "agent would hold full maintenance authority. Generate a "
+                "distinct confirm token"
             )
 
         if problems:

@@ -21,8 +21,8 @@ from acme_adcs_ra.app_state import (
     ServerContext,
     _audit,
     authenticate_account,
+    emit_audit_hook,
     get_context,
-    logger,
 )
 from acme_adcs_ra.jws import _base64url_decode
 from acme_adcs_ra.store import CertStatus, _now_iso, canonical_serial
@@ -130,10 +130,44 @@ async def revoke_cert(
         raise server_internal(f"revocation failed: {exc}") from exc
 
     revoked_at = revocation_result.revoked_at or _now_iso()
-    updated, won_cas = ctx.store.revoke_certificate(
-        cert_record.id,
-        revocation_result.reason if revocation_result.reason is not None else reason,
+
+    # Build the audit detail before the write: the certificate row, the order
+    # transition, and this audit row all commit in ONE transaction, so the
+    # details have to be known going in. See Store.record_revocation — a fault
+    # between the three separate commits this replaces left a certificate
+    # revoked in the store, served as 410 and queued for CA-side revocation,
+    # with no certificate-revoked event anywhere in the authoritative trail.
+    rev_meta = revocation_result.metadata
+    # The ADCS ReqID is carried in the cert's RA-store metadata (set by the
+    # enrollment leg), not on the cert itself — surface it so the operator's
+    # Revoke-Cert.ps1 has both identifiers (serial + ReqID) without re-parsing.
+    req_id = cert_record.metadata.get("req_id", "")
+    audit_details: dict[str, Any] = {
+        "certificate_id": cert_record.id,
+        "serial": serial_hex,
+        "reason": reason,
+        # WI-010: honestly distinguish RA-store revocation from CA-CRL
+        # revocation. The out-of-band leg records revocation_scope
+        # "ra-store-only" and ca_crl_updated "false" — the cert is revoked in
+        # the RA (GET → 410, order → revoked) but the CA CRL was NOT written.
+        "revocation_scope": rev_meta.get("revocation_scope", "ra-store-only"),
+        "ca_crl_updated": rev_meta.get("ca_crl_updated", "false"),
+    }
+    if req_id:
+        audit_details["req_id"] = req_id
+
+    (updated, won_cas), event = ctx.store.record_revocation(
+        cert_id=cert_record.id,
+        order_id=cert_record.order_id,
+        account_id=account_id,
+        reason=(
+            revocation_result.reason
+            if revocation_result.reason is not None
+            else reason
+        ),
         revoked_at=revoked_at,
+        sans=cert_sans,
+        audit_details=audit_details,
     )
     if updated is None:
         # The cert row vanished between the serial lookup and the UPDATE —
@@ -150,51 +184,14 @@ async def revoke_cert(
     if not won_cas:
         return JSONResponse(status_code=200, content={})
 
-    # H-1: flip the order to a revoked state so order and cert are consistent.
-    # WI-003: CAS-guarded on status IN ('valid', 'processing') so a concurrent
-    # finalize cannot be clobbered. If the CAS doesn't apply (order is in an
-    # unexpected state), log it — the cert is already revoked in the store.
-    order_revoked = ctx.store.transition_to_revoked(cert_record.order_id)
-    if not order_revoked:
-        logger.warning(
-            "revoke_cert: order %s was not in valid/processing state "
-            "during revocation (cert %s already revoked in store)",
-            cert_record.order_id, cert_record.id,
-        )
+    # The order transition and the audit row committed with the certificate
+    # CAS above. Only the SIEM fan-out is left, and it stays fail-open: the
+    # durable record is the audit table row, already written.
+    if event is not None:
+        emit_audit_hook(ctx, event)
 
-    # WI-010: honestly distinguish RA-store revocation from CA-CRL revocation.
-    # The out-of-band leg records revocation_scope="ra-store-only" and
-    # ca_crl_updated="false" — the cert is revoked in the RA (GET → 410, order
-    # → revoked) but the CA CRL was NOT written. The operator must run
-    # scripts/Revoke-Cert.ps1 out-of-band to write the CRL entry. Surfacing
-    # this in the audit + response prevents the audit log from implying the
-    # CA CRL was written when it was not.
-    rev_meta = revocation_result.metadata
-    revocation_scope = rev_meta.get("revocation_scope", "ra-store-only")
-    ca_crl_updated = rev_meta.get("ca_crl_updated", "false")
-    # The ADCS ReqID is carried in the cert's RA-store metadata (set by the
-    # enrollment leg), not on the cert itself — surface it so the operator's
-    # Revoke-Cert.ps1 has both identifiers (serial + ReqID) without re-parsing.
-    req_id = cert_record.metadata.get("req_id", "")
-    audit_details: dict[str, Any] = {
-        "certificate_id": cert_record.id,
-        "serial": serial_hex,
-        "reason": reason,
-        "revocation_scope": revocation_scope,
-        "ca_crl_updated": ca_crl_updated,
-    }
-    if req_id:
-        audit_details["req_id"] = req_id
-
-    _audit(
-        ctx,
-        event_type="certificate-revoked",
-        account_id=account_id,
-        order_id=cert_record.order_id,
-        sans=cert_sans,
-        outcome="success",
-        details=audit_details,
-    )
+    revocation_scope = audit_details["revocation_scope"]
+    ca_crl_updated = audit_details["ca_crl_updated"]
 
     # WI-010: surface the out-of-band step in the ACME response. RFC 8555 §7.6
     # specifies an empty body on success; extra fields are non-normative and

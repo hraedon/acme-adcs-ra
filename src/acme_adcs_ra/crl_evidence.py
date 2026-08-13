@@ -17,9 +17,12 @@ This module fetches and verifies that evidence. It is deliberately strict:
   from the certificate's own stored chain** — not against whatever the CRL
   claims about itself, and not against a separately configured trust anchor
   that could drift from the chain the certificate was actually issued under;
-* an expired CRL (``next_update`` in the past) is not evidence — a stale CRL
-  is exactly what an attacker suppressing a revocation would like the RA to
-  keep accepting;
+* freshness is checked independently of the signature, because a signed CRL
+  stays cryptographically valid for ever: ``nextUpdate`` must be present and
+  in the future, ``thisUpdate`` must not be in the future, and the document
+  must be within an absolute age ceiling. A replayed pre-revocation CRL is
+  exactly what an attacker suppressing a revocation would like the RA to keep
+  accepting, and ``nextUpdate`` alone is under the CA's control;
 * every failure returns "no evidence" rather than raising, so the caller
   decides whether missing evidence is fatal (``require_crl_evidence``) or
   merely downgrades the audit record to ``agent-asserted``.
@@ -29,13 +32,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
 import requests
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger("acme_adcs_ra.crl_evidence")
+
+# Tolerance for a CA clock running slightly ahead of the RA's.
+_CLOCK_SKEW = timedelta(minutes=5)
 
 # Verification outcomes recorded in the audit trail.
 CRL_VERIFIED = "crl-verified"
@@ -66,6 +73,19 @@ def _issuer_public_key(cert_pem: str, chain_pem: list[str]) -> object | None:
 
     The chain is what the CA returned at issuance, so it is the authoritative
     statement of which CA certificate this leaf was issued under.
+
+    **Matching is by signature, not by name.** Selecting the first chain entry
+    whose subject equalled the leaf's issuer was wrong in a case ADCS produces
+    routinely: a **CA key renewal** keeps the subject DN and changes the key, so
+    a chain carrying both generations has two equally good name matches and only
+    one of them actually signed this leaf. Picking the wrong one made the CRL
+    signature check fail, which withholds evidence — safe, but it presents as an
+    unexplained refusal to confirm, and under
+    ``require_crl_evidence`` it wedges revocation confirmation entirely.
+
+    ``verify_directly_issued_by`` checks the signature (and the issuer/subject
+    correspondence) rather than trusting the name, so the right generation is
+    selected even when several share a DN.
     """
     try:
         leaf = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
@@ -78,8 +98,15 @@ def _issuer_public_key(cert_pem: str, chain_pem: list[str]) -> object | None:
         except ValueError:
             continue
         for candidate in candidates:
-            if candidate.subject == leaf.issuer:
-                return candidate.public_key()
+            if candidate.subject != leaf.issuer:
+                continue
+            try:
+                leaf.verify_directly_issued_by(candidate)
+            except (ValueError, TypeError, InvalidSignature):
+                # Right name, wrong key — keep looking for the generation that
+                # actually signed this leaf.
+                continue
+            return candidate.public_key()
     return None
 
 
@@ -91,6 +118,7 @@ def fetch_crl_evidence(
     chain_pem: list[str],
     timeout_seconds: float = 10.0,
     max_bytes: int = 10 * 1024 * 1024,
+    max_age_seconds: int = 7 * 24 * 3600,
 ) -> CrlEvidence:
     """Check whether *serial_number* is on the CA's published CRL.
 
@@ -155,7 +183,22 @@ def fetch_crl_evidence(
     this_update = crl.last_update_utc
     next_update = crl.next_update_utc
     now = datetime.now(UTC)
-    if next_update is not None and next_update < now:
+
+    # Freshness, three ways. A signed CRL stays cryptographically valid forever,
+    # so signature verification alone says nothing about *when* it was true — an
+    # attacker who can replay an old, genuinely-signed CRL could otherwise keep
+    # feeding the RA a pre-revocation view indefinitely.
+    if next_update is None:
+        # Without nextUpdate there is no expiry, so the document would be
+        # accepted for ever. ADCS always sets it; a CRL that does not is not
+        # something to accept as evidence.
+        return CrlEvidence(
+            revoked=False,
+            checked=False,
+            detail="CRL has no nextUpdate, so its freshness cannot be established",
+            this_update=this_update.isoformat() if this_update else None,
+        )
+    if next_update < now:
         return CrlEvidence(
             revoked=False,
             checked=False,
@@ -163,6 +206,30 @@ def fetch_crl_evidence(
             this_update=this_update.isoformat() if this_update else None,
             next_update=next_update.isoformat(),
         )
+    if this_update is not None:
+        if this_update > now + _CLOCK_SKEW:
+            return CrlEvidence(
+                revoked=False,
+                checked=False,
+                detail=f"CRL thisUpdate {this_update.isoformat()} is in the future",
+                this_update=this_update.isoformat(),
+                next_update=next_update.isoformat(),
+            )
+        # nextUpdate alone is under the CA's control and can be set arbitrarily
+        # far out; an independent ceiling on age bounds how stale a view the RA
+        # will act on regardless.
+        age = now - this_update
+        if age > timedelta(seconds=max_age_seconds):
+            return CrlEvidence(
+                revoked=False,
+                checked=False,
+                detail=(
+                    f"CRL is {int(age.total_seconds())}s old, over the "
+                    f"{max_age_seconds}s freshness limit"
+                ),
+                this_update=this_update.isoformat(),
+                next_update=next_update.isoformat(),
+            )
 
     crl_number: str | None = None
     try:

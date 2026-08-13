@@ -189,8 +189,19 @@ if ([string]::IsNullOrWhiteSpace($AdminToken)) {
 if ([string]::IsNullOrWhiteSpace($ConfirmToken)) {
     $ConfirmToken = $env:ACME_CONFIRM_TOKEN
 }
-if ([string]::IsNullOrWhiteSpace($AdminToken)) {
-    Die "No admin token supplied: pass -AdminToken or set the ACME_ADMIN_TOKEN environment variable." 3
+# The confirm token is now sufficient authority for this whole script: the RA
+# accepts it for the read-only pending list as well as for confirming. That is
+# deliberate least privilege -- a revocation host that also holds the admin
+# token can reclaim a processing order and drain the nonce table, powers this
+# agent has no use for. -AdminToken remains accepted for a deployment that has
+# not yet provisioned a confirm token, but it is no longer required.
+if ([string]::IsNullOrWhiteSpace($AdminToken) -and [string]::IsNullOrWhiteSpace($ConfirmToken)) {
+    Die "No credential supplied: pass -ConfirmToken (preferred) or -AdminToken, or set ACME_CONFIRM_TOKEN / ACME_ADMIN_TOKEN." 3
+}
+if ([string]::IsNullOrWhiteSpace($ConfirmToken)) {
+    Write-Warning ("No -ConfirmToken supplied; falling back to the admin token to read the pending list. " +
+                   "The RA REFUSES the admin token when confirming, so every confirm below will fail and " +
+                   "serials will stay pending. Provision ACME_RA_REVOCATION_CONFIRM_TOKEN.")
 }
 
 # Resolve the Revoke-Cert.ps1 path.
@@ -219,7 +230,10 @@ try {
 } catch {
     Die $_.Exception.Message 3
 }
-$headers = @{ 'Authorization' = "Bearer $AdminToken" }
+# Prefer the confirm token for the read; fall back to the admin token only if
+# no confirm token was provisioned.
+$readToken = if ([string]::IsNullOrWhiteSpace($ConfirmToken)) { $AdminToken } else { $ConfirmToken }
+$headers = @{ 'Authorization' = "Bearer $readToken" }
 
 # Confirming a CA-side revocation now requires its own credential -- the RA
 # refuses the general admin token on that endpoint, so a compromised
@@ -275,6 +289,7 @@ if ($total -eq 0) {
 # 2. Process each pending revocation.
 $revoked = 0
 $failed = 0
+$confirmFailed = 0
 $dryRunCount = 0
 $index = 0
 
@@ -345,8 +360,16 @@ foreach ($entry in $pending) {
     #    the CA-side revocation (which already happened) -- it means the RA
     #    audit still shows ca_crl_updated=false and the serial will reappear
     #    on the next pull. Log visibly and keep counting it as revoked.
+    # `crl_published` tells the RA whether the CRL was actually republished, or
+    # only the CA database updated. On the default least-privilege path the
+    # officer CANNOT republish (that needs Manage-CA), so the honest answer is
+    # usually $false: the certificate is revoked at the CA but still absent
+    # from any published CRL, and relying parties keep accepting it until the
+    # next scheduled publication. The RA records the distinction rather than
+    # letting a field named ca_crl_updated imply more than happened.
     $confirmUrl = "$base/acme/admin/revocations/$serial/confirm"
-    $confirmBody = '{"ca_crl_updated": true}'
+    $confirmBody = if ($PublishCrl) { '{"ca_crl_updated": true, "crl_published": true}' }
+                   else { '{"ca_crl_updated": true, "crl_published": false}' }
     try {
         Invoke-RestMethod -Method Post -Uri $confirmUrl -Headers $confirmHeaders `
             -Body $confirmBody -ContentType 'application/json' -TimeoutSec 60 | Out-Null
@@ -355,6 +378,12 @@ foreach ($entry in $pending) {
         [Console]::Error.WriteLine(("WARNING: confirm POST for serial {0} failed: {1}" -f $serial, $_.Exception.Message))
         [Console]::Error.WriteLine("         The CA-side revocation SUCCEEDED, but the RA audit was not updated.")
         [Console]::Error.WriteLine("         The serial will reappear on the next pull until the confirm succeeds.")
+        # Count it. The CA and the RA now disagree, and the next run will
+        # re-revoke an already-revoked serial (certutil returns non-zero) and
+        # book THAT as the failure. Exiting 0 here told the scheduler
+        # everything was fine while the two sides drifted apart -- exactly the
+        # state an operator needs to be told about.
+        $confirmFailed++
     }
     $revoked++
     Write-Output ""
@@ -362,9 +391,14 @@ foreach ($entry in $pending) {
 
 # 4. Summary.
 Write-Output ""
-Write-Output ("SYNC COMPLETE: {0} pending, {1} revoked, {2} failed, {3} dry-run" -f $total, $revoked, $failed, $dryRunCount)
+Write-Output ("SYNC COMPLETE: {0} pending, {1} revoked, {2} failed, {3} confirm-failed, {4} dry-run" -f $total, $revoked, $failed, $confirmFailed, $dryRunCount)
 
-if ($failed -gt 0) {
+if ($confirmFailed -gt 0) {
+    [Console]::Error.WriteLine(("WARNING: {0} serial(s) were revoked at the CA but NOT confirmed back to the RA." -f $confirmFailed))
+    [Console]::Error.WriteLine("         The RA still lists them as pending and will offer them again next run.")
+}
+
+if ($failed -gt 0 -or $confirmFailed -gt 0) {
     exit 2
 }
 exit 0

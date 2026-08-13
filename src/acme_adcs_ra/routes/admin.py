@@ -51,6 +51,7 @@ def _crl_evidence_for(
             chain_pem=cert.chain_pem,
             timeout_seconds=ctx.config.revocation_confirm_crl_timeout_seconds,
             max_bytes=ctx.config.revocation_confirm_crl_max_bytes,
+            max_age_seconds=ctx.config.revocation_confirm_crl_max_age_seconds,
         )
     except Exception as exc:  # noqa: BLE001 - evidence gathering must never 500
         logger.warning("CRL evidence check failed", exc_info=True)
@@ -73,6 +74,29 @@ def _require_admin_token(request: Request, ctx: ServerContext) -> None:
         raise unauthorized("admin endpoint not configured")
     if not hmac.compare_digest(_bearer_token(request), admin_token):
         raise unauthorized("invalid admin token")
+
+
+def _require_revocation_authority(request: Request, ctx: ServerContext) -> None:
+    """Accept either the confirm token or the admin token, for revocation reads.
+
+    The pending-revocations list is read-only and revocation-scoped, so the
+    confirm credential is sufficient authority for it. Accepting that token
+    here is what lets the sync agent run with **only** the confirm token: it
+    previously needed the admin token just to read its work list, which also
+    handed the revocation host the authority to reclaim a processing order and
+    drain the nonce table — powers it has no use for and should not carry.
+
+    The admin token is still accepted, because this is a maintenance read and
+    existing ops tooling uses it. Confirming a revocation remains
+    confirm-token-only.
+    """
+    provided = _bearer_token(request)
+    confirm_token = ctx.config.revocation_confirm_token.get_secret_value()
+    admin_token = ctx.config.admin_token.get_secret_value()
+    for candidate in (confirm_token, admin_token):
+        if candidate and hmac.compare_digest(provided, candidate):
+            return
+    raise unauthorized("invalid admin or revocation confirmation token")
 
 
 def _require_revocation_confirm_token(request: Request, ctx: ServerContext) -> None:
@@ -280,7 +304,7 @@ async def list_pending_revocations(
     ctx: ServerContext = Depends(get_context),
     limit: int = 500,
 ) -> JSONResponse:
-    _require_admin_token(request, ctx)
+    _require_revocation_authority(request, ctx)
     if not 1 <= limit <= 500:
         raise malformed("limit must be between 1 and 500")
     certs = ctx.store.list_revoked_certificates(limit=limit)
@@ -364,6 +388,24 @@ async def confirm_ca_revocation(
         )
 
     verification = evidence.verification if evidence is not None else AGENT_ASSERTED
+
+    # Whether the agent actually republished the CRL, as opposed to revoking at
+    # the CA and leaving publication to the next scheduled run.
+    #
+    # This matters because the default sync path deliberately passes
+    # -SkipPublishCrl: a least-privilege officer cannot republish (that needs
+    # Manage-CA). So the common case is "revoked in the CA database, not yet on
+    # any published CRL" — during which relying parties still accept the
+    # certificate — while the RA drained the serial off its pending list and
+    # recorded a field named `ca_crl_updated`. The name overclaims. Recording
+    # the distinction is the same honesty fix as `verification`, one layer down.
+    crl_published = False
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            crl_published = body.get("crl_published") is True
+    except Exception:  # noqa: BLE001 - an absent or unparseable body means "no"
+        crl_published = False
     flipped = ctx.store.confirm_ca_revocation(serial_upper)
     if not flipped:
         return JSONResponse(content={
@@ -382,6 +424,8 @@ async def confirm_ca_revocation(
         # RA is recording a claim it could not check — the audit trail must
         # never imply more than that.
         "verification": verification,
+        # False means: revoked at the CA, but not yet on a published CRL.
+        "crl_published": crl_published,
     }
     if evidence is not None:
         details["crl_detail"] = evidence.detail
@@ -400,4 +444,5 @@ async def confirm_ca_revocation(
         "serial": serial_upper,
         "ca_crl_updated": True,
         "verification": verification,
+        "crl_published": crl_published,
     })
