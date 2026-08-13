@@ -124,6 +124,17 @@ Leave the CA and RA exactly as found. **Do not** revert the E-1 remediation (the
 enrollment gMSA's restricted primary group is a permanent hardening, not a test
 artifact).
 
+## The lab-specific half of this procedure
+
+This document is deliberately placeholder-only: it says *what* must be proven.
+The *how* for a given lab — hosts, credentials, the automated harness, and the
+tricks for provoking paths a well-behaved CA will not hand you (a policy denial,
+both transport-orphan branches, a failed confirmation) — belongs in a gitignored
+companion, because it names real infrastructure. In this checkout that is
+`samples/lab-validation-runbook.md`, with the harness itself at
+`samples/lab-harness/`. If you are re-proving in a different estate, write the
+equivalent for yours rather than putting identifiers here.
+
 ## Environment gotchas (observed)
 
 - **gMSA scheduled tasks** need `LogonType=Password` (a gMSA never logs on
