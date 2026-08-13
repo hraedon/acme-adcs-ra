@@ -85,10 +85,13 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **v1.9.0 — release candidate (`v1.9.0-rc2`, 2026-08-13).** The code is
-> complete and CI-green; the final tag follows the live lab re-proof on this
-> exact commit, per the cadence rule below. **v1.8.0 is the latest full
-> release.** Feature-complete for its charter and maintained deliberately rather
+> **v1.9.0 — release candidate, live-proven 2026-08-14.** The full lab re-proof
+> ran against `bef2022` (`v1.9.0-rc2` plus the two fixes that run produced) and
+> passed: issuance, both transport-orphan branches, the revocation round trip,
+> the confirm-authority split, and CRL evidence verified against a real ADCS
+> CRL. Three residuals are recorded in the
+> [validation log](docs/pre-pilot-checklist.md#validation-log); none blocks the
+> tag. **v1.8.0 is the latest full release.** Feature-complete for its charter and maintained deliberately rather
 > than passively: security reports (see `SECURITY.md`) and bug reports are
 > welcome, but there is no response-time commitment.
 

@@ -172,6 +172,56 @@ favour of flipping it: the test harness now drives a complete order to issuance
 with the GET form disabled, so the RA itself is complete without it. If the
 pilot client does not need it, the default should become False.
 
+## Proof gaps — closed by the 2026-08-14 live re-proof
+
+Gaps 1–5 below were closed against the real lab CA on 2026-08-14, on commit
+`bef2022` (rc2 plus the two fixes that run produced). The evidence is in the
+[validation log](pre-pilot-checklist.md#validation-log); the short version:
+
+* **1 (no live ADCS validation)** — closed. Full §A/§A.1/§C/§D pass, plus every
+  case this review added.
+* **2 (reason 8)** — closed. Refused at the RA (`400 badRevocationReason`, the
+  certificate stays valid and unqueued) and by `Revoke-Cert.ps1` (exit 3, before
+  `certutil`).
+* **3 (transport-orphan quarantine)** — closed, **both branches**, by making the
+  CA refuse one Web Enrollment URL so it genuinely issues and the RA fails after
+  it. Leaf-in-hand → quarantined row with serial + ReqID, later revoked by the
+  ordinary pull agent. ReqID-only → no row, loud audit, revoked by hand.
+* **4 (pinned installer on Windows)** — closed, including the strong form: the
+  whole closure installs into a fresh venv on Windows/3.14 with
+  `--require-hashes --only-binary :all:`.
+* **5 (CRL freshness vs cadence)** — measured, and **the default does not fit
+  this CA**: a 7d 12h 20m validity window against a 7-day ceiling. See the
+  residual below.
+
+Three residuals came out of that run. Two are new:
+
+* **A quarantined transport orphan can never satisfy
+  `revocation_confirm_require_crl_evidence=true`.** F14 and F12 interact: the
+  chain fetch failing *is* the orphan case, so the quarantined row has no stored
+  chain — and F12 pins the CRL's issuer by selecting, from the certificate's own
+  stored chain, the key that signed it. Observed live: *"could not locate the
+  issuing CA certificate in the stored chain, so the CRL signature cannot be
+  verified"*. The serial is then revoked at the CA on every run and confirmed on
+  none: the queue never drains and the agent exits 2 indefinitely. Fail-closed,
+  so not an exposure. **The default configuration is unaffected** — verified by
+  running the same serial through with the default `false`, where it confirmed
+  as `agent-asserted` and drained. Open question: which trust source may verify a
+  CRL for a row that has no chain.
+* **`Register-MaintenanceTasks.ps1` re-introduces the admin token on the
+  revocation host.** F9 separated the authorities, and the agent genuinely needs
+  only `-ConfirmToken` (proven live). But the registration script takes
+  `-AdminToken` as mandatory and always writes it into the sync task's action,
+  so a deployment following the documented path still puts the maintenance
+  credential on the revocation host.
+
+And one carried forward: **the pilot-client question is still open.** With
+`allow_unauthenticated_resource_get=false` a complete order issues through
+POST-as-GET alone and both GET forms answer 401 — the RA is complete without
+them. Certify the Web is not installed in the lab, so whether the *client* can
+do POST-as-GET remains unestablished, which is the only reason the default is
+still `True`.
+
 ## Proof gaps — what this review did NOT establish
 
 1. **No live ADCS validation of any of it.** All seventeen fixes were validated

@@ -72,7 +72,8 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**Released: v1.9.0-rc2 (2026-08-13) — two external security reviews.** The
+**v1.9.0-rc2 (2026-08-13), live-proven on `bef2022` (2026-08-14) — two external
+security reviews.** The
 2026-08-14 scan of rc1 found seventeen further findings, two blocking: ACME
 **reason 8 (removeFromCRL) was accepted and reached `certutil`**, so a revokeCert
 carrying it recorded a successful revocation while asking the CA to *un-revoke*
@@ -112,11 +113,15 @@ rules:
   procedure in `docs/live-reproof-runbook.md`). Latest: WI-028 (v1.5, 2026-07-23)
   + WI-035/036 (v1.6, 2026-07-23/24) + 2026-08-07 security-hardening (2026-08-08)
   + 2026-08-11 security review (26/26, incl. the new §A.1 front-control checks)
-  + **2026-08-13 review (on `26eae31`; found two PowerShell defects)**.
-  The 2026-08-14 review is **not** live-proven at all — it changed the issuance,
-  revocation and deployment legs, so the pending re-proof targets `v1.9.0-rc2`.
-  The rule is *on the exact commit being shipped* — a re-proof on an earlier
-  commit does not transfer, which is exactly the open item on v1.9.0.
+  + **2026-08-13 review (on `26eae31`; found two PowerShell defects)**
+  + **2026-08-14 review (on `bef2022`; found one blocking PowerShell defect and
+  a red lint gate on the rc2 tip)**. The rule is *on the exact commit being
+  shipped* — a re-proof on an earlier commit does not transfer.
+- **Run the whole re-proof, not the delta, and start it from a known config.**
+  The 2026-08-14 pass is automated end to end (methodology in the gitignored
+  `samples/lab-validation-runbook.md`). One toggle left set by an earlier step
+  silently changed what three later steps proved, so the driver now asserts the
+  default configuration before it measures anything.
 - **A green cross-platform Pester run is not evidence about the CA host.** The
   two defects the v1.9.0 re-proof found were Windows PowerShell 5.1 *language*
   semantics — a single-element array has no `.Count` under 5.1 but yields `1`

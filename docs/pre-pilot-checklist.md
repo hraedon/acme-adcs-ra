@@ -132,6 +132,167 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **v1.9.0 second live re-proof — PASSED (2026-08-14), one blocking defect
+  found and fixed, three residuals opened.** Run against commit `bef2022`,
+  which is `v1.9.0-rc2` plus the two fixes this run produced. This is the full
+  pass the rc1 row below demanded: **§A, §A.1, §B/§C, §D, §E from a clean
+  start**, plus every case the 2026-08-14 review added. The whole sequence is
+  automated end to end, so it is repeatable rather than a one-off; the
+  methodology, the access paths and the tricks for provoking each path live in
+  a gitignored runbook (`samples/lab-validation-runbook.md`) because they name
+  the real hosts.
+
+  **Before anything was measured: the tip was CI-red.** `v1.9.0-rc2`
+  (`cb1285c`) failed `ruff` on three `RUF059` findings in the new review tests
+  — the lint job, on all three Python versions. Fixed in `a3e68d8`. Proving a
+  commit that cannot ship is wasted lab time, so this is now the first
+  preflight step.
+
+  **§A — issuance (real CA), 14/14.** Full round-trip issued a real
+  certificate: EKU exactly `serverAuth`, SAN from the CSR, chain leaf → issuing
+  CA → existing root, and the CA database recording the requester as the
+  enrollment gMSA under `ACME-ServerAuth`. An out-of-scope SAN is refused at
+  finalize; an EC P-256 key draws a genuine `Denied by Policy Module` from the
+  CA, mapped to `400 rejectedIdentifier`.
+
+  **Reason 8 is refused, and no path emits it** (the 2026-08-14 blocker).
+  `revokeCert` with reason 8 → `400 badRevocationReason`; the certificate stays
+  valid, is still served, and **is not queued** for CA-side revocation.
+  `Revoke-Cert.ps1 -Reason 8` exits **3** before it touches `certutil`. Reason 7
+  likewise refused.
+
+  **§A.1 — front controls, 13/13.** URL binding pinned to `base_url` (JWS `url`
+  + `Host:` naming another deployment → rejected; EAB naming another deployment
+  → `badExternalAccountBinding`; foreign `kid` → rejected), deactivation then
+  401, POST-as-GET resolves order/account/orders, another account's certificate
+  → 401, `/docs` `/redoc` `/openapi.json` → 404, and the nonce ceiling returning
+  a 204/429 mix with `Retry-After`.
+
+  **The transport-orphan quarantine, against the real CA — both branches.**
+  Provoked by making the CA refuse exactly one Web Enrollment URL (IIS request
+  filtering scoped to `/CertSrv`), so the CA genuinely issues and the RA fails
+  after it:
+  - `certnew.p7b` refused (leaf in hand) → **500**, order terminal-`invalid`, a
+    `quarantined` row carrying serial and ReqID, queued for CA-side revocation,
+    never served on a retried finalize. The CA confirms the certificate as
+    `Issued` — and the ordinary pull agent later revoked it, which is the whole
+    design closing.
+  - `certnew.cer` refused (ReqID only) → **500**, order terminal-`invalid`, **no
+    row** (the RA never received the bytes), and the ReqID made loud in the
+    audit. Both orphans were revoked by hand at teardown, which is exactly the
+    operator action this branch documents.
+
+  **§C — revocation round trip, as the gMSA, through the shipped registration
+  path.** `Register-MaintenanceTasks.ps1` registered the sync task
+  (`LogonType=Password`), the task ran as `gMSA-acme-ra$`, revoked at the CA and
+  confirmed back: CA disposition `Revoked` with the requested reason, RA pending
+  set drained to empty, exit 0.
+
+  **Authority separation, end to end.** The admin token is **refused** on the
+  confirm endpoint (401) — both directly and through the agent: an agent given
+  only the admin token revokes at the CA, fails every confirm, leaves the serial
+  pending and **exits 2**. The same agent given only `-ConfirmToken` — no admin
+  token anywhere — reads the pending list, confirms, drains the queue and exits
+  0.
+
+  **CRL evidence, against the real ADCS CRL.** With
+  `revocation_confirm_require_crl_evidence=true`: the confirm is **refused**
+  (`400`, audit `reason: crl-evidence-required-but-absent`) while the serial is
+  not yet on a published CRL — the scoped officer cannot publish one
+  (`certutil -CRL` → `0x80070005`). After an administrator republished, the same
+  confirm succeeded with audit `verification: "crl-verified"`, carrying the CRL
+  number and `thisUpdate`. Fail-closed control and positive both observed.
+
+  **§C least privilege / §D enrollment bound.** As the gMSA: CRL publication
+  denied `0x80070005` (no Manage-CA); revoking a certificate on another template
+  denied `0x80094009 CERTSRV_E_RESTRICTEDOFFICER` (template scoping enforced);
+  and the live token shows **no `Domain Computers`** — the E-1 hardening still
+  holds.
+
+  **The pinned installer runs on Windows.** `install-windows.ps1` installed from
+  `deploy/requirements.lock.txt` with `--require-hashes --only-binary :all:`,
+  exit 0. Stronger form also checked: the full 29-package closure — exported on
+  Linux for 3.13 — installs clean into a **throwaway venv** on Windows /
+  Python 3.14, so every wheel was actually fetched and hash-verified rather than
+  reported "already satisfied". No platform wheel gap.
+
+  ### The defect this run found
+
+  **`Set-OfficerRights.ps1` could not provision a CA that had no `OfficerRights`
+  value — the default, and therefore the first-provisioning path.** It aborted
+  with `Buffer cannot be null` and wrote nothing, *after* the CA-side
+  Certificate Manager grant had already been made, leaving the CA
+  half-configured. Cause: the 2026-08-13 fix for the single-element unwrap
+  wrapped every return in `,$result`, and `,@()` reaches the call site as a
+  one-element array holding an empty array — so `@(Get-ExistingAces $b).Count`
+  was 1 with no ACEs and the phantom entry went into the ACE builder with a null
+  `RawAce`. Fixed in `bef2022`; provisioning then succeeded on the pristine lab
+  CA and the template scoping enforced correctly.
+
+  It **reproduces under pwsh 7 on Linux** — unlike the previous round's two
+  defects, CI could have caught this one. It did not, because the two Pester
+  tests covering the empty case asserted `$result = Get-ExistingAces $null`,
+  and assignment collapses a single-item pipeline back to the item, while the
+  shipped code says `@(Get-ExistingAces …)`. **The tests asserted a shape the
+  shipped code never uses.** They now assert the call-site expression, and
+  reverting the library fix fails them.
+
+  ### Residuals this run opened
+
+  - [ ] **A quarantined transport orphan can never satisfy
+        `revocation_confirm_require_crl_evidence=true`.** The chain-fetch
+        failure *is* the orphan case, so the quarantined row has **no stored
+        chain** — and CRL evidence pins the issuer by selecting, from the
+        certificate's own stored chain, the key that signed it (the F12 fix).
+        Observed live: `could not locate the issuing CA certificate in the
+        stored chain, so the CRL signature cannot be verified`. The serial is
+        revoked at the CA on every run and confirmed on none, so the queue never
+        drains and the agent exits 2 forever. Fail-closed, so not an exposure,
+        but a guaranteed stuck queue. **Default configuration is unaffected** —
+        verified: with the default (`false`) the same serial confirmed as
+        `agent-asserted` and drained. Needs a decision on which trust source may
+        verify a CRL for a chain-less row.
+  - [ ] **The default CRL freshness ceiling is narrower than this CA's
+        cadence.** `CRLPeriod = 1 Week`, and the published CRL's validity window
+        is **7d 12h 20m** against a default `revocation_confirm_crl_max_age_seconds`
+        of 7 days. In steady state the age of the current CRL reaches the
+        ceiling exactly as the next one is published — zero margin — so any
+        delayed publication starts failing evidence checks. The ceiling should
+        be set from the CA's real cadence (≥ `CRLPeriod` + overlap), not left at
+        the default; the freshness gate itself was confirmed live (a 1-second
+        ceiling refuses the real CRL).
+  - [ ] **`Register-MaintenanceTasks.ps1` re-introduces the admin token on the
+        revocation host.** `-AdminToken` is mandatory and is always written into
+        the revocation-sync task action as `$env:ACME_ADMIN_TOKEN`, even when a
+        confirm token is supplied — which undoes, at deployment time, the
+        authority split the confirm token exists to create. The agent itself
+        needs only `-ConfirmToken` (proven above); the registration script is
+        what forces the broader credential onto the host.
+  - [ ] **The pilot-client question is still unanswered.**
+        `allow_unauthenticated_resource_get` was exercised both ways: with it
+        **off**, a complete order still issues through POST-as-GET only, and
+        both GET forms answer 401. So the RA is complete without them. But
+        **Certify the Web is not installed in this lab**, so nothing here
+        establishes whether the pilot client can do POST-as-GET, which is the
+        only reason the default is still `True`.
+
+  **Lab returned to its pre-run state** (verified, not assumed): CA security
+  descriptor byte-identical at 224 bytes with its four original ACEs,
+  `OfficerRights` absent, `denyUrlSequences` empty, `certsvc` running; every
+  certificate this run caused the CA to issue revoked and the CRL republished;
+  scheduled tasks unregistered; RA store and dotenv restored from the pre-run
+  backup (`integrity_check` ok, matching row counts); app pool left `Started` as
+  found; temp directories cleared on both hosts. Ten unrevoked ACME test
+  certificates from *earlier* sessions remain and were deliberately not touched.
+  The E-1 hardening was left in place, as the runbook requires.
+
+  **Teardown hazard worth recording:** restoring the SQLite store by copying the
+  backup `.db` over a newer database corrupted it (`database disk image is
+  malformed`) — the write landed while the worker still held the file. Stop the
+  pool, confirm it is actually `Stopped`, remove `acme_ra.db` **and its `-wal`
+  / `-shm` sidecars**, then copy. Re-done that way, `integrity_check` returned
+  `ok` and the row counts matched the backup exactly.
+
 - **v1.9.0 live re-proof — PASSED (2026-08-13), with two defects found and
   fixed.** Run against commit `26eae31` (the 2026-08-13 security review),
   deployed as a wheel into the gMSA app-pool venv on the lab RA host with
@@ -207,7 +368,7 @@ engineered to. Until then it has not — regardless of a green local test run.
   - [x] §A re-cleared on the deployed commit (live issue + denial + revocation).
   - [x] §F revocation runbook re-exercised (`Sync-Revocations.ps1` +
         `Revoke-Cert.ps1` requester check, live at the CA).
-  - [ ] **The proven artifact is NOT the shipped artifact — a fresh full pass is
+  - [x] **The proven artifact is NOT the shipped artifact — a fresh full pass is
         required before the v1.9.0 tag.** Everything above ran against
         `26eae31`. The two fixes landed after it, as did the release-preparation
         changes (docs, an IPv6-loopback fix in `Assert-SafeRaUrl`, and
@@ -234,13 +395,13 @@ engineered to. Until then it has not — regardless of a green local test run.
 - **Additional cases the 2026-08-14 review adds to the re-proof.** These are
   the fixes whose correctness genuinely cannot be established off a real CA:
 
-  - [ ] **Reason 8 is refused, and never reaches `certutil`.** Submit a
+  - [x] **Reason 8 is refused, and never reaches `certutil`.** Submit a
         `revokeCert` with `reason: 8` → **400 badRevocationReason**, and the
         certificate must remain valid and absent from the pending list. Then run
         `Revoke-Cert.ps1 -Reason 8` directly → **exit 3**. Plan 004 recorded
         that reason 8 leaves a held certificate "off the CRL and valid", so the
         point is that no path can now emit it.
-  - [ ] **The transport-orphan quarantine, against a real CA.** The fix most in
+  - [x] **The transport-orphan quarantine, against a real CA.** The fix most in
         need of live proof, because provoking it means interrupting the RA
         between the CA's "issued" response and the chain fetch — and the whole
         question is what the CA is left holding. Confirm the certificate is
@@ -248,13 +409,19 @@ engineered to. Until then it has not — regardless of a green local test run.
         revocation, is never served, and that the order is terminal. Confirm the
         ReqID-only branch too (block `certnew.cer`): no row, but a loud audit
         row carrying the ReqID.
-  - [ ] **The pinned installer runs on Windows.** `--require-hashes` with
+  - [x] **The pinned installer runs on Windows.** `--require-hashes` with
         `--only-binary :all:` is stricter than what the host did before, and the
         lock file was exported on Linux for Python 3.13 — a platform-specific
         wheel gap surfaces only here.
-  - [ ] **CRL freshness against the real publication cadence.** The default age
-        ceiling is seven days; a CA publishing less often would start failing
-        evidence checks. Confirm against the lab CA's actual cadence.
+  - [x] **CRL freshness against the real publication cadence — measured
+        2026-08-14, and the default does not fit.** The lab CA publishes weekly
+        (`CRLPeriod = 1 Week`) and its CRL declares a **7d 12h 20m** validity
+        window against a 7-day default ceiling, so the current CRL's age reaches
+        the ceiling exactly as the next one is published: zero margin, and any
+        delayed publication fails evidence checks. Set
+        `revocation_confirm_crl_max_age_seconds` from the CA's real cadence
+        (≥ `CRLPeriod` + overlap). The gate itself is live — a 1-second ceiling
+        refuses the real CRL, and the default accepts it.
   - [ ] **Does the pilot client need the unauthenticated GET forms?**
         `allow_unauthenticated_resource_get` was left defaulting to **True**
         deliberately, because the docs claim these routes were retained for an
@@ -263,10 +430,10 @@ engineered to. Until then it has not — regardless of a green local test run.
         record the result. If the client is fine, **the default should become
         False.** (The test harness already drives a complete order to issuance
         with the GET form disabled, so the RA itself is complete without it.)
-  - [ ] **The revocation agent runs with only `-ConfirmToken`.** No admin token
+  - [x] **The revocation agent runs with only `-ConfirmToken`.** No admin token
         on the revocation host: confirm the pending-list read still works and
         the whole loop completes.
-  - [ ] **A failed confirm exits 2.** Point the agent at an RA that will refuse
+  - [x] **A failed confirm exits 2.** Point the agent at an RA that will refuse
         the confirm; the CA-side revocation should succeed, the serial stay
         pending, and the script exit 2 rather than 0.
   - **Still open before pilot:** the operator-owned items in §B–§E, unchanged.

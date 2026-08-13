@@ -6,8 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.9.0] — 2026-08-13
 
-> **Release candidate (`v1.9.0-rc2`).** Awaiting the full live lab re-proof on
-> this commit; the `v1.9.0` tag follows it. See the open item in the
+> **Live-proven 2026-08-14.** The full lab re-proof ran against `bef2022` —
+> `v1.9.0-rc2` plus the two fixes the run itself produced (a red `ruff` gate on
+> the rc2 tip, and the `Set-OfficerRights.ps1` defect below). Issuance, both
+> transport-orphan branches, the revocation round trip, the authority split and
+> CRL evidence against a real ADCS CRL all pass; three residuals are open and
+> none blocks the tag. See the
 > [validation log](docs/pre-pilot-checklist.md#validation-log).
 
 ### Security — 2026-08-14 external scan (seventeen findings)
