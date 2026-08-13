@@ -56,13 +56,13 @@ _ACME_PATHS = {
 
 
 class ActiveEnrollments:
-    """Order IDs with a live enrollment worker in *this* process.
+    """Order IDs with a live enrollment in *this* process.
 
     The RA is a single application process (threat-model assumption). An
-    enrollment runs on a threadpool thread inside that process and holds its
-    order in ``processing`` for the whole life of the ADCS call sequence. This
-    registry is therefore an authoritative, in-memory answer to "is a worker
-    enrolling this order right now" — which elapsed time can only approximate.
+    enrollment holds its order in ``processing`` for the whole life of the ADCS
+    call sequence. This registry is therefore an authoritative, in-memory
+    answer to "is an enrollment in flight for this order right now" — which
+    elapsed time can only approximate.
 
     The admin reclaim endpoint consults it to refuse reclaiming a genuinely
     live enrollment, independent of how long enrollment has run. That closes
@@ -70,30 +70,56 @@ class ActiveEnrollments:
     up to ~4×30s) enrollment flipped the order back to ``ready`` and let the
     client drive a second CA issuance.
 
-    It deliberately does NOT survive a process restart: after a crash the set is
-    empty, which is correct — a crashed worker is exactly the wedged-``processing``
-    case reclaim exists to recover, and that path additionally requires the
-    operator's explicit CA-checked assertion (see the reclaim endpoint).
+    **The mark must cover the whole in-flight interval, not just the running
+    worker.** It is taken in the finalize *route* — around the
+    ``ready``→``processing`` CAS, the threadpool hand-off, and the completion
+    that records the certificate — precisely because the worker is not the
+    unit of risk. Marking inside the worker (the original shape) left two
+    gaps: a task still *queued* behind a saturated threadpool was invisible,
+    and so was the window between the worker returning and the certificate row
+    being written. In either gap a reclaim could truthfully observe "no live
+    worker, no cert row", reopen the order, and let a second finalize race the
+    first to the CA.
+
+    The registry is process-local and advisory. The durable half of the
+    guarantee is the store's ``processing_generation`` lease, which every
+    worker re-checks immediately before submitting to the CA.
+
+    It deliberately does NOT survive a process restart: after a crash the
+    registry is empty, which is correct — a crashed worker is exactly the
+    wedged-``processing`` case reclaim exists to recover, and that path
+    additionally requires the operator's explicit CA-checked assertion (see the
+    reclaim endpoint).
+
+    Reference-counted rather than a plain set: if two holders for one order ever
+    overlap, the first to exit must not clear the mark out from under the
+    second. That should not happen — the CAS admits one finalize at a time —
+    but "should not" is the wrong strength for the thing standing between a
+    reclaim and a double issuance.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._active: set[str] = set()
+        self._active: dict[str, int] = {}
 
     @contextmanager
     def enrolling(self, order_id: str) -> Iterator[None]:
         """Mark ``order_id`` as actively enrolling for the duration of the block."""
         with self._lock:
-            self._active.add(order_id)
+            self._active[order_id] = self._active.get(order_id, 0) + 1
         try:
             yield
         finally:
             with self._lock:
-                self._active.discard(order_id)
+                remaining = self._active.get(order_id, 0) - 1
+                if remaining > 0:
+                    self._active[order_id] = remaining
+                else:
+                    self._active.pop(order_id, None)
 
     def is_active(self, order_id: str) -> bool:
         with self._lock:
-            return order_id in self._active
+            return self._active.get(order_id, 0) > 0
 
 
 @dataclass

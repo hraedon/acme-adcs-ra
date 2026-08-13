@@ -90,6 +90,12 @@ honest: check a box only when the thing is actually true, not when it's planned.
 - [ ] **Monitoring alerts on time-in-`processing` p99** (pilot condition);
       `GET /acme/admin/orders?status=processing` surfaces stuck orders. SLOs +
       alerting guidance: `docs/operations.md` ## Monitoring and SLOs.
+- [ ] **SIEM alerts on `finalize-enrollment-abandoned`.** A stale enrollment
+      abandoned before the CA call because its order was reclaimed while it was
+      still queued. Nothing was issued — but it means ordinary queueing is
+      crossing the reclaim age floor, which is the schedule the double-issuance
+      finding needed. Investigate enrollment latency, not the reclaim.
+      Background: `docs/security-review-2026-08-15-rescan.md`.
 - [ ] **Audit leaves the box — REQUIRED, not "consider" (§4.D.1).** The default
       `jsonl` sink writes next to the database, so a compromise of the RA host —
       the adversary §4.A calls load-bearing — destroys the audit table *and* its

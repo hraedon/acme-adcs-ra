@@ -73,7 +73,14 @@ def _finalize_existing_cert(
     refreshed = _refresh_order_or_500(ctx, order_id, "after double-finalize check")
     if refreshed.status == OrderStatus.PROCESSING:
         certificate_url = _certificate_url(ctx, existing_cert.id)
-        applied = ctx.store.transition_processing_to_valid(order_id, certificate_url)
+        # Guarded on the lease we just read: this call does not hold one, so if
+        # the order's lease moved on between the read and here, the decision
+        # this branch was made on is stale and the CAS must lose.
+        applied = ctx.store.transition_processing_to_valid(
+            order_id,
+            certificate_url,
+            expected_generation=refreshed.processing_generation,
+        )
         if applied:
             _audit(ctx,
                 event_type="finalize-order-reconciled",
@@ -238,14 +245,16 @@ def _finalize_parse_and_validate_csr(
 
 def _finalize_transition_to_processing(
     ctx: ServerContext, order_id: str,
-) -> JSONResponse | None:
-    """Atomically transition ready→processing.
+) -> int | JSONResponse:
+    """Atomically transition ready→processing and take the enrollment lease.
 
-    Returns None on success (proceed with enrollment).
+    Returns the lease generation (an ``int >= 1``) on success — the caller
+    must carry it to the worker and hand it back on every lease re-check.
     Returns a JSONResponse if the CAS lost the race (return current state).
     """
-    if ctx.store.transition_order_to_processing(order_id):
-        return None
+    generation = ctx.store.acquire_processing_lease(order_id)
+    if generation is not None:
+        return generation
     refreshed = _refresh_order_or_500(ctx, order_id, "during finalization")
     if refreshed.status == OrderStatus.PROCESSING:
         return JSONResponse(
@@ -262,26 +271,91 @@ def _finalize_submit_enrollment(
     csr: x509.CertificateSigningRequest,
     csr_subject: str,
     decision: PolicyDecision,
+    generation: int,
 ) -> EnrollmentResult | JSONResponse:
-    """Submit CSR to enrollment.
+    """Submit CSR to enrollment, if this call still owns the order.
+
+    Runs on a threadpool thread. ``generation`` is the lease minted by the
+    ``ready``→``processing`` CAS that admitted this call; it is re-checked
+    against the store here, *immediately* before the CA is touched, because
+    an arbitrary amount of wall-clock time can pass between the CAS and this
+    function actually running — the threadpool may be saturated, and the task
+    can sit queued past the reclaim age floor. In that window an operator can
+    truthfully verify at the CA that nothing was issued, reclaim the order to
+    ``ready``, and a second finalize can take a fresh lease. Submitting anyway
+    would put two requests for one order in front of ADCS.
 
     Returns EnrollmentResult on success, or JSONResponse on recoverable error
-    (enrollment denied with lost race, or transport error).
+    (stale lease, enrollment denied with lost race, or transport error).
     Raises on unrecoverable error.
     """
     csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("utf-8")
-    # Register the order as actively enrolling for the whole duration below —
-    # the ADCS call sequence AND the outcome handling that follows it (store
-    # transition / quarantine). While this is held, the admin reclaim endpoint
-    # will refuse to reclaim this order, which is what prevents a reclaim fired
-    # during a slow enrollment from driving a second CA issuance. The order is
-    # only released once its terminal state (valid / ready-reverted / quarantined)
-    # is durably written, so there is no window in which it is both inactive and
-    # still wedged in `processing` without a certificate row.
-    with ctx.active_enrollments.enrolling(order_id):
-        return _submit_enrollment_inner(
-            ctx, order_id, account_id, requested_sans, csr_pem, decision
-        )
+    stale = _abandon_if_lease_lapsed(
+        ctx, order_id, account_id, requested_sans, decision, generation
+    )
+    if stale is not None:
+        return stale
+    return _submit_enrollment_inner(
+        ctx, order_id, account_id, requested_sans, csr_pem, decision, generation
+    )
+
+
+def _abandon_if_lease_lapsed(
+    ctx: ServerContext,
+    order_id: str,
+    account_id: str,
+    requested_sans: list[str],
+    decision: PolicyDecision,
+    generation: int,
+) -> JSONResponse | None:
+    """Return a response (and audit) if this call no longer owns the order.
+
+    Returns None when the lease is still held and the caller should proceed.
+
+    There is exactly one place this can be asked, and it is deliberate:
+    immediately before ``submit_csr``. Once the CA has issued, the answer stops
+    mattering — the certificate exists and must be recorded whether or not the
+    order moved on, which is what ``record_issuance`` does (row written, order
+    flip lease-scoped). A lease check *after* issuance could only choose to
+    orphan a live certificate, which is the defect the earlier reviews closed.
+
+    The abandoning call must not write to the order: it does not own it any
+    more, and whoever does is mid-flight. It reports the order's *current*
+    state to its own client, which is the truthful answer — the client's
+    finalize was superseded, and the order status tells it what to do next.
+
+    The audit row is the operator's signal that a reclaim landed on a request
+    that was still queued. It should be rare; if it is not, the threadpool is
+    saturated and the reclaim floor is being crossed by ordinary queueing.
+    """
+    if ctx.store.holds_processing_lease(order_id, generation):
+        return None
+    order = _refresh_order_or_500(ctx, order_id, "after a lapsed lease")
+    _audit(ctx,
+        event_type="finalize-enrollment-abandoned",
+        account_id=account_id,
+        order_id=order_id,
+        sans=requested_sans,
+        template=decision.template,
+        outcome="denied",
+        details={
+            "reason": "processing-lease-lapsed",
+            "stage": "before-submit",
+            "held_generation": generation,
+            "current_generation": order.processing_generation,
+            "current_status": order.status,
+        },
+    )
+    logger.warning(
+        "abandoned enrollment for order %s before submitting to the CA: this "
+        "call held processing generation %d but the order is now %s at "
+        "generation %d. The CA was NOT called. A reclaim (or a competing "
+        "finalize) took the order while this request was queued.",
+        order_id, generation, order.status, order.processing_generation,
+    )
+    return JSONResponse(
+        content=_order_to_json(order), headers={"Retry-After": "3"}
+    )
 
 
 def _submit_enrollment_inner(
@@ -291,6 +365,7 @@ def _submit_enrollment_inner(
     requested_sans: list[str],
     csr_pem: str,
     decision: PolicyDecision,
+    generation: int,
 ) -> EnrollmentResult | JSONResponse:
     try:
         return ctx.enrollment.submit_csr(
@@ -299,7 +374,12 @@ def _submit_enrollment_inner(
             requested_sans=requested_sans,
         )
     except EnrollmentDenied as exc:
-        applied = ctx.store.transition_processing_to_ready(order_id)
+        # Revert only our own lease: if the order moved on while the CA was
+        # deciding, releasing it back to `ready` would hand a client a second
+        # finalize against work someone else now owns.
+        applied = ctx.store.transition_processing_to_ready(
+            order_id, expected_generation=generation
+        )
         _audit(ctx,
             event_type="finalize-enrollment-denied",
             account_id=account_id,
@@ -330,6 +410,7 @@ def _submit_enrollment_inner(
                 requested_sans=requested_sans,
                 template=decision.template,
                 exc=exc,
+                generation=generation,
             )
         _audit(ctx,
             event_type="finalize-enrollment-transport-failed",
@@ -592,6 +673,7 @@ def _quarantine_transport_orphan(
     requested_sans: list[str],
     template: str | None,
     exc: EnrollmentTransportError,
+    generation: int,
 ) -> JSONResponse:
     """Record a certificate the CA issued but the RA could not complete.
 
@@ -692,7 +774,11 @@ def _quarantine_transport_orphan(
     # Terminal either way — the CA has already satisfied this request.
     # NOT transition_active_to_invalid: that one excludes 'processing' on
     # purpose, so it would silently no-op here and leave the client polling.
-    ctx.store.transition_processing_to_invalid(order_id)
+    # Scoped to our own lease so this cannot terminate an order that a reclaim
+    # plus a later finalize have since handed to a different enrollment.
+    ctx.store.transition_processing_to_invalid(
+        order_id, expected_generation=generation
+    )
     order = _refresh_order_or_500(ctx, order_id, "after transport orphan")
     return JSONResponse(
         status_code=500,
@@ -708,11 +794,17 @@ def _finalize_complete(
     csr_subject: str,
     decision: PolicyDecision,
     enrollment_result: EnrollmentResult,
+    generation: int,
 ) -> JSONResponse:
     """Record the certificate and transition to valid.
 
     Handles the post-enrollment completion: create cert record, CAS-flip
     processing→valid, audit, and return the final order state.
+
+    ``generation`` is the enrollment lease this issuance was performed under.
+    The CA has already issued by the time this runs, so the certificate row is
+    written unconditionally — an issued certificate is never left untracked —
+    but the order flip is scoped to the lease.
     """
     # MED-1: verify the issued cert carries only DNS SANs the order authorized.
     # A misconfigured template injecting an unauthorized SAN (or any non-DNS
@@ -818,6 +910,7 @@ def _finalize_complete(
         certificate_url_fn=lambda cert_id: _certificate_url(ctx, cert_id),
         sans=requested_sans,
         csr_subject=csr_subject,
+        expected_generation=generation,
     )
     # The audit row is already durable; this only fans it out to SIEM.
     emit_audit_hook(ctx, _event)

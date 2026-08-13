@@ -390,7 +390,7 @@ def test_issuance_and_its_audit_row_are_atomic(tmp_path: Path) -> None:
         finalize_url_fn=lambda i: f"http://t/acme/finalize/{i}",
     )
     store.transition_pending_to_ready(order.id)
-    store.transition_order_to_processing(order.id)
+    assert store.acquire_processing_lease(order.id) is not None
 
     from importlib import resources
 
@@ -441,7 +441,7 @@ def test_a_failed_audit_write_rolls_back_the_certificate_row(
         finalize_url_fn=lambda i: f"http://t/acme/finalize/{i}",
     )
     store.transition_pending_to_ready(order.id)
-    store.transition_order_to_processing(order.id)
+    assert store.acquire_processing_lease(order.id) is not None
 
     from importlib import resources
 
@@ -697,7 +697,7 @@ class TestQuarantineIsNotServable:
             finalize_url_fn=lambda i: f"http://t/acme/finalize/{i}",
         )
         store.transition_pending_to_ready(order.id)
-        store.transition_order_to_processing(order.id)
+        assert store.acquire_processing_lease(order.id) is not None
         record, _event = store.quarantine_certificate(
             order_id=order.id,
             account_id=account.id,

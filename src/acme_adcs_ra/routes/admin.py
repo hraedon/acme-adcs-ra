@@ -191,12 +191,14 @@ async def reclaim_processing_order(
         return JSONResponse(content=_order_to_json(order))
 
     # Authoritative liveness check FIRST. The RA is a single process, and a
-    # live enrollment holds its order in this in-memory registry for the whole
-    # ADCS call sequence (see finalize._finalize_submit_enrollment). If a worker
-    # is enrolling this order right now, reclaiming it back to `ready` would let
-    # the client drive a SECOND CA issuance while the first is still in flight —
-    # the loser then becomes an untracked orphan at the CA. Elapsed time cannot
-    # see this; the registry can. Refuse regardless of age.
+    # live enrollment marks its order in this in-memory registry for the whole
+    # in-flight interval — the ready→processing CAS, the wait for a threadpool
+    # slot, the ADCS call sequence, and the completion that records the
+    # certificate (see routes/orders.finalize_order). If an enrollment is in
+    # flight for this order, reclaiming it back to `ready` would let the client
+    # drive a SECOND CA issuance while the first is still live — the loser then
+    # becomes an untracked orphan at the CA. Elapsed time cannot see this; the
+    # registry can. Refuse regardless of age.
     if ctx.active_enrollments.is_active(order_id):
         _audit(ctx,
             event_type="admin-order-reclaim-denied",
@@ -242,7 +244,11 @@ async def reclaim_processing_order(
         # loop safely (no re-enrollment, no double-issuance). Always allowed:
         # a recorded certificate is authoritative proof issuance happened.
         certificate_url = _certificate_url(ctx, existing_cert.id)
-        applied = ctx.store.transition_processing_to_valid(order_id, certificate_url)
+        applied = ctx.store.transition_processing_to_valid(
+            order_id,
+            certificate_url,
+            expected_generation=order.processing_generation,
+        )
         new_status = OrderStatus.VALID
         had_certificate = True
     else:
@@ -270,7 +276,15 @@ async def reclaim_processing_order(
                 "?ca_verified_no_issuance=true only after confirming at the "
                 "ADCS CA database that no certificate was issued for this order."
             )
-        applied = ctx.store.transition_processing_to_ready(order_id)
+        # Scoped to the lease generation this decision was made against. The
+        # liveness check, the CA-verification assertion, and the age floor were
+        # all evaluated against the order as read at the top of this handler;
+        # if its lease has moved since, every one of those judgements is stale
+        # and the CAS must lose rather than reopen an order that is now in
+        # flight under a different enrollment.
+        applied = ctx.store.transition_processing_to_ready(
+            order_id, expected_generation=order.processing_generation
+        )
         new_status = OrderStatus.READY
         had_certificate = False
 

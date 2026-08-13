@@ -80,6 +80,18 @@ The minimum to serve an enterprise client:
   synchronous multi-second CA round-trip inline would stall every other request
   in the process. The supported deployment is a single process, so nothing else
   absorbs it.
+- **An enrollment holds a lease over its order, not just a mark.** The
+  `ready`→`processing` CAS mints a monotonically increasing
+  `processing_generation` on the order row; the route holds the in-process
+  `ActiveEnrollments` mark across the CAS, the threadpool hand-off, the CA calls
+  and the certificate recording; and the worker re-checks the generation against
+  the store immediately before it submits. The mark is the fast, authoritative
+  answer for the reclaim endpoint; the lease is the durable one, and it is what
+  stops an enrollment that sat *queued* — committed to `processing`, doing no
+  visible work — from submitting after a reclaim reopened its order. Both are
+  needed: the mark alone is process memory over an interval it did not cover,
+  and the lease alone would let a reclaim proceed and merely fail the loser
+  late. See `docs/security-review-2026-08-15-rescan.md`.
 - **Single-backend CBT assumption (WI-006):** the channel-binding token is
   derived from a side-channel TLS probe of the `/certsrv/` host. This is correct
   for Mode A (one CA host) and single-host Mode C. If `/certsrv/` is fronted by

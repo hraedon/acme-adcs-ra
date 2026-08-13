@@ -276,30 +276,52 @@ async def finalize_order(
         ctx, payload, order, account_id, order_id
     )
 
-    # Point of no return: transition ready→processing.
-    race_resp = _finalize_transition_to_processing(ctx, order_id)
-    if race_resp is not None:
-        return race_resp
-
-    # Submit to enrollment — on a worker thread, not the event loop.
+    # Point of no return. Everything from here to the terminal state is one
+    # in-flight enrollment, and it is marked as such for its *whole* duration —
+    # the CAS, the wait for a threadpool slot, the ADCS call sequence, and the
+    # completion that records the certificate. The admin reclaim endpoint
+    # refuses any order that is marked, so no part of this interval can be
+    # reclaimed out from under us and re-finalized into a second CA issuance.
     #
-    # This handler is `async def`, so FastAPI runs it ON the loop rather than in
-    # the threadpool it uses for `def` handlers. The enrollment leg is
-    # synchronous `requests` against the CA and routinely takes seconds (its own
-    # default timeout is 30s). Called inline it stalled every other request in
-    # the process for that whole window — new-nonce, revokeCert, the admin
-    # endpoints — turning one slow CA into a service-wide outage. The supported
-    # deployment is a single process, so there is no second worker to absorb it.
-    enrollment_result = await run_in_threadpool(
-        _finalize_submit_enrollment,
-        ctx, order_id, account_id, requested_sans,
-        csr, csr_subject, decision,
-    )
-    if isinstance(enrollment_result, JSONResponse):
-        return enrollment_result
+    # The mark deliberately starts *before* the CAS and the threadpool
+    # hand-off. Marking inside the worker (the original shape) meant a task
+    # still queued behind a saturated threadpool was invisible: a reclaim could
+    # truthfully observe no live worker and no certificate, reopen the order,
+    # and let a second finalize race the queued one to the CA. Losing the CAS
+    # simply releases the mark on the way out.
+    with ctx.active_enrollments.enrolling(order_id):
+        transition = _finalize_transition_to_processing(ctx, order_id)
+        if isinstance(transition, JSONResponse):
+            return transition
+        generation = transition
 
-    # Record cert and transition to valid.
-    return _finalize_complete(
-        ctx, order_id, account_id, requested_sans,
-        csr_subject, decision, enrollment_result,
-    )
+        # Submit to enrollment — on a worker thread, not the event loop.
+        #
+        # This handler is `async def`, so FastAPI runs it ON the loop rather than
+        # in the threadpool it uses for `def` handlers. The enrollment leg is
+        # synchronous `requests` against the CA and routinely takes seconds (its
+        # own default timeout is 30s). Called inline it stalled every other
+        # request in the process for that whole window — new-nonce, revokeCert,
+        # the admin endpoints — turning one slow CA into a service-wide outage.
+        # The supported deployment is a single process, so there is no second
+        # worker to absorb it.
+        #
+        # The worker re-checks `generation` against the store immediately before
+        # it touches ADCS. That is the durable half of the guarantee: the mark
+        # above is process-local memory, the lease is a row.
+        enrollment_result = await run_in_threadpool(
+            _finalize_submit_enrollment,
+            ctx, order_id, account_id, requested_sans,
+            csr, csr_subject, decision, generation,
+        )
+        if isinstance(enrollment_result, JSONResponse):
+            return enrollment_result
+
+        # Record cert and transition to valid — still inside the mark, because
+        # the CA has issued but the RA has not yet recorded it. A reclaim landing
+        # in this window would see no certificate row and could reopen an order
+        # the CA has already satisfied.
+        return _finalize_complete(
+            ctx, order_id, account_id, requested_sans,
+            csr_subject, decision, enrollment_result, generation,
+        )

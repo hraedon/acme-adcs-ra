@@ -441,13 +441,30 @@ up. The serial simply stays pending and the next sync cycle confirms it.
 reconciles an order wedged in `processing` after a crash mid-enrollment.
 
 **Live enrollments are refused authoritatively.** The RA keeps an in-process
-registry of orders with a live enrollment worker; if one is running for this
-order, reclaim is refused (`-denied`, `reason=enrollment-in-flight`) regardless
-of how long it has been processing. This is what makes reclaiming a genuinely
-in-flight enrollment — and thus double-issuing — impossible in the single-process
+registry of orders with an enrollment in flight; if one exists for this order,
+reclaim is refused (`-denied`, `reason=enrollment-in-flight`) regardless of how
+long it has been processing. This is what makes reclaiming a genuinely in-flight
+enrollment — and thus double-issuing — impossible in the single-process
 deployment, rather than relying on an elapsed-time heuristic. A secondary age
 floor (`reclaim_minimum_processing_age_seconds`, default 60s) still applies as
 defence-in-depth.
+
+The mark covers the **whole** in-flight interval, not just the running worker:
+the `ready`→`processing` CAS, the wait for a threadpool slot, the ADCS call
+sequence, and the completion that records the certificate. That matters because
+a finalize queued behind a busy threadpool has already committed its order to
+`processing` while doing no visible work, and the window between the CA issuing
+and the RA recording the certificate looks identical to "nothing happened".
+
+**A durable lease backs the registry.** Each entry into `processing` mints a
+`processing_generation` on the order row, and the enrollment re-checks it against
+the store immediately before submitting to ADCS. If the order was reclaimed (or
+re-finalized) in the meantime, the stale enrollment abandons without calling the
+CA and audits `finalize-enrollment-abandoned` with `reason=processing-lease-lapsed`.
+**Seeing this event means a reclaim landed on a request that was still queued.**
+It is safe — nothing was issued — but it should be rare; a run of them means the
+threadpool is saturated and ordinary queueing is crossing the reclaim age floor.
+Investigate enrollment latency and the CA's responsiveness, not the reclaim.
 
 For a wedged order (no live worker) it has two branches:
 

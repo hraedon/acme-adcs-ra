@@ -122,6 +122,25 @@ def _serial_from_pem(cert_pem: str) -> str:
     return canonical_serial(format(cert.serial_number, "x"))
 
 
+def _processing_cas(
+    sql: str, params: tuple[Any, ...], expected_generation: int | None
+) -> tuple[str, tuple[Any, ...]]:
+    """Optionally narrow a ``status = 'processing'`` CAS to one lease generation.
+
+    Every transition *out* of ``processing`` ends an enrollment lease. When the
+    caller knows which lease it is ending — its own, or the one it read before
+    deciding — it passes that generation and the UPDATE additionally requires
+    ``processing_generation = ?``. A caller that legitimately does not hold or
+    observe a lease passes None and gets the plain status CAS.
+
+    ``sql`` must end with the ``AND status = ?`` clause, which is where the
+    generation predicate is appended.
+    """
+    if expected_generation is None:
+        return sql, params
+    return f"{sql} AND processing_generation = ?", (*params, expected_generation)
+
+
 NONCE_TTL_SECONDS: int = 1800  # 30 minutes
 NONCE_GC_PROBABILITY: int = 100  # 1-in-N chance to clean expired nonces on create
 
@@ -155,6 +174,11 @@ class OrderRecord:
     created_at: str
     updated_at: str
     processing_started_at: str | None = None
+    # Monotonic counter, incremented on every entry into ``processing``. It is
+    # the durable identity of the current enrollment lease: a worker that was
+    # admitted under generation N must not touch the CA once the row has moved
+    # on. See Store.acquire_processing_lease / holds_processing_lease.
+    processing_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -266,7 +290,8 @@ CREATE TABLE IF NOT EXISTS orders (
     expires TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    processing_started_at TEXT
+    processing_started_at TEXT,
+    processing_generation INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status_created
     ON orders (status, created_at);
@@ -370,7 +395,7 @@ class Store:
         """LOW-4: add a UNIQUE index on certificates(order_id).
 
         A DB-level last line of defense against two cert rows for the same
-        order — the CAS on ``transition_order_to_processing`` plus the
+        order — the CAS on ``acquire_processing_lease`` plus the
         existing-cert check already prevent this in normal operation. The
         index is created inside the schema migration (not in ``_SCHEMA``) so
         that an upgrade of an already-deployed DB that somehow accumulated a
@@ -459,15 +484,19 @@ class Store:
                 conn.execute(f"ALTER TABLE certificates ADD COLUMN {column} {ddl}")
 
     def _migrate_orders_table(self, conn: sqlite3.Connection) -> None:
-        """Add processing_started_at column to orders if missing."""
+        """Add the processing-lease columns to orders if they are missing."""
         columns = {
             row[1]
             for row in conn.execute(
                 "PRAGMA table_info(orders)"
             ).fetchall()
         }
-        if "processing_started_at" not in columns:
-            conn.execute("ALTER TABLE orders ADD COLUMN processing_started_at TEXT")
+        for column, ddl in (
+            ("processing_started_at", "TEXT"),
+            ("processing_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE orders ADD COLUMN {column} {ddl}")
 
     def _migrate_authorizations_table(self, conn: sqlite3.Connection) -> None:
         """Drop the dead challenges JSON column from authorizations if present.
@@ -532,6 +561,7 @@ class Store:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             processing_started_at=row["processing_started_at"],
+            processing_generation=row["processing_generation"],
         )
 
 
@@ -727,22 +757,67 @@ class Store:
             return None
         return self._order_from_row(row)
 
-    def transition_order_to_processing(self, order_id: str) -> bool:
-        """Atomically transition an order from 'ready' to 'processing'.
+    def acquire_processing_lease(self, order_id: str) -> int | None:
+        """Atomically transition 'ready'→'processing' and mint a lease generation.
 
         M3: prevents double-issuance on concurrent or retried finalize calls.
-        Returns True if the transition succeeded, False if the order was not
-        in 'ready' state (already processing/valid or other).
+        Returns the new ``processing_generation`` (always ``>= 1``) if the CAS
+        succeeded, or ``None`` if the order was not in 'ready' state (already
+        processing/valid or other).
+
+        The returned generation is the caller's *durable* claim on this order.
+        It is the sole way into ``processing``, so every entry mints a fresh
+        one, and any earlier holder is invalidated the moment a new one is
+        minted. A worker must re-check it with ``holds_processing_lease``
+        immediately before any issue-capable CA call: winning the CAS is not
+        enough, because the worker may sit queued behind the threadpool for
+        long enough that an operator reclaim (``processing``→``ready``) and a
+        second finalize both complete before it runs. Without the re-check,
+        both the stale worker and the new one submit the same order to ADCS.
+
+        The UPDATE and the read-back share one connection (and therefore one
+        implicit transaction), so the generation returned is the one this call
+        wrote, not a later writer's.
         """
         updated_at = _now_iso()
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE orders SET status = ?, updated_at = ?, processing_started_at = ? "
+                "UPDATE orders SET status = ?, updated_at = ?, "
+                "processing_started_at = ?, "
+                "processing_generation = processing_generation + 1 "
                 "WHERE id = ? AND status = ?",
                 (OrderStatus.PROCESSING, updated_at, updated_at, order_id,
                  OrderStatus.READY),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT processing_generation FROM orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+        # The UPDATE matched, so the row exists.
+        return int(row["processing_generation"])
+
+    def holds_processing_lease(self, order_id: str, generation: int) -> bool:
+        """True iff ``order_id`` is still ``processing`` under ``generation``.
+
+        The revalidation half of ``acquire_processing_lease``. False means the
+        caller's claim has lapsed — the order left ``processing`` (reclaimed,
+        completed, invalidated) and/or a newer finalize minted a later
+        generation. A caller that gets False must not perform the work it was
+        admitted for; it no longer owns the order.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status, processing_generation FROM orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        return (
+            row["status"] == OrderStatus.PROCESSING
+            and int(row["processing_generation"]) == generation
+        )
 
     def transition_pending_to_ready(self, order_id: str) -> bool:
         """Atomically transition an order from 'pending' to 'ready'.
@@ -764,7 +839,9 @@ class Store:
             )
             return cursor.rowcount == 1
 
-    def transition_processing_to_ready(self, order_id: str) -> bool:
+    def transition_processing_to_ready(
+        self, order_id: str, *, expected_generation: int | None = None
+    ) -> bool:
         """Atomically transition an order from 'processing' back to 'ready'.
 
         Operator-initiated reconciliation of an order wedged in 'processing'
@@ -773,39 +850,60 @@ class Store:
         enrollment or a concurrent transition. Clears ``processing_started_at``.
         Returns True if the transition was applied.
 
+        Leaving ``processing`` ends the current enrollment lease: any worker
+        still holding the generation this order was in ``processing`` under
+        will now fail ``holds_processing_lease`` and abandon rather than
+        submit to the CA. ``processing_generation`` itself is deliberately NOT
+        reset — it must never go backwards, or a later finalize could re-mint a
+        generation a queued worker is still holding.
+
         **Safety:** the caller (an operator via the admin endpoint) MUST first
         confirm from the ADCS CA database that no certificate was issued for
         this order's request — otherwise re-finalizing would double-issue.
+
+        ``expected_generation`` narrows the CAS to one specific lease. Callers
+        that read the order and then decide (the admin reclaim endpoint) pass
+        the generation they read, so a lease that changed between the read and
+        this write loses the CAS instead of silently overwriting the decision
+        the read was based on.
         """
         updated_at = _now_iso()
+        sql, params = _processing_cas(
+            "UPDATE orders SET status = ?, processing_started_at = NULL, "
+            "updated_at = ? WHERE id = ? AND status = ?",
+            (OrderStatus.READY, updated_at, order_id, OrderStatus.PROCESSING),
+            expected_generation,
+        )
         with self._connect() as conn:
-            cursor = conn.execute(
-                "UPDATE orders SET status = ?, processing_started_at = NULL, "
-                "updated_at = ? WHERE id = ? AND status = ?",
-                (OrderStatus.READY, updated_at, order_id, OrderStatus.PROCESSING),
-            )
-            return cursor.rowcount == 1
+            return conn.execute(sql, params).rowcount == 1
 
     def transition_processing_to_valid(
-        self, order_id: str, certificate_url: str
+        self,
+        order_id: str,
+        certificate_url: str,
+        *,
+        expected_generation: int | None = None,
     ) -> bool:
         """Atomically transition an order from 'processing' to 'valid'.
 
         Reconciliation for the case where enrollment succeeded and a certificate
         row was recorded, but the order's status flip was missed (e.g. a crash
         between ``create_certificate`` and this transition). CAS-guarded
-        on ``status = 'processing'``. Returns True if the transition was applied.
+        on ``status = 'processing'``, and on ``processing_generation`` when
+        ``expected_generation`` is supplied. Returns True if the transition was
+        applied.
         """
         updated_at = _now_iso()
+        sql, params = _processing_cas(
+            "UPDATE orders SET status = ?, certificate_url = ?, "
+            "processing_started_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status = ?",
+            (OrderStatus.VALID, certificate_url, updated_at, order_id,
+             OrderStatus.PROCESSING),
+            expected_generation,
+        )
         with self._connect() as conn:
-            cursor = conn.execute(
-                "UPDATE orders SET status = ?, certificate_url = ?, "
-                "processing_started_at = NULL, updated_at = ? "
-                "WHERE id = ? AND status = ?",
-                (OrderStatus.VALID, certificate_url, updated_at, order_id,
-                 OrderStatus.PROCESSING),
-            )
-            return cursor.rowcount == 1
+            return conn.execute(sql, params).rowcount == 1
 
     def transition_active_to_invalid(self, order_id: str) -> bool:
         """Atomically transition a still-active order to 'invalid'.
@@ -844,7 +942,9 @@ class Store:
         ).replace(tzinfo=UTC)
         return (datetime.now(UTC) - started).total_seconds()
 
-    def transition_processing_to_invalid(self, order_id: str) -> bool:
+    def transition_processing_to_invalid(
+        self, order_id: str, *, expected_generation: int | None = None
+    ) -> bool:
         """Terminate an order whose enrollment is definitively over.
 
         Deliberately separate from ``transition_active_to_invalid``, which
@@ -856,16 +956,19 @@ class Store:
         CA has already satisfied, and would leave it eligible for the admin
         reclaim path.
 
-        Returns True if applied.
+        Returns True if applied. ``expected_generation`` narrows the CAS to the
+        caller's own lease, so a worker whose lease already lapsed cannot
+        terminate an order a later finalize now owns.
         """
         updated_at = _now_iso()
+        sql, params = _processing_cas(
+            "UPDATE orders SET status = ?, updated_at = ? "
+            "WHERE id = ? AND status = ?",
+            (OrderStatus.INVALID, updated_at, order_id, OrderStatus.PROCESSING),
+            expected_generation,
+        )
         with self._connect() as conn:
-            cursor = conn.execute(
-                "UPDATE orders SET status = ?, updated_at = ? "
-                "WHERE id = ? AND status = ?",
-                (OrderStatus.INVALID, updated_at, order_id, OrderStatus.PROCESSING),
-            )
-            return cursor.rowcount == 1
+            return conn.execute(sql, params).rowcount == 1
 
     def transition_to_revoked(self, order_id: str) -> bool:
         """Atomically transition an order to 'revoked' (CAS-guarded).
@@ -1340,6 +1443,7 @@ class Store:
         certificate_url_fn: Callable[[str], str],
         sans: Sequence[str],
         csr_subject: str,
+        expected_generation: int | None = None,
     ) -> tuple[CertificateRecord, bool, dict[str, Any]]:
         """Persist an issuance — certificate row, order transition, audit row —
         in ONE transaction.
@@ -1357,6 +1461,13 @@ class Store:
         caller won the processing→valid CAS. The audit event reflects the
         outcome that actually committed: ``certificate-issued`` when the CAS
         applied, ``finalize-enrollment-race`` when it did not.
+
+        ``expected_generation`` additionally requires that the order still
+        carries the caller's enrollment lease. Losing on generation means the
+        order was reclaimed and re-finalized while this issuance was in flight:
+        the certificate row is still written (an issued certificate is never
+        left untracked), but the order belongs to the newer lease and this
+        caller must not flip it to ``valid``.
         """
         existing = self.get_certificate_by_order(order_id)
         cert_id = existing.id if existing is not None else uuid.uuid4().hex
@@ -1394,7 +1505,7 @@ class Store:
                         None,
                     ),
                 )
-            cursor = conn.execute(
+            cas_sql, cas_params = _processing_cas(
                 "UPDATE orders SET status = ?, certificate_url = ? "
                 "WHERE id = ? AND status = ?",
                 (
@@ -1403,8 +1514,9 @@ class Store:
                     order_id,
                     OrderStatus.PROCESSING,
                 ),
+                expected_generation,
             )
-            applied = cursor.rowcount == 1
+            applied = conn.execute(cas_sql, cas_params).rowcount == 1
 
             if applied:
                 event = self._record_audit_in_conn(

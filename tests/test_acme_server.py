@@ -964,7 +964,7 @@ class TestMaybeReadyOrderCasGuard:
         # The order is 'ready' after _walk_to_ready. Simulate the race: a
         # concurrent finalize moved it to 'processing' (no cert yet). Manually
         # flip ready→processing so the CAS in transition_pending_to_ready loses.
-        assert store.transition_order_to_processing(order_id) is True
+        assert store.acquire_processing_lease(order_id) is not None
         assert store.get_order(order_id).status == "processing"
 
         # Reset the order to 'pending' so _maybe_ready_order's status check
@@ -974,9 +974,9 @@ class TestMaybeReadyOrderCasGuard:
         _force_order_status(store, order_id, "pending")
         # Now simulate: a concurrent finalize flips pending→ready→processing
         # before _maybe_ready_order's CAS runs. First walk to processing:
-        assert store.transition_order_to_processing(
+        assert store.acquire_processing_lease(
             order_id
-        ) is False  # can't: it's pending, not ready
+        ) is None  # can't: it's pending, not ready
         # Manually set to processing to simulate the concurrent finalize.
         _force_order_status(store, order_id, "processing")
 
@@ -1173,7 +1173,7 @@ class TestDoubleFinalizeGuard:
         order_id = order["finalize"].split("/")[-1]
         # Simulate a first finalize that crashed mid-enrollment: order is
         # 'processing', no cert stored yet.
-        assert store.transition_order_to_processing(order_id) is True
+        assert store.acquire_processing_lease(order_id) is not None
         assert store.get_certificate_by_order(order_id) is None
 
         resp = ac.finalize_order(order["finalize"], _make_csr(["web.WORK-DOMAIN.local"]))

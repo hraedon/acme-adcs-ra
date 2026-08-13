@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-15 hardening rescan (one finding)
+
+A rescan (Codex, with Daybreak Blue) of the two commits below, `5468e0f..f1fd80a`
+— one medium finding, high confidence, and the first in the series to arrive with
+a working reproduction rather than a source-only hypothesis. It reproduced here
+before anything changed. See `docs/security-review-2026-08-15-rescan.md`.
+
+- **An enrollment is now marked in flight for its whole duration.** The
+  `ActiveEnrollments` mark added below sat *inside* the worker: a finalize whose
+  task was still queued behind a busy threadpool had already committed the order
+  to `processing` but was invisible to the reclaim endpoint, and the mark was
+  released before the certificate row was written. In either gap a reclaim could
+  truthfully observe "no live worker, no certificate", reopen the order, and let
+  a second finalize race the first to the CA. The mark now lives in the finalize
+  route, covering the `ready`→`processing` CAS, the threadpool hand-off, and the
+  completion. It is also reference-counted, so one holder finishing cannot clear
+  liveness for another.
+- **A durable enrollment lease backs it up.** New `processing_generation` column
+  on `orders`: `Store.acquire_processing_lease` (replacing
+  `transition_order_to_processing`) is the only way into `processing` and mints a
+  monotonically increasing generation. The worker re-checks it via
+  `holds_processing_lease` **immediately before `submit_csr`**, so a task that was
+  queued across a reclaim abandons — audited `finalize-enrollment-abandoned`,
+  `reason=processing-lease-lapsed` — instead of submitting to ADCS. Every
+  transition out of `processing` (the enrollment-denied revert, the transport
+  orphan, the issuance flip, the finalize self-heal, both reclaim branches) is
+  now scoped to the lease its caller holds or observed, so reclaim's read and its
+  write are no longer independent critical sections. Upgrade-safe: the column is
+  added by the existing migration and defaults to 0; no config or API change.
+
 ### Security — 2026-08-15 external scan (four findings)
 
 A third external scan (Codex, with Daybreak Blue), of `v1.9.1` at `5468e0f` —

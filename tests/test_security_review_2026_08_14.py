@@ -631,7 +631,7 @@ def _seed_processing_order(store: Store) -> tuple[str, str]:
         finalize_url_fn=lambda i: f"http://testserver/acme/finalize/{i}",
     )
     store.transition_pending_to_ready(order.id)
-    store.transition_order_to_processing(order.id)
+    assert store.acquire_processing_lease(order.id) is not None
     return order.id, account.id
 
 
@@ -658,6 +658,7 @@ def _run_orphan_handler(
         requested_sans=["a.example.com"],
         template="ACME-ServerAuth",
         exc=exc,
+        generation=1,
     )
 
 

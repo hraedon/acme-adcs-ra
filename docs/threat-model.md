@@ -260,7 +260,19 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
     probing order IDs is visible to SIEM.
   The server's **automated** paths never double-issue (the `ready`→`processing`
   CAS is the guard); the reclaim `ready` branch is the one operator-enabled
-  exception, gated by the documented CA-DB pre-condition. Both the
+  exception, gated by the documented CA-DB pre-condition **and by an enrollment
+  lease** (2026-08-15 rescan). Every entry into `processing` mints a
+  monotonically increasing `processing_generation`; the enrollment carries it and
+  re-checks it against the store immediately before submitting to ADCS, and every
+  transition *out* of `processing` is scoped to the generation its caller holds or
+  observed. That closes the gap where an enrollment still queued behind a busy
+  threadpool — already committed to `processing`, but invisible to the in-process
+  registry — could be reclaimed out from under itself and then submit alongside
+  the client's second finalize. A stale enrollment abandons before the CA call
+  (`finalize-enrollment-abandoned`, `reason=processing-lease-lapsed`). The
+  in-process registry now covers the whole in-flight interval (CAS, threadpool
+  hand-off, ADCS calls, certificate recording), so the two guards are
+  coextensive. Both the
   `EnrollmentDenied` revert and the success-path `processing`→`valid` flip
   are CAS-guarded so a concurrent reclaim or self-heal cannot be clobbered; a
   lost CAS race is audited (`finalize-enrollment-race` at ERROR + SIEM) and
