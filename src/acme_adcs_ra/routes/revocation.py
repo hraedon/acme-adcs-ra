@@ -54,14 +54,25 @@ async def revoke_cert(
     except Exception as exc:
         raise malformed(f"unable to parse certificate: {exc}") from exc
 
-    # RFC 5280 §5.3.1 reason codes 0-10 are valid for ACME revocation,
-    # EXCEPT reason 7 ("unused" in RFC 5280). M-1: the out-of-band
-    # `scripts/Revoke-Cert.ps1` rejects reason 7 (certutil rejects it), so the
-    # ACME route must reject it too — otherwise an accepted reason 7 would
-    # silently break the out-of-band revocation loop (the operator's
-    # `Revoke-Cert.ps1` would fail on the recorded reason). The valid set is
-    # {0,1,2,3,4,5,6,8,9,10} (7 excluded); the error uses bad_revocation_reason.
-    _VALID_REVOCATION_REASONS = frozenset({0, 1, 2, 3, 4, 5, 6, 8, 9, 10})
+    # RFC 5280 §5.3.1 reason codes, minus two that must never reach the CA:
+    #
+    #   7 — "unused" in RFC 5280, and `certutil` rejects it. An accepted 7
+    #       would silently break the out-of-band loop, because the operator's
+    #       `Revoke-Cert.ps1` would fail on the recorded reason (M-1).
+    #
+    #   8 — **removeFromCRL: the inverse of revocation.** This reached
+    #       `certutil -revoke <serial> 8` verbatim through the pending list and
+    #       the sync agent. A revokeCert carrying reason 8 therefore recorded a
+    #       successful revocation in the RA — 410 on the certificate, order
+    #       flipped, serial drained off the pending queue — while the CA-side
+    #       call asked to *undo* a revocation rather than perform one. Plan 004
+    #       confirmed the effect against the lab CA: a held certificate given
+    #       reason 8 ends up "off the CRL and valid". The owner is told the
+    #       certificate is contained while it stays live and trusted
+    #       domain-wide.
+    #
+    # Valid set: {0,1,2,3,4,5,6,9,10}. Both exclusions use bad_revocation_reason.
+    _VALID_REVOCATION_REASONS = frozenset({0, 1, 2, 3, 4, 5, 6, 9, 10})
     reason = payload.get("reason")
     if reason is not None and (
         not isinstance(reason, int)
@@ -69,8 +80,9 @@ async def revoke_cert(
         or reason not in _VALID_REVOCATION_REASONS
     ):
         raise bad_revocation_reason(
-            "reason code must be an integer in the set 0-6, 8-10 "
-            "(reason 7 is unused in RFC 5280 and rejected by certutil)"
+            "reason code must be an integer in the set 0-6, 9-10 "
+            "(reason 7 is unused in RFC 5280 and rejected by certutil; "
+            "reason 8 is removeFromCRL, which un-revokes rather than revokes)"
         )
 
     serial_hex = canonical_serial(format(cert.serial_number, "x"))

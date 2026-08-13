@@ -3,26 +3,38 @@ BeforeAll {
 }
 
 Describe 'Get-ValidRevocationReasons' {
-    It 'Returns exactly @(0, 1, 2, 3, 4, 5, 6, 8, 9, 10)' {
+    It 'Returns exactly @(0, 1, 2, 3, 4, 5, 6, 9, 10)' {
         $reasons = Get-ValidRevocationReasons
-        $reasons | Should -Be @(0, 1, 2, 3, 4, 5, 6, 8, 9, 10)
+        $reasons | Should -Be @(0, 1, 2, 3, 4, 5, 6, 9, 10)
     }
 
     It 'Does NOT contain 7' {
         $reasons = Get-ValidRevocationReasons
         $reasons | Should -Not -Contain 7
     }
+
+    It 'Does NOT contain 8 (removeFromCRL un-revokes)' {
+        # Plan 004 proved against the lab CA that reason 8 leaves a held
+        # certificate "off the CRL and valid". A revocation path must never
+        # be able to emit it.
+        $reasons = Get-ValidRevocationReasons
+        $reasons | Should -Not -Contain 8
+    }
 }
 
 Describe 'Test-RevocationReason' {
     It 'Returns $true for each valid reason' {
-        foreach ($r in @(0, 1, 2, 3, 4, 5, 6, 8, 9, 10)) {
+        foreach ($r in @(0, 1, 2, 3, 4, 5, 6, 9, 10)) {
             Test-RevocationReason $r | Should -BeTrue -Because "reason $r should be valid"
         }
     }
 
     It 'Returns $false for 7 (unused in RFC 5280)' {
         Test-RevocationReason 7 | Should -BeFalse
+    }
+
+    It 'Returns $false for 8 (removeFromCRL is the un-revoke operation)' {
+        Test-RevocationReason 8 | Should -BeFalse
     }
 
     It 'Returns $false for -1' {

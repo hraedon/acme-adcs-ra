@@ -793,6 +793,29 @@ class Store:
             )
             return cursor.rowcount == 1
 
+    def transition_processing_to_invalid(self, order_id: str) -> bool:
+        """Terminate an order whose enrollment is definitively over.
+
+        Deliberately separate from ``transition_active_to_invalid``, which
+        excludes ``processing`` so a stale snapshot can never flip an order out
+        from under a live enrollment. This one is the opposite case and needs
+        the opposite CAS: the caller *knows* the enrollment finished — the CA
+        issued and the RA could not complete — so leaving the order in
+        ``processing`` would have a client poll forever against a request the
+        CA has already satisfied, and would leave it eligible for the admin
+        reclaim path.
+
+        Returns True if applied.
+        """
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE orders SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status = ?",
+                (OrderStatus.INVALID, updated_at, order_id, OrderStatus.PROCESSING),
+            )
+            return cursor.rowcount == 1
+
     def transition_to_revoked(self, order_id: str) -> bool:
         """Atomically transition an order to 'revoked' (CAS-guarded).
 

@@ -128,13 +128,22 @@ function Die([string]$Message, [int]$Code) {
     exit $Code
 }
 
-# RFC 5280 section 5.3.1 reason codes. certutil -revoke uses the same numeric codes,
-# EXCEPT reason 7 is "unused" in RFC 5280 (not an RFC 8555 reason) and is
-# rejected here. Reason 6 is certificateHold; reason 8 is removeFromCRL (the
-# un-hold operation, accepted for completeness).
-$validReasons = @(0, 1, 2, 3, 4, 5, 6, 8, 9, 10)
+# RFC 5280 section 5.3.1 reason codes. certutil -revoke uses the same numeric
+# codes, with two exclusions:
+#
+#   7 -- "unused" in RFC 5280 (not an RFC 8555 reason); certutil rejects it.
+#   8 -- removeFromCRL. This is the UN-revoke operation, not a revocation.
+#        `certutil -revoke <serial> 8` asks the CA to take a certificate back
+#        OFF the CRL. This script exists to revoke, and it is the last gate in
+#        front of the CA for both the operator path and the sync agent, so it
+#        refuses 8 outright. Reason 6 (certificateHold) is still accepted: a
+#        hold is strictly more restrictive than valid.
+#
+# The RA rejects 8 at the ACME surface too, but this check is what protects a
+# deployment whose store still holds a reason-8 row written before that fix.
+$validReasons = @(0, 1, 2, 3, 4, 5, 6, 9, 10)
 if ($Reason -notin $validReasons) {
-    Die ("Reason {0} is not a valid RFC 8555 revocation reason (0-6, 8-10). Reason 7 is unused in RFC 5280." -f $Reason) 3
+    Die ("Reason {0} is not a valid revocation reason (0-6, 9-10). Reason 7 is unused in RFC 5280; reason 8 is removeFromCRL, which un-revokes rather than revokes." -f $Reason) 3
 }
 
 # WI-022: the requester check is a defense-in-depth gate -- an empty value

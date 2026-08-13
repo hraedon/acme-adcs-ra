@@ -294,6 +294,21 @@ def _finalize_submit_enrollment(
             return JSONResponse(content=_order_to_json(refreshed))
         raise rejected_identifier(str(exc)) from exc
     except EnrollmentTransportError as exc:
+        if exc.ca_issued:
+            # The CA issued and then something downstream failed — the leaf
+            # fetch, the PKCS#7 chain fetch, or the chain-binds-to-leaf check.
+            # A live, domain-trusted certificate exists at the CA. Recording
+            # only the error string (the previous behaviour) left it an
+            # untracked orphan whose serial appeared nowhere in the RA, which
+            # is the same defect the post-issuance verifiers were fixed for.
+            return _quarantine_transport_orphan(
+                ctx,
+                order_id=order_id,
+                account_id=account_id,
+                requested_sans=requested_sans,
+                template=decision.template,
+                exc=exc,
+            )
         _audit(ctx,
             event_type="finalize-enrollment-transport-failed",
             account_id=account_id,
@@ -301,7 +316,7 @@ def _finalize_submit_enrollment(
             sans=requested_sans,
             template=decision.template,
             outcome="failed",
-            details={"error": str(exc)},
+            details={"error": str(exc), "ca_issued": False},
         )
         order = _refresh_order_or_500(
             ctx, order_id, "during enrollment transport error"
@@ -545,6 +560,122 @@ def _quarantine_and_fail(
         )
 
     raise server_internal(message)
+
+
+def _quarantine_transport_orphan(
+    ctx: ServerContext,
+    *,
+    order_id: str,
+    account_id: str,
+    requested_sans: list[str],
+    template: str | None,
+    exc: EnrollmentTransportError,
+) -> JSONResponse:
+    """Record a certificate the CA issued but the RA could not complete.
+
+    Two cases, and the difference matters to whoever cleans up:
+
+    * **The leaf is in hand** (the chain fetch or the chain-binds-to-leaf check
+      failed). The serial is derivable, so this quarantines exactly like a
+      verifier rejection: a ``quarantined`` row carrying the serial and ReqID,
+      queued for CA-side revocation through the ordinary pull agent.
+    * **Only the ReqID is known** (the leaf fetch itself failed). There is no
+      certificate row to write — the store keys on the bytes, which the RA
+      never received. All that can be done is to make the ReqID impossible to
+      miss, so the operator can revoke by ReqID at the CA by hand.
+
+    Either way the order goes terminal-``invalid``: a retried finalize must not
+    re-enroll against a request the CA has already satisfied.
+    """
+    if exc.cert_pem is not None:
+        try:
+            record, event = ctx.store.quarantine_certificate(
+                order_id=order_id,
+                account_id=account_id,
+                cert_pem=exc.cert_pem,
+                chain_pem=exc.chain_pem,
+                template=template or "",
+                requester="",
+                metadata={"req_id": exc.req_id or ""},
+                event_type="finalize-enrollment-transport-orphan",
+                violations=[str(exc)],
+                reason=(
+                    "the CA issued this certificate, but the RA could not "
+                    "complete enrollment (chain fetch or chain validation "
+                    "failed), so it was never honoured"
+                ),
+                sans=requested_sans,
+                extra_details={"ca_issued": True, "transport_error": str(exc)},
+            )
+            emit_audit_hook(ctx, event)
+            logger.error(
+                "QUARANTINED a CA-issued certificate after a transport failure: "
+                "serial=%s req_id=%s order=%s. It is LIVE at the CA and queued "
+                "for CA-side revocation; run the revocation sync agent.",
+                record.serial_number,
+                exc.req_id,
+                order_id,
+            )
+        except Exception:  # noqa: BLE001 - the finding must survive a store failure
+            logger.exception(
+                "failed to quarantine a CA-issued certificate for order %s "
+                "(req_id %s); it is LIVE at the CA and NOT tracked — revoke it "
+                "manually",
+                order_id,
+                exc.req_id,
+            )
+            _audit(ctx,
+                event_type="finalize-enrollment-transport-orphan",
+                account_id=account_id,
+                order_id=order_id,
+                sans=requested_sans,
+                template=template,
+                outcome="failed",
+                details={
+                    "error": str(exc),
+                    "ca_issued": True,
+                    "req_id": exc.req_id,
+                    "quarantined": False,
+                    "quarantine_error": "see logs",
+                },
+            )
+    else:
+        # No bytes, so no row can be written. Make the ReqID loud instead.
+        logger.error(
+            "The CA ISSUED a certificate the RA could not retrieve: req_id=%s "
+            "order=%s. It is LIVE at the CA, is NOT in the RA store, and CANNOT "
+            "be revoked by the sync agent. Revoke it by ReqID at the CA by hand.",
+            exc.req_id,
+            order_id,
+        )
+        _audit(ctx,
+            event_type="finalize-enrollment-transport-orphan",
+            account_id=account_id,
+            order_id=order_id,
+            sans=requested_sans,
+            template=template,
+            outcome="failed",
+            details={
+                "error": str(exc),
+                "ca_issued": True,
+                "req_id": exc.req_id,
+                "quarantined": False,
+                "reason": (
+                    "the CA issued but the RA never received the certificate "
+                    "bytes; revoke by ReqID at the CA manually"
+                ),
+            },
+        )
+
+    # Terminal either way — the CA has already satisfied this request.
+    # NOT transition_active_to_invalid: that one excludes 'processing' on
+    # purpose, so it would silently no-op here and leave the client polling.
+    ctx.store.transition_processing_to_invalid(order_id)
+    order = _refresh_order_or_500(ctx, order_id, "after transport orphan")
+    return JSONResponse(
+        status_code=500,
+        content=_order_to_json(order),
+    )
 
 
 def _finalize_complete(

@@ -265,8 +265,11 @@ class TestRevokeCertReasonValidation:
     # M-1: reason 7 is unused in RFC 5280 and rejected by certutil, so the RA
     # must reject it too — otherwise an accepted reason 7 would silently break
     # the out-of-band revocation loop (Revoke-Cert.ps1 would fail on the
-    # recorded reason). The valid set is {0,1,2,3,4,5,6,8,9,10} (7 excluded).
-    @pytest.mark.parametrize("reason", [0, 1, 2, 3, 4, 5, 6, 8, 9, 10])
+    # recorded reason).
+    # 2026-08-14 review: reason 8 (removeFromCRL) is excluded for a sharper
+    # reason — see test_reason_8_rejected below.
+    # The valid set is {0,1,2,3,4,5,6,9,10}.
+    @pytest.mark.parametrize("reason", [0, 1, 2, 3, 4, 5, 6, 9, 10])
     def test_valid_reason_codes_accepted(
         self,
         client: TestClient,
@@ -302,6 +305,41 @@ class TestRevokeCertReasonValidation:
         record = store.get_certificate_by_serial(serial_hex)
         assert record is not None
         assert record.status == "valid"
+
+    def test_reason_8_rejected(
+        self,
+        client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        """Reason 8 (removeFromCRL) must never reach the CA.
+
+        It is the inverse of revocation. Accepted, it flowed verbatim through
+        the pending list into ``certutil -revoke <serial> 8`` — so a revokeCert
+        carrying it recorded a *successful* revocation in the RA (410 on the
+        certificate, order flipped, serial drained off the pending queue) while
+        asking the CA to take the certificate back off the CRL. Plan 004
+        confirmed the CA-side effect against the lab: a held certificate given
+        reason 8 ends up "off the CRL and valid".
+
+        The critical assertion is the last one: the certificate must remain
+        ``valid`` in the store, because a rejection that still flipped the row
+        would leave the RA claiming a revocation the CA never performed.
+        """
+        ac, cert_der = _issue_cert(client, test_config, account_key)
+        resp = ac.revoke_certificate(cert_der, reason=8)
+        assert resp.status_code == 400
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:badRevocationReason"
+        assert "removeFromCRL" in resp.json()["detail"]
+
+        cert = x509.load_der_x509_certificate(cert_der)
+        serial_hex = format(cert.serial_number, "x").upper()
+        store = Store(test_config.db_path)
+        record = store.get_certificate_by_serial(serial_hex)
+        assert record is not None
+        assert record.status == "valid"
+        # And it must not be queued for a CA-side "revocation" either.
+        assert all(c.serial_number != serial_hex for c in store.list_revoked_certificates())
 
     @pytest.mark.parametrize("reason", [-1, 11, 128, "not-an-int"])
     def test_invalid_reason_codes_rejected(

@@ -3,12 +3,19 @@
 # (tests/pester/Revocation.Tests.ps1). The production script keeps its logic
 # inline (it is simple enough); this lib validates the same logic independently.
 
-# RFC 5280 section 5.3.1 reason codes. certutil -revoke uses the same numeric codes,
-# EXCEPT reason 7 is "unused" in RFC 5280 (not an RFC 8555 reason) and is
-# rejected here. Reason 6 is certificateHold; reason 8 is removeFromCRL (the
-# un-hold operation, accepted for completeness).
+# RFC 5280 section 5.3.1 reason codes. certutil -revoke uses the same numeric
+# codes. Two are excluded:
+#
+#   7 -- "unused" in RFC 5280 (not an RFC 8555 reason); certutil rejects it.
+#   8 -- removeFromCRL, the UN-revoke operation. Confirmed against the lab CA
+#        during the Plan 004 spike: a certificate placed on hold and then
+#        given reason 8 ends up "off the CRL and valid" while ADCS keeps its
+#        DB Disposition at 21. A revocation tool must never emit it.
+#
+# Reason 6 (certificateHold) stays valid: a hold is strictly more restrictive
+# than valid, so it cannot be used to undo containment.
 function Get-ValidRevocationReasons {
-    return @(0, 1, 2, 3, 4, 5, 6, 8, 9, 10)
+    return @(0, 1, 2, 3, 4, 5, 6, 9, 10)
 }
 
 function Test-RevocationReason([int]$Reason) {

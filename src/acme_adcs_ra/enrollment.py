@@ -58,7 +58,39 @@ class EnrollmentDenied(Exception):
 
 
 class EnrollmentTransportError(Exception):
-    """A transport / connectivity error when contacting the ADCS CA."""
+    """A transport / connectivity error when contacting the ADCS CA.
+
+    ``req_id`` and ``cert_pem`` are set when the failure happened **after the
+    CA had already issued**. That window is real: ``certfnsh.asp`` returns an
+    "issued" disposition with a ReqID, and only then does the leg fetch the
+    certificate, fetch the PKCS#7 chain, and validate that the chain binds to
+    the leaf. A failure in any of those steps leaves a live, domain-trusted
+    certificate at the CA — with a serial and a CA database row — while the RA
+    is about to return 503.
+
+    Carrying the identifiers out with the exception is what lets the finalize
+    path quarantine it instead of orphaning it. Without them the RA recorded
+    only ``{"error": ...}``, and the operator had a timestamp with which to go
+    hunting in the CA database. See ``finalize._quarantine_transport_orphan``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        req_id: str | None = None,
+        cert_pem: str | None = None,
+        chain_pem: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.req_id = req_id
+        self.cert_pem = cert_pem
+        self.chain_pem = list(chain_pem) if chain_pem is not None else []
+
+    @property
+    def ca_issued(self) -> bool:
+        """True when the CA issued before this failure — the dangerous case."""
+        return self.req_id is not None
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +306,14 @@ class CertsrvEnrollmentLeg:
         base = f"https://{self._host}/certsrv"
         timeout = self._timeout
 
+        # Everything the CA has already committed to, tracked outside the try
+        # so the handlers below can hand it to the caller. Once `issued_req_id`
+        # is set, a live certificate exists at the CA no matter how this call
+        # ends, and the RA owes it a quarantine row rather than a bare 503.
+        issued_req_id: str | None = None
+        issued_cert_pem: str | None = None
+        issued_chain_pem: list[str] = []
+
         try:
             # 1. Submit the CSR to certfnsh.asp (payload per magnuswatn/certsrv).
             form = {
@@ -300,6 +340,9 @@ class CertsrvEnrollmentLeg:
             if disposition != "issued":
                 raise EnrollmentTransportError(detail)
             req_id = detail
+            # From here on the CA has issued. Record it before the first call
+            # that can fail.
+            issued_req_id = req_id
 
             # 2. Fetch the issued certificate (base64 or PEM).
             cert_resp = session.get(
@@ -319,8 +362,12 @@ class CertsrvEnrollmentLeg:
                 snippet = " ".join(cert_resp.text[:400].split())
                 raise EnrollmentTransportError(
                     f"certnew.cer did not return a parseable certificate "
-                    f"(content-type {ct!r}): {exc}; body: {snippet}"
+                    f"(content-type {ct!r}): {exc}; body: {snippet}",
+                    req_id=req_id,
                 ) from exc
+            # The bytes are in hand: every later failure can now quarantine a
+            # fully identified certificate rather than just a ReqID.
+            issued_cert_pem = cert_pem
 
             # The production finalize path always supplies a parsed, valid
             # CSR.  A few transport-only unit fakes intentionally use a
@@ -354,17 +401,27 @@ class CertsrvEnrollmentLeg:
             )
             chain_resp.raise_for_status()
             chain_pem = _parse_pkcs7_chain(chain_resp.content)
+            issued_chain_pem = list(chain_pem)
             _validate_chain_binds_to_leaf(cert_pem, chain_pem)
         except EnrollmentDenied:
             raise
-        except EnrollmentTransportError:
+        except EnrollmentTransportError as exc:
+            # Attach what the CA already issued, unless a raise site already
+            # did. A transport error raised after issuance is the orphan case.
+            if exc.req_id is None and issued_req_id is not None:
+                exc.req_id = issued_req_id
+                exc.cert_pem = issued_cert_pem
+                exc.chain_pem = issued_chain_pem
             raise
         except Exception as exc:
             # Preserve the stack for diagnosis — the wrapped message alone loses
             # where in the request/parse flow an unexpected error originated.
             _log.exception("certsrv enrollment failed (unexpected error)")
             raise EnrollmentTransportError(
-                f"ADCS enrollment transport error: {exc}"
+                f"ADCS enrollment transport error: {exc}",
+                req_id=issued_req_id,
+                cert_pem=issued_cert_pem,
+                chain_pem=issued_chain_pem,
             ) from exc
 
         metadata: dict[str, str] = {
