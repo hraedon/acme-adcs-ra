@@ -137,12 +137,13 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [Parameter(Mandatory = $true)][string]$BaseUrl,
-    [Parameter(Mandatory = $true)][string]$AdminToken,
+    [string]$AdminToken = "",
     [string]$ConfirmToken = "",
     [int]$IntervalMinutes = 15,
     [string]$TaskUser = "WORK-DOMAIN\gMSA-acme-ra$",
     [string]$TaskFolder = "\acme-adcs-ra\",
     [switch]$RegisterRevocationSync,
+    [switch]$RevocationSyncOnly,
     [string]$CaConfig = "",
     [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
     [switch]$LocalMode,
@@ -161,10 +162,35 @@ if ($IntervalMinutes -lt 1) {
     exit 3
 }
 
-# -RegisterRevocationSync requires -CaConfig (passed through to
+# Which task groups are we registering?
+#   * General maintenance (nonce cleanup + expired-order sweep) hit admin-only
+#     endpoints, so they require the admin token and belong ONLY on the RA host.
+#   * The revocation-sync task runs on the (recommended separate) revocation
+#     host and needs only the narrow confirm token.
+# -RevocationSyncOnly is the dedicated-revocation-host mode: it skips the
+# general tasks entirely, so no admin token is required or planted there.
+$registerGeneral = -not $RevocationSyncOnly
+$registerSync = $RegisterRevocationSync -or $RevocationSyncOnly
+
+# The general maintenance tasks embed the admin token; refuse to register them
+# without one. On a revocation host, pass -RevocationSyncOnly to skip them.
+if ($registerGeneral -and [string]::IsNullOrWhiteSpace($AdminToken)) {
+    Write-Error "-AdminToken is required to register the general nonce/sweep maintenance tasks (they call admin-only endpoints). On a dedicated revocation host, pass -RevocationSyncOnly with -ConfirmToken to register only the revocation-sync task and omit the admin token entirely."
+    exit 3
+}
+
+# The revocation-sync task needs at least one credential. ConfirmToken is the
+# least-privilege choice and the only one the confirm endpoint accepts; the
+# admin token is accepted as a fallback for deployments not yet split.
+if ($registerSync -and [string]::IsNullOrWhiteSpace($ConfirmToken) -and [string]::IsNullOrWhiteSpace($AdminToken)) {
+    Write-Error "-RegisterRevocationSync/-RevocationSyncOnly requires -ConfirmToken (preferred) or -AdminToken."
+    exit 3
+}
+
+# The revocation-sync task requires -CaConfig (passed through to
 # Sync-Revocations.ps1 and onward to Revoke-Cert.ps1 / certutil -config).
-if ($RegisterRevocationSync -and [string]::IsNullOrWhiteSpace($CaConfig)) {
-    Write-Error "-RegisterRevocationSync requires -CaConfig (the CA configuration string, e.g. 'CA01\WORK-DOMAIN-CA')."
+if ($registerSync -and [string]::IsNullOrWhiteSpace($CaConfig)) {
+    Write-Error "-RegisterRevocationSync/-RevocationSyncOnly requires -CaConfig (the CA configuration string, e.g. 'CA01\WORK-DOMAIN-CA')."
     exit 3
 }
 
@@ -352,13 +378,18 @@ function Register-RevocationSyncTask {
     }
 }
 
-foreach ($task in $tasks) {
-    Register-OrUpdate-Task $task
+# General maintenance tasks (nonce cleanup, expired-order sweep). Skipped on a
+# dedicated revocation host (-RevocationSyncOnly) so the admin token is never
+# planted there.
+if ($registerGeneral) {
+    foreach ($task in $tasks) {
+        Register-OrUpdate-Task $task
+    }
 }
 
 # Optionally register the revocation-sync task (WI-032). Off by default so
 # the two-identity utility-host deployment is unaffected.
-if ($RegisterRevocationSync) {
+if ($registerSync) {
     Write-Output ""
     Register-RevocationSyncTask
 }
@@ -369,8 +400,9 @@ if (-not $WhatIfPreference) {
     Write-Output "Validation -- registered tasks:"
     # Get-ScheduledTask matches the leaf name via -TaskName + the folder via
     # -TaskPath; passing the full "\folder\name" as -TaskName does NOT match.
-    $names = @($tasks | ForEach-Object { $_.Name })
-    if ($RegisterRevocationSync) { $names += 'acme-adcs-ra-sync-revocations' }
+    $names = @()
+    if ($registerGeneral) { $names += @($tasks | ForEach-Object { $_.Name }) }
+    if ($registerSync) { $names += 'acme-adcs-ra-sync-revocations' }
     foreach ($name in $names) {
         $t = Get-ScheduledTask -TaskName $name -TaskPath $TaskFolder -ErrorAction SilentlyContinue
         if ($t) {

@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from fastapi import Request
@@ -53,6 +55,47 @@ _ACME_PATHS = {
 }
 
 
+class ActiveEnrollments:
+    """Order IDs with a live enrollment worker in *this* process.
+
+    The RA is a single application process (threat-model assumption). An
+    enrollment runs on a threadpool thread inside that process and holds its
+    order in ``processing`` for the whole life of the ADCS call sequence. This
+    registry is therefore an authoritative, in-memory answer to "is a worker
+    enrolling this order right now" — which elapsed time can only approximate.
+
+    The admin reclaim endpoint consults it to refuse reclaiming a genuinely
+    live enrollment, independent of how long enrollment has run. That closes
+    the double-issuance race where a reclaim fired during a slow (multi-call,
+    up to ~4×30s) enrollment flipped the order back to ``ready`` and let the
+    client drive a second CA issuance.
+
+    It deliberately does NOT survive a process restart: after a crash the set is
+    empty, which is correct — a crashed worker is exactly the wedged-``processing``
+    case reclaim exists to recover, and that path additionally requires the
+    operator's explicit CA-checked assertion (see the reclaim endpoint).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: set[str] = set()
+
+    @contextmanager
+    def enrolling(self, order_id: str) -> Iterator[None]:
+        """Mark ``order_id`` as actively enrolling for the duration of the block."""
+        with self._lock:
+            self._active.add(order_id)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active.discard(order_id)
+
+    def is_active(self, order_id: str) -> bool:
+        with self._lock:
+            return order_id in self._active
+
+
 @dataclass
 class ServerContext:
     """Dependencies shared across every request."""
@@ -62,6 +105,11 @@ class ServerContext:
     policy: IssuancePolicy
     enrollment: EnrollmentLeg
     revocation: RevocationLeg
+    # Order IDs with a live enrollment worker in this process. The admin
+    # reclaim endpoint consults it to refuse reclaiming an in-flight
+    # enrollment (which would double-issue at the CA). Process-local by
+    # design; see ActiveEnrollments.
+    active_enrollments: ActiveEnrollments = field(default_factory=ActiveEnrollments)
     # Optional extension hook for SIEM emission (Phase 3).  Called after the
     # audit row is persisted, unconditionally, for every issuance event.
     # When None, create_app wires the default SIEM emitter from config.

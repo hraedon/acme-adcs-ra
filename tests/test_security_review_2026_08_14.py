@@ -243,16 +243,63 @@ class TestReclaimRefusesLiveEnrollment:
         self, tmp_path: Path
     ) -> None:
         """The negative control: the endpoint must still do its job. Without
-        this, refusing everything would pass the test above."""
+        this, refusing everything would pass the test above. The no-cert branch
+        now requires the operator's explicit CA-checked assertion."""
         store, client, order_id = self._processing_order(tmp_path, age_seconds=3600)
         resp = client.post(
-            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            f"/acme/admin/orders/{order_id}/reclaim-processing"
+            "?ca_verified_no_issuance=true",
             headers={"Authorization": f"Bearer {_ADMIN_TOKEN}"},
         )
         assert resp.status_code == 200
         order = store.get_order(order_id)
         assert order is not None
         assert order.status == "ready"
+
+    def test_reclaim_to_ready_requires_ca_verification_assertion(
+        self, tmp_path: Path
+    ) -> None:
+        """Elapsed time is not proof the CA did not issue. Reclaiming a
+        no-cert order to ``ready`` must require the operator to assert they
+        reconciled against the CA; without it, refuse and leave it processing."""
+        store, client, order_id = self._processing_order(tmp_path, age_seconds=3600)
+        resp = client.post(
+            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            headers={"Authorization": f"Bearer {_ADMIN_TOKEN}"},
+        )
+        assert resp.status_code == 400
+        order = store.get_order(order_id)
+        assert order is not None
+        assert order.status == "processing"
+        denied = store.list_audit_events(event_type="admin-order-reclaim-denied")
+        assert any(
+            e["details"].get("reason") == "ca-verification-not-asserted"
+            for e in denied
+        )
+
+    def test_reclaim_refused_while_a_worker_is_actively_enrolling(
+        self, tmp_path: Path
+    ) -> None:
+        """The authoritative guard: a live enrollment worker in this process
+        holds the order in the in-memory registry. Reclaim must refuse it even
+        past the age window and even with the CA-checked flag set, because the
+        first enrollment is genuinely in flight and reclaiming would double-issue."""
+        store, client, order_id = self._processing_order(tmp_path, age_seconds=3600)
+        ctx = client.app.state.context
+        with ctx.active_enrollments.enrolling(order_id):
+            resp = client.post(
+                f"/acme/admin/orders/{order_id}/reclaim-processing"
+                "?ca_verified_no_issuance=true",
+                headers={"Authorization": f"Bearer {_ADMIN_TOKEN}"},
+            )
+        assert resp.status_code == 400
+        order = store.get_order(order_id)
+        assert order is not None
+        assert order.status == "processing"
+        denied = store.list_audit_events(event_type="admin-order-reclaim-denied")
+        assert any(
+            e["details"].get("reason") == "enrollment-in-flight" for e in denied
+        )
 
 
 class TestOneAccountPerKey:
@@ -418,10 +465,16 @@ class TestUnauthenticatedResourceGetIsControllable:
     The existing docs justified them as "not an existence oracle, the URL is
     unguessable". True, and beside the point: they also answer for a
     certificate whose account has been deactivated or whose EAB kid has been
-    pulled, so a URL captured before an eviction still reads. The operator now
-    has a switch; the default stays on pending the lab run (see the config
-    comment), which is why both directions are pinned here.
+    pulled, so a URL captured before an eviction still reads. The operator has
+    a switch, and as of the 2026-08-15 review it defaults OFF (finding 4);
+    both directions plus the default are pinned here.
     """
+
+    def test_the_production_default_is_off(self) -> None:
+        """Secure by default: a fresh RAConfig must have the legacy GET off."""
+        from acme_adcs_ra.config import RAConfig
+
+        assert RAConfig(base_url="http://testserver").allow_unauthenticated_resource_get is False
 
     def _issued_cert_url(self, client: Any, tmp_path: Path) -> str:
         from cryptography.hazmat.primitives.asymmetric import rsa

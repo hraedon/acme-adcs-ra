@@ -17,6 +17,24 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
+# RSA account-key bounds, enforced in _public_key_from_jwk before the key is
+# built or any signature is verified. The minimum blocks factorable legacy
+# keys (possession of the public JWK would otherwise become eventual account
+# takeover). The maximum modulus and the exponent allowlist bound the cost of
+# the *unauthenticated* newAccount public-key operation: newAccount verifies an
+# attacker-chosen n/e before it reads any EAB credential, and the 64 KiB JWS
+# body cap does not bound compute (a 64 KiB body still admits a ~290 kbit
+# modulus). The installed OpenSSL happens to reject oversized moduli and
+# short-circuit huge exponents today, but that is incidental to the backend;
+# enforcing the bound here keeps the guarantee in our own code.
+_RSA_MIN_MODULUS_BITS = 2048
+_RSA_MAX_MODULUS_BITS = 16384
+# 65537 is what every ACME client generates; 3 is retained as a deliberate
+# compatibility choice and is equally cost-safe (a tiny exponent). Both are far
+# below any DoS threshold — the allowlist exists to reject the *large* exponent,
+# not the small one.
+_RSA_ALLOWED_EXPONENTS = frozenset({3, 65537})
+
 
 class JWSValidationError(Exception):
     """Raised when a JWS fails structural or cryptographic validation."""
@@ -99,15 +117,27 @@ def _public_key_from_jwk(jwk: dict[str, Any]) -> rsa.RSAPublicKey | ec.EllipticC
     if kty == "RSA":
         n = int.from_bytes(_base64url_decode(cast(str, jwk["n"])), "big")
         e = int.from_bytes(_base64url_decode(cast(str, jwk["e"])), "big")
-        key = rsa.RSAPublicNumbers(e=e, n=n).public_key()
-        # Account keys authorize issuance and revocation for their full
-        # lifetime.  Accepting a factorable legacy RSA key turns possession of
-        # the public JWK into eventual account takeover.
-        if key.key_size < 2048:
+        # Bound the public-key operation on the decoded integers, BEFORE
+        # constructing the key or verifying a signature — this runs on
+        # unauthenticated, attacker-chosen n/e ahead of any EAB check. See the
+        # _RSA_* constants above for the rationale behind each bound.
+        modulus_bits = n.bit_length()
+        if modulus_bits < _RSA_MIN_MODULUS_BITS:
             raise JWSValidationError(
-                f"RSA account key size {key.key_size} is below the 2048-bit minimum"
+                f"RSA account key size {modulus_bits} is below the "
+                f"{_RSA_MIN_MODULUS_BITS}-bit minimum"
             )
-        return key
+        if modulus_bits > _RSA_MAX_MODULUS_BITS:
+            raise JWSValidationError(
+                f"RSA account key size {modulus_bits} exceeds the "
+                f"{_RSA_MAX_MODULUS_BITS}-bit maximum"
+            )
+        if e not in _RSA_ALLOWED_EXPONENTS:
+            raise JWSValidationError(
+                f"RSA public exponent {e} is not a supported value "
+                f"(supported: {sorted(_RSA_ALLOWED_EXPONENTS)})"
+            )
+        return rsa.RSAPublicNumbers(e=e, n=n).public_key()
     if kty == "EC":
         crv = cast(str, jwk.get("crv"))
         curve_map: dict[str, ec.EllipticCurve] = {

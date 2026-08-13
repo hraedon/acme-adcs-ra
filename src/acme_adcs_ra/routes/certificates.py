@@ -35,15 +35,15 @@ async def get_certificate(
 ) -> Response:
     """Unauthenticated read of a certificate by its unguessable URL.
 
-    **Gated by config.** Controlled by
-    ``ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET`` (default on, pending the lab
-    run — see the config comment). for a client that cannot do
-    POST-as-GET. It was justified as "not an existence oracle, the URL is
-    unguessable", which is true and beside the point: it also answers for a
-    certificate whose account has been *deactivated*, or whose EAB kid has been
-    pulled from the allowlist. Kid eviction is supposed to be complete and is
-    re-checked on every authenticated request — but a URL captured before the
-    eviction still reads through here.
+    **Gated by config, default OFF.** Controlled by
+    ``ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET`` (default False as of the
+    2026-08-15 review — see the config comment). Retained only for a client
+    that cannot do POST-as-GET. It was justified as "not an existence oracle,
+    the URL is unguessable", which is true and beside the point: it also
+    answers for a certificate whose account has been *deactivated*, or whose
+    EAB kid has been pulled from the allowlist. Kid eviction is supposed to be
+    complete and is re-checked on every authenticated request — but a URL
+    captured before the eviction still reads through here.
     """
     if not ctx.config.allow_unauthenticated_resource_get:
         raise unauthorized("use POST-as-GET (RFC 8555 §7.4.2)")

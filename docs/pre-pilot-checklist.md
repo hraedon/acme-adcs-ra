@@ -263,20 +263,23 @@ engineered to. Until then it has not — regardless of a green local test run.
         be set from the CA's real cadence (≥ `CRLPeriod` + overlap), not left at
         the default; the freshness gate itself was confirmed live (a 1-second
         ceiling refuses the real CRL).
-  - [ ] **`Register-MaintenanceTasks.ps1` re-introduces the admin token on the
-        revocation host.** `-AdminToken` is mandatory and is always written into
+  - [x] **`Register-MaintenanceTasks.ps1` re-introduces the admin token on the
+        revocation host.** `-AdminToken` was mandatory and always written into
         the revocation-sync task action as `$env:ACME_ADMIN_TOKEN`, even when a
-        confirm token is supplied — which undoes, at deployment time, the
-        authority split the confirm token exists to create. The agent itself
-        needs only `-ConfirmToken` (proven above); the registration script is
-        what forces the broader credential onto the host.
-  - [ ] **The pilot-client question is still unanswered.**
+        confirm token was supplied — which undoes, at deployment time, the
+        authority split the confirm token exists to create. **Resolved in the
+        2026-08-15 review (finding 3):** `-AdminToken` is now optional, and
+        `-RevocationSyncOnly -ConfirmToken …` registers only the sync task with
+        zero admin-token bytes in its action. See docs/operations.md.
+  - [ ] **The pilot-client question is still unanswered (default now flipped).**
         `allow_unauthenticated_resource_get` was exercised both ways: with it
         **off**, a complete order still issues through POST-as-GET only, and
-        both GET forms answer 401. So the RA is complete without them. But
-        **Certify the Web is not installed in this lab**, so nothing here
-        establishes whether the pilot client can do POST-as-GET, which is the
-        only reason the default is still `True`.
+        both GET forms answer 401. So the RA is complete without them.
+        **As of the 2026-08-15 review (finding 4) the default is now `False`**
+        (secure by default; the gated code path is retained). What remains is
+        the client-side proof: **Certify the Web is not installed in this lab**,
+        so confirm the pilot client completes issuance with the legacy GET off,
+        then remove the plain GET forms entirely.
 
   **Lab returned to its pre-run state** (verified, not assumed): CA security
   descriptor byte-identical at 224 bytes with its four original ACEs,
@@ -425,13 +428,14 @@ engineered to. Until then it has not — regardless of a green local test run.
         (≥ `CRLPeriod` + overlap). The gate itself is live — a 1-second ceiling
         refuses the real CRL, and the default accepts it.
   - [ ] **Does the pilot client need the unauthenticated GET forms?**
-        `allow_unauthenticated_resource_get` was left defaulting to **True**
-        deliberately, because the docs claim these routes were retained for an
-        observed client need and flipping blind risked breaking the proven
-        client. Set it to `false`, run a full Certify the Web round-trip, and
-        record the result. If the client is fine, **the default should become
-        False.** (The test harness already drives a complete order to issuance
-        with the GET form disabled, so the RA itself is complete without it.)
+        `allow_unauthenticated_resource_get` **now defaults to `False`** as of
+        the 2026-08-15 review (finding 4) — secure by default, with the gated
+        code path retained. The remaining work is client-side proof: run a full
+        Certify the Web round-trip against the default (GET off) and record the
+        result. If the client completes via POST-as-GET, **remove the plain GET
+        forms entirely.** (The test harness already drives a complete order to
+        issuance with the GET form disabled, so the RA itself is complete
+        without it.)
   - [x] **The revocation agent runs with only `-ConfirmToken`.** No admin token
         on the revocation host: confirm the pending-list read still works and
         the whole loop completes.

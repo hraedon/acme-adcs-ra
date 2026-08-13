@@ -390,6 +390,25 @@ the pending list. Set it before promoting the revocation loop to `-Execute`.
 Set it the same way as the admin token (own value, `acme-ra.env`, app-pool
 restart), and pass it to the agent as `-ConfirmToken` (or `ACME_CONFIRM_TOKEN`).
 
+**Registering the revocation-sync task least-privilege (dedicated host).** On a
+separate revocation host, register **only** the sync task and give it **only**
+the confirm token — the confirm token alone is sufficient authority for the whole
+sync workflow (reading the pending list and confirming serials). Use
+`-RevocationSyncOnly` so the general nonce/sweep tasks (which need the admin
+token) are not registered there, and omit `-AdminToken` entirely:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
+    -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
+    -RevocationSyncOnly -ConfirmToken "REPLACE-WITH-CONFIRM-TOKEN" `
+    -CaConfig 'CA01\WORK-DOMAIN-CA' -RequesterName "WORK-DOMAIN\gMSA-acme-ra$"
+```
+
+The generated task action then carries zero admin-token bytes, so a compromise
+of the revocation host cannot reach order reclaim or nonce cleanup. Passing
+`-AdminToken` remains supported for a single-host deployment that has not split
+the credentials, and for the general tasks on the RA host.
+
 ### Optional: independent CRL evidence for confirmations
 
 By default a confirmation is recorded honestly as `verification:
@@ -419,24 +438,37 @@ up. The serial simply stays pending and the next sync cycle confirms it.
 ### The reclaim endpoint (double-issuance gate)
 
 `POST /acme/admin/orders/{id}/reclaim-processing` (admin-token-gated)
-reconciles an order wedged in `processing` after a crash mid-enrollment. It
-has two branches:
+reconciles an order wedged in `processing` after a crash mid-enrollment.
+
+**Live enrollments are refused authoritatively.** The RA keeps an in-process
+registry of orders with a live enrollment worker; if one is running for this
+order, reclaim is refused (`-denied`, `reason=enrollment-in-flight`) regardless
+of how long it has been processing. This is what makes reclaiming a genuinely
+in-flight enrollment — and thus double-issuing — impossible in the single-process
+deployment, rather than relying on an elapsed-time heuristic. A secondary age
+floor (`reclaim_minimum_processing_age_seconds`, default 60s) still applies as
+defence-in-depth.
+
+For a wedged order (no live worker) it has two branches:
 
 - **Cert recorded, status flip missed** (crash window between
   `create_certificate` and the status flip): the endpoint CAS-closes the
-  loop to `valid` (`admin-order-reclaimed`, `had_certificate=true`). No
+  loop to `valid` (`admin-order-reclaimed`, `had_certificate=true`). Always
+  allowed — a recorded cert is authoritative proof issuance happened. No
   re-enrollment, no operator judgment needed.
-- **No cert recorded** (enrollment did not visibly complete): the endpoint
-  CAS-reverts the order to `ready` (`admin-order-reclaimed`,
-  `had_certificate=false`). **Before this `ready` branch the operator MUST
-  confirm from the ADCS CA database that no cert was issued for the order's
-  ReqID** — this is the one operator action that can enable a re-enroll, and
-  it is the operator's double-issuance gate, not the server's. Re-finalizing
-  would otherwise double-issue if the CA accepted the first request and the
-  RA crashed before recording the cert.
+- **No cert recorded** (enrollment did not visibly complete): reverting to
+  `ready` lets the client re-enroll, so the endpoint **refuses unless the
+  operator passes `?ca_verified_no_issuance=true`**, asserting they have
+  confirmed at the ADCS CA database that no cert was issued for the order's
+  ReqID. Absence of a cert row does **not** prove non-issuance (a crash after
+  the CA committed leaves exactly this state), and elapsed time proves nothing —
+  so the assertion is now enforced by the server, not merely documented. Without
+  it the attempt is refused (`-denied`, `reason=ca-verification-not-asserted`)
+  and the order stays `processing`. The assertion is recorded on the success
+  audit (`ca_verified_no_issuance`).
 
-No-op, lost-race, and not-found reclaim attempts are audited
-(`admin-order-reclaim-noop` / `-denied`) so a stolen admin token probing
+No-op, lost-race, in-flight, unverified, and not-found reclaim attempts are all
+audited (`admin-order-reclaim-noop` / `-denied`) so a stolen admin token probing
 order IDs is visible to SIEM.
 
 ## Monitoring and SLOs

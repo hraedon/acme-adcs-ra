@@ -736,7 +736,10 @@ class TestQuarantineIsNotServable:
         self, tmp_path: Path
     ) -> None:
         store, record = self._quarantined(tmp_path)
-        cfg = _config(tmp_path)
+        # Enable the legacy GET so this exercises the quarantine refusal itself
+        # (410) rather than the default POST-as-GET gate (401); the point of the
+        # test is that a quarantined cert is not served through the plain route.
+        cfg = _config(tmp_path, allow_unauthenticated_resource_get=True)
         ctx = ServerContext(
             config=cfg,
             store=store,

@@ -339,16 +339,18 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   second crypto authorization path to a security endpoint for a client that
   never uses it would widen surface for no operational gain — recorded here
   as a deliberate non-goal, reversible if a future client needs it.
-- **Cert-URL discoverability (narrowed 2026-08-11):** the cert URL remains in
-  the order JSON after revocation (the URL is 128-bit unguessable); the *body*
-  is 410. `GET /acme/cert/{id}` and `GET /acme/authz/{id}` are still plain,
-  unauthenticated GETs of unguessable URLs, retained for the clients this RA was
-  proven against; for a holder of the URL, **401 vs 410 vs 200 leaks
-  existence**. **Account-scoped `POST`-as-`GET` forms now exist for both** (RFC
-  8555 §6.3), along with the order and account resources, so a conforming client
-  never needs the unauthenticated path and the oracle is avoidable rather than
-  inherent. Retiring the plain GETs is a future breaking change, gated on
-  confirming no deployed client uses them.
+- **Cert-URL discoverability (narrowed 2026-08-11; default flipped 2026-08-15):**
+  the cert URL remains in the order JSON after revocation (the URL is 128-bit
+  unguessable); the *body* is 410. `GET /acme/cert/{id}` and `GET /acme/authz/{id}`
+  are the plain, unauthenticated GET forms; for a holder of the URL, **401 vs 410
+  vs 200 leaks existence**, and they also bypass account deactivation and EAB-kid
+  eviction. As of the 2026-08-15 review (finding 4) they are **disabled by
+  default** (`allow_unauthenticated_resource_get=False`); the code path is
+  retained but gated for a client known not to support POST-as-GET. **Account-scoped
+  `POST`-as-`GET` forms exist for both** (RFC 8555 §6.3), along with the order and
+  account resources, so a conforming client never needs the unauthenticated path.
+  Retiring the plain GETs entirely is a future breaking change, gated on confirming
+  the pilot client (Certify the Web) uses POST-as-GET.
 - **Residual:** a compromised issuing account can revoke its own certs (denial
   of availability for that account's services). Bounded; audited.
 - **CA-side revocation is out-of-band, operator-runbook'd (WI-010, decided

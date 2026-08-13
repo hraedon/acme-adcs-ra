@@ -163,6 +163,7 @@ async def reclaim_processing_order(
     order_id: str,
     request: Request,
     ctx: ServerContext = Depends(get_context),
+    ca_verified_no_issuance: bool = False,
 ) -> JSONResponse:
     _require_admin_token(request, ctx)
     order = ctx.store.get_order(order_id)
@@ -189,19 +190,31 @@ async def reclaim_processing_order(
         )
         return JSONResponse(content=_order_to_json(order))
 
-    # A minimum age before an order may be reclaimed.
-    #
-    # The only machine check below is "no certificate row exists" — which is
-    # equally true of an order whose enrollment is still IN FLIGHT, because the
-    # row is not written until the CA answers. Reclaiming such an order flips it
-    # back to `ready`, a client finalize re-enrolls, and the CA issues a SECOND
-    # certificate; the in-flight first one then loses the UNIQUE(order_id) race
-    # and becomes an untracked orphan at the CA. The docstring says the operator
-    # has checked the CA database first, but nothing enforced that, and a
-    # 30-second CA call is exactly when someone reaches for this endpoint.
-    #
-    # The guard is time, because time is the only signal the RA has: an order
-    # cannot still be enrolling long after the enrollment leg's own timeout.
+    # Authoritative liveness check FIRST. The RA is a single process, and a
+    # live enrollment holds its order in this in-memory registry for the whole
+    # ADCS call sequence (see finalize._finalize_submit_enrollment). If a worker
+    # is enrolling this order right now, reclaiming it back to `ready` would let
+    # the client drive a SECOND CA issuance while the first is still in flight —
+    # the loser then becomes an untracked orphan at the CA. Elapsed time cannot
+    # see this; the registry can. Refuse regardless of age.
+    if ctx.active_enrollments.is_active(order_id):
+        _audit(ctx,
+            event_type="admin-order-reclaim-denied",
+            order_id=order_id,
+            account_id=order.account_id,
+            outcome="failed",
+            details={"reason": "enrollment-in-flight"},
+        )
+        raise malformed(
+            "an enrollment worker for this order is running in this process "
+            "right now; reclaim is refused because it would cause double "
+            "issuance. Wait for the enrollment to finish or fail."
+        )
+
+    # Secondary age floor, defence-in-depth behind the registry. A live worker
+    # is already refused above; this additionally refuses a hasty reclaim within
+    # the enrollment window even in a (future) multi-process deployment where the
+    # registry would not see another process's worker.
     age_seconds = ctx.store.processing_age_seconds(order_id)
     minimum = ctx.config.reclaim_minimum_processing_age_seconds
     if age_seconds is not None and age_seconds < minimum:
@@ -226,14 +239,37 @@ async def reclaim_processing_order(
     existing_cert = ctx.store.get_certificate_by_order(order_id)
     if existing_cert is not None:
         # Enrollment succeeded but the status flip was missed — close the
-        # loop safely (no re-enrollment, no double-issuance).
+        # loop safely (no re-enrollment, no double-issuance). Always allowed:
+        # a recorded certificate is authoritative proof issuance happened.
         certificate_url = _certificate_url(ctx, existing_cert.id)
         applied = ctx.store.transition_processing_to_valid(order_id, certificate_url)
         new_status = OrderStatus.VALID
         had_certificate = True
     else:
-        # No cert recorded — the operator has verified at the ADCS CA DB
-        # that no cert was issued for this request before calling this.
+        # No cert recorded. This is the dangerous branch: reclaiming to `ready`
+        # lets the client re-enroll, and the *absence* of a cert row does NOT
+        # prove the CA did not issue — the wedged order may have crashed after
+        # the CA committed but before the row was written. Elapsed time cannot
+        # prove non-issuance either. Require the operator to explicitly assert
+        # they have reconciled against the ADCS CA database that no certificate
+        # exists for this order; without that assertion, refuse rather than
+        # silently trust time.
+        if not ca_verified_no_issuance:
+            _audit(ctx,
+                event_type="admin-order-reclaim-denied",
+                order_id=order_id,
+                account_id=order.account_id,
+                outcome="failed",
+                details={"reason": "ca-verification-not-asserted"},
+            )
+            raise malformed(
+                "reclaiming this order to 'ready' lets the client re-enroll. "
+                "No certificate row exists, but that does not prove the CA did "
+                "not issue one (a crash after the CA committed leaves exactly "
+                "this state), and elapsed time proves nothing. Retry with "
+                "?ca_verified_no_issuance=true only after confirming at the "
+                "ADCS CA database that no certificate was issued for this order."
+            )
         applied = ctx.store.transition_processing_to_ready(order_id)
         new_status = OrderStatus.READY
         had_certificate = False
@@ -258,6 +294,7 @@ async def reclaim_processing_order(
         details={
             "new_status": new_status,
             "had_certificate": had_certificate,
+            "ca_verified_no_issuance": ca_verified_no_issuance,
         },
     )
     refreshed = _refresh_order_or_500(ctx, order_id, "after reclaim")

@@ -194,6 +194,56 @@ class TestJWSVerify:
         rebuilt = _public_key_from_jwk(jwk)
         assert isinstance(rebuilt, ec.EllipticCurvePublicKey)
 
+    def test_oversized_rsa_modulus_rejected(self) -> None:
+        # A 64 KiB JWS body admits a modulus far larger than any real key.
+        # Reject it on the raw integer, before RSAPublicNumbers.public_key()
+        # or any verify runs — the newAccount DoS bound must not depend on the
+        # crypto backend rejecting the key for us.
+        oversized_n = (1 << 16384) | 1  # 16385 bits, one over the maximum
+        jwk = {
+            "kty": "RSA",
+            "n": _base64url_encode(
+                oversized_n.to_bytes((oversized_n.bit_length() + 7) // 8, "big")
+            ),
+            "e": _base64url_encode((65537).to_bytes(3, "big")),
+        }
+        with pytest.raises(JWSValidationError, match="exceeds the 16384-bit maximum"):
+            _public_key_from_jwk(jwk)
+
+    def test_unsupported_rsa_exponent_rejected(self) -> None:
+        # A large attacker-chosen exponent is the other asymmetric-work lever;
+        # reject anything outside the allowlist before the key is built.
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        n = key.public_key().public_numbers().n
+        huge_e = (1 << 4096) | 1  # well-formed but not 3 or 65537
+        jwk = {
+            "kty": "RSA",
+            "n": _base64url_encode(n.to_bytes((n.bit_length() + 7) // 8, "big")),
+            "e": _base64url_encode(huge_e.to_bytes((huge_e.bit_length() + 7) // 8, "big")),
+        }
+        with pytest.raises(JWSValidationError, match="not a supported value"):
+            _public_key_from_jwk(jwk)
+
+    def test_standard_rsa_exponents_accepted(self) -> None:
+        # 65537 (universal) and 3 (retained compatibility choice) must both
+        # still build; the allowlist targets only the oversized exponent.
+        for public_exponent in (3, 65537):
+            key = rsa.generate_private_key(
+                public_exponent=public_exponent, key_size=2048
+            )
+            numbers = key.public_key().public_numbers()
+            jwk = {
+                "kty": "RSA",
+                "n": _base64url_encode(
+                    numbers.n.to_bytes((numbers.n.bit_length() + 7) // 8, "big")
+                ),
+                "e": _base64url_encode(
+                    numbers.e.to_bytes((numbers.e.bit_length() + 7) // 8, "big")
+                ),
+            }
+            rebuilt = _public_key_from_jwk(jwk)
+            assert isinstance(rebuilt, rsa.RSAPublicKey)
+
 
 class TestEABVerify:
     def test_valid_eab_hs256(self, rsa_key: rsa.RSAPrivateKey) -> None:

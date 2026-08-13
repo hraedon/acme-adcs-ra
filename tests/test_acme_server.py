@@ -44,6 +44,9 @@ def _make_test_config(tmp_path: Path) -> RAConfig:
             "kid-002": {"dns_patterns": ["*.prod.WORK-DOMAIN.local"]},
         },
         adcs_template="ACME-ServerAuth",
+        # Flow tests read cert/authz via plain GET for convenience; the
+        # production default is False (2026-08-15 review, finding 4).
+        allow_unauthenticated_resource_get=True,
         admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
         revocation_confirm_token=SecretStr("test-confirm-token-0123456789abcdef-32+"),
     )
@@ -1598,8 +1601,11 @@ class TestStuckProcessingReclaim:
         _force_order_status(store, order_id, "processing")
         assert store.get_certificate_by_order(order_id) is None
 
+        # The no-cert branch requires the operator's explicit CA-checked
+        # assertion (absence of a cert row does not prove non-issuance).
         resp = client.post(
-            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            f"/acme/admin/orders/{order_id}/reclaim-processing"
+            "?ca_verified_no_issuance=true",
             headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
@@ -1720,9 +1726,11 @@ class TestStuckProcessingReclaim:
         assert leg.submit_csr_call_count == 0
         assert store.get_certificate_by_order(order_id) is None
 
-        # Operator (having confirmed no cert at the CA) reclaims to ready.
+        # Operator (having confirmed no cert at the CA) reclaims to ready,
+        # asserting the CA-checked reconciliation the endpoint now requires.
         resp = client.post(
-            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            f"/acme/admin/orders/{order_id}/reclaim-processing"
+            "?ca_verified_no_issuance=true",
             headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200

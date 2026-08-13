@@ -25,8 +25,9 @@ async def get_authorization(
 ) -> JSONResponse:
     """Unauthenticated read of an authorization by its unguessable URL.
 
-    **Gated by config.** — see the certificate GET for the reasoning.
-    Controlled by ``ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET``.
+    **Gated by config, default OFF** (2026-08-15 review, finding 4) — see the
+    certificate GET for the reasoning. Controlled by
+    ``ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET``.
     """
     if not ctx.config.allow_unauthenticated_resource_get:
         raise unauthorized("use POST-as-GET (RFC 8555 §6.3)")

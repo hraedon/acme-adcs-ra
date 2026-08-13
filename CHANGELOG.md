@@ -4,6 +4,35 @@ All notable changes to acme-adcs-ra are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security — 2026-08-15 external scan (four findings)
+
+A third external scan (Codex, with Daybreak Blue), of `v1.9.1` at `5468e0f` —
+three medium, one low, none high. Every finding was reproduced before any code
+changed. See `docs/security-review-2026-08-15.md` for the full validation,
+including the one finding whose stated DoS impact did not survive measurement.
+
+- **Reclaim can no longer race a live enrollment (finding 2).** The reclaim
+  endpoint now refuses any order with a live in-process enrollment worker
+  (authoritative, age-independent), and the `processing → ready` recovery branch
+  requires an explicit `?ca_verified_no_issuance=true` operator assertion rather
+  than trusting elapsed time. Closes a double-issuance race.
+- **Revocation-task registration is least-privilege (finding 3).** `-AdminToken`
+  is now optional; `-RevocationSyncOnly -ConfirmToken …` registers only the sync
+  task with **zero admin-token bytes** in its action, so a dedicated revocation
+  host no longer carries unrelated maintenance authority.
+- **Legacy unauthenticated GET is off by default (finding 4).**
+  `allow_unauthenticated_resource_get` now defaults to `False` (secure by
+  default). The gated code path is retained; re-enable with
+  `ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET=true` only for a client that
+  cannot do POST-as-GET. Removal of the plain GET forms is pending a Certify the
+  Web POST-as-GET confirmation.
+- **RSA account-key bounds (finding 1, defence-in-depth).**
+  `_public_key_from_jwk` now bounds the modulus to `[2048, 16384]` bits and the
+  public exponent to `{3, 65537}` before constructing the key, rather than
+  relying on the crypto backend to reject oversized values.
+
 ## [1.9.1] — 2026-08-14
 
 > **The release of the 1.9 line.** 1.9.0 never shipped: it existed only as

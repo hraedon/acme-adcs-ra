@@ -249,19 +249,18 @@ class RAConfig(BaseSettings):
     # deactivated, or whose EAB kid has been pulled from the allowlist. Kid
     # eviction is meant to be a complete eviction, re-checked on every
     # authenticated request; a URL held from before the eviction still reads
-    # through the GET form.
+    # through the GET form, bypassing that eviction.
     #
-    # Defaulted True — deliberately, against this project's usual preference for
-    # the stricter default — because the existing docs record these routes as
-    # retained "for compatibility with the clients this RA was proven against",
-    # i.e. an actual observed need, and no evidence here says whether Certify
-    # the Web can do POST-as-GET. Flipping the default blind, immediately before
-    # a lab re-proof, would risk breaking the proven client for a low-severity
-    # oracle. The lab run should establish whether the pilot client needs it;
-    # if it does not, this default should become False.
-    #
-    # Set to False now if your client is known to use POST-as-GET.
-    allow_unauthenticated_resource_get: bool = True
+    # Defaulted False (2026-08-15 review, finding 4): secure by default, in
+    # line with this project's usual preference for the stricter default. The
+    # RA's own POST-as-GET path is proven to complete a full order→certificate
+    # flow with this off (see the security-review regression tests), so the
+    # only compatibility question is client-side. The legacy GET code path is
+    # retained but gated: set this True to re-enable it for a client that is
+    # known NOT to support POST-as-GET. The pending lab re-proof now validates
+    # the secure (default-off) configuration; if Certify the Web is confirmed
+    # to use POST-as-GET, the legacy GET forms should be removed entirely.
+    allow_unauthenticated_resource_get: bool = False
 
     @model_validator(mode="after")
     def _no_duplicate_eab_kids(self) -> RAConfig:

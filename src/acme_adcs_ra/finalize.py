@@ -270,6 +270,28 @@ def _finalize_submit_enrollment(
     Raises on unrecoverable error.
     """
     csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+    # Register the order as actively enrolling for the whole duration below —
+    # the ADCS call sequence AND the outcome handling that follows it (store
+    # transition / quarantine). While this is held, the admin reclaim endpoint
+    # will refuse to reclaim this order, which is what prevents a reclaim fired
+    # during a slow enrollment from driving a second CA issuance. The order is
+    # only released once its terminal state (valid / ready-reverted / quarantined)
+    # is durably written, so there is no window in which it is both inactive and
+    # still wedged in `processing` without a certificate row.
+    with ctx.active_enrollments.enrolling(order_id):
+        return _submit_enrollment_inner(
+            ctx, order_id, account_id, requested_sans, csr_pem, decision
+        )
+
+
+def _submit_enrollment_inner(
+    ctx: ServerContext,
+    order_id: str,
+    account_id: str,
+    requested_sans: list[str],
+    csr_pem: str,
+    decision: PolicyDecision,
+) -> EnrollmentResult | JSONResponse:
     try:
         return ctx.enrollment.submit_csr(
             csr_pem,

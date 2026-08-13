@@ -128,3 +128,39 @@ Describe 'Build-SyncActionCommand confirm token' {
         $cmd | Should -Not -BeLike '*"*'
     }
 }
+
+Describe 'Build-SyncActionCommand confirm-only least privilege' {
+    # 2026-08-15 review, finding 3: a dedicated revocation host registered with
+    # only a confirm token must get a task action carrying ZERO admin-token
+    # bytes. The confirm token alone is sufficient authority for the whole sync
+    # workflow; embedding the admin token would grant unrelated maintenance
+    # authority (order reclaim, nonce drain) on the separate host.
+
+    It 'Omits ACME_ADMIN_TOKEN entirely when no admin token is supplied' {
+        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token '' `
+            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
+            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
+            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
+        $cmd | Should -Not -BeLike '*ACME_ADMIN_TOKEN*'
+    }
+
+    It 'Contains no bytes of a would-be admin token in confirm-only mode' {
+        $adminSecret = 'super-secret-admin-token-deadbeef'
+        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token '' `
+            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
+            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
+            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
+        # The confirm token IS present; the admin secret must not be.
+        $cmd | Should -BeLike "*`$env:ACME_CONFIRM_TOKEN = 'confirm-tok'*"
+        $cmd.Contains($adminSecret) | Should -BeFalse
+    }
+
+    It 'Still invokes the sync script with -Execute in confirm-only mode' {
+        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token '' `
+            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
+            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
+            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
+        $cmd.Contains("& 'C:\s\Sync-Revocations.ps1'") | Should -BeTrue
+        $cmd | Should -Match '-Execute'
+    }
+}

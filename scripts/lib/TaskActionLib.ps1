@@ -38,6 +38,13 @@ try {
 #   2. The admin token is passed via the environment ($env:ACME_ADMIN_TOKEN),
 #      NOT as a -AdminToken parameter, so it never lands on Sync-Revocations.ps1's
 #      process command line. Sync-Revocations.ps1 reads the env fallback.
+#      It is emitted ONLY when a non-empty admin token is supplied: the confirm
+#      token alone is sufficient authority for the whole sync workflow, so a
+#      dedicated revocation host registered with -ConfirmToken but no
+#      -AdminToken gets a task action carrying zero admin-token bytes. The
+#      broader token would otherwise sit in that host's persistent task command
+#      and grant unrelated maintenance authority (order reclaim, nonce drain)
+#      that this agent has no use for.
 # The single-quoted literals assume the token / URL / CA config contain no
 # single quote -- the same assumption the nonce/sweep action already makes.
 #   3. The dedicated revocation-confirmation token travels the same way
@@ -48,6 +55,7 @@ function Build-SyncActionCommand([string]$BaseUrl, [string]$Token, [string]$CaCo
     $localFlag = if ($Local) { " -LocalMode" } else { "" }
     $modeFlag = if ($DryRunMode) { " -DryRun" } else { " -Execute" }
     $crlFlag = if ($PublishCrlMode) { " -PublishCrl" } else { "" }
+    $adminEnv = if ([string]::IsNullOrWhiteSpace($Token)) { "" } else { "`$env:ACME_ADMIN_TOKEN = '$Token'; " }
     $confirmEnv = if ([string]::IsNullOrWhiteSpace($ConfirmTokenValue)) { "" } else { "`$env:ACME_CONFIRM_TOKEN = '$ConfirmTokenValue'; " }
-    return "`$env:ACME_ADMIN_TOKEN = '$Token'; $confirmEnv& '$ScriptPath' -RaBaseUrl '$BaseUrl' -CaConfig '$CaConfigStr' -RequesterName '$Requester'$modeFlag$localFlag$crlFlag; exit `$LASTEXITCODE"
+    return "$adminEnv$confirmEnv& '$ScriptPath' -RaBaseUrl '$BaseUrl' -CaConfig '$CaConfigStr' -RequesterName '$Requester'$modeFlag$localFlag$crlFlag; exit `$LASTEXITCODE"
 }
