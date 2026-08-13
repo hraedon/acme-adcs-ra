@@ -28,31 +28,11 @@ def _certificate_response(cert: CertificateRecord) -> Response:
     return Response(content=body, media_type=_PEM_CHAIN_MEDIA_TYPE)
 
 
-@router.get("/acme/cert/{cert_id}")
-async def get_certificate(
-    cert_id: str,
-    ctx: ServerContext = Depends(get_context),
-) -> Response:
-    """Unauthenticated read of a certificate by its unguessable URL.
-
-    **Gated by config, default OFF.** Controlled by
-    ``ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET`` (default False as of the
-    2026-08-15 review — see the config comment). Retained only for a client
-    that cannot do POST-as-GET. It was justified as "not an existence oracle,
-    the URL is unguessable", which is true and beside the point: it also
-    answers for a certificate whose account has been *deactivated*, or whose
-    EAB kid has been pulled from the allowlist. Kid eviction is supposed to be
-    complete and is re-checked on every authenticated request — but a URL
-    captured before the eviction still reads through here.
-    """
-    if not ctx.config.allow_unauthenticated_resource_get:
-        raise unauthorized("use POST-as-GET (RFC 8555 §7.4.2)")
-    cert = ctx.store.get_certificate(cert_id)
-    if cert is None:
-        raise unauthorized("certificate not found")
-    return _certificate_response(cert)
-
-
+# The plain unauthenticated GET form was removed in the 2026-08-15 review
+# (finding 4). It bypassed account deactivation and EAB-kid eviction — a URL
+# captured before an eviction still read through it — and RFC 8555 §7.4.2
+# specifies POST-as-GET, which every conforming client uses. Only the
+# account-scoped POST-as-GET form below remains.
 @router.post("/acme/cert/{cert_id}")
 async def post_certificate(
     cert_id: str,

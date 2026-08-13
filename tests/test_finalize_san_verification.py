@@ -177,9 +177,6 @@ def _make_test_config(tmp_path: Any) -> RAConfig:
         eab_allowlist=[EABEntry(kid="kid-001", mac_key="c3VwZXItc2VjcmV0LWtleS0zMi1ieXRlcy1sb25nISE")],
         san_scopes={"kid-001": {"dns_patterns": ["srv01.WORK-DOMAIN.local"]}},
         adcs_template="ACME-ServerAuth",
-        # Flow tests read cert/authz via plain GET for convenience; the
-        # production default is False (2026-08-15 review, finding 4).
-        allow_unauthenticated_resource_get=True,
     )
 
 

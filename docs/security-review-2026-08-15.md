@@ -129,35 +129,38 @@ pulled still reads. The default was `True`, deliberately, pending a lab check of
 whether the pilot client (Certify the Web) can do POST-as-GET.
 
 The **server side is already proven**: the regression suite completes a full
-order → certificate issuance using *only* POST-as-GET with the legacy GET
-disabled (`test_the_same_certificate_is_refused_when_the_get_form_is_off`). So
-the only open question is client-side.
+order → certificate issuance using *only* POST-as-GET.
 
-**Fixed by flipping the default** (owner decision, 2026-08-15):
-`allow_unauthenticated_resource_get` now defaults to `False` — secure by
-default, matching the project's strict-default preference. The legacy GET code
-path is **retained but gated**, re-enablable with a single env var
-(`ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET=true`) for a client known not to
-support POST-as-GET. This also improves sequencing: the next lab re-proof now
-validates the *secure* configuration, and any client incompatibility surfaces as
-a one-variable fix rather than a code change.
+**Fixed by removing the plain GET forms entirely** (owner + Sol decision,
+2026-08-15). The first step flipped the default to `False`; the loop was then
+closed completely: both `GET /acme/cert/{id}` and `GET /acme/authz/{id}` handlers
+are deleted, and the now-dead `allow_unauthenticated_resource_get` config field
+is removed. Only the account-scoped POST-as-GET forms remain, which is what
+RFC 8555 (§6.3, §7.4.2) specifies and what every conforming client uses. The
+decision was made on RFC-conformance grounds; if Certify the Web (Certes-based,
+RFC 8555 POST-as-GET since 2019) somehow regresses, that is a CtW bug to file,
+not a reason to keep an ownership/eviction bypass.
 
-Test: a fresh `RAConfig` has the legacy GET off
-(`test_the_production_default_is_off`). Flow tests that read via plain GET as a
-convenience set the flag explicitly, so they still target what they intend.
+A plain GET to either path now returns 405 (only POST is registered). Tests
+assert both routes are gone and that POST-as-GET still reads the certificate
+(`TestUnauthenticatedResourceGetIsRemoved`); the ~30 flow-test reads were
+migrated to POST-as-GET via the `HandRolledAcmeClient` read helpers. Removing
+the config field is upgrade-safe (`extra="ignore"`, so a stale
+`ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET` in an env file is ignored, not an
+error).
 
 ## What remains unproven
 
-- **Certify the Web POST-as-GET (finding 4).** With the default now off, the
-  next step is a client-side proof: run a CtW round-trip against the default
-  (GET off) and confirm it completes. If it does, **remove the plain GET forms
-  entirely** — the finding's ideal end-state. A self-contained probe (a logging
-  ACME stub that records whether the client uses GET or POST-as-GET) can answer
-  this in one CtW run without the full ADCS lab.
+- **Certify the Web POST-as-GET (finding 4).** The plain GET forms were removed
+  outright on RFC-conformance grounds rather than gated, so there is no fallback
+  to keep validated. The next CtW re-proof simply exercises the POST-as-GET-only
+  RA; if CtW regresses (it should not — Certes has used POST-as-GET since 2019),
+  that is a CtW bug to file, per the owner's direction.
 - **Live re-proof.** As with prior reviews, no live ADCS/IIS/AD/PowerShell 5.1
   execution was performed here. The fixes are static-plus-unit only; the pending
   re-proof should exercise the reclaim registry, the confirm-only revocation
-  task registration, and the GET-off default against the real estate.
+  task registration, and the POST-as-GET-only resource routes against the real
+  estate.
 
 ## Corrections to the scan
 

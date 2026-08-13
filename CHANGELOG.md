@@ -22,12 +22,14 @@ including the one finding whose stated DoS impact did not survive measurement.
   is now optional; `-RevocationSyncOnly -ConfirmToken …` registers only the sync
   task with **zero admin-token bytes** in its action, so a dedicated revocation
   host no longer carries unrelated maintenance authority.
-- **Legacy unauthenticated GET is off by default (finding 4).**
-  `allow_unauthenticated_resource_get` now defaults to `False` (secure by
-  default). The gated code path is retained; re-enable with
-  `ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET=true` only for a client that
-  cannot do POST-as-GET. Removal of the plain GET forms is pending a Certify the
-  Web POST-as-GET confirmation.
+- **Legacy unauthenticated GET removed (finding 4).** The plain
+  `GET /acme/cert/{id}` and `GET /acme/authz/{id}` forms — which bypassed
+  account deactivation and EAB-kid eviction — are removed entirely; only the
+  account-scoped POST-as-GET forms (RFC 8555 §6.3, §7.4.2) remain. A plain GET
+  now returns 405. The `allow_unauthenticated_resource_get` config field is
+  removed (a stale `ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET` env var is
+  ignored, not an error). Clients must use POST-as-GET, which every conforming
+  ACME client already does.
 - **RSA account-key bounds (finding 1, defence-in-depth).**
   `_public_key_from_jwk` now bounds the modulus to `[2048, 16384]` bits and the
   public exponent to `{3, 65537}` before constructing the key, rather than

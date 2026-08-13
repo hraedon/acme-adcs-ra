@@ -36,9 +36,6 @@ def _make_test_config(tmp_path: Path) -> RAConfig:
             "kid-001": {"dns_patterns": ["*.WORK-DOMAIN.local", "srv01.WORK-DOMAIN.local"]},
         },
         adcs_template="ACME-ServerAuth",
-        # Flow tests read cert/authz via plain GET for convenience; the
-        # production default is False (2026-08-15 review, finding 4).
-        allow_unauthenticated_resource_get=True,
     )
 
 

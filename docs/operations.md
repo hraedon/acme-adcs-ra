@@ -571,7 +571,8 @@ needed for revocation lookups (serial → cert) and audit. Retention guidance:
   validity period + overlap, then delete from the live SQLite. Keep
   revoked cert rows until the revocation is no longer on the CRL.
 - The `serial_number` index supports fast revocation lookup; the table is
-  not on the hot path (only `revoke_cert` and `GET /acme/cert/{id}` read it).
+  not on the hot path (only `revoke_cert` and the POST-as-GET
+  `/acme/cert/{id}` read it).
 
 ### SIEM JSONL sink
 
@@ -677,8 +678,8 @@ out-of-band revocation loop: an accepted reason 7 would cause
 The RA's audit log records `ca_crl_updated=false` until the operator runs
 `Revoke-Cert.ps1`. The RA has no way to know whether the CRL was actually
 republished — the operator must verify this on the CA side. The RA's
-`GET /acme/cert/{id}` returns 410 Gone for revoked certs (RA-store level);
-clients that check the CA's CRL will see the revocation only after
+POST-as-GET `/acme/cert/{id}` returns 410 Gone for revoked certs (RA-store
+level); clients that check the CA's CRL will see the revocation only after
 `Revoke-Cert.ps1` runs.
 
 ### Revocation reconciliation (WI-017)

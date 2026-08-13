@@ -736,10 +736,7 @@ class TestQuarantineIsNotServable:
         self, tmp_path: Path
     ) -> None:
         store, record = self._quarantined(tmp_path)
-        # Enable the legacy GET so this exercises the quarantine refusal itself
-        # (410) rather than the default POST-as-GET gate (401); the point of the
-        # test is that a quarantined cert is not served through the plain route.
-        cfg = _config(tmp_path, allow_unauthenticated_resource_get=True)
+        cfg = _config(tmp_path)
         ctx = ServerContext(
             config=cfg,
             store=store,
@@ -748,8 +745,13 @@ class TestQuarantineIsNotServable:
             revocation=FakeRevocationLeg(),
         )
         client = TestClient(create_app(ctx), raise_server_exceptions=False)
+        # The plain unauthenticated GET form was removed (2026-08-15 review,
+        # finding 4), so there is no unauthenticated path a quarantined cert
+        # could leak through: only POST is registered, so a GET is 405. The
+        # quarantine→410 refusal itself lives on the account-scoped POST-as-GET
+        # path (_certificate_response, shared by both).
         resp = client.get(f"/acme/cert/{record.id}")
-        assert resp.status_code == 410
+        assert resp.status_code == 405
 
     def test_confirming_a_quarantined_serial_clears_it(self, tmp_path: Path) -> None:
         """The quarantine drains through the normal pull-agent loop."""

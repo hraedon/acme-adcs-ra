@@ -53,9 +53,6 @@ def _build(tmp_path: Path) -> tuple[TestClient, ServerContext]:
         eab_allowlist=[EABEntry(kid=KID, mac_key=MAC_B64)],
         san_scopes={KID: {"dns_patterns": ["*.WORK-DOMAIN.local"]}},
         adcs_template="ACME-ServerAuth",
-        # Flow tests read cert/authz via plain GET for convenience; the
-        # production default is False (2026-08-15 review, finding 4).
-        allow_unauthenticated_resource_get=True,
         admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
     )
     store = Store(cfg.db_path)
@@ -126,9 +123,11 @@ def test_pulling_the_eab_kid_blocks_revocation(
     the operator believed the credential was cut off.
     """
     acme = _account(env)
-    client, ctx = env
+    _client, ctx = env
     order = _issue_cert(acme)
-    cert_pem = client.get(order["certificate"]).text
+    # Download the cert via POST-as-GET while the account is still valid (the
+    # plain GET form was removed — 2026-08-15 review, finding 4).
+    cert_pem = acme.get_certificate(order["certificate"]).text
     cert_der = base64.b64decode(
         "".join(cert_pem.split("-----")[2].split())
     )

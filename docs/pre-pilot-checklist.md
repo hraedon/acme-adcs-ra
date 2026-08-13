@@ -271,15 +271,14 @@ engineered to. Until then it has not — regardless of a green local test run.
         2026-08-15 review (finding 3):** `-AdminToken` is now optional, and
         `-RevocationSyncOnly -ConfirmToken …` registers only the sync task with
         zero admin-token bytes in its action. See docs/operations.md.
-  - [ ] **The pilot-client question is still unanswered (default now flipped).**
+  - [x] **The plain GET forms are removed (finding 4, 2026-08-15).**
         `allow_unauthenticated_resource_get` was exercised both ways: with it
-        **off**, a complete order still issues through POST-as-GET only, and
-        both GET forms answer 401. So the RA is complete without them.
-        **As of the 2026-08-15 review (finding 4) the default is now `False`**
-        (secure by default; the gated code path is retained). What remains is
-        the client-side proof: **Certify the Web is not installed in this lab**,
-        so confirm the pilot client completes issuance with the legacy GET off,
-        then remove the plain GET forms entirely.
+        **off**, a complete order still issues through POST-as-GET only. On that
+        basis (and RFC 8555 conformance) the owner + Sol closed the loop
+        entirely — both plain GET routes and the config flag are removed; a plain
+        GET now returns 405. The re-proof runs against the POST-as-GET-only RA;
+        if Certify the Web regresses, file a CtW bug (it uses Certes, which does
+        POST-as-GET).
 
   **Lab returned to its pre-run state** (verified, not assumed): CA security
   descriptor byte-identical at 224 bytes with its four original ACEs,
@@ -427,15 +426,14 @@ engineered to. Until then it has not — regardless of a green local test run.
         `revocation_confirm_crl_max_age_seconds` from the CA's real cadence
         (≥ `CRLPeriod` + overlap). The gate itself is live — a 1-second ceiling
         refuses the real CRL, and the default accepts it.
-  - [ ] **Does the pilot client need the unauthenticated GET forms?**
-        `allow_unauthenticated_resource_get` **now defaults to `False`** as of
-        the 2026-08-15 review (finding 4) — secure by default, with the gated
-        code path retained. The remaining work is client-side proof: run a full
-        Certify the Web round-trip against the default (GET off) and record the
-        result. If the client completes via POST-as-GET, **remove the plain GET
-        forms entirely.** (The test harness already drives a complete order to
-        issuance with the GET form disabled, so the RA itself is complete
-        without it.)
+  - [x] **The unauthenticated GET forms are removed (finding 4, 2026-08-15).**
+        Closed entirely on RFC 8555 conformance grounds: `GET /acme/cert/{id}`
+        and `GET /acme/authz/{id}` and the `allow_unauthenticated_resource_get`
+        flag are gone; only account-scoped POST-as-GET remains, and a plain GET
+        returns 405. The re-proof should confirm Certify the Web completes a full
+        round-trip against the POST-as-GET-only RA; if it does not, that is a CtW
+        bug to file. (The test harness already drives a complete order to
+        issuance via POST-as-GET only.)
   - [x] **The revocation agent runs with only `-ConfirmToken`.** No admin token
         on the revocation host: confirm the pending-list read still works and
         the whole loop completes.

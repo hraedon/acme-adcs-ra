@@ -459,24 +459,17 @@ class TestHecQueueFloor:
                 )
 
 
-class TestUnauthenticatedResourceGetIsControllable:
-    """F16 — the legacy GET forms bypass ownership AND eviction.
+class TestUnauthenticatedResourceGetIsRemoved:
+    """F16 — the legacy plain GET forms bypassed ownership AND eviction.
 
-    The existing docs justified them as "not an existence oracle, the URL is
-    unguessable". True, and beside the point: they also answer for a
-    certificate whose account has been deactivated or whose EAB kid has been
-    pulled, so a URL captured before an eviction still reads. The operator has
-    a switch, and as of the 2026-08-15 review it defaults OFF (finding 4);
-    both directions plus the default are pinned here.
+    They answered for a certificate whose account had been deactivated or whose
+    EAB kid had been pulled, so a URL captured before an eviction still read.
+    RFC 8555 (§6.3, §7.4.2) specifies POST-as-GET, which every conforming client
+    uses. As of the 2026-08-15 review (finding 4) the plain GET forms are
+    **removed entirely** — only the account-scoped POST-as-GET forms remain.
     """
 
-    def test_the_production_default_is_off(self) -> None:
-        """Secure by default: a fresh RAConfig must have the legacy GET off."""
-        from acme_adcs_ra.config import RAConfig
-
-        assert RAConfig(base_url="http://testserver").allow_unauthenticated_resource_get is False
-
-    def _issued_cert_url(self, client: Any, tmp_path: Path) -> str:
+    def _issued_cert_url(self, client: Any, tmp_path: Path) -> tuple[Any, str]:
         from cryptography.hazmat.primitives.asymmetric import rsa
 
         from .hand_rolled_acme_client import HandRolledAcmeClient
@@ -488,43 +481,42 @@ class TestUnauthenticatedResourceGetIsControllable:
         ac.new_account("kid-001", _eab_mac_key(cfg, "kid-001"))
         order = ac.new_order(["srv01.WORK-DOMAIN.local"]).json()
         for authz_url in order["authorizations"]:
-            # POST-as-GET deliberately: this helper has to work with the plain
-            # GET form disabled, which is also the point — a conforming client
-            # never needs it.
             authz = ac.post_as_get(authz_url).json()
             for challenge in authz["challenges"]:
                 ac.validate_challenge(challenge["url"])
         finalized = ac.finalize_order(
             order["finalize"], _make_csr(["srv01.WORK-DOMAIN.local"])
         ).json()
-        return str(finalized["certificate"])
+        return ac, str(finalized["certificate"])
 
-    def test_a_real_certificate_is_readable_by_get_when_enabled(
-        self, tmp_path: Path
-    ) -> None:
-        """The negative control, and a record of the current default."""
+    def test_the_plain_get_cert_route_is_gone(self, tmp_path: Path) -> None:
+        """A real, valid certificate URL: a plain GET must no longer read it —
+        only POST is registered, so the method is refused (405)."""
         _store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
-        url = self._issued_cert_url(client, tmp_path)
-        assert client.get(url).status_code == 200
+        _ac, url = self._issued_cert_url(client, tmp_path)
+        assert client.get(url).status_code == 405
 
-    def test_the_same_certificate_is_refused_when_the_get_form_is_off(
-        self, tmp_path: Path
-    ) -> None:
-        """Same URL, same certificate — only the switch differs. Asserting on
-        the status alone would not discriminate, because the disabled path and
-        a genuine miss both answer 401; a mutation confirmed that. So this
-        proves a *readable* certificate becomes unreadable."""
+    def test_the_plain_get_authz_route_is_gone(self, tmp_path: Path) -> None:
         _store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
-        url = self._issued_cert_url(client, tmp_path)
-        assert client.get(url).status_code == 200
+        from cryptography.hazmat.primitives.asymmetric import rsa
 
-        _store2, strict = _app_with_leg(
-            tmp_path / "strict", FakeEnrollmentLeg(), allow_get=False
-        )
-        url2 = self._issued_cert_url(strict, tmp_path / "strict")
-        resp = strict.get(url2)
-        assert resp.status_code == 401
-        assert "POST-as-GET" in resp.text
+        from .hand_rolled_acme_client import HandRolledAcmeClient
+        from .test_revocation import _eab_mac_key, _make_test_config
+
+        cfg = _make_test_config(tmp_path)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ac = HandRolledAcmeClient(client, "http://testserver", key)
+        ac.new_account("kid-001", _eab_mac_key(cfg, "kid-001"))
+        order = ac.new_order(["srv01.WORK-DOMAIN.local"]).json()
+        authz_url = order["authorizations"][0]
+        assert client.get(authz_url).status_code == 405
+
+    def test_post_as_get_still_reads_the_certificate(self, tmp_path: Path) -> None:
+        """The negative control: removing the plain GET must not break the
+        conforming read path. The owning account reads its cert via POST-as-GET."""
+        _store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        ac, url = self._issued_cert_url(client, tmp_path)
+        assert ac.post_as_get(url).status_code == 200
 
 
 def _issue_via(ac: Any, client: Any) -> bytes:
@@ -561,9 +553,7 @@ def _backdate_processing(store: Store, order_id: str, seconds: int) -> None:
         )
 
 
-def _app_with_leg(
-    tmp_path: Path, leg: Any, *, allow_get: bool = True
-) -> tuple[Store, Any]:
+def _app_with_leg(tmp_path: Path, leg: Any) -> tuple[Store, Any]:
     """An app whose issuance policy actually permits an order to be driven.
 
     Reuses test_revocation's config (real EAB kids and SAN scopes) rather than
@@ -581,10 +571,7 @@ def _app_with_leg(
 
     tmp_path.mkdir(parents=True, exist_ok=True)
     cfg = _make_test_config(tmp_path).model_copy(
-        update={
-            "admin_token": SecretStr(_ADMIN_TOKEN),
-            "allow_unauthenticated_resource_get": allow_get,
-        }
+        update={"admin_token": SecretStr(_ADMIN_TOKEN)}
     )
     store = Store(cfg.db_path)
     ctx = ServerContext(

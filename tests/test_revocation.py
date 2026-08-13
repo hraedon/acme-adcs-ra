@@ -51,9 +51,6 @@ def _make_test_config(tmp_path: Any) -> RAConfig:
             "kid-002": {"dns_patterns": ["*.prod.WORK-DOMAIN.local"]},
         },
         adcs_template="ACME-ServerAuth",
-        # Flow tests read cert/authz via plain GET for convenience; the
-        # production default is False (2026-08-15 review, finding 4).
-        allow_unauthenticated_resource_get=True,
     )
 
 
@@ -786,7 +783,7 @@ class TestOutOfBandRevocation:
         assert order is not None
         assert order.status == "revoked"
 
-        cert_resp = out_of_band_client.get(f"/acme/cert/{record.id}")
+        cert_resp = ac.get_certificate(f"{test_config.base_url}/acme/cert/{record.id}")
         assert cert_resp.status_code == 410
 
     def test_siem_event_for_out_of_band_path_carries_honest_scope(
@@ -1077,7 +1074,11 @@ class TestRevokedCertNotServed:
         test_config: RAConfig,
         account_key: rsa.RSAPrivateKey,
     ) -> None:
-        """H-1: After revocation, GET on the cert URL returns 410 Gone."""
+        """H-1: After revocation, reading the cert (POST-as-GET) returns 410 Gone.
+
+        The plain unauthenticated GET form was removed (2026-08-15 review,
+        finding 4); the owning account reads via POST-as-GET, which returns 410
+        for a revoked cert exactly as the GET form did."""
         ac, cert_der = _issue_cert(client, test_config, account_key)
         cert = x509.load_der_x509_certificate(cert_der)
 
@@ -1091,9 +1092,9 @@ class TestRevokedCertNotServed:
         resp = ac.revoke_certificate(cert_der, reason=0)
         assert resp.status_code == 200
 
-        # GET the cert URL → 410 Gone.
-        cert_url = f"/acme/cert/{cert_record.id}"
-        cert_resp = client.get(cert_url)
+        # POST-as-GET the cert URL → 410 Gone.
+        cert_url = f"{test_config.base_url}/acme/cert/{cert_record.id}"
+        cert_resp = ac.get_certificate(cert_url)
         assert cert_resp.status_code == 410
 
     def test_order_status_reflects_revoked(

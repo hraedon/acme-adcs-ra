@@ -18,25 +18,10 @@ from acme_adcs_ra.store import OrderStatus, _now_iso, is_expired
 router = APIRouter()
 
 
-@router.get("/acme/authz/{authz_id}")
-async def get_authorization(
-    authz_id: str,
-    ctx: ServerContext = Depends(get_context),
-) -> JSONResponse:
-    """Unauthenticated read of an authorization by its unguessable URL.
-
-    **Gated by config, default OFF** (2026-08-15 review, finding 4) — see the
-    certificate GET for the reasoning. Controlled by
-    ``ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET``.
-    """
-    if not ctx.config.allow_unauthenticated_resource_get:
-        raise unauthorized("use POST-as-GET (RFC 8555 §6.3)")
-    authz = ctx.store.get_authorization(authz_id)
-    if authz is None:
-        raise unauthorized("authorization not found")
-    return JSONResponse(content=_authz_to_json(authz))
-
-
+# The plain unauthenticated GET form was removed in the 2026-08-15 review
+# (finding 4); it bypassed account deactivation and EAB-kid eviction. RFC 8555
+# §6.3 specifies POST-as-GET, which every conforming client uses. Only the
+# account-scoped POST-as-GET form below remains.
 @router.post("/acme/authz/{authz_id}")
 async def post_authorization(
     authz_id: str,

@@ -214,7 +214,11 @@ class HandRolledAcmeClient:
         return self._post_jws(url, payload)
 
     def get_authorization(self, authz_url: str) -> Any:
-        return self.http.get(authz_url)
+        # The plain unauthenticated GET form was removed (2026-08-15 review,
+        # finding 4). Reading an authorization is now POST-as-GET, so this
+        # helper does what a conforming client does; the name is intent, not
+        # HTTP method.
+        return self.post_as_get(authz_url)
 
     def post_as_get(self, url: str) -> Any:
         """RFC 8555 §6.3 POST-as-GET: a signed request with an EMPTY payload.
@@ -238,7 +242,9 @@ class HandRolledAcmeClient:
         return self._post_jws(finalize_url, payload)
 
     def get_certificate(self, cert_url: str) -> Any:
-        return self.http.get(cert_url)
+        # Plain GET removed (2026-08-15 review, finding 4); downloading the
+        # certificate is now POST-as-GET (RFC 8555 §7.4.2).
+        return self.post_as_get(cert_url)
 
     def revoke_certificate(
         self,
