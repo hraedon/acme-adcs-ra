@@ -171,23 +171,26 @@ Describe 'Build-OfficerRightsSD' {
 }
 
 Describe 'Get-ExistingAces' {
-    # Regression, found live on the CA 2026-08-13. PowerShell unwraps a
-    # single-element array as it crosses a function boundary; the resulting
-    # bare [pscustomobject] has NO .Count under Windows PowerShell 5.1 (pwsh 7
-    # yields 1, which is why this suite was green while Set-OfficerRights.ps1
-    # aborted on a *successful* single-officer provisioning). Assert the TYPE,
-    # not the count -- the count is precisely the thing that differs by host.
-    It 'Always returns an array, even for a single ACE (PS 5.1 .Count trap)' {
+    # Regression, found live on the CA 2026-08-13, corrected 2026-08-14.
+    # PowerShell unwraps a single-element array as it crosses a function
+    # boundary, and the resulting bare [pscustomobject] has NO .Count under
+    # Windows PowerShell 5.1 (pwsh 7 yields 1, which is why this suite was
+    # green while Set-OfficerRights.ps1 aborted on a *successful*
+    # single-officer provisioning). The contract that fixes that is at the CALL
+    # SITE -- `@(Get-ExistingAces $bytes)` -- so that is what these assert.
+    # Asserting the bare return type instead is what let the empty-case
+    # phantom entry ship; see the two count tests below.
+    It 'Is an array at the call site, even for a single ACE (PS 5.1 .Count trap)' {
         $ace = Build-CallbackAce 'S-1-5-21-1004336348-1177238915-682003330-517' '1.3.6.1.4.1.311.21.8.16593888.12298824.5193888.14804498.16898264.10598498.10498398'
         $aceList = [System.Collections.Generic.List[byte[]]]::new()
         $aceList.Add($ace)
-        $result = Get-ExistingAces (Build-OfficerRightsSD $aceList)
+        $result = @(Get-ExistingAces (Build-OfficerRightsSD $aceList))
         $result -is [array] | Should -BeTrue
     }
 
-    It 'Always returns an array when there are no ACEs to report' {
-        (Get-ExistingAces $null) -is [array] | Should -BeTrue
-        (Get-ExistingAces ([byte[]]@(1, 2, 3, 4, 5))) -is [array] | Should -BeTrue
+    It 'Is an array at the call site when there are no ACEs to report' {
+        @(Get-ExistingAces $null) -is [array] | Should -BeTrue
+        @(Get-ExistingAces ([byte[]]@(1, 2, 3, 4, 5))) -is [array] | Should -BeTrue
     }
 
     It 'Returns empty array for $null input' {
@@ -198,6 +201,33 @@ Describe 'Get-ExistingAces' {
     It 'Returns empty array for a byte array shorter than 20 bytes' {
         $result = Get-ExistingAces ([byte[]]@(1, 2, 3, 4, 5))
         $result.Count | Should -Be 0
+    }
+
+    # The two tests above assign the result; the SHIPPED call sites wrap it in
+    # @(), and that is a different expression. Assignment collapses a
+    # single-item pipeline back to the item, so `,@()` looked empty here while
+    # `@(Get-ExistingAces $null)` was a 1-element array holding an empty array.
+    # Set-OfficerRights.ps1 then treated a pristine CA (OfficerRights absent --
+    # the default, so this is the FIRST-provisioning path) as having one
+    # existing ACE, carried it into the builder with a $null RawAce, and died
+    # on "Buffer cannot be null" having written nothing. Found on the CA
+    # 2026-08-14. Assert the call-site expression, not a convenient one.
+    It 'Counts zero through the @() the call sites use (no phantom entry)' {
+        @(Get-ExistingAces $null).Count | Should -Be 0
+        @(Get-ExistingAces ([byte[]]@(1, 2, 3, 4, 5))).Count | Should -Be 0
+    }
+
+    It 'Counts one through the @() the call sites use' {
+        $ace = Build-CallbackAce 'S-1-5-21-1004336348-1177238915-682003330-517' '1.3.6.1.4.1.311.21.8.16593888.12298824.5193888.14804498.16898264.10598498.10498398'
+        $aceList = [System.Collections.Generic.List[byte[]]]::new()
+        $aceList.Add($ace)
+        $wrapped = @(Get-ExistingAces (Build-OfficerRightsSD $aceList))
+        $wrapped.Count | Should -Be 1
+        # Not just the count: the element must be the ACE record itself, not an
+        # array holding it, or `[byte[]]$a.RawAce` flattens via member
+        # enumeration and the rebuilt blob is corrupt.
+        $wrapped[0].OfficerSid | Should -BeOfType [string]
+        $wrapped[0].RawAce | Should -Not -BeNullOrEmpty
     }
 
     It 'Correctly parses a well-formed SD' {

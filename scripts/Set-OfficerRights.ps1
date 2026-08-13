@@ -200,7 +200,14 @@ $currentBytes = Get-OfficerRightsBytes $CaConfig
 # @() is load-bearing, not decoration: a single existing ACE arrives here as a
 # bare [pscustomobject] whose .Count is $null under Windows PowerShell 5.1, so
 # the count test below would report an in-force restriction as "absent".
-$existingAces = @(Get-ExistingAces $currentBytes)
+$existingAces = @(Get-ExistingAces $currentBytes) | Where-Object {
+    # An entry with no ACE bytes cannot be preserved, and carrying one into the
+    # builder writes a $null buffer -- which is how the 2026-08-14 phantom-entry
+    # bug surfaced: "Buffer cannot be null" on a CA whose OfficerRights value was
+    # simply absent, provisioning nothing while the CA looked configured.
+    $null -ne $_ -and $null -ne $_.RawAce -and -not [string]::IsNullOrEmpty($_.OfficerSid)
+}
+$existingAces = @($existingAces)
 if ($existingAces.Count -gt 0) {
     Write-Output ("Current OfficerRights: {0} ACE(s)." -f $existingAces.Count)
     foreach ($a in $existingAces) {

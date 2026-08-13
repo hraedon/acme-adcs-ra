@@ -74,8 +74,26 @@ prove and the one place the stricter default was deliberately not taken.
   reflects a CA/RA disagreement.
 - Enrollment responses are size-capped before parsing.
 
-### Fixed — 2026-08-14
+### Fixed — 2026-08-14 (live re-proof of rc2)
 
+- **`Set-OfficerRights.ps1` could not provision a CA that had no
+  `OfficerRights` value — the default, and therefore the first-provisioning
+  path.** It aborted with `Exception calling "Write" ... Buffer cannot be null`
+  and wrote nothing, while the CA-side grant that precedes it *had* been made,
+  so the CA looked half-configured. Cause: the 2026-08-13 fix for the
+  single-element unwrap wrapped every return in `,$result`, which makes `,@()`
+  arrive at the call site as a **one-element array holding an empty array** —
+  so `@(Get-ExistingAces $bytes).Count` was 1 with no ACEs, and the phantom
+  entry reached the ACE builder with a `$null` RawAce. The contract is now
+  stated where it belongs: the function returns plainly and the call sites wrap
+  in `@()` (both already did). `Set-OfficerRights.ps1` additionally drops
+  entries with no ACE bytes before building. Found on the lab CA, 2026-08-14.
+- **Two Pester tests asserted a shape the shipped code never uses.** They
+  bound the result with `$result = Get-ExistingAces ...`, and assignment
+  collapses a single-item pipeline back to the item — so the empty case looked
+  correct while `@(...)` at the real call site did not. They now assert the
+  call-site expression, and two count tests cover the empty and single-ACE
+  cases. Reverting the library fix fails them.
 - **`TestHecQueueBound` was flaky.** It relied on `.invalid` DNS *stalling* to
   pin its workers; a resolver returning NXDOMAIN quickly lets them drain, so the
   drop count came in under what the test expected. It failed once during a full

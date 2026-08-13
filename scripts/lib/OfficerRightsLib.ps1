@@ -154,17 +154,26 @@ function Build-OfficerRightsSD($AceBytesList) {
 # and the raw ACE bytes. This lets us filter by officer without re-parsing the
 # opaque ApplicationData -- non-matching ACEs are preserved verbatim.
 #
-# ALWAYS returns an array (note the `,` in every return). PowerShell unwraps a
-# single-element array as it crosses a function boundary, and the resulting
-# bare [pscustomobject] has NO .Count under Windows PowerShell 5.1 -- so a
-# caller's `$aces.Count` silently becomes $null in the single-officer case,
-# which is the default deployment. (Under pwsh 7 the same expression yields 1,
-# so Pester on Linux cannot see the difference. Found on the CA, 2026-08-13.)
+# CALL IT AS `@(Get-ExistingAces $bytes)` -- that wrapper, at the call site, is
+# what makes the count right on every host, and both call sites in
+# Set-OfficerRights.ps1 do it.
+#
+# Do NOT "protect" the return with `return ,$result`. That was added on
+# 2026-08-13 against the single-element unwrap (PowerShell unwraps a
+# one-element array across a function boundary, and the resulting bare
+# [pscustomobject] has no .Count under Windows PowerShell 5.1). It fixed that
+# case and broke the empty one: `,@()` emits the empty array as a single
+# pipeline ITEM, so `@(Get-ExistingAces $null).Count` was 1, not 0. On a CA with
+# no OfficerRights value -- absent is the default, and therefore the
+# first-provisioning path -- Set-OfficerRights.ps1 then carried a phantom
+# entry with a $null RawAce into the ACE builder and died on
+# "Buffer cannot be null" without writing anything. Found on the CA, 2026-08-14.
+# (It reproduces under pwsh 7 too: the empty case is not host-specific.)
 function Get-ExistingAces([byte[]]$Bytes) {
     $result = @()
-    if ($null -eq $Bytes -or $Bytes.Length -lt 20) { return ,$result }
+    if ($null -eq $Bytes -or $Bytes.Length -lt 20) { return $result }
     $daclOffset = [BitConverter]::ToUInt32($Bytes, 16)
-    if ($daclOffset -eq 0 -or $daclOffset -ge $Bytes.Length) { return ,$result }
+    if ($daclOffset -eq 0 -or $daclOffset -ge $Bytes.Length) { return $result }
     $aceCount = [BitConverter]::ToUInt16($Bytes, $daclOffset + 4)
     $aceOffset = $daclOffset + 8
     for ($i = 0; $i -lt $aceCount; $i++) {
@@ -182,5 +191,5 @@ function Get-ExistingAces([byte[]]$Bytes) {
         $result += [pscustomobject]@{ OfficerSid = $sid; RawAce = $rawAce }
         $aceOffset += $aceSize
     }
-    return ,$result
+    return $result
 }
