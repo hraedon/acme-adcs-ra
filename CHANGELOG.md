@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.9.0] — 2026-08-13
 
+> **Release candidate (`v1.9.0-rc1`).** Awaiting the full live lab re-proof on
+> this commit; the `v1.9.0` tag follows it. See the open item in the
+> [validation log](docs/pre-pilot-checklist.md#validation-log).
+
 **Security hardening (2026-08-13 external scan).** Ten findings — nine medium,
 one low — from an external static scan of v1.8.0. Every one was independently
 reproduced against the shipped build before any code changed, and every new

@@ -220,8 +220,11 @@ engineered to. Until then it has not — regardless of a green local test run.
         re-proof at every release, on the exact commit being shipped* — is
         precisely what caught these two defects, and both were invisible to a
         green Linux CI run. Waiving it for the commit that fixes them would draw
-        the wrong lesson. **Re-run §A, §A.1 and §C on the final commit and add a
-        second validation-log entry before tagging.**
+        the wrong lesson. **Re-run the full runbook — §A, §A.1, §B or §C, §D,
+        §E — against `v1.9.0-rc1`, from a clean start, and add a second
+        validation-log entry before the v1.9.0 tag.** Full scope rather than
+        the PowerShell delta: the lesson of this round is exactly that a subset
+        does not transfer.
   - **Still open before pilot:** the operator-owned items in §B–§E, unchanged.
   - **Lab returned to its pre-run state:** CA `OfficerRights` removed and the CA
     security descriptor restored byte-for-byte, the temporary group membership

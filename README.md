@@ -85,10 +85,12 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **Released at v1.9.0 (2026-08-13).** Feature-complete for its charter and
-> maintained deliberately rather than passively: security reports (see
-> `SECURITY.md`) and bug reports are welcome, but there is no response-time
-> commitment.
+> **v1.9.0 — release candidate (`v1.9.0-rc1`, 2026-08-13).** The code is
+> complete and CI-green; the final tag follows the live lab re-proof on this
+> exact commit, per the cadence rule below. **v1.8.0 is the latest full
+> release.** Feature-complete for its charter and maintained deliberately rather
+> than passively: security reports (see `SECURITY.md`) and bug reports are
+> welcome, but there is no response-time commitment.
 
 The full pipeline works and has been proven against a real CA: an RA running as
 the gMSA behind IIS drives `/certsrv/` and returns a **serverAuth-only**
