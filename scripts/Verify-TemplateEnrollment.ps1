@@ -14,14 +14,19 @@
 
     Reads the template's AD security descriptor over LDAP (a single hop -- works
     from a normal domain session; no CA admin rights needed) and reports every
-    principal that can enroll, FAILING (exit 2) if any broad principal can.
+    principal that can enroll. FAILS (exit 2) if any broad principal can, and
+    (exit 3) if any principal outside -ExpectedEnrollee holds enroll rights.
 
 .PARAMETER Template
     The certificate template CN (e.g. ACME-ServerAuth).
 
 .PARAMETER ExpectedEnrollee
     Principal(s) that are *expected* to hold Enroll (e.g. WORK-DOMAIN\gMSA-acme-ra$).
-    Listed as OK; everything else with enroll rights is reported for review.
+    Listed as OK. Anything ELSE holding enroll rights fails the script (exit 3)
+    unless -AllowAdditionalEnrollees is passed. The script's stated invariant is
+    "the gMSA is the SOLE gate", so an unexpected enrollee is a failure, not a
+    note: printing it and exiting 0 meant any automation gating on this script
+    would report success against a template that had been widened.
 
 .PARAMETER ConfigNC
     Configuration naming context DN. Default: read from RootDSE.
@@ -35,7 +40,10 @@ param(
     [Parameter(Mandatory = $true)][string]$Template,
     [string[]]$ExpectedEnrollee = @(),
     [string]$ConfigNC,
-    [string]$BindUser
+    [string]$BindUser,
+    # Accept enrollees outside -ExpectedEnrollee (e.g. Domain Admins holding
+    # FullControl). Deliberate and explicit; without it they fail the run.
+    [switch]$AllowAdditionalEnrollees
 )
 
 $ErrorActionPreference = "Stop"
@@ -92,9 +100,31 @@ if ($bad.Count -gt 0) {
     Write-Output ("FAIL: a normal user CAN request '{0}' -- broad principal(s) hold enroll: {1}" -f $Template, (($bad | ForEach-Object { $_.Identity }) -join ", "))
     exit 2
 }
-$unexpected = @($enrollees | Where-Object { $ExpectedEnrollee -notcontains $_.Identity })
 Write-Output ("PASS: no broad principal can enroll '$Template' -- a normal user cannot request this cert directly.")
+
+# Anything outside -ExpectedEnrollee is a FAILURE, not a note.
+#
+# This script exists to assert one thing: that the gMSA is the sole gate to the
+# server-auth template. It used to compute this list, print it as a NOTE, and
+# exit 0 -- so a template that had been widened to an extra service account
+# still produced a green run, and any automation gating on the exit code
+# reported the control as holding. That is the same defect class as the
+# OfficerRights readback that printed without asserting (2026-08-13, finding 8).
+#
+# Domain/Enterprise Admins with FullControl genuinely are normal in most
+# estates, which is why the escape hatch exists -- but it must be explicit and
+# recorded in the runbook, not the silent default.
+$unexpected = @($enrollees | Where-Object { $ExpectedEnrollee -notcontains $_.Identity })
 if ($unexpected.Count -gt 0) {
-    Write-Output ("  NOTE: enrollees beyond -ExpectedEnrollee (review; admins w/ FullControl are normal): {0}" -f (($unexpected | ForEach-Object { $_.Identity }) -join ", "))
+    $names = ($unexpected | ForEach-Object { $_.Identity }) -join ", "
+    if ($AllowAdditionalEnrollees) {
+        Write-Output ("  NOTE: enrollees beyond -ExpectedEnrollee, allowed by -AllowAdditionalEnrollees: {0}" -f $names)
+    } else {
+        Write-Output ("FAIL: principals outside -ExpectedEnrollee hold enroll on '{0}': {1}" -f $Template, $names)
+        Write-Output "      The gMSA is not the sole gate to this template. Either remove these"
+        Write-Output "      grants, add them to -ExpectedEnrollee if they are intended, or pass"
+        Write-Output "      -AllowAdditionalEnrollees to accept them deliberately."
+        exit 3
+    }
 }
 exit 0

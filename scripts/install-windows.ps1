@@ -366,13 +366,34 @@ Write-Host "  venv verified: $venvProbe"
 
 Write-Host "Installing acme-adcs-ra ..."
 & $venvPy -m pip install --upgrade pip | Out-Null
-# Installs from the source tree on this host. The Windows-only SSPI dep
-# (pyspnego, used by the in-tree negotiate_auth for channel-bound Negotiate)
-# resolves here; confirm wheels exist for this Python (pyspnego ships abi3
-# wheels). To install a prebuilt wheel instead, replace $repoRoot with the
-# .whl path.
-& $venvPy -m pip install --upgrade $repoRoot
-if ($LASTEXITCODE -ne 0) { throw "pip install of acme-adcs-ra failed (exit $LASTEXITCODE)." }
+
+# Dependencies come from the hash-pinned closure, NOT from a live resolve.
+#
+# A bare `pip install <repoRoot>` re-resolves every dependency against the
+# index at install time, so the closure landing on an issuance-path host was
+# not the one CI tested (`uv sync --locked`), and nothing verified what came
+# down the wire. deploy/requirements.lock.txt is exported from uv.lock and
+# carries a hash for every artifact; --require-hashes makes pip refuse anything
+# that does not match. The project itself is then installed --no-deps, so this
+# file is the only thing that decides dependency versions.
+$lockFile = Join-Path $repoRoot "deploy\requirements.lock.txt"
+if (Test-Path $lockFile) {
+    Write-Host "  Installing pinned dependencies from deploy/requirements.lock.txt ..."
+    & $venvPy -m pip install --require-hashes --only-binary :all: -r $lockFile
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Pinned dependency install failed (exit $LASTEXITCODE). Do NOT fall back to " +
+               "an unpinned install on an issuance-path host: regenerate the lock file " +
+               "(uv export --locked ...) for this platform and Python version instead.")
+    }
+    & $venvPy -m pip install --no-deps --upgrade $repoRoot
+    if ($LASTEXITCODE -ne 0) { throw "pip install of acme-adcs-ra failed (exit $LASTEXITCODE)." }
+} else {
+    # The lock file ships with the repo; its absence means an incomplete copy.
+    throw ("deploy/requirements.lock.txt is missing. It pins the production dependency " +
+           "closure by hash and is required for an issuance-path install. Copy the full " +
+           "repository, or regenerate it with: uv export --locked --format requirements-txt " +
+           "--no-emit-project --no-dev -o deploy/requirements.lock.txt")
+}
 $installedVer = ((& $venvPy -m pip show acme-adcs-ra 2>$null | Select-String "^Version:") -replace "^Version:\s*", "").Trim()
 Write-Host "  Installed acme-adcs-ra version: $installedVer"
 

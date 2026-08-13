@@ -25,10 +25,11 @@ async def get_authorization(
 ) -> JSONResponse:
     """Unauthenticated read of an authorization by its unguessable URL.
 
-    Retained for compatibility with the clients this RA was proven against.
-    Prefer the POST-as-GET form below, which is what RFC 8555 §6.3 specifies
-    and which is account-scoped.
+    **Gated by config.** — see the certificate GET for the reasoning.
+    Controlled by ``ACME_RA_ALLOW_UNAUTHENTICATED_RESOURCE_GET``.
     """
+    if not ctx.config.allow_unauthenticated_resource_get:
+        raise unauthorized("use POST-as-GET (RFC 8555 §6.3)")
     authz = ctx.store.get_authorization(authz_id)
     if authz is None:
         raise unauthorized("authorization not found")

@@ -412,6 +412,68 @@ class TestHecQueueFloor:
                 )
 
 
+class TestUnauthenticatedResourceGetIsControllable:
+    """F16 — the legacy GET forms bypass ownership AND eviction.
+
+    The existing docs justified them as "not an existence oracle, the URL is
+    unguessable". True, and beside the point: they also answer for a
+    certificate whose account has been deactivated or whose EAB kid has been
+    pulled, so a URL captured before an eviction still reads. The operator now
+    has a switch; the default stays on pending the lab run (see the config
+    comment), which is why both directions are pinned here.
+    """
+
+    def _issued_cert_url(self, client: Any, tmp_path: Path) -> str:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from .hand_rolled_acme_client import HandRolledAcmeClient
+        from .test_revocation import _eab_mac_key, _make_csr, _make_test_config
+
+        cfg = _make_test_config(tmp_path)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ac = HandRolledAcmeClient(client, "http://testserver", key)
+        ac.new_account("kid-001", _eab_mac_key(cfg, "kid-001"))
+        order = ac.new_order(["srv01.WORK-DOMAIN.local"]).json()
+        for authz_url in order["authorizations"]:
+            # POST-as-GET deliberately: this helper has to work with the plain
+            # GET form disabled, which is also the point — a conforming client
+            # never needs it.
+            authz = ac.post_as_get(authz_url).json()
+            for challenge in authz["challenges"]:
+                ac.validate_challenge(challenge["url"])
+        finalized = ac.finalize_order(
+            order["finalize"], _make_csr(["srv01.WORK-DOMAIN.local"])
+        ).json()
+        return str(finalized["certificate"])
+
+    def test_a_real_certificate_is_readable_by_get_when_enabled(
+        self, tmp_path: Path
+    ) -> None:
+        """The negative control, and a record of the current default."""
+        store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        url = self._issued_cert_url(client, tmp_path)
+        assert client.get(url).status_code == 200
+
+    def test_the_same_certificate_is_refused_when_the_get_form_is_off(
+        self, tmp_path: Path
+    ) -> None:
+        """Same URL, same certificate — only the switch differs. Asserting on
+        the status alone would not discriminate, because the disabled path and
+        a genuine miss both answer 401; a mutation confirmed that. So this
+        proves a *readable* certificate becomes unreadable."""
+        store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        url = self._issued_cert_url(client, tmp_path)
+        assert client.get(url).status_code == 200
+
+        _store2, strict = _app_with_leg(
+            tmp_path / "strict", FakeEnrollmentLeg(), allow_get=False
+        )
+        url2 = self._issued_cert_url(strict, tmp_path / "strict")
+        resp = strict.get(url2)
+        assert resp.status_code == 401
+        assert "POST-as-GET" in resp.text
+
+
 def _issue_via(ac: Any, client: Any) -> bytes:
     from cryptography.hazmat.primitives import serialization
 
@@ -446,7 +508,9 @@ def _backdate_processing(store: Store, order_id: str, seconds: int) -> None:
         )
 
 
-def _app_with_leg(tmp_path: Path, leg: Any) -> tuple[Store, Any]:
+def _app_with_leg(
+    tmp_path: Path, leg: Any, *, allow_get: bool = True
+) -> tuple[Store, Any]:
     """An app whose issuance policy actually permits an order to be driven.
 
     Reuses test_revocation's config (real EAB kids and SAN scopes) rather than
@@ -464,7 +528,10 @@ def _app_with_leg(tmp_path: Path, leg: Any) -> tuple[Store, Any]:
 
     tmp_path.mkdir(parents=True, exist_ok=True)
     cfg = _make_test_config(tmp_path).model_copy(
-        update={"admin_token": SecretStr(_ADMIN_TOKEN)}
+        update={
+            "admin_token": SecretStr(_ADMIN_TOKEN),
+            "allow_unauthenticated_resource_get": allow_get,
+        }
     )
     store = Store(cfg.db_path)
     ctx = ServerContext(

@@ -240,6 +240,29 @@ class RAConfig(BaseSettings):
     # deployments must leave it False.
     allow_weak_credentials: bool = False
 
+    # --- Legacy unauthenticated resource reads --------------------------------
+    # RFC 8555 §7.4.2 specifies POST-as-GET for the certificate and
+    # authorization; both POST forms exist and are account-scoped. The plain
+    # GET forms were retained for client compatibility, and were documented as
+    # "not an existence oracle because the URL is unguessable" — but they are
+    # more than that: they answer for a certificate whose *account* has been
+    # deactivated, or whose EAB kid has been pulled from the allowlist. Kid
+    # eviction is meant to be a complete eviction, re-checked on every
+    # authenticated request; a URL held from before the eviction still reads
+    # through the GET form.
+    #
+    # Defaulted True — deliberately, against this project's usual preference for
+    # the stricter default — because the existing docs record these routes as
+    # retained "for compatibility with the clients this RA was proven against",
+    # i.e. an actual observed need, and no evidence here says whether Certify
+    # the Web can do POST-as-GET. Flipping the default blind, immediately before
+    # a lab re-proof, would risk breaking the proven client for a low-severity
+    # oracle. The lab run should establish whether the pilot client needs it;
+    # if it does not, this default should become False.
+    #
+    # Set to False now if your client is known to use POST-as-GET.
+    allow_unauthenticated_resource_get: bool = True
+
     @model_validator(mode="after")
     def _no_duplicate_eab_kids(self) -> RAConfig:
         """Duplicate kids would silently overwrite EAB credentials — reject them."""
