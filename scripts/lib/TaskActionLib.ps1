@@ -40,9 +40,14 @@ try {
 #      process command line. Sync-Revocations.ps1 reads the env fallback.
 # The single-quoted literals assume the token / URL / CA config contain no
 # single quote -- the same assumption the nonce/sweep action already makes.
-function Build-SyncActionCommand([string]$BaseUrl, [string]$Token, [string]$CaConfigStr, [bool]$Local, [bool]$DryRunMode, [string]$ScriptPath, [string]$Requester, [bool]$PublishCrlMode) {
+#   3. The dedicated revocation-confirmation token travels the same way
+#      ($env:ACME_CONFIRM_TOKEN). The RA refuses the general admin token on the
+#      confirm endpoint, so without this the sync task would revoke at the CA
+#      and then fail every confirm.
+function Build-SyncActionCommand([string]$BaseUrl, [string]$Token, [string]$CaConfigStr, [bool]$Local, [bool]$DryRunMode, [string]$ScriptPath, [string]$Requester, [bool]$PublishCrlMode, [string]$ConfirmTokenValue = "") {
     $localFlag = if ($Local) { " -LocalMode" } else { "" }
     $modeFlag = if ($DryRunMode) { " -DryRun" } else { " -Execute" }
     $crlFlag = if ($PublishCrlMode) { " -PublishCrl" } else { "" }
-    return "`$env:ACME_ADMIN_TOKEN = '$Token'; & '$ScriptPath' -RaBaseUrl '$BaseUrl' -CaConfig '$CaConfigStr' -RequesterName '$Requester'$modeFlag$localFlag$crlFlag; exit `$LASTEXITCODE"
+    $confirmEnv = if ([string]::IsNullOrWhiteSpace($ConfirmTokenValue)) { "" } else { "`$env:ACME_CONFIRM_TOKEN = '$ConfirmTokenValue'; " }
+    return "`$env:ACME_ADMIN_TOKEN = '$Token'; $confirmEnv& '$ScriptPath' -RaBaseUrl '$BaseUrl' -CaConfig '$CaConfigStr' -RequesterName '$Requester'$modeFlag$localFlag$crlFlag; exit `$LASTEXITCODE"
 }

@@ -104,8 +104,24 @@ function Die([string]$Message, [int]$Code) {
 # --- OfficerRights I/O -------------------------------------------------------
 
 # Read the current OfficerRights REG_BINARY. Returns a byte[], or $null if absent.
-# Tries certutil -getreg; falls back to the registry provider.
+#
+# The registry provider is tried FIRST and is authoritative: it returns the raw
+# bytes. The `certutil -getreg` path recovers the value by regex-scanning hex
+# pairs out of formatted console text, which also renders an ASCII gutter --
+# a lossy parse that can pick up bytes that are not part of the value. That is
+# fine as a last-resort fallback, but it must not be what a security control
+# verifies itself against.
 function Get-OfficerRightsBytes([string]$Config) {
+    $caName = $Config.Split('\')[-1]
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName"
+    if (Test-Path $regPath) {
+        $props = Get-ItemProperty -Path $regPath -Name 'OfficerRights' -ErrorAction SilentlyContinue
+        if ($null -ne $props -and $null -ne $props.OfficerRights) {
+            return [byte[]]($props.OfficerRights)
+        }
+        # The key exists and the value does not: definitively absent.
+        return $null
+    }
     $out = & certutil -getreg CA\OfficerRights 2>&1
     if ($LASTEXITCODE -eq 0) {
         $hexPairs = @()
@@ -121,15 +137,6 @@ function Get-OfficerRightsBytes([string]$Config) {
                 $bytes[$i] = [Convert]::ToByte($hexPairs[$i], 16)
             }
             return $bytes
-        }
-    }
-    # Fallback: read the registry directly.
-    $caName = $Config.Split('\')[-1]
-    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName"
-    if (Test-Path $regPath) {
-        $props = Get-ItemProperty -Path $regPath -Name 'OfficerRights' -ErrorAction SilentlyContinue
-        if ($null -ne $props -and $null -ne $props.OfficerRights) {
-            return [byte[]]($props.OfficerRights)
         }
     }
     return $null
@@ -241,33 +248,111 @@ if ($Remove) {
     Set-OfficerRightsBytes $CaConfig $newSd
 }
 
-# Restart certsvc (required for the change to take effect).
+# Restart certsvc. This is NOT cosmetic: the CA reads OfficerRights at service
+# start, so until certsvc has actually restarted the restriction on disk is not
+# in force. Reporting success on a written-but-not-loaded restriction is the
+# dangerous outcome -- the operator believes a compromised officer is bounded
+# to one template when it is not. Every failure below is fatal.
 Write-Output ""
 Write-Output "Restarting certsvc (required for the change to take effect)..."
+
+# Record the pre-restart start time so we can prove the process actually
+# recycled, rather than trusting that a command reported success.
+$priorStart = $null
+try {
+    $priorStart = (Get-Process -Name certsrv -ErrorAction Stop | Select-Object -First 1).StartTime
+} catch {
+    $priorStart = $null
+}
+
+$restarted = $false
 try {
     Restart-Service -Name certsvc -Force -ErrorAction Stop
+    $restarted = $true
     Write-Output "PASS: certsvc restarted."
 } catch {
     Write-Warning "Restart-Service failed; attempting net stop/net start: $($_.Exception.Message)"
     & net stop certsvc 2>&1 | ForEach-Object { Write-Output $_ }
+    $stopCode = $LASTEXITCODE
     & net start certsvc 2>&1 | ForEach-Object { Write-Output $_ }
+    $startCode = $LASTEXITCODE
+    # `net stop` returning non-zero is tolerable (the service may already have
+    # been stopped); `net start` failing is not -- it means the CA is DOWN.
+    if ($startCode -ne 0) {
+        Die ("certsvc failed to start (net stop exit {0}, net start exit {1}). " -f $stopCode, $startCode +
+             "The CA service may be STOPPED -- investigate immediately. The OfficerRights " +
+             "value was written but is NOT in force.") 1
+    }
+    $restarted = $true
 }
 
-# Verify by readback.
+if (-not $restarted) {
+    Die "certsvc was not restarted; the OfficerRights value is written but NOT in force." 1
+}
+
+# Prove the service is actually running now, and that it really recycled.
+$svc = Get-Service -Name certsvc -ErrorAction SilentlyContinue
+if ($null -eq $svc -or $svc.Status -ne 'Running') {
+    $state = if ($null -eq $svc) { 'not found' } else { $svc.Status }
+    Die ("certsvc is '{0}' after the restart attempt, not 'Running'. The CA is not " -f $state +
+         "serving and the OfficerRights restriction is NOT in force.") 1
+}
+Write-Output ("PASS: certsvc service state is '{0}'." -f $svc.Status)
+
+try {
+    $newStart = (Get-Process -Name certsrv -ErrorAction Stop | Select-Object -First 1).StartTime
+    if ($null -ne $priorStart -and $newStart -le $priorStart) {
+        Die ("certsvc process start time did not advance ({0} -> {1}); the service did " -f $priorStart, $newStart +
+             "not actually recycle, so the OfficerRights restriction is NOT loaded.") 1
+    }
+    Write-Output ("PASS: certsvc process restarted at {0}." -f $newStart)
+} catch [System.Management.Automation.ActionPreferenceStopException] {
+    Die "certsvc process not found after restart; the CA is not running." 1
+} catch {
+    # Some builds deny StartTime to a non-elevated caller; the Running state
+    # above is still authoritative for "the service came back".
+    Write-Warning ("Could not read the certsvc process start time ({0}); relying on " -f $_.Exception.Message +
+                   "the service state above.")
+}
+
+# Verify by readback -- and ASSERT, do not merely print. A readback that lists
+# ACEs without checking they are the ones we intended proved nothing: the same
+# output appears whether the write landed, was overwritten, or was never made.
 Write-Output ""
 Write-Output "Verifying by readback..."
 $verifyBytes = Get-OfficerRightsBytes $CaConfig
-if ($null -eq $verifyBytes) {
-    if ($Remove -and $keptAces.Count -eq 0) {
-        Write-Output "PASS: OfficerRights deleted (unrestricted)."
-    } else {
+
+if ($Remove -and $keptAces.Count -eq 0) {
+    if ($null -ne $verifyBytes) {
+        Die "Readback: OfficerRights still present after removing the last ACE." 1
+    }
+    Write-Output "PASS: OfficerRights deleted (unrestricted)."
+} else {
+    if ($null -eq $verifyBytes) {
         Die "Readback: OfficerRights absent after write -- the set did not take effect." 1
     }
-} else {
     $verifyAces = Get-ExistingAces $verifyBytes
     Write-Output ("Readback: {0} ACE(s) present." -f $verifyAces.Count)
     foreach ($a in $verifyAces) {
         Write-Output ("  officer={0}" -f $a.OfficerSid)
+    }
+
+    $matching = @($verifyAces | Where-Object { $_.OfficerSid -eq $OfficerSid })
+    if ($Remove) {
+        if ($matching.Count -ne 0) {
+            Die ("Readback: officer {0} still has an ACE after -Remove." -f $OfficerSid) 1
+        }
+        Write-Output ("PASS: officer {0} no longer has an OfficerRights ACE." -f $OfficerSid)
+    } else {
+        if ($matching.Count -ne 1) {
+            Die ("Readback: expected exactly 1 ACE for officer {0}, found {1}. The " -f $OfficerSid, $matching.Count +
+                 "restriction is NOT correctly in force.") 1
+        }
+        if ($verifyAces.Count -ne $allAces.Count) {
+            Die ("Readback: expected {0} ACE(s), found {1}. The written value does not " -f $allAces.Count, $verifyAces.Count +
+                 "match what this script built.") 1
+        }
+        Write-Output ("PASS: officer {0} is restricted to template {1}." -f $OfficerSid, $TemplateOid)
     }
 }
 

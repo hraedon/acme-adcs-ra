@@ -98,3 +98,33 @@ Describe 'Build-ActionScriptBlock' {
         $script:result | Should -Match '-TimeoutSec 60'
     }
 }
+
+Describe 'Build-SyncActionCommand confirm token' {
+    # 2026-08-13 review, finding 1: the RA refuses the general admin token on
+    # the confirm endpoint, so the sync task must carry a dedicated credential.
+
+    It 'Injects ACME_CONFIRM_TOKEN when a confirm token is supplied' {
+        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token 'admin-tok' `
+            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
+            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
+            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
+        $cmd | Should -BeLike "*`$env:ACME_CONFIRM_TOKEN = 'confirm-tok'*"
+        $cmd | Should -BeLike "*`$env:ACME_ADMIN_TOKEN = 'admin-tok'*"
+    }
+
+    It 'Omits ACME_CONFIRM_TOKEN when no confirm token is supplied' {
+        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token 'admin-tok' `
+            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
+            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
+            -PublishCrlMode $false
+        $cmd | Should -Not -BeLike '*ACME_CONFIRM_TOKEN*'
+    }
+
+    It 'Still contains no double quotes with the confirm token present' {
+        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token 'admin-tok' `
+            -CaConfigStr 'CA01\TEST-CA' -Local $true -DryRunMode $false `
+            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
+            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
+        $cmd | Should -Not -BeLike '*"*'
+    }
+}

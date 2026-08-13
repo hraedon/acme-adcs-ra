@@ -38,6 +38,11 @@ class OrderStatus(StrEnum):
 class CertStatus(StrEnum):
     VALID = "valid"
     REVOKED = "revoked"
+    # The CA issued this certificate, but a post-issuance verifier (SAN, EKU,
+    # or CA-capability) rejected it. It is recorded so the serial is knowable
+    # and revocable, and it is NEVER served to a client. See
+    # Store.quarantine_certificate.
+    QUARANTINED = "quarantined"
 
 
 class AccountStatus(StrEnum):
@@ -632,11 +637,37 @@ class Store:
         probabilistic GC and the admin cron have both missed it. An expired
         nonce is left in the table for the sweep (a retry of the same nonce
         fails identically — badNonce either way, no oracle).
+
+        **Invalid nonces are rejected by a read, never a write.** A nonce
+        arrives on an unauthenticated POST, before signature/account/EAB
+        checks, so an unauthenticated peer chooses it. Issuing the DELETE
+        unconditionally took SQLite's single writer lock even for a nonce that
+        could not possibly match, letting a flood of garbage nonces contend
+        with the issuance path (measured: a bogus nonce blocked for the full
+        5s busy_timeout and then raised "database is locked", surfacing as a
+        500 rather than a 400 badNonce). The SELECT below runs in WAL read
+        mode alongside a live writer, so the overwhelming majority of hostile
+        traffic never reaches the write lock at all.
+
+        The DELETE's ``rowcount`` remains the authority for single-use: two
+        concurrent consumers of the *same valid* nonce both pass the SELECT,
+        but only one DELETE reports a row, so replay protection is unchanged.
         """
+        # Defence in depth: the protocol layer rejects non-string nonces with a
+        # badNonce problem document, but a non-string reaching sqlite3 binding
+        # raises ProgrammingError, so never let one through to a query.
+        if not isinstance(nonce, str):
+            return False
         cutoff = (datetime.now(UTC) - timedelta(seconds=NONCE_TTL_SECONDS)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         with self._connect() as conn:
+            present = conn.execute(
+                "SELECT 1 FROM nonces WHERE nonce = ? AND created_at >= ?",
+                (nonce, cutoff),
+            ).fetchone()
+            if present is None:
+                return False
             cursor = conn.execute(
                 "DELETE FROM nonces WHERE nonce = ? AND created_at >= ?",
                 (nonce, cutoff),
@@ -1148,14 +1179,23 @@ class Store:
     # ------------------------------------------------------------------
 
     def get_certificate_by_order(self, order_id: str) -> CertificateRecord | None:
-        """Return the certificate for an order, if one exists.
+        """Return the *honoured* certificate for an order, if one exists.
 
         M3: used by the finalize path to detect double-issuance — if a
         certificate already exists for this order, do not re-enroll.
+
+        Quarantined rows are deliberately excluded. Every caller of this method
+        treats a hit as "issuance already succeeded, close the loop and serve
+        it" — the finalize double-issuance guard, ``_finalize_existing_cert``,
+        and the admin reclaim path all flip the order to ``valid`` with this
+        certificate's URL. A quarantined certificate is one the RA has decided
+        it must **not** honour, so returning it here would hand a client the
+        certificate a post-issuance verifier just rejected.
         """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM certificates WHERE order_id = ?", (order_id,)
+                "SELECT * FROM certificates WHERE order_id = ? AND status != ?",
+                (order_id, CertStatus.QUARANTINED),
             ).fetchone()
         if row is None:
             return None
@@ -1212,6 +1252,270 @@ class Store:
             metadata=metadata or {},
             serial_number=serial_number,
         )
+
+    def record_issuance(
+        self,
+        *,
+        order_id: str,
+        account_id: str,
+        cert_pem: str,
+        chain_pem: Sequence[str],
+        template: str,
+        requester: str,
+        metadata: dict[str, str] | None,
+        certificate_url_fn: Callable[[str], str],
+        sans: Sequence[str],
+        csr_subject: str,
+    ) -> tuple[CertificateRecord, bool, dict[str, Any]]:
+        """Persist an issuance — certificate row, order transition, audit row —
+        in ONE transaction.
+
+        Auditing every issuance is a hard rule of this project, but the three
+        writes used to be three independent commits: ``create_certificate``,
+        then the CAS to ``valid``, then ``record_audit``. A crash or a SQLite
+        error in the window between them committed a stored, serveable
+        certificate with **no** ``certificate-issued`` audit row — proven by
+        fault injection, which left one certificate row and zero issuance
+        events. That is precisely the silent issuance the audit rule exists to
+        make impossible.
+
+        Returns ``(record, applied, event)`` where *applied* is whether this
+        caller won the processing→valid CAS. The audit event reflects the
+        outcome that actually committed: ``certificate-issued`` when the CAS
+        applied, ``finalize-enrollment-race`` when it did not.
+        """
+        existing = self.get_certificate_by_order(order_id)
+        cert_id = existing.id if existing is not None else uuid.uuid4().hex
+        issued_at = existing.issued_at if existing is not None else _now_iso()
+        serial_number = _serial_from_pem(cert_pem)
+        certificate_url = certificate_url_fn(cert_id)
+
+        with self._connect() as conn:
+            # One transaction for the certificate row, the order transition,
+            # and the audit row. BEGIN IMMEDIATE takes the write lock up front
+            # so the CAS cannot interleave with a concurrent finalize.
+            conn.execute("BEGIN IMMEDIATE")
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO certificates
+                    (id, order_id, account_id, cert_pem, chain_pem, template,
+                     requester, issued_at, metadata, serial_number, status,
+                     revocation_reason, revoked_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cert_id,
+                        order_id,
+                        account_id,
+                        cert_pem,
+                        _dump_json(list(chain_pem)),
+                        template,
+                        requester,
+                        issued_at,
+                        _dump_json(metadata or {}),
+                        serial_number,
+                        CertStatus.VALID,
+                        None,
+                        None,
+                    ),
+                )
+            cursor = conn.execute(
+                "UPDATE orders SET status = ?, certificate_url = ? "
+                "WHERE id = ? AND status = ?",
+                (
+                    OrderStatus.VALID,
+                    certificate_url,
+                    order_id,
+                    OrderStatus.PROCESSING,
+                ),
+            )
+            applied = cursor.rowcount == 1
+
+            if applied:
+                event = self._record_audit_in_conn(
+                    conn,
+                    event_type="certificate-issued",
+                    account_id=account_id,
+                    order_id=order_id,
+                    sans=sans,
+                    template=template,
+                    requester=requester,
+                    outcome="success",
+                    details={
+                        "certificate_id": cert_id,
+                        "serial": serial_number,
+                        "csr_subject": csr_subject,
+                    },
+                )
+            else:
+                winner = conn.execute(
+                    "SELECT certificate_url FROM orders WHERE id = ?", (order_id,)
+                ).fetchone()
+                winner_cert_id = (
+                    winner["certificate_url"].rsplit("/", 1)[-1]
+                    if winner is not None and winner["certificate_url"]
+                    else None
+                )
+                event = self._record_audit_in_conn(
+                    conn,
+                    event_type="finalize-enrollment-race",
+                    account_id=account_id,
+                    order_id=order_id,
+                    sans=sans,
+                    template=template,
+                    requester=requester,
+                    outcome="failed",
+                    details={
+                        "certificate_id": cert_id,
+                        "serial": serial_number,
+                        "winner_certificate_id": winner_cert_id,
+                        "reason": "lost-processing-cas",
+                    },
+                )
+
+        record = CertificateRecord(
+            id=cert_id,
+            order_id=order_id,
+            account_id=account_id,
+            cert_pem=cert_pem,
+            chain_pem=list(chain_pem),
+            template=template,
+            requester=requester,
+            issued_at=issued_at,
+            metadata=metadata or {},
+            serial_number=serial_number,
+            status=CertStatus.VALID,
+        )
+        return record, applied, event
+
+    def quarantine_certificate(
+        self,
+        *,
+        order_id: str,
+        account_id: str,
+        cert_pem: str,
+        chain_pem: Sequence[str],
+        template: str,
+        requester: str,
+        metadata: dict[str, str] | None,
+        event_type: str,
+        violations: list[str],
+        reason: str,
+        sans: Sequence[str],
+        extra_details: dict[str, Any] | None = None,
+    ) -> tuple[CertificateRecord, dict[str, Any]]:
+        """Record a CA-issued certificate that a post-issuance verifier rejected.
+
+        By the time the SAN / EKU / CA-capability verifiers run, **ADCS has
+        already issued the certificate**: it has a serial, it is in the CA
+        database, and it is valid to every relying party in the domain. The RA
+        used to respond 500 and record nothing — no certificate row, and an
+        audit event that did not even carry the serial. The dangerous
+        certificate the RA had just decided it must not honour was therefore
+        invisible to the RA's own revocation workflow, and an operator had only
+        a timestamp with which to go hunting in the CA database.
+
+        This records it instead, in one transaction:
+
+        * a certificate row with status ``quarantined`` — carrying the serial,
+          the ReqID (in metadata), the bytes, and the violations, so it is
+          identifiable; never served, because ``_certificate_response`` serves
+          only ``valid``, and never returned by ``get_certificate_by_order``,
+          so a retried finalize cannot pick it up;
+        * ``ca_crl_updated = 0`` and a ``revoked_at`` stamp, so it appears in
+          ``list_revoked_certificates`` and the existing CA-side pull agent
+          revokes it through the normal loop rather than a bespoke path;
+        * the order flipped to ``invalid`` (terminal — the client must create a
+          new order; it must not be able to retry into a serve path);
+        * the audit row, carrying the serial and the violations.
+        """
+        cert_id = uuid.uuid4().hex
+        issued_at = _now_iso()
+        serial_number = _serial_from_pem(cert_pem)
+        req_id = (metadata or {}).get("req_id", "")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO certificates
+                (id, order_id, account_id, cert_pem, chain_pem, template,
+                 requester, issued_at, metadata, serial_number, status,
+                 revocation_reason, revoked_at, ca_crl_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    cert_id,
+                    order_id,
+                    account_id,
+                    cert_pem,
+                    _dump_json(list(chain_pem)),
+                    template,
+                    requester,
+                    issued_at,
+                    _dump_json(metadata or {}),
+                    serial_number,
+                    CertStatus.QUARANTINED,
+                    # Reason 0 (unspecified) is the RFC 5280 code the CA-side
+                    # certutil call will use; the real cause is the violation
+                    # list on the audit row and in metadata.
+                    0,
+                    issued_at,
+                ),
+            )
+            # Terminal: the client must not be able to retry this order into a
+            # path that serves the quarantined certificate.
+            conn.execute(
+                "UPDATE orders SET status = ? WHERE id = ? AND status IN (?, ?)",
+                (
+                    OrderStatus.INVALID,
+                    order_id,
+                    OrderStatus.PROCESSING,
+                    OrderStatus.READY,
+                ),
+            )
+            event = self._record_audit_in_conn(
+                conn,
+                event_type=event_type,
+                account_id=account_id,
+                order_id=order_id,
+                sans=sans,
+                template=template,
+                requester=requester,
+                outcome="failed",
+                details={
+                    "certificate_id": cert_id,
+                    "serial": serial_number,
+                    "req_id": req_id,
+                    "violations": violations,
+                    "reason": reason,
+                    "quarantined": True,
+                    "pending_ca_revocation": True,
+                    # Verifier-specific context (which SANs, which EKUs) must be
+                    # part of the row that is written, not decorated onto the
+                    # returned dict afterwards — the persisted audit trail is
+                    # the artefact an investigator reads.
+                    **(extra_details or {}),
+                },
+            )
+
+        record = CertificateRecord(
+            id=cert_id,
+            order_id=order_id,
+            account_id=account_id,
+            cert_pem=cert_pem,
+            chain_pem=list(chain_pem),
+            template=template,
+            requester=requester,
+            issued_at=issued_at,
+            metadata=metadata or {},
+            serial_number=serial_number,
+            status=CertStatus.QUARANTINED,
+            revocation_reason=0,
+            revoked_at=issued_at,
+        )
+        return record, event
 
     def get_certificate(self, cert_id: str) -> CertificateRecord | None:
         with self._connect() as conn:
@@ -1307,11 +1611,19 @@ class Store:
         return RevocationUpdate(record=self.get_certificate(cert_id), won_cas=False)
 
     def list_revoked_certificates(self, *, limit: int = 500) -> list[CertificateRecord]:
+        """Certificates awaiting a CA-side revocation.
+
+        Includes ``quarantined`` rows as well as ``revoked`` ones. A quarantined
+        certificate was issued by the CA and then rejected by a post-issuance
+        verifier — it is live at the CA and must come off through exactly the
+        same pull-agent loop as a client-requested revocation, rather than
+        needing a second mechanism.
+        """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM certificates WHERE status = ? AND ca_crl_updated = 0 "
-                "ORDER BY revoked_at DESC LIMIT ?",
-                (CertStatus.REVOKED, limit),
+                "SELECT * FROM certificates WHERE status IN (?, ?) "
+                "AND ca_crl_updated = 0 ORDER BY revoked_at DESC LIMIT ?",
+                (CertStatus.REVOKED, CertStatus.QUARANTINED, limit),
             ).fetchall()
         return [self._certificate_from_row(row) for row in rows]
 
@@ -1324,8 +1636,12 @@ class Store:
         with self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE certificates SET ca_crl_updated = 1 "
-                "WHERE serial_number = ? AND status = ? AND ca_crl_updated = 0",
-                (canonical_serial(serial_hex), CertStatus.REVOKED),
+                "WHERE serial_number = ? AND status IN (?, ?) AND ca_crl_updated = 0",
+                (
+                    canonical_serial(serial_hex),
+                    CertStatus.REVOKED,
+                    CertStatus.QUARANTINED,
+                ),
             )
             return cursor.rowcount == 1
 
@@ -1350,6 +1666,37 @@ class Store:
         Returns the audit event dict so callers can feed an extension hook
         (e.g. a SIEM emitter in Phase 3).
         """
+        with self._connect() as conn:
+            return self._record_audit_in_conn(
+                conn,
+                event_type=event_type,
+                account_id=account_id,
+                order_id=order_id,
+                sans=sans,
+                template=template,
+                requester=requester,
+                outcome=outcome,
+                details=details,
+            )
+
+    def _record_audit_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_type: str,
+        account_id: str | None = None,
+        order_id: str | None = None,
+        sans: Sequence[str] | None = None,
+        template: str | None = None,
+        requester: str | None = None,
+        outcome: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Write an audit row on an existing connection/transaction.
+
+        Callers that must not commit state without its audit (issuance,
+        quarantine) use this so both rows land in a single transaction.
+        """
         timestamp = _now_iso()
         event: dict[str, Any] = {
             "event_type": event_type,
@@ -1362,26 +1709,25 @@ class Store:
             "details": details or {},
             "timestamp": timestamp,
         }
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO audit_log
-                (event_type, account_id, order_id, sans, template, requester,
-                 outcome, details, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_type,
-                    account_id,
-                    order_id,
-                    _dump_json(event["sans"]),
-                    template,
-                    requester,
-                    outcome,
-                    _dump_json(event["details"]),
-                    timestamp,
-                ),
-            )
+        cursor = conn.execute(
+            """
+            INSERT INTO audit_log
+            (event_type, account_id, order_id, sans, template, requester,
+             outcome, details, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_type,
+                account_id,
+                order_id,
+                _dump_json(event["sans"]),
+                template,
+                requester,
+                outcome,
+                _dump_json(event["details"]),
+                timestamp,
+            ),
+        )
         event["id"] = cursor.lastrowid
         return event
 

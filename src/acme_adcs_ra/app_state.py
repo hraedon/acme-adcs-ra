@@ -28,10 +28,17 @@ def _dummy_hmac(eab_jws: dict[str, Any]) -> None:
     """Perform a dummy HMAC to equalize timing on unknown EAB kid path.
 
     This mitigates the kid-existence timing side-channel (threat-model §4.B).
+
+    The inputs are attacker-controlled and arrive before any signature check,
+    so the encode must not be able to raise: a non-ASCII ``protected``/
+    ``payload`` previously turned this timing-equalisation helper into an
+    unauthenticated 500 (UnicodeEncodeError). Only the elapsed time matters
+    here, never the bytes, so encoding losslessly in UTF-8 is equivalent for
+    the purpose and cannot fail.
     """
     protected_b64 = eab_jws.get("protected", "")
     payload_b64 = eab_jws.get("payload", "")
-    signing_input = f"{protected_b64}.{payload_b64}".encode("ascii")
+    signing_input = f"{protected_b64}.{payload_b64}".encode()
     # Use a fixed dummy key - the result is discarded, only the time matters.
     dummy_key = b"dummy-timing-equalization-key-32-bytes!!"
     hmac.new(dummy_key, signing_input, hashlib.sha256).digest()
@@ -64,18 +71,30 @@ class ServerContext:
     nonce_bucket: TokenBucket | None = None
 
 
+def emit_audit_hook(ctx: ServerContext, event: dict[str, Any]) -> None:
+    """Fan an already-persisted audit event out to the SIEM hook.
+
+    Fail-open by design: SIEM emission must never roll back or block an action
+    whose audit row is already durable. Callers that write the audit row inside
+    a larger transaction (issuance, quarantine) use this directly, after the
+    commit, instead of ``_audit``.
+    """
+    if ctx.audit_hook is None:
+        return
+    try:
+        ctx.audit_hook(event)
+    except Exception:
+        logger.warning(
+            "audit hook failed for event_type=%s; continuing",
+            event.get("event_type"),
+            exc_info=True,
+        )
+
+
 def _audit(ctx: ServerContext, **kwargs: Any) -> None:
     """Persist an audit row and notify the optional SIEM hook."""
     event = ctx.store.record_audit(**kwargs)
-    if ctx.audit_hook is not None:
-        try:
-            ctx.audit_hook(event)
-        except Exception:
-            logger.warning(
-                "audit hook failed for event_type=%s; continuing",
-                event.get("event_type"),
-                exc_info=True,
-            )
+    emit_audit_hook(ctx, event)
 
 
 def _url(context: ServerContext, path: str) -> str:

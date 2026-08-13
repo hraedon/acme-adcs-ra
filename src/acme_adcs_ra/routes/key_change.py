@@ -74,6 +74,10 @@ async def key_change(
     inner_nonce = inner_header.get("nonce")
     if not inner_nonce:
         raise bad_nonce("inner JWS protected header missing nonce")
+    # Same class as the outer nonce: a truthy non-string reaches SQLite
+    # parameter binding and 500s. RFC 8555 §6.5 nonces are strings.
+    if not isinstance(inner_nonce, str):
+        raise bad_nonce("inner JWS Replay-Nonce must be a string")
     if not ctx.store.consume_nonce(inner_nonce):
         raise bad_nonce("invalid or replayed inner JWS nonce")
 

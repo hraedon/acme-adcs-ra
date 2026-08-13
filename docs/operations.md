@@ -361,6 +361,61 @@ re-enroll — so the token is a high-value secret, treated like an EAB MAC key.
 5. Confirm the old token is rejected (`GET /acme/admin/orders` with the old
    token → 401).
 
+### Minimum strength (enforced at startup)
+
+Since v1.9.0 the RA **refuses to start** on a weak credential: EAB MAC keys
+must decode to at least 32 bytes and `ACME_RA_ADMIN_TOKEN` /
+`ACME_RA_REVOCATION_CONFIRM_TOKEN` must be at least 32 characters. Everything
+`python scripts/eab.py new` generates clears this. `allow_weak_credentials=true`
+waives it and exists for lab and CI fixtures only — never set it in production.
+
+The floor also closes a sharper hole: an EAB entry whose `mac_key` decoded to
+zero bytes used to count as a *present* key, so anyone who knew the kid could
+forge the binding with an empty HMAC key.
+
+### The revocation-confirmation token (separate authority)
+
+`ACME_RA_REVOCATION_CONFIRM_TOKEN` gates **only**
+`POST /acme/admin/revocations/{serial}/confirm`, and the general admin token is
+**not accepted** there. Confirming a revocation asserts something the RA cannot
+see — that the CA really revoked the serial — so it is deliberately not the same
+authority as nonce cleanup or order listing. While they shared a credential, any
+admin-token holder could drop a still-valid certificate off the retry queue and
+leave a success audit behind for a revocation that never happened.
+
+If it is unset the confirm endpoint is **disabled** (401), which fails closed but
+means the sync agent revokes at the CA and then cannot confirm — serials stay on
+the pending list. Set it before promoting the revocation loop to `-Execute`.
+
+Set it the same way as the admin token (own value, `acme-ra.env`, app-pool
+restart), and pass it to the agent as `-ConfirmToken` (or `ACME_CONFIRM_TOKEN`).
+
+### Optional: independent CRL evidence for confirmations
+
+By default a confirmation is recorded honestly as `verification:
+"agent-asserted"` — the RA is writing down a claim it could not check. To make
+it verifiable, point the RA at the CA's published CRL:
+
+```ini
+ACME_RA_REVOCATION_CONFIRM_CRL_URL=http://pki.WORK-DOMAIN.local/crl/WORK-DOMAIN-CA.crl
+# Fail closed: refuse to confirm unless the CRL proves the serial is revoked.
+ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true
+```
+
+The CRL is signed by the CA and readable without privilege, so this is the one
+check available to the RA that does not depend on the calling agent's honesty.
+The RA verifies the CRL's signature against the issuing CA certificate from the
+certificate's **own stored chain**, and refuses an expired CRL as evidence.
+Confirmations then record `verification: "crl-verified"` with the CRL number.
+
+Note the timing trade-off before setting `REQUIRE_CRL_EVIDENCE`: a serial is not
+on the CRL until the CA next publishes one. On the default least-privilege path
+the agent does not force a republish (it has no Manage-CA right), so a
+confirmation can legitimately fail until the scheduled CRL publication catches
+up. The serial simply stays pending and the next sync cycle confirms it.
+**This path has not yet been exercised against a real ADCS CRL** — see
+`docs/security-review-2026-08-13.md`.
+
 ### The reclaim endpoint (double-issuance gate)
 
 `POST /acme/admin/orders/{id}/reclaim-processing` (admin-token-gated)
@@ -520,6 +575,38 @@ running `scripts/Revoke-Cert.ps1`.
    is the matching out-of-band half.
 
 Keep both records together in incident review.
+
+### Quarantined certificates (mis-issuance, not a client request)
+
+A third kind of entry can appear on the pending-revocation list, with
+`status: "quarantined"` rather than `"revoked"`.
+
+The RA runs three verifiers on the certificate ADCS returns — SAN scope, EKU
+(serverAuth-only), and CA-capability. By the time they run **the CA has already
+issued**: the certificate has a serial, is in the CA database, and is trusted
+domain-wide. When one of them rejects, the RA refuses to serve the certificate
+(finalize returns 500, the order goes `invalid`) — but the certificate is still
+live at the CA.
+
+Before v1.9.0 the RA recorded *nothing* in this case, not even the serial, so
+that certificate was invisible to this runbook. It is now recorded as a
+`quarantined` certificate row and queued for CA-side revocation through the
+**same** pull-agent loop as any other pending serial. No separate procedure:
+the agent revokes it, confirms it, and it drops off the list.
+
+Treat a quarantined entry as an incident, not routine traffic. It means the
+ADCS template issued outside the policy the RA enforces, which is the condition
+the serverAuth-only blast-radius bound depends on. Check:
+
+* the audit event (`finalize-issued-cert-san-mismatch`,
+  `finalize-issued-cert-eku-mismatch`, or `finalize-issued-cert-ca-capability`)
+  — its `details.violations` names exactly what was wrong, and `details.serial`
+  and `details.req_id` identify the certificate at the CA;
+* the `ACME-ServerAuth` template's current configuration — something changed it,
+  or the RA is pointed at the wrong template;
+* whether any earlier certificate was issued under the same misconfiguration
+  and **was** honoured (the verifiers are the only thing standing between a
+  template change and a clientAuth-capable certificate reaching a client).
 
 ### Reason 7 is rejected
 
@@ -690,7 +777,7 @@ host, running as `gMSA-acme-revoker$`:
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\acme-adcs-ra\scripts\Sync-Revocations.ps1 -RaBaseUrl 'https://ra.WORK-DOMAIN.local' -AdminToken '<admin-token>' -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute"
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\acme-adcs-ra\scripts\Sync-Revocations.ps1 -RaBaseUrl 'https://ra.WORK-DOMAIN.local' -AdminToken '<admin-token>' -ConfirmToken '<confirm-token>' -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute"
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
     -RepetitionInterval (New-TimeSpan -Minutes 5)
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
@@ -705,6 +792,19 @@ a file the task reads); rotate it by re-registering (see the admin-token
 runbook). Tune the interval to your latency requirement (default 5 minutes
 shown; the RA audit records `ca_crl_updated` lag so you can measure the
 actual cadence).
+
+`-ConfirmToken` is the separate revocation-confirmation credential (see above);
+without it every confirm returns 401 and serials never leave the pending list.
+`Register-MaintenanceTasks.ps1` passes both tokens via the environment
+(`ACME_ADMIN_TOKEN`, `ACME_CONFIRM_TOKEN`) so neither lands on the script's
+process command line, and warns if `-ConfirmToken` is omitted.
+
+**`-RaBaseUrl` must be https.** Since v1.9.0 both `Sync-Revocations.ps1` and
+`Register-MaintenanceTasks.ps1` validate it before attaching any token — https
+only, no embedded credentials, no query, fragment, or path. A scheduled task
+bakes the URL in, so a cleartext typo would have disclosed the maintenance
+token on every run with nothing in the output to show it. A loopback-only lab
+over http needs the explicit `-AllowInsecureUrl`.
 
 #### Dry-run → execute promotion
 

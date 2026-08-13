@@ -19,3 +19,65 @@ function Get-SyncExitCode([int]$FailedCount) {
     if ($FailedCount -gt 0) { return 2 }
     return 0
 }
+
+# Validate the RA base URL before any credential is attached to a request.
+#
+# This script sends a high-value maintenance Bearer token to whatever
+# -RaBaseUrl it is handed. Nothing used to check the scheme, so a deployment
+# typo ("http://..." instead of "https://...", or a stale hostname) silently
+# disclosed the token to anyone on the path. The RA runbooks say HTTPS; a
+# runbook is not a control.
+#
+# Rejects, in order: unparseable/relative URLs, any scheme but https, embedded
+# credentials (https://user:pass@host -- which also hide the real authority),
+# a query or fragment, and any path beyond "/". Returns the normalised base
+# (no trailing slash) for endpoint joining.
+#
+# -AllowInsecureUrl is the explicit, deliberate opt-out for a loopback lab
+# where the RA serves plain HTTP; it still refuses cleartext to a non-loopback
+# host, because that is the case that leaks the token onto a network.
+function Assert-SafeRaUrl {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Url,
+        [switch]$AllowInsecureUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        throw "RaBaseUrl must not be empty."
+    }
+
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw ("RaBaseUrl '{0}' is not an absolute URL." -f $Url)
+    }
+
+    $loopback = @('localhost', '127.0.0.1', '::1') -contains $uri.Host.ToLowerInvariant()
+
+    if ($uri.Scheme -ne 'https') {
+        if (-not ($AllowInsecureUrl -and $uri.Scheme -eq 'http' -and $loopback)) {
+            throw ("RaBaseUrl '{0}' uses scheme '{1}'; the maintenance token may " +
+                   "only be sent over https. (Pass -AllowInsecureUrl for a " +
+                   "loopback-only lab over http.)") -f $Url, $uri.Scheme
+        }
+    }
+
+    if (-not [string]::IsNullOrEmpty($uri.UserInfo)) {
+        throw ("RaBaseUrl '{0}' embeds credentials in the URL; remove the " +
+               "user:password@ portion." -f $Url)
+    }
+
+    if (-not [string]::IsNullOrEmpty($uri.Fragment)) {
+        throw ("RaBaseUrl '{0}' carries a fragment; it must be a bare base URL." -f $Url)
+    }
+
+    if (-not [string]::IsNullOrEmpty($uri.Query)) {
+        throw ("RaBaseUrl '{0}' carries a query string; it must be a bare base URL." -f $Url)
+    }
+
+    if ($uri.AbsolutePath -ne '/' -and -not [string]::IsNullOrEmpty($uri.AbsolutePath)) {
+        throw ("RaBaseUrl '{0}' carries a path ('{1}'); it must be a bare base URL " +
+               "-- the script appends /acme/admin/... itself." -f $Url, $uri.AbsolutePath)
+    }
+
+    return $Url.TrimEnd('/')
+}

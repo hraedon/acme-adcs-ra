@@ -138,6 +138,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BaseUrl,
     [Parameter(Mandatory = $true)][string]$AdminToken,
+    [string]$ConfirmToken = "",
     [int]$IntervalMinutes = 15,
     [string]$TaskUser = "WORK-DOMAIN\gMSA-acme-ra$",
     [string]$TaskFolder = "\acme-adcs-ra\",
@@ -146,12 +147,14 @@ param(
     [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
     [switch]$LocalMode,
     [switch]$DryRun,
-    [switch]$PublishCrl
+    [switch]$PublishCrl,
+    [switch]$AllowInsecureUrl
 )
 
 $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot/lib/TaskActionLib.ps1"
+. "$PSScriptRoot/lib/SyncLib.ps1"
 
 if ($IntervalMinutes -lt 1) {
     Write-Error "-IntervalMinutes must be >= 1 (got $IntervalMinutes)."
@@ -171,8 +174,16 @@ if (($LocalMode -or $DryRun) -and -not $RegisterRevocationSync) {
     Write-Warning "-LocalMode and -DryRun only apply to the revocation-sync task; pass -RegisterRevocationSync to register it. Ignoring these flags for the nonce/sweep tasks."
 }
 
-# Normalize the base URL (strip trailing slash for joining).
-$base = $BaseUrl.TrimEnd('/')
+# Validate the base URL before it is baked into a scheduled-task action that
+# carries the admin token. A task registered against an http:// or
+# credential-embedding URL would disclose the token on every run, forever, with
+# nothing in the task output to show it.
+try {
+    $base = Assert-SafeRaUrl -Url $BaseUrl -AllowInsecureUrl:$AllowInsecureUrl
+} catch {
+    Write-Error $_.Exception.Message
+    exit 3
+}
 
 # Two maintenance tasks: (name, endpoint path). Both are DELETE with the
 # admin Bearer token. The task action is a PowerShell one-liner that invokes
@@ -269,7 +280,14 @@ function Register-RevocationSyncTask {
         exit 1
     }
 
-    $actionScript = Build-SyncActionCommand -BaseUrl $base -Token $AdminToken -CaConfigStr $CaConfig -Local $LocalMode -DryRunMode $DryRun -ScriptPath $syncScriptPath -Requester $RequesterName -PublishCrlMode $PublishCrl
+    $actionScript = Build-SyncActionCommand -BaseUrl $base -Token $AdminToken -CaConfigStr $CaConfig -Local $LocalMode -DryRunMode $DryRun -ScriptPath $syncScriptPath -Requester $RequesterName -PublishCrlMode $PublishCrl -ConfirmTokenValue $ConfirmToken
+
+    if ([string]::IsNullOrWhiteSpace($ConfirmToken)) {
+        Write-Warning ("No -ConfirmToken supplied. The RA refuses the general admin token on the " +
+                       "revocation-confirm endpoint, so this task will revoke at the CA and then " +
+                       "fail every confirm, leaving serials on the pending list. Set " +
+                       "ACME_RA_REVOCATION_CONFIRM_TOKEN on the RA and pass it here.")
+    }
 
     if ($PSCmdlet.ShouldProcess($fullName, "Register revocation-sync scheduled task")) {
         # Idempotent: unregister the existing task if present, then register.

@@ -72,7 +72,30 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**Unreleased on `main`: the 2026-08-11 security review** (13 findings; see
+**Unreleased on `main`: the 2026-08-13 security review** (10 findings from an
+external static scan of v1.8.0; see `docs/security-review-2026-08-13.md`). Every
+finding was reproduced against the shipped build before any code changed, and
+every new test was mutation-checked. The load-bearing three: the CA-side
+revocation **confirm** endpoint took the caller's word — any admin-token holder
+could drop a still-valid cert off the retry queue and write a success audit for
+a revocation that never happened (now a separate credential, honest
+`agent-asserted`/`crl-verified` labelling, and optional CRL proof); a certificate
+**rejected** by the SAN/EKU/CA-capability verifiers was recorded *nowhere*, not
+even its serial, leaving a live unrevocable cert at the CA (now quarantined and
+queued for CA-side revocation); and issuance committed **separately** from its
+mandatory audit row, so a fault between them left a serveable cert with zero
+`certificate-issued` events (now one transaction).
+**Consequences for operators: `ACME_RA_REVOCATION_CONFIRM_TOKEN` is now required
+for the revocation loop, and weak EAB/admin credentials refuse startup.**
+
+> ⚠️ **This review has NOT been live-proven.** It changed the issuance leg
+> (`record_issuance`, quarantine, the certificate-response gate), which under
+> this repo's own re-entry rules earns a live lab re-proof against a real CA
+> before deployment. The CRL-evidence path has never met a real ADCS CRL, and
+> the PowerShell changes were parse-checked and Pester-tested on Linux only.
+> See the proof-gaps section of the review doc.
+
+**Previously on `main`: the 2026-08-11 security review** (13 findings; see
 `docs/security-review-2026-08-11.md`). The load-bearing two: the JWS **and** EAB
 URL bindings were derived from `str(request.url)` — i.e. the client's `Host`
 header — so they only proved a client was self-consistent and an EAB minted for

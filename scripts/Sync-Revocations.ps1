@@ -152,16 +152,20 @@
 param(
     [Parameter(Mandatory = $true)][string]$RaBaseUrl,
     [string]$AdminToken = "",
+    [string]$ConfirmToken = "",
     [Parameter(Mandatory = $true)][string]$CaConfig,
     [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
     [switch]$DryRun,
     [switch]$Execute,
     [string]$ScriptDir = "",
     [switch]$LocalMode,
-    [switch]$PublishCrl
+    [switch]$PublishCrl,
+    [switch]$AllowInsecureUrl
 )
 
 $ErrorActionPreference = "Stop"
+
+. "$PSScriptRoot/lib/SyncLib.ps1"
 
 function Die([string]$Message, [int]$Code) {
     [Console]::Error.WriteLine("ERROR: $Message")
@@ -181,6 +185,9 @@ $liveMode = [bool]$Execute
 # process command line (visible in a process listing during the run window).
 if ([string]::IsNullOrWhiteSpace($AdminToken)) {
     $AdminToken = $env:ACME_ADMIN_TOKEN
+}
+if ([string]::IsNullOrWhiteSpace($ConfirmToken)) {
+    $ConfirmToken = $env:ACME_CONFIRM_TOKEN
 }
 if ([string]::IsNullOrWhiteSpace($AdminToken)) {
     Die "No admin token supplied: pass -AdminToken or set the ACME_ADMIN_TOKEN environment variable." 3
@@ -205,9 +212,22 @@ try {
 }
 if ([string]::IsNullOrWhiteSpace($pwshExe)) { $pwshExe = "powershell.exe" }
 
-# Normalize the base URL (strip trailing slash for joining).
-$base = $RaBaseUrl.TrimEnd('/')
+# Validate the URL BEFORE any token is attached to a request. A bad scheme or
+# an embedded-credential URL must fail here, not after the token is on the wire.
+try {
+    $base = Assert-SafeRaUrl -Url $RaBaseUrl -AllowInsecureUrl:$AllowInsecureUrl
+} catch {
+    Die $_.Exception.Message 3
+}
 $headers = @{ 'Authorization' = "Bearer $AdminToken" }
+
+# Confirming a CA-side revocation now requires its own credential -- the RA
+# refuses the general admin token on that endpoint, so a compromised
+# monitoring/ops token cannot forge "the CA revoked it". Fall back to the
+# admin token only when no confirm token was supplied, so an operator who has
+# not yet provisioned one gets the RA's explicit 401 rather than a silent skip.
+$confirmTokenValue = if ([string]::IsNullOrWhiteSpace($ConfirmToken)) { $AdminToken } else { $ConfirmToken }
+$confirmHeaders = @{ 'Authorization' = "Bearer $confirmTokenValue" }
 
 if ($liveMode) {
     if ($LocalMode) {
@@ -318,7 +338,7 @@ foreach ($entry in $pending) {
     $confirmUrl = "$base/acme/admin/revocations/$serial/confirm"
     $confirmBody = '{"ca_crl_updated": true}'
     try {
-        Invoke-RestMethod -Method Post -Uri $confirmUrl -Headers $headers `
+        Invoke-RestMethod -Method Post -Uri $confirmUrl -Headers $confirmHeaders `
             -Body $confirmBody -ContentType 'application/json' -TimeoutSec 60 | Out-Null
         Write-Output ("PASS: confirmed serial {0} with the RA." -f $serial)
     } catch {

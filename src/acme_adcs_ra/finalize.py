@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -21,6 +21,7 @@ from acme_adcs_ra.app_state import (
     ServerContext,
     _audit,
     _certificate_url,
+    emit_audit_hook,
     logger,
 )
 from acme_adcs_ra.csr_validation import (
@@ -467,6 +468,85 @@ def _issued_cert_ca_capability_violations(cert_pem: str) -> list[str]:
     return violations
 
 
+def _quarantine_and_fail(
+    ctx: ServerContext,
+    *,
+    order_id: str,
+    account_id: str,
+    requested_sans: list[str],
+    enrollment_result: EnrollmentResult,
+    event_type: str,
+    violations: list[str],
+    reason: str,
+    message: str,
+    extra_details: dict[str, Any] | None = None,
+) -> NoReturn:
+    """Quarantine a CA-issued certificate the RA refuses to honour, then 500.
+
+    All three post-issuance verifiers (SAN, EKU, CA-capability) run *after*
+    ADCS has issued: the certificate exists, has a serial, and is trusted
+    domain-wide. Recording nothing — the previous behaviour — left it as an
+    unrevocable orphan whose serial appeared neither in the store nor in the
+    audit event. The quarantine row makes it identifiable and puts it in the
+    existing CA-side revocation queue; the 500 is unchanged, because a
+    template that issues outside policy really is a server-side fault.
+
+    Quarantining must never itself lose the finding, so a store failure here
+    is logged loudly and the original violation is still surfaced.
+    """
+    try:
+        record, event = ctx.store.quarantine_certificate(
+            order_id=order_id,
+            account_id=account_id,
+            cert_pem=enrollment_result.cert_pem,
+            chain_pem=enrollment_result.chain_pem,
+            template=enrollment_result.template,
+            requester=enrollment_result.requester,
+            metadata=dict(enrollment_result.metadata),
+            event_type=event_type,
+            violations=violations,
+            reason=reason,
+            sans=requested_sans,
+            extra_details=extra_details,
+        )
+        emit_audit_hook(ctx, event)
+        logger.error(
+            "QUARANTINED a CA-issued certificate: serial=%s req_id=%s order=%s "
+            "violations=%s. It is LIVE at the CA and queued for CA-side "
+            "revocation; run the revocation sync agent.",
+            record.serial_number,
+            record.metadata.get("req_id", ""),
+            order_id,
+            violations,
+        )
+    except Exception:  # noqa: BLE001 - the finding must survive any store failure
+        # Fall back to a plain audit row so the violation is never silent.
+        logger.exception(
+            "failed to quarantine a rejected CA-issued certificate for order %s; "
+            "the certificate is LIVE at the CA and NOT tracked — revoke it manually",
+            order_id,
+        )
+        _audit(
+            ctx,
+            event_type=event_type,
+            account_id=account_id,
+            order_id=order_id,
+            sans=requested_sans,
+            template=enrollment_result.template,
+            requester=enrollment_result.requester,
+            outcome="failed",
+            details={
+                "violations": violations,
+                "reason": reason,
+                "quarantined": False,
+                "quarantine_error": "see logs",
+                **(extra_details or {}),
+            },
+        )
+
+    raise server_internal(message)
+
+
 def _finalize_complete(
     ctx: ServerContext,
     order_id: str,
@@ -503,26 +583,24 @@ def _finalize_complete(
             "issued cert SANs outside order scope — ADCS template likely "
             "misconfigured (it must take only DNS SANs from the request)"
         )
-        _audit(
+        _quarantine_and_fail(
             ctx,
-            event_type="finalize-issued-cert-san-mismatch",
-            account_id=account_id,
             order_id=order_id,
-            sans=requested_sans,
-            template=enrollment_result.template,
-            requester=enrollment_result.requester,
-            outcome="failed",
-            details={
-                "certificate_id_order": order_id,
+            account_id=account_id,
+            requested_sans=requested_sans,
+            enrollment_result=enrollment_result,
+            event_type="finalize-issued-cert-san-mismatch",
+            violations=violations,
+            reason=reason,
+            message=(
+                f"issued certificate fails SAN verification — {'; '.join(violations)}; "
+                "the ADCS template is likely misconfigured"
+            ),
+            extra_details={
                 "issued_dns_sans": issued_dns_sans,
                 "unauthorized_dns_sans": unauthorized_dns,
                 "non_dns_san_types": non_dns_san_types,
-                "reason": reason,
             },
-        )
-        raise server_internal(
-            f"issued certificate fails SAN verification — {'; '.join(violations)}; "
-            "the ADCS template is likely misconfigured"
         )
 
     # WI-026: verify the issued cert is serverAuth-only. The cardinal blast-radius
@@ -532,110 +610,72 @@ def _finalize_complete(
     # case short of a signing key. Enforce on the result; fail closed like MED-1.
     eku_violations = _issued_cert_eku_violations(enrollment_result.cert_pem)
     if eku_violations:
-        _audit(
+        _quarantine_and_fail(
             ctx,
-            event_type="finalize-issued-cert-eku-mismatch",
-            account_id=account_id,
             order_id=order_id,
-            sans=requested_sans,
-            template=enrollment_result.template,
-            requester=enrollment_result.requester,
-            outcome="failed",
-            details={
-                "certificate_id_order": order_id,
-                "eku_violations": eku_violations,
-                "reason": (
-                    "issued cert is not serverAuth-only — the ADCS template must "
-                    "issue the serverAuth EKU and nothing else"
-                ),
-            },
-        )
-        raise server_internal(
-            f"issued certificate fails EKU verification — {'; '.join(eku_violations)}; "
-            "the ADCS template is likely misconfigured (serverAuth-only required)"
+            account_id=account_id,
+            requested_sans=requested_sans,
+            enrollment_result=enrollment_result,
+            event_type="finalize-issued-cert-eku-mismatch",
+            violations=eku_violations,
+            reason=(
+                "issued cert is not serverAuth-only — the ADCS template must "
+                "issue the serverAuth EKU and nothing else"
+            ),
+            message=(
+                f"issued certificate fails EKU verification — "
+                f"{'; '.join(eku_violations)}; the ADCS template is likely "
+                "misconfigured (serverAuth-only required)"
+            ),
         )
 
     ca_capability_violations = _issued_cert_ca_capability_violations(
         enrollment_result.cert_pem
     )
     if ca_capability_violations:
-        _audit(
+        _quarantine_and_fail(
             ctx,
+            order_id=order_id,
+            account_id=account_id,
+            requested_sans=requested_sans,
+            enrollment_result=enrollment_result,
             event_type="finalize-issued-cert-ca-capability",
-            account_id=account_id,
-            order_id=order_id,
-            sans=requested_sans,
-            template=enrollment_result.template,
-            requester=enrollment_result.requester,
-            outcome="failed",
-            details={"violations": ca_capability_violations},
-        )
-        raise server_internal(
-            "issued certificate is CA-capable — "
-            f"{'; '.join(ca_capability_violations)}; "
-            "the ADCS template is dangerously misconfigured"
+            violations=ca_capability_violations,
+            reason=(
+                "issued cert is CA-capable — the ADCS template is dangerously "
+                "misconfigured"
+            ),
+            message=(
+                "issued certificate is CA-capable — "
+                f"{'; '.join(ca_capability_violations)}; "
+                "the ADCS template is dangerously misconfigured"
+            ),
         )
 
-    existing_cert = ctx.store.get_certificate_by_order(order_id)
-    if existing_cert is not None:
-        cert_record = existing_cert
-    else:
-        cert_record = ctx.store.create_certificate(
-            order_id=order_id,
-            account_id=account_id,
-            cert_pem=enrollment_result.cert_pem,
-            chain_pem=enrollment_result.chain_pem,
-            template=enrollment_result.template,
-            requester=enrollment_result.requester,
-            metadata=dict(enrollment_result.metadata),
-        )
-
-    certificate_url = _certificate_url(ctx, cert_record.id)
-    applied = ctx.store.transition_processing_to_valid(
-        order_id, certificate_url
+    # The certificate row, the order transition, and the mandatory issuance
+    # audit row commit together — see Store.record_issuance.
+    cert_record, applied, _event = ctx.store.record_issuance(
+        order_id=order_id,
+        account_id=account_id,
+        cert_pem=enrollment_result.cert_pem,
+        chain_pem=enrollment_result.chain_pem,
+        template=enrollment_result.template,
+        requester=enrollment_result.requester,
+        metadata=dict(enrollment_result.metadata),
+        certificate_url_fn=lambda cert_id: _certificate_url(ctx, cert_id),
+        sans=requested_sans,
+        csr_subject=csr_subject,
     )
+    # The audit row is already durable; this only fans it out to SIEM.
+    emit_audit_hook(ctx, _event)
 
-    if applied:
-        _audit(ctx,
-            event_type="certificate-issued",
-            account_id=account_id,
-            order_id=order_id,
-            sans=requested_sans,
-            template=enrollment_result.template,
-            requester=enrollment_result.requester,
-            outcome="success",
-            details={
-                "certificate_id": cert_record.id,
-                "csr_subject": csr_subject,
-            },
-        )
-    else:
-        refreshed = ctx.store.get_order(order_id)
-        winner_cert_id = (
-            refreshed.certificate_url.rsplit("/", 1)[-1]
-            if refreshed and refreshed.certificate_url
-            else None
-        )
-        _audit(ctx,
-            event_type="finalize-enrollment-race",
-            account_id=account_id,
-            order_id=order_id,
-            sans=requested_sans,
-            template=enrollment_result.template,
-            requester=enrollment_result.requester,
-            outcome="failed",
-            details={
-                "certificate_id": cert_record.id,
-                "winner_certificate_id": winner_cert_id,
-                "reason": "lost-processing-cas",
-            },
-        )
+    if not applied:
         logger.error(
             "finalize CAS lost race for order %s; cert %s recorded but "
             "order was moved by a concurrent operation (winner cert=%s)",
             order_id,
             cert_record.id,
-            winner_cert_id,
+            _event["details"].get("winner_certificate_id"),
         )
 
     refreshed_order = _refresh_order_or_500(ctx, order_id, "after finalization")

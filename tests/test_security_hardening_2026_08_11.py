@@ -41,7 +41,7 @@ def _client(tmp_path: Path, **overrides: object) -> TestClient:
         base_url="http://testserver",
         db_path=tmp_path / "ra.db",
         siem_jsonl_path=tmp_path / "ra.siem.jsonl",
-        admin_token=SecretStr("t"),
+        admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
         **overrides,  # type: ignore[arg-type]
     )
     store = Store(cfg.db_path)

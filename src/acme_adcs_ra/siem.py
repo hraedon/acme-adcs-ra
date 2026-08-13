@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -54,6 +55,9 @@ class SiemConfig:
     hec_token: str = ""
     hec_index: str = ""
     hec_sourcetype: str = "acme-adcs-ra"
+    # Maximum audit events held in memory awaiting HEC delivery. See
+    # SiemEmitter._to_hec for why an unbounded queue was a liability.
+    hec_queue_max: int = 1000
 
 
 class SiemEmitter:
@@ -82,6 +86,10 @@ class SiemEmitter:
         self._syslog: logging.Logger | None = None
         self._pool: ThreadPoolExecutor | None = None
         self._enabled: bool = False
+        # HEC backpressure accounting (see _to_hec).
+        self._hec_inflight = 0
+        self._hec_dropped = 0
+        self._hec_lock = threading.Lock()
 
         if config.sink == "syslog":
             if config.syslog_host:
@@ -216,11 +224,65 @@ class SiemEmitter:
         self._syslog.info(json.dumps(event, default=str, sort_keys=True))
 
     def _to_hec(self, event: dict[str, Any]) -> None:
+        """Hand the event to the HEC worker pool, or drop it under backpressure.
+
+        ``ThreadPoolExecutor``'s work queue is a ``SimpleQueue`` — unbounded.
+        With two workers each able to block for the full ``urlopen`` timeout,
+        a slow or unreachable HEC endpoint let the queue grow without limit
+        while audit events kept arriving; unauthenticated account-creation
+        denials alone can generate them faster than delivery (measured: 5000
+        events submitted against a dead endpoint left 4987 queued). That is an
+        unauthenticated peer turning the audit path into memory exhaustion on
+        an issuance-path host.
+
+        The queue is now explicitly bounded. On overflow the event is dropped
+        *from the HEC sink only* — the durable record is the audit table row,
+        which is already committed by the time this runs — and counted, so the
+        loss is visible rather than silent. Dropping the newest event is the
+        right trade here: it bounds memory deterministically, and the RA-store
+        audit row plus the CA database remain the authoritative trail.
+        """
         if self._pool is None:
             return
-        self._pool.submit(self._hec_post, event)
+        with self._hec_lock:
+            if self._hec_inflight >= self._config.hec_queue_max:
+                self._hec_dropped += 1
+                dropped = self._hec_dropped
+                # Log the first drop and then every 100th, so a sustained
+                # outage is visible without the log itself becoming the flood.
+                should_log = dropped == 1 or dropped % 100 == 0
+                if should_log:
+                    logger.error(
+                        "SIEM HEC queue full (%d in flight, max %d); dropped %d "
+                        "audit event(s) from the HEC sink so far. The local audit "
+                        "table still holds every event. Check HEC reachability.",
+                        self._hec_inflight,
+                        self._config.hec_queue_max,
+                        dropped,
+                    )
+                return
+            self._hec_inflight += 1
+        try:
+            self._pool.submit(self._hec_post, event)
+        except RuntimeError:
+            # Pool already shut down (close() raced with a late event).
+            with self._hec_lock:
+                self._hec_inflight -= 1
+
+    @property
+    def hec_dropped(self) -> int:
+        """Audit events dropped from the HEC sink due to backpressure."""
+        with self._hec_lock:
+            return self._hec_dropped
 
     def _hec_post(self, event: dict[str, Any]) -> None:
+        try:
+            self._hec_post_inner(event)
+        finally:
+            with self._hec_lock:
+                self._hec_inflight -= 1
+
+    def _hec_post_inner(self, event: dict[str, Any]) -> None:
         cfg = self._config
         try:
             envelope: dict[str, Any] = {
@@ -266,6 +328,7 @@ def build_siem_config(config: RAConfig) -> SiemConfig:
         hec_token=hec_token,
         hec_index=config.siem_hec_index,
         hec_sourcetype=config.siem_hec_sourcetype,
+        hec_queue_max=config.siem_hec_queue_max,
     )
 
 

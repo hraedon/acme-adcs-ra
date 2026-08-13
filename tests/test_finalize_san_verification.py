@@ -30,7 +30,7 @@ from acme_adcs_ra.enrollment import EnrollmentResult, FakeEnrollmentLeg
 from acme_adcs_ra.finalize import _issued_cert_san_violations
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.server import ServerContext, create_app
-from acme_adcs_ra.store import Store
+from acme_adcs_ra.store import CertStatus, Store
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
 
@@ -260,17 +260,26 @@ def test_finalize_rejects_issued_cert_with_unauthorized_san(
     assert resp.status_code == 500
     assert "SAN verification" in resp.json()["detail"]
 
-    # No certificate row was recorded for the order.
-    cert_rows = store._connect().execute("SELECT id FROM certificates").fetchall()
-    assert cert_rows == []
+    # The CA already issued this certificate, so it is quarantined rather than
+    # forgotten: tracked, never served, and queued for CA-side revocation
+    # (2026-08-13 review, finding 6).
+    cert_rows = store._connect().execute(
+        "SELECT id, status, serial_number FROM certificates"
+    ).fetchall()
+    assert len(cert_rows) == 1
+    assert cert_rows[0]["status"] == CertStatus.QUARANTINED
+    assert store.list_revoked_certificates()[0].serial_number == (
+        cert_rows[0]["serial_number"]
+    )
 
-    # The mismatch was audited.
+    # The mismatch was audited, with the serial the operator needs.
     events = store.list_audit_events(
         account_id=None, event_type="finalize-issued-cert-san-mismatch"
     )
     assert any(e["outcome"] == "failed" for e in events)
     failed = next(e for e in events if e["outcome"] == "failed")
     assert "evil.WORK-DOMAIN.local" in failed["details"]["unauthorized_dns_sans"]
+    assert failed["details"]["serial"] == cert_rows[0]["serial_number"]
 
 
 def test_finalize_accepts_issued_cert_with_matching_san(

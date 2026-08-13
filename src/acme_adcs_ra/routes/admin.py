@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
@@ -13,12 +14,56 @@ from acme_adcs_ra.app_state import (
     _audit,
     _certificate_url,
     get_context,
+    logger,
 )
+from acme_adcs_ra.crl_evidence import AGENT_ASSERTED, CrlEvidence, fetch_crl_evidence
 from acme_adcs_ra.finalize import _refresh_order_or_500
 from acme_adcs_ra.serializers import _order_to_admin_json, _order_to_json
-from acme_adcs_ra.store import CertStatus, OrderStatus
+from acme_adcs_ra.store import CertificateRecord, CertStatus, OrderStatus
 
 router = APIRouter()
+
+
+def _crl_evidence_for(
+    ctx: ServerContext, cert: CertificateRecord
+) -> CrlEvidence | None:
+    """Fetch CRL evidence for a certificate, or None when not configured.
+
+    Never raises: a CRL problem must not become a 500 on the confirm path. The
+    caller decides whether absent evidence is fatal.
+    """
+    crl_url = ctx.config.revocation_confirm_crl_url
+    if not crl_url:
+        return None
+    try:
+        serial_int = int(cert.serial_number or "", 16)
+    except ValueError:
+        return CrlEvidence(
+            revoked=False,
+            checked=False,
+            detail=f"stored serial is not hexadecimal: {cert.serial_number!r}",
+        )
+    try:
+        return fetch_crl_evidence(
+            crl_url=crl_url,
+            serial_number=serial_int,
+            cert_pem=cert.cert_pem,
+            chain_pem=cert.chain_pem,
+            timeout_seconds=ctx.config.revocation_confirm_crl_timeout_seconds,
+            max_bytes=ctx.config.revocation_confirm_crl_max_bytes,
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence gathering must never 500
+        logger.warning("CRL evidence check failed", exc_info=True)
+        return CrlEvidence(
+            revoked=False, checked=False, detail=f"CRL check error: {exc}"
+        )
+
+
+def _bearer_token(request: Request) -> str:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise unauthorized("missing Bearer token")
+    return auth_header.split(" ", 1)[1]
 
 
 def _require_admin_token(request: Request, ctx: ServerContext) -> None:
@@ -26,12 +71,32 @@ def _require_admin_token(request: Request, ctx: ServerContext) -> None:
     admin_token = ctx.config.admin_token.get_secret_value()
     if not admin_token:
         raise unauthorized("admin endpoint not configured")
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise unauthorized("missing Bearer token")
-    provided = auth_header.split(" ", 1)[1]
-    if not hmac.compare_digest(provided, admin_token):
+    if not hmac.compare_digest(_bearer_token(request), admin_token):
         raise unauthorized("invalid admin token")
+
+
+def _require_revocation_confirm_token(request: Request, ctx: ServerContext) -> None:
+    """Verify the dedicated revocation-confirmation credential.
+
+    Confirming a CA-side revocation is a different authority from general
+    maintenance: it asserts an external security event the RA cannot observe.
+    While it shared ``admin_token``, **any** holder of that token — monitoring,
+    ops tooling, a stale runbook credential — could mark a still-valid
+    certificate as confirmed-revoked, drop it off the retry queue, and leave a
+    success audit behind for a revocation that never happened.
+
+    The admin token is deliberately NOT accepted here, and an unset confirm
+    token disables the endpoint rather than silently falling back.
+    """
+    confirm_token = ctx.config.revocation_confirm_token.get_secret_value()
+    if not confirm_token:
+        raise unauthorized(
+            "revocation confirmation is not configured; set "
+            "ACME_RA_REVOCATION_CONFIRM_TOKEN (the general admin token is "
+            "deliberately not accepted for this endpoint)"
+        )
+    if not hmac.compare_digest(_bearer_token(request), confirm_token):
+        raise unauthorized("invalid revocation confirmation token")
 
 
 # Administrative: explicit nonce cleanup endpoint for cron (replaces
@@ -194,6 +259,11 @@ async def list_pending_revocations(
             "req_id": cert.metadata.get("req_id", ""),
             "reason": cert.revocation_reason,
             "revoked_at": cert.revoked_at,
+            # "revoked" = a client asked for it; "quarantined" = the CA issued
+            # it and a post-issuance verifier rejected it, so it was never
+            # served. Both must come off the CA, but the operator should be
+            # able to tell a routine revocation from a template misconfiguration.
+            "status": cert.status,
         })
     _audit(ctx,
         event_type="admin-list-pending-revocations",
@@ -214,7 +284,7 @@ async def confirm_ca_revocation(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _require_admin_token(request, ctx)
+    _require_revocation_confirm_token(request, ctx)
     serial_upper = serial.strip().upper().removeprefix("0X").removeprefix("0x")
     if not serial_upper:
         raise malformed("serial must not be empty")
@@ -226,26 +296,74 @@ async def confirm_ca_revocation(
             details={"serial": serial_upper, "reason": "not-found"},
         )
         raise not_found("certificate not found in RA store")
-    if cert.status != CertStatus.REVOKED:
+    if cert.status not in (CertStatus.REVOKED, CertStatus.QUARANTINED):
         _audit(ctx,
             event_type="admin-revocation-confirm-denied",
             outcome="failed",
             details={"serial": serial_upper, "reason": "not-revoked", "cert_status": cert.status},
         )
         raise malformed("certificate is not revoked in the RA store")
+
+    # Independent evidence, where the operator has configured it. The RA cannot
+    # ask the CA whether it revoked something, but a CRL is signed by the CA and
+    # readable by anyone — it is the one check that does not rest on the calling
+    # agent's honesty.
+    evidence = _crl_evidence_for(ctx, cert)
+    if ctx.config.revocation_confirm_require_crl_evidence and not (
+        evidence is not None and evidence.revoked
+    ):
+        detail = evidence.detail if evidence is not None else "no CRL configured"
+        _audit(ctx,
+            event_type="admin-revocation-confirm-denied",
+            account_id=cert.account_id,
+            order_id=cert.order_id,
+            outcome="failed",
+            details={
+                "serial": serial_upper,
+                "reason": "crl-evidence-required-but-absent",
+                "crl_detail": detail,
+            },
+        )
+        raise malformed(
+            "CRL evidence is required to confirm a CA-side revocation, and the "
+            f"CRL does not prove this serial is revoked: {detail}"
+        )
+
+    verification = evidence.verification if evidence is not None else AGENT_ASSERTED
     flipped = ctx.store.confirm_ca_revocation(serial_upper)
     if not flipped:
-        return JSONResponse(content={"serial": serial_upper, "ca_crl_updated": True})
+        return JSONResponse(content={
+            "serial": serial_upper,
+            "ca_crl_updated": True,
+            "verification": verification,
+        })
+    details: dict[str, Any] = {
+        "serial": serial_upper,
+        "certificate_id": cert.id,
+        "ca_crl_updated": True,
+        "revocation_scope": "ca-crl",
+        "prior_status": cert.status,
+        # The load-bearing distinction: "crl-verified" means the RA saw the
+        # serial on a validly signed, in-date CRL. "agent-asserted" means the
+        # RA is recording a claim it could not check — the audit trail must
+        # never imply more than that.
+        "verification": verification,
+    }
+    if evidence is not None:
+        details["crl_detail"] = evidence.detail
+        if evidence.crl_number:
+            details["crl_number"] = evidence.crl_number
+        if evidence.this_update:
+            details["crl_this_update"] = evidence.this_update
     _audit(ctx,
         event_type="revocation-ca-confirmed",
         account_id=cert.account_id,
         order_id=cert.order_id,
         outcome="success",
-        details={
-            "serial": serial_upper,
-            "certificate_id": cert.id,
-            "ca_crl_updated": True,
-            "revocation_scope": "ca-crl",
-        },
+        details=details,
     )
-    return JSONResponse(content={"serial": serial_upper, "ca_crl_updated": True})
+    return JSONResponse(content={
+        "serial": serial_upper,
+        "ca_crl_updated": True,
+        "verification": verification,
+    })

@@ -101,6 +101,11 @@ def _consume_nonce(store: Store, header: dict[str, Any], request_url: str) -> No
     nonce = header.get("nonce")
     if not nonce:
         raise bad_nonce(f"missing Replay-Nonce in protected header for {request_url}")
+    # A JSON object or array is truthy, so it passed the check above and reached
+    # SQLite parameter binding, raising ProgrammingError — an unauthenticated
+    # 500 on every JWS-authenticated route. RFC 8555 §6.5 nonces are strings.
+    if not isinstance(nonce, str):
+        raise bad_nonce(f"Replay-Nonce must be a string for {request_url}")
     if not store.consume_nonce(nonce):
         raise bad_nonce(f"invalid or replayed Replay-Nonce for {request_url}")
 

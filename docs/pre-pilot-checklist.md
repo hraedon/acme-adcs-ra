@@ -303,6 +303,32 @@ engineered to. Until then it has not — regardless of a green local test run.
   - [x] cryptography 50.0.0 verified on Windows Server 2025 / Python 3.14.
   - [ ] **Still open before pilot:** the operator-owned §B–E items (unchanged).
 
+- **2026-08-13 — security review closed in code, LIVE RE-PROOF OUTSTANDING.**
+  Ten findings from an external static scan of v1.8.0, all independently
+  reproduced first and all remediated (`docs/security-review-2026-08-13.md`).
+  566 tests + 81 Pester tests green; `ruff` and `mypy --strict` clean; every new
+  test mutation-checked.
+
+  **This entry is deliberately not marked PASSED.** Unlike the 2026-08-07 and
+  2026-08-11 rows above, no live lab re-proof has been run against this code.
+  The issuance leg changed (`Store.record_issuance`, certificate quarantine, the
+  `_certificate_response` valid-only gate), so §A must be re-run per
+  `docs/live-reproof-runbook.md` before pilot.
+
+  - [ ] **§A issuance-leg re-proof on the 2026-08-13 commit — NOT RUN.**
+  - [ ] **CRL-evidence path never exercised against a real ADCS CRL.** Only
+        enable `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE` after proving
+        it against the lab CA's published CRL.
+  - [ ] **`Set-OfficerRights.ps1` restart assertions not run on a CA.** The new
+        `Get-Service` / `Get-Process certsrv` checks are Windows-only and were
+        parse-checked on Linux `pwsh` only.
+  - [ ] **New required config before the revocation loop works:**
+        `ACME_RA_REVOCATION_CONFIRM_TOKEN` on the RA and `-ConfirmToken` on the
+        sync agent. Without it every confirm returns 401.
+  - [ ] **Existing deployments: re-check credential strength.** EAB MAC keys
+        < 32 bytes or admin tokens < 32 chars now refuse startup.
+  - [ ] Still open before pilot: the operator-owned §B–E items (unchanged).
+
 - **2026-08-11 — security review + live re-proof, PASSED.** Twelve findings from
   a pre-production-deployment review closed (`docs/security-review-2026-08-11.md`),
   plus a thirteenth found while reading real `certutil` output. Re-proved live

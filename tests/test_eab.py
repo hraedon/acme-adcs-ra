@@ -181,22 +181,22 @@ class TestEabSanScopeValueParsable:
 _AUDIT_KIDS = [
     {
         "kid": "kid-001",
-        "mac_key": "mac-AAA-do-not-leak-001",
+        "mac_key": "bWFjLUFBQS1kby1ub3QtbGVhay0wMDEtLS0tLS0tLS0",
         "patterns": ["*.WORK-DOMAIN.local", "srv01.WORK-DOMAIN.local"],
     },
     {
         "kid": "kid-002",
-        "mac_key": "mac-BBB-do-not-leak-002",
+        "mac_key": "bWFjLUJCQi1kby1ub3QtbGVhay0wMDItLS0tLS0tLS0",
         "patterns": ["exact.WORK-DOMAIN.local"],
     },
     {
         "kid": "kid-003",
-        "mac_key": "mac-CCC-do-not-leak-003",
+        "mac_key": "bWFjLUNDQy1kby1ub3QtbGVhay0wMDMtLS0tLS0tLS0",
         "patterns": None,
     },
     {
         "kid": "kid-004",
-        "mac_key": "mac-DDD-do-not-leak-004",
+        "mac_key": "bWFjLURERC1kby1ub3QtbGVhay0wMDQtLS0tLS0tLS0",
         "patterns": ["*.prod.WORK-DOMAIN.local"],
     },
 ]
@@ -313,7 +313,7 @@ class TestEabAudit:
 
     def test_audit_abbreviates_long_kid(self, tmp_path: Path) -> None:
         long_kid = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
-        allowlist = json.dumps([{"kid": long_kid, "mac_key": "mac-xxx-do-not-leak"}])
+        allowlist = json.dumps([{"kid": long_kid, "mac_key": "bWFjLXh4eC1kby1ub3QtbGVhay0tLS0tLS0tLS0tLS0"}])
         env_content = (
             f"ACME_RA_EAB_ALLOWLIST={allowlist}\n"
             f'ACME_RA_SAN_SCOPES__{long_kid}__DNS_PATTERNS='

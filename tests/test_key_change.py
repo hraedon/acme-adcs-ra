@@ -29,7 +29,7 @@ def _make_config(tmp_path: Path) -> RAConfig:
         eab_allowlist=[EABEntry(kid="kid-001", mac_key=mac_key_b64)],
         san_scopes={"kid-001": {"dns_patterns": ["*.WORK-DOMAIN.local"]}},
         adcs_template="ACME-ServerAuth",
-        admin_token=SecretStr("test-admin-token"),
+        admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
     )
 
 

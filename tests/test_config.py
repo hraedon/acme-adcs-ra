@@ -29,13 +29,16 @@ class TestRAConfig:
             )
 
     def test_unique_eab_kids_allowed(self) -> None:
+        # Keys must clear the MIN_EAB_MAC_KEY_BYTES floor: both decode to 32 bytes.
+        k1 = "azEta2V5LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0"
+        k2 = "azIta2V5LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0"
         cfg = RAConfig(
             eab_allowlist=[
-                EABEntry(kid="k1", mac_key="a"),
-                EABEntry(kid="k2", mac_key="b"),
+                EABEntry(kid="k1", mac_key=k1),
+                EABEntry(kid="k2", mac_key=k2),
             ]
         )
-        assert cfg.eab_keys_by_kid() == {"k1": "a", "k2": "b"}
+        assert cfg.eab_keys_by_kid() == {"k1": k1, "k2": k2}
 
     def test_no_audit_emit_toggle(self) -> None:
         """Auditing is unconditional; there must be no toggle to disable it."""

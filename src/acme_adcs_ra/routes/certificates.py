@@ -18,6 +18,12 @@ def _certificate_response(cert: CertificateRecord) -> Response:
     # H-1: revoked certs must not be installable — return 410 Gone.
     if cert.status == CertStatus.REVOKED:
         return Response(status_code=410)
+    # Fail closed on anything that is not an honoured issuance. A quarantined
+    # certificate — one the CA issued and a post-issuance verifier rejected —
+    # must never be served; no code path builds a URL for one, and this makes
+    # that a property of the response builder rather than of its callers.
+    if cert.status != CertStatus.VALID:
+        return Response(status_code=410)
     body = cert.cert_pem + "".join(cert.chain_pem)
     return Response(content=body, media_type=_PEM_CHAIN_MEDIA_TYPE)
 

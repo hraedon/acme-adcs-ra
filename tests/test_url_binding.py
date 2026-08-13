@@ -69,7 +69,7 @@ def client(tmp_path: Path) -> TestClient:
         eab_allowlist=[EABEntry(kid=KID, mac_key=MAC_B64)],
         san_scopes={KID: {"dns_patterns": ["*.WORK-DOMAIN.local"]}},
         adcs_template="ACME-ServerAuth",
-        admin_token=SecretStr("test-admin-token"),
+        admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
     )
     store = Store(cfg.db_path)
     policy = IssuancePolicy(

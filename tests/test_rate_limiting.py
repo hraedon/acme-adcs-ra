@@ -44,7 +44,7 @@ def _make_rate_limit_config(
             "kid-002": {"dns_patterns": ["*.prod.WORK-DOMAIN.local"]},
         },
         adcs_template="ACME-ServerAuth",
-        admin_token=SecretStr("test-admin-token"),
+        admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
         rate_limit_orders_per_window=per_kid,
         rate_limit_window_seconds=window,
         rate_limit_global_per_window=global_limit,

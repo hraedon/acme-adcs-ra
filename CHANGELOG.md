@@ -6,6 +6,97 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-08-13
+
+**Security hardening (2026-08-13 external scan).** Ten findings — nine medium,
+one low — from an external static scan of v1.8.0. Every one was independently
+reproduced against the shipped build before any code changed, and every new
+test was mutation-checked. See `docs/security-review-2026-08-13.md`, which also
+records what this review did **not** prove.
+
+> ### ⚠️ Upgrade requirements — read before deploying
+>
+> **1. `ACME_RA_REVOCATION_CONFIRM_TOKEN` is now required for the CA-side
+> revocation loop.** Confirming a revocation asserts an external event the RA
+> cannot observe, so it is no longer the same authority as general maintenance:
+> the confirm endpoint requires its own credential and **refuses the admin
+> token**. Without it, `POST /acme/admin/revocations/{serial}/confirm` returns
+> 401 and serials remain on the pending list. Pass it to
+> `Sync-Revocations.ps1 -ConfirmToken` (or `ACME_CONFIRM_TOKEN`);
+> `Register-MaintenanceTasks.ps1 -ConfirmToken` forwards it.
+>
+> **2. Weak credentials now refuse startup.** EAB MAC keys must decode to ≥ 32
+> bytes and admin/confirm tokens must be ≥ 32 characters. Regenerate with
+> `python scripts/eab.py new`, or set `allow_weak_credentials` for a lab/CI
+> fixture only.
+>
+> **3. The revocation scripts reject non-https RA URLs.** A loopback-http lab
+> needs `-AllowInsecureUrl`.
+>
+> **4. `audit_offbox_required` now fails startup** when the configured sink
+> cannot actually emit (previously it checked only the sink's name).
+
+### Security
+
+- **Revocation confirmations are no longer taken on faith.** The confirm
+  endpoint requires a dedicated token, and every confirmation records
+  `verification: "agent-asserted"` or `"crl-verified"` so the audit trail never
+  implies the RA observed a CA-side event it did not. Optional independent
+  verification against the CA's published CRL
+  (`ACME_RA_REVOCATION_CONFIRM_CRL_URL`) can be made mandatory with
+  `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`; the CRL's signature is
+  checked against the issuing CA certificate from the certificate's own stored
+  chain, and an expired CRL is not accepted as evidence.
+- **Certificates rejected by a post-issuance verifier are now quarantined
+  rather than orphaned.** ADCS has already issued by the time the SAN / EKU /
+  CA-capability checks run; the RA previously recorded nothing at all — not even
+  the serial — leaving a live, unrevocable certificate at the CA. It is now
+  recorded as `quarantined` (serial, ReqID, bytes, violations), the order goes
+  terminal, and it is queued for CA-side revocation through the existing pull
+  agent. It is never served: `get_certificate_by_order` excludes quarantined
+  rows and the certificate response serves only `valid`.
+- **Issuance and its mandatory audit row now commit in one transaction**
+  (`Store.record_issuance`). Fault injection previously left a stored,
+  serveable certificate with zero `certificate-issued` events. The issuance
+  event now also carries the serial.
+- **Invalid nonces are rejected by a read, not a SQLite write.** An
+  unauthenticated peer could make every bogus nonce contend for the single
+  writer lock; measured, a bogus nonce blocked for the full 5 s `busy_timeout`
+  and then raised `database is locked` (a 500, not a 400). Single-use semantics
+  are unchanged.
+- **EAB MAC keys and admin/confirm tokens have enforced strength floors.** An
+  EAB key decoding to zero bytes was previously treated as *present*, letting
+  anyone who knew the kid forge the binding with an empty HMAC key.
+- **The HEC audit queue is bounded** (`ACME_RA_SIEM_HEC_QUEUE_MAX`, default
+  1000). A dead HEC endpoint previously let request-driven audit events
+  accumulate without limit; overflow now drops from the HEC sink only — never
+  from the local audit table — and is counted and logged.
+- **`audit_offbox_required` asserts the constructed emitter**, so a deployment
+  can no longer claim the off-box audit gate while emitting nothing.
+- **Malformed JWS input returns ACME 4xx instead of 500.** Three
+  unauthenticated crashes: a non-object EAB protected header, a non-string
+  nonce reaching SQLite parameter binding, and a non-ASCII EAB payload reaching
+  the timing-equalisation helper's ASCII encode.
+- **`Sync-Revocations.ps1` / `Register-MaintenanceTasks.ps1` validate the RA URL
+  before attaching the token** — https only, no embedded credentials, no query,
+  fragment, or path. A scheduled task bakes the URL in, so a typo would have
+  disclosed the token on every run.
+- **`Set-OfficerRights.ps1` proves activation before reporting success.** The
+  CA loads `OfficerRights` at service start, so a written-but-not-reloaded
+  restriction is not in force. `net start` failure is now fatal, the service
+  must be `Running`, the process must have actually recycled, and the readback
+  asserts the target officer's ACE landed (or is gone, for `-Remove`) instead of
+  merely printing it. `Get-OfficerRightsBytes` reads the registry provider
+  first rather than regex-scanning `certutil` console text.
+
+### Changed
+
+- `scripts/lib/SyncLib.ps1` is now dot-sourced by `Sync-Revocations.ps1` rather
+  than being a test-only copy, so the URL validation the Pester suite exercises
+  is the code that actually runs.
+- `/acme/admin/revocations/pending` entries carry `status`, distinguishing a
+  client-requested revocation from a quarantined mis-issuance.
+
 ## [1.8.0] — 2026-08-11
 
 **Security hardening (2026-08-11 pre-deployment review).** Thirteen findings

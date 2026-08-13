@@ -31,7 +31,7 @@ from acme_adcs_ra.finalize import _issued_cert_eku_violations
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
-from acme_adcs_ra.store import Store
+from acme_adcs_ra.store import CertStatus, Store
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
 
@@ -190,9 +190,13 @@ def _context_with_leg(config: RAConfig, leg: Any) -> ServerContext:
 def test_finalize_rejects_issued_cert_with_clientauth_eku(
     test_config: RAConfig, account_key: rsa.RSAPrivateKey
 ) -> None:
-    """WI-026: a template that issues serverAuth+clientAuth must not be recorded
-    or served. Finalize returns 500, the mismatch is audited (outcome=failed),
-    and no cert row is created."""
+    """WI-026: a template that issues serverAuth+clientAuth must not be served.
+
+    Finalize returns 500 and the mismatch is audited. The certificate is
+    *quarantined* rather than discarded: ADCS already issued it, so the RA
+    records the serial and queues it for CA-side revocation instead of leaving
+    an unrevocable orphan (2026-08-13 review, finding 6).
+    """
     context = _context_with_leg(
         test_config, _EkuMisconfigEnrollmentLeg([_SERVER_AUTH, _CLIENT_AUTH])
     )
@@ -203,13 +207,28 @@ def test_finalize_rejects_issued_cert_with_clientauth_eku(
     assert "EKU verification" in resp.json()["detail"]
 
     store = Store(test_config.db_path)
-    assert store._connect().execute("SELECT id FROM certificates").fetchall() == []
+    rows = store._connect().execute(
+        "SELECT id, status, serial_number FROM certificates"
+    ).fetchall()
+    assert len(rows) == 1, "the CA-issued certificate must be tracked"
+    assert rows[0]["status"] == CertStatus.QUARANTINED
+    assert rows[0]["serial_number"]
+
+    # No valid certificate exists for the order, so nothing is servable and a
+    # retried finalize cannot pick it up.
+    assert store.get_certificate_by_order(rows[0]["id"]) is None
+
+    # It is queued for CA-side revocation through the normal pull-agent loop.
+    pending = store.list_revoked_certificates()
+    assert [c.serial_number for c in pending] == [rows[0]["serial_number"]]
 
     events = store.list_audit_events(
         account_id=None, event_type="finalize-issued-cert-eku-mismatch"
     )
     failed = next(e for e in events if e["outcome"] == "failed")
-    assert any("clientAuth" in v for v in failed["details"]["eku_violations"])
+    assert any("clientAuth" in v for v in failed["details"]["violations"])
+    # The serial is in the audit trail — the operator's handle on the orphan.
+    assert failed["details"]["serial"] == rows[0]["serial_number"]
 
 
 def test_finalize_rejects_issued_cert_with_no_eku(

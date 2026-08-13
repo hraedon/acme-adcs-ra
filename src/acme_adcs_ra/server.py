@@ -46,6 +46,25 @@ def create_app(context: ServerContext) -> FastAPI:
     _siem_emitter: SiemEmitter | None = None
     if context.audit_hook is None:
         _siem_emitter = _default_siem_emitter(context.config)
+        # `audit_offbox_required` validates the configured sink *name*, which is
+        # not the same question as whether events actually leave the box. An
+        # emitter disables itself when its config is unusable — empty
+        # syslog_host, an HEC URL that is not https or carries embedded
+        # credentials, an empty HEC token, a failed syslog handler setup — and
+        # the app used to start anyway with the disabled hook installed. The
+        # operator would then believe the production off-box audit gate was
+        # satisfied while the only audit evidence lived on the host an attacker
+        # is assumed to control. Assert the constructed emitter, not the name.
+        if context.config.audit_offbox_required and not _siem_emitter.enabled:
+            raise RuntimeError(
+                "audit_offbox_required is set, but the "
+                f"{context.config.siem_sink!r} SIEM emitter failed to initialise "
+                "and is disabled, so no audit event would leave this host. "
+                "Check the sink's configuration (syslog_host, or an https "
+                "hec_url without embedded credentials plus a non-empty "
+                "hec_token); the RA is refusing to start rather than run "
+                "without the off-box audit trail it was told to require."
+            )
         context.audit_hook = _siem_emitter.export
     if context.nonce_bucket is None:
         context.nonce_bucket = _default_nonce_bucket(context.config)

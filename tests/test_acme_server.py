@@ -44,7 +44,8 @@ def _make_test_config(tmp_path: Path) -> RAConfig:
             "kid-002": {"dns_patterns": ["*.prod.WORK-DOMAIN.local"]},
         },
         adcs_template="ACME-ServerAuth",
-        admin_token=SecretStr("test-admin-token"),
+        admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
+        revocation_confirm_token=SecretStr("test-confirm-token-0123456789abcdef-32+"),
     )
 
 
@@ -1587,7 +1588,7 @@ class TestStuckProcessingReclaim:
 
         resp = client.post(
             f"/acme/admin/orders/{order_id}/reclaim-processing",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "ready"
@@ -1630,7 +1631,7 @@ class TestStuckProcessingReclaim:
 
         resp = client.post(
             f"/acme/admin/orders/{order_id}/reclaim-processing",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -1710,7 +1711,7 @@ class TestStuckProcessingReclaim:
         # Operator (having confirmed no cert at the CA) reclaims to ready.
         resp = client.post(
             f"/acme/admin/orders/{order_id}/reclaim-processing",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "ready"
@@ -1766,7 +1767,7 @@ class TestStuckProcessingReclaim:
         # to SIEM — threat-model §4.F).
         resp = client.post(
             f"/acme/admin/orders/{order_id}/reclaim-processing",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "ready"
@@ -1788,7 +1789,7 @@ class TestStuckProcessingReclaim:
     ) -> None:
         resp = client.post(
             "/acme/admin/orders/does-not-exist/reclaim-processing",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 404
 
@@ -1824,7 +1825,7 @@ class TestAdminSweeps:
 
         resp = client.delete(
             "/acme/admin/nonces",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         assert resp.json()["deleted"] >= 1
@@ -1848,7 +1849,7 @@ class TestAdminSweeps:
 
         resp = client.delete(
             "/acme/admin/expired-orders",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         assert resp.json()["invalidated"] >= 1
@@ -1878,7 +1879,7 @@ class TestAdminSweeps:
 
         resp = client.delete(
             "/acme/admin/expired-orders",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
 
@@ -2090,7 +2091,7 @@ class TestAdminOrderListing:
 
         resp = client.get(
             "/acme/admin/orders",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         orders = resp.json()["orders"]
@@ -2109,7 +2110,7 @@ class TestAdminOrderListing:
 
         resp = client.get(
             "/acme/admin/orders?status=ready",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         orders = resp.json()["orders"]
@@ -2122,7 +2123,7 @@ class TestAdminOrderListing:
     ) -> None:
         resp = client.get(
             "/acme/admin/orders?status=invalid_status",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 400
 
@@ -2132,7 +2133,7 @@ class TestAdminOrderListing:
     ) -> None:
         resp = client.get(
             "/acme/admin/orders?limit=-1",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 400
 
@@ -2142,7 +2143,7 @@ class TestAdminOrderListing:
     ) -> None:
         resp = client.get(
             "/acme/admin/orders?limit=999",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 400
 
@@ -2157,7 +2158,7 @@ class TestAdminOrderListing:
 
         client.get(
             "/acme/admin/orders?status=ready",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
 
         store = Store(test_config.db_path)
@@ -2184,7 +2185,7 @@ class TestAdminOrderListing:
 
         resp = client.get(
             "/acme/admin/orders",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         orders = resp.json()["orders"]
@@ -2224,7 +2225,7 @@ class TestAdminPendingRevocations:
     ) -> None:
         resp = client.get(
             "/acme/admin/revocations/pending",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         assert resp.json() == {"pending_revocations": []}
@@ -2242,7 +2243,7 @@ class TestAdminPendingRevocations:
 
         resp = client.get(
             "/acme/admin/revocations/pending",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -2264,7 +2265,7 @@ class TestAdminPendingRevocations:
 
         resp = client.get(
             "/acme/admin/revocations/pending",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -2275,13 +2276,13 @@ class TestAdminPendingRevocations:
     ) -> None:
         resp = client.get(
             "/acme/admin/revocations/pending?limit=0",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 400
 
         resp = client.get(
             "/acme/admin/revocations/pending?limit=501",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 400
 
@@ -2298,7 +2299,7 @@ class TestAdminPendingRevocations:
 
         client.get(
             "/acme/admin/revocations/pending",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
 
         events = store.list_audit_events(event_type="admin-list-pending-revocations")
@@ -2326,7 +2327,7 @@ class TestAdminConfirmRevocation:
     def test_confirm_unknown_serial_404(self, client: TestClient) -> None:
         resp = client.post(
             "/acme/admin/revocations/DEADBEEF/confirm",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-confirm-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 404
 
@@ -2340,7 +2341,7 @@ class TestAdminConfirmRevocation:
         assert cert is not None
         resp = client.post(
             f"/acme/admin/revocations/{cert.serial_number}/confirm",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-confirm-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 400
 
@@ -2357,7 +2358,7 @@ class TestAdminConfirmRevocation:
 
         resp = client.post(
             f"/acme/admin/revocations/{cert.serial_number}/confirm",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-confirm-token-0123456789abcdef-32+"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -2377,7 +2378,7 @@ class TestAdminConfirmRevocation:
 
         client.post(
             f"/acme/admin/revocations/{cert.serial_number}/confirm",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-confirm-token-0123456789abcdef-32+"},
         )
 
         events = store.list_audit_events(event_type="revocation-ca-confirmed")
@@ -2395,7 +2396,7 @@ class TestAdminConfirmRevocation:
     ) -> None:
         client.post(
             "/acme/admin/revocations/DEADBEEF/confirm",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-confirm-token-0123456789abcdef-32+"},
         )
         store = Store(test_config.db_path)
         events = store.list_audit_events(event_type="admin-revocation-confirm-denied")
@@ -2414,18 +2415,18 @@ class TestAdminConfirmRevocation:
 
         resp = client.get(
             "/acme/admin/revocations/pending",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert len(resp.json()["pending_revocations"]) == 1
 
         client.post(
             f"/acme/admin/revocations/{cert.serial_number}/confirm",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-confirm-token-0123456789abcdef-32+"},
         )
 
         resp = client.get(
             "/acme/admin/revocations/pending",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
         )
         assert resp.json()["pending_revocations"] == []
 
@@ -2442,13 +2443,13 @@ class TestAdminConfirmRevocation:
 
         resp1 = client.post(
             f"/acme/admin/revocations/{cert.serial_number}/confirm",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-confirm-token-0123456789abcdef-32+"},
         )
         assert resp1.status_code == 200
 
         resp2 = client.post(
             f"/acme/admin/revocations/{cert.serial_number}/confirm",
-            headers={"Authorization": "Bearer test-admin-token"},
+            headers={"Authorization": "Bearer test-confirm-token-0123456789abcdef-32+"},
         )
         assert resp2.status_code == 200
         assert resp2.json()["ca_crl_updated"] is True

@@ -295,6 +295,34 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
   unauthenticated caller that could reach the RA.
 
 ### E. Revocation abuse
+- **Confirming a CA-side revocation is a distinct authority (2026-08-13).** The
+  WI-024 callback exists because the RA holds no CA rights and so cannot observe
+  whether the CA actually revoked a serial. It previously accepted the general
+  `admin_token` and wrote `revocation-ca-confirmed` on the caller's word alone,
+  which made the audit trail assert an external security event the RA had not
+  seen — and let any admin-token holder drop a **still-valid** certificate off
+  the retry queue, suppressing the very retry that would have revoked it. Now:
+  a dedicated `revocation_confirm_token` (the admin token is refused; unset ⇒
+  endpoint disabled, fail closed); every confirmation labelled
+  `verification="agent-asserted"` unless proven otherwise; and optional
+  independent proof via the CA's **published CRL** — signed by the CA, readable
+  without privilege, and the only check available to the RA that does not depend
+  on the calling agent's honesty. The CRL signature is verified against the
+  issuing CA certificate from the certificate's own stored chain, and an expired
+  CRL is not evidence. `require_crl_evidence` makes proof mandatory.
+  *Residual:* an attacker holding the **confirm** token can still assert falsely
+  unless CRL evidence is required; the control is least privilege plus honest
+  labelling, not elimination.
+- **Mis-issued certificates are quarantined, not forgotten (2026-08-13).** The
+  post-issuance verifiers (SAN, EKU, CA-capability) run *after* ADCS has issued,
+  so a rejection leaves a real, trusted certificate in the CA database. The RA
+  previously recorded nothing — not even the serial — so the certificate it had
+  just refused to honour was unrevocable through the RA's own workflow. It is
+  now written as a `quarantined` row (serial, ReqID, bytes, violations), the
+  order goes terminal, and it enters the **same** CA-side revocation queue as
+  any other pending serial. It is never served: `get_certificate_by_order`
+  excludes quarantined rows so a retried finalize cannot pick it up, and the
+  certificate response serves only `valid`.
 - **Only the issuing account may revoke** its own cert (lookup scoped to
   `(serial, account_id)`); cross-account → 404 (no leak). Already-revoked →
   **200** (RFC §7.6 idempotent). Revoked certs are **not served** (GET → 410

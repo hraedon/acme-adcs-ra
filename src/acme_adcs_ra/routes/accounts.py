@@ -72,6 +72,21 @@ async def new_account(
         )
         raise bad_external_account_binding("externalAccountBinding is required")
 
+    # The three JWS members are attacker-controlled and reach string operations
+    # downstream — _base64url_decode, and _dummy_hmac's ASCII encode of
+    # "protected.payload". A non-string member (or a non-ASCII one) surfaced as
+    # an unhandled 500 with a stack trace instead of a 400. Check the shape once,
+    # here, before anything touches them.
+    if not all(isinstance(eab_jws.get(k), str) for k in ("protected", "payload", "signature")):
+        _audit(ctx,
+            event_type="account-creation-denied",
+            outcome="failed",
+            details={"reason": "EAB protected/payload/signature must be strings"},
+        )
+        raise bad_external_account_binding(
+            "externalAccountBinding protected, payload, and signature must be strings"
+        )
+
     try:
         eab_header = json.loads(_base64url_decode(eab_jws["protected"]))
     except Exception as exc:
@@ -83,7 +98,31 @@ async def new_account(
         raise bad_external_account_binding(
             f"invalid externalAccountBinding protected header: {exc}"
         ) from exc
+
+    # A protected header that decodes to valid JSON but is not an *object* (an
+    # array, a bare string, a number) previously reached ``.get`` and raised
+    # AttributeError — an unauthenticated 500. verify_eab_jws checks this too,
+    # but the kid is read here, before that call.
+    if not isinstance(eab_header, dict):
+        _audit(ctx,
+            event_type="account-creation-denied",
+            outcome="failed",
+            details={"reason": "EAB protected header is not a JSON object"},
+        )
+        raise bad_external_account_binding(
+            "externalAccountBinding protected header must be a JSON object"
+        )
+
     eab_kid = eab_header.get("kid")
+    if eab_kid is not None and not isinstance(eab_kid, str):
+        _audit(ctx,
+            event_type="account-creation-denied",
+            outcome="failed",
+            details={"reason": "EAB kid must be a string"},
+        )
+        raise bad_external_account_binding(
+            "externalAccountBinding protected header kid must be a string"
+        )
     if not eab_kid:
         _audit(ctx,
             event_type="account-creation-denied",
@@ -94,7 +133,11 @@ async def new_account(
             "externalAccountBinding protected header missing kid"
         )
     mac_key = ctx.config.eab_key_bytes(eab_kid)
-    if mac_key is None:
+    # `not mac_key`, not `mac_key is None`: a configured key that decodes to
+    # zero bytes is not a key. Treating b"" as present let anyone who knew the
+    # kid forge the binding with an empty HMAC key. Config validation now
+    # rejects such an entry at startup; this is the second line of defence.
+    if not mac_key:
         # Timing equalization: perform a dummy HMAC with a random key so
         # the unknown-kid path takes comparable time to the known-kid path.
         # This mitigates the kid-existence timing side-channel (threat-model §4.B).
