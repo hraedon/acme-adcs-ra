@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import tomllib
+from pathlib import Path
+
 import pytest
 
+import acme_adcs_ra
 from acme_adcs_ra.config import EABEntry, RAConfig, SANScope
+
+
+def test_package_version_matches_pyproject() -> None:
+    """__version__ must track pyproject, not a hand-maintained literal.
+
+    It sat at "0.1.0" from the first commit through v1.8.0 because nothing read
+    it. A release artifact that misreports its own version is a trap for
+    whoever eventually does.
+    """
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text())["project"]["version"]
+    assert acme_adcs_ra.__version__ == declared
 
 
 class TestEABEntry:

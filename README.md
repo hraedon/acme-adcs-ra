@@ -85,92 +85,94 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **Project status:** **released at v1.7.0** (2026-08-08) — feature-complete for
-> its charter. v1.7 is a **security hardening** release (CA-capable CSR/cert
-> rejection, CN→SAN binding, certsrv key binding, rate-limit TOCTOU fix, JWS
-> streaming cap, algorithm exactness, EAB URL binding, HEC HTTPS enforcement,
-> cryptography ≥50.0.0) — live re-proven against ADCS. v1.5–v1.6 added
-> **automated CA-side revocation** and **self-enforced serverAuth EKU
-> verification**; the **v1.6 hardening sweep** closed the enrollment-side bound
-> (Finding E-1), added a Pester test suite + deterministic CI, proved the
-> two-identity design's compromise-independence property live, and added a
-> live-re-proof runbook.
-> Maintained deliberately, not passively: security reports (see `SECURITY.md`) and
-> bug reports are welcome, but there is no response-time commitment.
->
-> **Known limitations before a production pilot** (see
-> [`plans/007-v1.6-hardening-sweep.md`](plans/007-v1.6-hardening-sweep.md)):
->
-> - **Enrollment-side bound (Finding E-1) — remediated in v1.6 (WI-035).** The
->   enrollment gMSA was moved off the Domain Computers `Machine`-enroll path and
->   verified to enroll only `ACME-ServerAuth`; apply the equivalent change per your
->   estate. See [`docs/revocation-scope-validation.md`](docs/revocation-scope-validation.md).
-> - **Recommended topology — proven live (WI-036).** The two-identity
->   (dedicated-revoker) design was proven end-to-end: a separate revoker gMSA
->   revoked an `ACME-ServerAuth` cert at the CA and confirmed it back, with the
->   enrollment gMSA holding no officer rights (compromise independence).
->   *Operator note:* create the revoker gMSA with AES Kerberos etypes
->   (`-KerberosEncryptionType AES128,AES256`) — see `docs/live-reproof-runbook.md`.
-> - **PowerShell test coverage — added in v1.6 (WI-037):** a Pester pure-logic
->   suite (golden-bytes OfficerRights blob, action-string builder, reason/requester
->   logic) runs in CI. Deploy the whole `scripts/` dir including `scripts/lib/`.
-> - **CI ≠ ADCS-verified:** cloud CI cannot reach a CA, so a green build does not
->   confirm the enrollment/revocation legs still work — those rest on periodic live
->   re-proofs. See [`docs/live-reproof-runbook.md`](docs/live-reproof-runbook.md)
->   and the validation log in the checklist.
-> - **`base_url` is security configuration (2026-08-11).** Since the
->   [2026-08-11 review](docs/security-review-2026-08-11.md), every JWS and EAB
->   binding is validated against the URL derived from `ACME_RA_BASE_URL` rather
->   than the URL the request arrived on. Set it to the exact public origin —
->   scheme, host and port — or every legitimate request fail-closes on day 1.
->   Mint **separate EAB kids per environment**; a kid shared with a staging RA
->   no longer verifies against production.
-> - **Two operator items are now required, not recommended:** an off-box audit
->   sink (`ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with syslog or HEC — the default
->   `jsonl` sink dies with the host it is auditing) and the network allowlist in
->   front of the unauthenticated nonce endpoint. See the checklist §C/§E.
->
-> Deploying this is issuance-path infrastructure: work through
-> [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md) before running it
-> anywhere that matters.
+> **Released at v1.9.0 (2026-08-13).** Feature-complete for its charter and
+> maintained deliberately rather than passively: security reports (see
+> `SECURITY.md`) and bug reports are welcome, but there is no response-time
+> commitment.
 
-**At the production-pilot bar — Plans 001–006 complete (v1.5 on `main`).** The
-full pipeline — ACME server (RFC 8555 subset: directory, EAB-gated accounts,
-orders, finalize, cert retrieval, revokeCert, keyChange, account-scoped
-POST-as-GET resource reads and §7.3.6 deactivation), deterministic
-issuance policy with **post-issuance SAN + EKU verification**, **automated
-CA-side revocation** (template-scoped officer; two-identity default + opt-in
-single-identity), in-app per-account order rate limiting, SIEM audit, and the
-real ADCS **enrollment** leg — issues
-a real certificate: a deployed RA running as the gMSA behind IIS drives
-`/certsrv/` and returns a **serverAuth-only** cert with the **SAN from the
-CSR**, issued off the existing CA and **chaining to the existing root** (no new
-intermediate). See [`docs/architecture.md`](docs/architecture.md),
-[`docs/threat-model.md`](docs/threat-model.md),
-[`docs/certsrv-setup.md`](docs/certsrv-setup.md), and the result in
-[`docs/spike-runbook.md`](docs/spike-runbook.md). **WI-015** (the live lab
-re-proof against the exact piloted commit) **PASSED** 2026-07-13 — all 12 cases
-green; see [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).
-Plan 003 (WI-016–WI-020) added in-app rate limiting, RA-vs-CA revocation
-reconciliation (read-only), an EAB scope audit view, `keyChange`
-(RFC 8555 §7.3.5), and locale-robust `certfnsh.asp` parsing — see
-[`docs/operations.md`](docs/operations.md).
+The full pipeline works and has been proven against a real CA: an RA running as
+the gMSA behind IIS drives `/certsrv/` and returns a **serverAuth-only**
+certificate with the **SAN from the CSR**, issued off the existing CA and
+chaining to the **existing root** — no new intermediate.
+
+### How it got here
+
+| Release | What it added |
+|---|---|
+| **v1.0** | ACME server (RFC 8555 subset), deterministic issuance policy, the live ADCS enrollment leg |
+| **v1.5–v1.6** | Automated CA-side revocation (two-identity default, opt-in single-identity), self-enforced serverAuth EKU verification, the enrollment-side bound (Finding E-1), a Pester suite, and the live re-proof runbook |
+| **v1.7** | Security hardening — CA-capable CSR/cert rejection, CN→SAN binding, rate-limit TOCTOU, JWS streaming cap, algorithm exactness |
+| **v1.8** | `base_url` URL binding, account eviction, serial re-padding to the CA database form |
+| **v1.9** | The [2026-08-13 review](docs/security-review-2026-08-13.md) — ten findings, including separated revocation-confirm authority with optional CRL proof, certificate quarantine, and atomic issuance+audit |
+
+Each release's live re-proof is recorded in the validation log in
+[`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).
+
+### What "proven" means here, and what it does not
+
+**Green CI is not ADCS verification.** Cloud CI cannot reach a CA, so a green
+build proves the code and the operator scripts' *logic* — never that issuance or
+CA-side revocation still work. Only the live re-proof
+([`docs/live-reproof-runbook.md`](docs/live-reproof-runbook.md)) does, and it is
+required at every release, before any pilot, after any change to the issuance
+leg, and quarterly while deployed.
+
+That distinction is not theoretical. The v1.9.0 re-proof found two defects Linux
+CI **structurally could not see** — both Windows PowerShell 5.1 language
+semantics that `pwsh` 7 on Linux silently differs on, one of them inside the
+review's own fix. See the v1.9.0 entry in the validation log.
+
+### Before you deploy
+
+This is issuance-path infrastructure. Work through
+[`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md) first. Five items
+are load-bearing enough to call out here:
+
+- **`base_url` is security configuration, not a display value.** Every JWS and
+  EAB binding is validated against the URL derived from `ACME_RA_BASE_URL`, not
+  the URL the request arrived on. Set it to the exact public origin — scheme,
+  host, and port — or every legitimate request fail-closes on day 1. Mint
+  **separate EAB kids per environment**; a kid shared with a staging RA no
+  longer verifies against production.
+- **An off-box audit sink is required, not recommended.** Set
+  `ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with syslog or HEC — the default `jsonl`
+  sink dies with the host it is auditing. Since v1.9 the RA refuses to start if
+  the configured sink cannot actually emit.
+- **The network allowlist is required**, in front of the unauthenticated nonce
+  endpoint.
+- **`ACME_RA_REVOCATION_CONFIRM_TOKEN` is required** for the CA-side revocation
+  loop, and the general admin token is deliberately refused there. Without it,
+  serials revoke at the CA but stay on the RA's pending list.
+- **Credentials have strength floors.** EAB MAC keys must decode to ≥ 32 bytes
+  and admin/confirm tokens must be ≥ 32 characters; generate them with
+  `python scripts/eab.py new`. Weak values refuse startup.
+
+Apply the enrollment-side bound (Finding E-1) per your estate — move the
+enrollment gMSA off the Domain Computers `Machine`-enroll path and verify it can
+enroll only `ACME-ServerAuth`. See
+[`docs/revocation-scope-validation.md`](docs/revocation-scope-validation.md).
+If you use the two-identity topology, create the revoker gMSA with AES Kerberos
+etypes (`-KerberosEncryptionType AES128,AES256`) — a gMSA created without them
+gets RC4 added, which fails wherever DCs block RC4, and the symptom reads
+misleadingly as a KDS or time-sync problem.
+
+### How revocation works
+
+ADCS Web Enrollment exposes no revocation endpoint, so revocation is a
+first-class **out-of-band** path rather than a reason to widen the gMSA's rights
+(WI-010, threat-model §E). `revokeCert` records the revocation in the RA store
+and queues the serial; `scripts/Sync-Revocations.ps1`, running as a
+template-scoped officer identity, revokes it at the CA and confirms back.
+`scripts/Revoke-Cert.ps1` is the manual equivalent. Reason 7 is rejected by both
+the RA and the scripts (RFC 5280 "unused"; `certutil` rejects it), so an accepted
+reason can never silently break the loop.
 
 Authentication to `/certsrv/` is the ambient **gMSA** identity over SPNEGO with
 **channel binding** (RFC 5929 `tls-server-end-point`), via the in-tree
-`negotiate_auth.NegotiateAuth` over `pyspnego` — so it works against a `/certsrv/`
-hardened with **EPA=Require**. Deploy with `scripts/install-windows.ps1` (IIS +
-HttpPlatformHandler, app pool as the gMSA, on a configurable port).
-
-**CA-side revocation is handled by a first-class out-of-band path** — ADCS Web
-Enrollment exposes no revocation endpoint, so the mechanism decision (WI-010,
-2026-06-30) was to keep the gMSA least-privileged and ship revocation as an
-operator tool rather than widening its rights (threat-model §E). The
-out-of-band path (`scripts/Revoke-Cert.ps1`, operator-run) is the shipped
-mechanism and was lab-validated in WI-015; `revokeCert` records the revocation
-in the RA store only and surfaces an `out_of_band_revocation` hint. Reason 7 is
-rejected by both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil`
-rejects it) so an accepted reason can never silently break the out-of-band loop.
+`negotiate_auth.NegotiateAuth` over `pyspnego` — so it works against a
+`/certsrv/` hardened with **EPA=Require**. Deploy with
+`scripts/install-windows.ps1` (IIS + HttpPlatformHandler, app pool as the gMSA,
+on a configurable port).
 
 ## Installation
 

@@ -74,7 +74,12 @@ function Assert-SafeRaUrl {
         throw ("RaBaseUrl '{0}' is not an absolute URL." -f $Url)
     }
 
-    $loopback = @('localhost', '127.0.0.1', '::1') -contains $uri.Host.ToLowerInvariant()
+    # [System.Uri] returns an IPv6 host in its bracketed literal form ("[::1]"),
+    # so compare against the unbracketed address or the opt-out silently never
+    # applies to an IPv6 loopback lab. Deliberately an explicit allowlist rather
+    # than $uri.IsLoopback, which also accepts the whole of 127.0.0.0/8.
+    $hostName = $uri.Host.ToLowerInvariant().Trim('[', ']')
+    $loopback = @('localhost', '127.0.0.1', '::1') -contains $hostName
 
     if ($uri.Scheme -ne 'https') {
         if (-not ($AllowInsecureUrl -and $uri.Scheme -eq 'http' -and $loopback)) {

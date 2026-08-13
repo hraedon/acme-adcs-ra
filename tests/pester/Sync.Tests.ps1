@@ -94,6 +94,14 @@ Describe 'Assert-SafeRaUrl' {
         Assert-SafeRaUrl -Url 'http://127.0.0.1:8000' -AllowInsecureUrl | Should -Be 'http://127.0.0.1:8000'
     }
 
+    It 'Treats an IPv6 literal loopback as loopback' {
+        # [System.Uri].Host renders IPv6 bracketed ("[::1]"), so comparing it
+        # raw against '::1' silently made the opt-out unreachable for an IPv6
+        # loopback lab. Fail-closed, but wrong.
+        { Assert-SafeRaUrl -Url 'http://[::1]:8000' } | Should -Throw
+        Assert-SafeRaUrl -Url 'http://[::1]:8000' -AllowInsecureUrl | Should -Be 'http://[::1]:8000'
+    }
+
     It 'Rejects embedded credentials' {
         { Assert-SafeRaUrl -Url 'https://user:pass@ra.example.local' } |
             Should -Throw -ExpectedMessage '*embeds credentials*'

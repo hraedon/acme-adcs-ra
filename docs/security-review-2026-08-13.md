@@ -248,48 +248,83 @@ in UTF-8, which cannot fail and is equivalent for timing equalisation.
 * Two pre-existing tests asserted the **old** finding-6 behaviour ("no cert row
   is created") and were updated to the new contract, deliberately and visibly.
 
-## Proof gaps — what this review did NOT establish
+## Proof status
 
-> **Update, 2026-08-13 (later the same day): gaps 1, 2 and 3 are now closed by a
-> live lab re-proof** against a real ADCS CA — see the v1.9.0 entry in
-> [`pre-pilot-checklist.md`](pre-pilot-checklist.md#validation-log). It also
-> found **two defects that only exist off Linux**, one of them in this review's
-> own finding-8 fix: `Set-OfficerRights.ps1` aborted on a *successful*
-> single-officer provisioning (Windows PowerShell 5.1 gives a bare
-> `[pscustomobject]` no `.Count`; pwsh 7 gives it 1, so the Pester suite was
-> green), and `Sync-Revocations.ps1` aborted its whole batch on the first failed
-> revoke. Both are fixed and re-verified against the CA. **The lesson is gap 3's,
-> sharpened:** the problem is not only Windows-only *APIs*, it is Windows
-> PowerShell 5.1 *language semantics* that Linux `pwsh` silently differs on — a
-> green cross-platform Pester run is not evidence about the CA host.
+The remediation above was validated **only against fakes on Linux**. A live lab
+re-proof against a real ADCS CA followed the same day and changed this picture
+substantially — including by finding two defects the Linux suite structurally
+could not.
 
-Stated plainly because the changes touch the issuance and revocation paths:
+### Closed by the live re-proof
 
-1. **No live ADCS validation.** All of this was validated on Linux against
-   fakes. Per the project's own re-entry rules, the issuance leg changed
-   (`record_issuance`, quarantine, the certificate response gate), so this
-   earns a live lab re-proof against a real CA before deployment —
-   `docs/live-reproof-runbook.md`. **Not done.**
-2. **The CRL evidence path has never met a real ADCS CRL.** It *is* tested
-   end-to-end against genuinely signed CRLs served over a real socket — DER and
-   PEM bodies, a serial present, a serial absent, an expired CRL, a CRL signed
-   by the wrong key, a missing issuer in the chain, and a garbage body, each
-   producing the intended verdict. But those CAs are synthetic. ADCS CRL
-   specifics (delta CRLs, the CDP layout, publication cadence) are unexercised,
-   so treat `revocation_confirm_require_crl_evidence` as unproven in production
-   until run against the lab CA's published CRL. Note the operational coupling:
-   a serial is not on the CRL until the CA next publishes, and on the default
-   least-privilege path the agent cannot force a republish.
-3. **The PowerShell changes were parse-checked and unit-tested on Linux
-   `pwsh`, not run on a CA.** `Set-OfficerRights.ps1`'s new restart assertions
-   (`Get-Service`, `Get-Process certsrv` start time) touch Windows-only
-   surfaces that Pester on Linux cannot exercise.
-4. **Deployment configuration remains operator-owned and unverified here** —
-   the network allowlist, reverse-proxy limits, SIEM reachability, task ACLs,
-   and monitoring. Unchanged from the 2026-08-11 review.
-5. **Dependency CVE status was not re-checked online.** `pip-audit` runs in CI;
+Run against commit `26eae31`, deployed as a wheel into the gMSA app-pool venv on
+the lab RA host. Full detail is in the v1.9.0 entry of the
+[validation log](pre-pilot-checklist.md#validation-log).
+
+1. **Live ADCS validation — done.** A full ACME round-trip issued a real
+   certificate off the existing chain (serverAuth-only EKU, SAN from the CSR,
+   requester recorded as the enrollment gMSA), an out-of-scope SAN was rejected
+   at finalize, and CA-side revocation round-tripped through the scheduled task
+   with the least-privilege bound holding visibly (`certutil -revoke` succeeded
+   while the `-PublishCrl` republish was denied `0x80070005`). Each of the ten
+   findings was exercised against the deployment.
+2. **CRL evidence has now met a real ADCS CRL.** With
+   `revocation_confirm_require_crl_evidence` set, a genuinely revoked serial
+   confirmed as `crl-verified`; the negative control — a serial absent from the
+   CRL — was refused, fail-closed.
+3. **The PowerShell changes ran on a real CA**, which is how the two defects
+   below surfaced.
+
+### The lesson, sharpened
+
+The two defects the re-proof found were **not** Windows-only *APIs*, which is
+what gap 3 had anticipated. They were Windows PowerShell 5.1 **language
+semantics** that Linux `pwsh` 7 silently differs on — a single-element array
+crossing a function boundary has no `.Count` under 5.1 but yields `1` under 7,
+and `$PSNativeCommandUseErrorActionPreference` defaults differently. Both
+produced a **green** Pester run on Linux while the shipped script was broken on
+the CA host.
+
+So: *a green cross-platform Pester run is not evidence about the CA host.* One
+of the two defects — the `Sync-Revocations.ps1` batch abort — is documented as
+having **no regression test on purpose**, because two candidate tests were
+written, found vacuous by mutation, and deleted rather than shipped. Only the
+live re-proof covers it.
+
+### Still open
+
+1. **The proven artifact is not yet the shipped artifact.** The re-proof ran on
+   `26eae31`; the fixes for the two defects it found landed afterwards, as did
+   the release-preparation changes. The issuance leg is untouched by all of
+   them, but `Set-OfficerRights.ps1` and `Sync-Revocations.ps1` are not the
+   bytes that were proved end-to-end from a clean start. Under the runbook's own
+   cadence rule — *a full live re-proof at every release, on the exact commit
+   being shipped* — **v1.9.0 requires a fresh full pass before tagging.** That
+   rule is exactly what caught these two defects; waiving it for the commit that
+   fixes them would be the wrong lesson to draw.
+2. **ADCS CRL specifics beyond the happy path are unexercised.** Delta CRLs, the
+   CDP layout, and publication cadence were not tested. Note the operational
+   coupling observed live: a serial does not reach the CRL until the CA next
+   publishes, and on the default least-privilege path the agent cannot force a
+   republish — during the re-proof an administrator had to publish by hand.
+3. **CRL issuer selection matches on subject DN alone.** `_issuer_public_key`
+   returns the first certificate in the stored chain whose subject equals the
+   leaf's issuer, without confirming it actually signed the leaf. After a **CA
+   key renewal** — which keeps the subject DN and changes the key, a routine
+   ADCS event — a chain holding both generations could yield the wrong key. The
+   failure is safe (the signature check fails, evidence is withheld, a required
+   -evidence deployment fails closed) but it presents as an unexplained refusal
+   to confirm. Match on the authority key identifier if this is ever seen.
+4. **A CRL with no `nextUpdate` is accepted indefinitely**, and `thisUpdate` is
+   not checked at all. ADCS always sets `nextUpdate`, so this is theoretical
+   there; the direction of failure is again safe, since a stale CRL lacking the
+   serial withholds evidence rather than fabricating it.
+5. **Deployment configuration remains operator-owned and unverified here** — the
+   network allowlist, reverse-proxy limits, SIEM reachability, task ACLs, and
+   monitoring. Unchanged from the 2026-08-11 review.
+6. **Dependency CVE status was not re-checked online.** `pip-audit` runs in CI;
    no external advisory database was queried in this session.
-6. **Multi-worker behaviour is still out of scope.** The nonce rate limiter and
+7. **Multi-worker behaviour is still out of scope.** The nonce rate limiter and
    the HEC queue accounting are per-process. The supported deployment is a
    single process; a multi-worker deployment needs both re-reviewed.
 

@@ -109,7 +109,19 @@ endpoints, and the PKCS#7 chain now bound to the leaf.
 **Consequence for operators: `ACME_RA_BASE_URL` is now security configuration** —
 wrong value ⇒ everything fail-closes.
 
-**Released: v1.7.0 (2026-08-08) — security hardening release.** v1.7 closes
+**Released: v1.9.0 (2026-08-13) — the 2026-08-13 security review.** v1.9 closes
+ten findings from an external static scan of v1.8.0 (separated
+revocation-confirm authority with optional CRL proof, certificate quarantine,
+atomic issuance+audit, read-path nonce rejection, credential floors, bounded
+HEC queue, off-box audit gate on the constructed emitter, JWS type guards, RA
+URL validation in the revocation scripts, OfficerRights activation proof).
+**The live re-proof of those fixes then found two defects Linux CI structurally
+cannot see** — Windows PowerShell 5.1 language semantics that `pwsh` 7 differs
+on, one inside the review's own fix. Read `docs/security-review-2026-08-13.md`
+§ Proof status before touching the PowerShell.
+
+v1.8 (2026-08-11) bound URL validation to `base_url` and added account
+eviction. v1.7 (2026-08-08) closed
 nine findings from the 2026-08-07 security review (CA-capable CSR/cert
 rejection, CN→SAN binding, certsrv key binding, rate-limit TOCTOU fix, JWS
 streaming cap, algorithm exactness, EAB URL binding, HEC HTTPS enforcement,
@@ -126,7 +138,16 @@ rules:
   project rule — see the validation log in `docs/pre-pilot-checklist.md` and the
   procedure in `docs/live-reproof-runbook.md`). Latest: WI-028 (v1.5, 2026-07-23)
   + WI-035/036 (v1.6, 2026-07-23/24) + 2026-08-07 security-hardening (2026-08-08)
-  + **2026-08-11 security review (26/26, incl. the new §A.1 front-control checks)**.
+  + 2026-08-11 security review (26/26, incl. the new §A.1 front-control checks)
+  + **2026-08-13 review (on `26eae31`; found two PowerShell defects)**.
+  The rule is *on the exact commit being shipped* — a re-proof on an earlier
+  commit does not transfer, which is exactly the open item on v1.9.0.
+- **A green cross-platform Pester run is not evidence about the CA host.** The
+  two defects the v1.9.0 re-proof found were Windows PowerShell 5.1 *language*
+  semantics — a single-element array has no `.Count` under 5.1 but yields `1`
+  under `pwsh` 7; `$PSNativeCommandUseErrorActionPreference` defaults differ —
+  not Windows-only APIs, which is the gap everyone anticipates. Linux Pester was
+  green while the shipped script was broken on the CA.
 - **Two review lessons worth carrying forward.** (1) Every finding in the
   2026-08-11 review was in an *inherited framework default* — FastAPI's docs
   endpoints, Starlette's `request.url`, uvicorn's proxy-header trust, the

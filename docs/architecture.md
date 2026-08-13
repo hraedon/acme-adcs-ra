@@ -93,12 +93,84 @@ The minimum to serve an enterprise client:
 - **Gating:** EAB credential pinned to the authorized ACME client (Certify the
   Web) + network/IP allowlist at the reverse proxy.
 
+## Certificate lifecycle states
+
+A certificate row in the RA store is in exactly one of three states, and the
+distinction is load-bearing rather than bookkeeping:
+
+| State | Meaning | Served to a client? |
+|---|---|---|
+| `valid` | Issued by the CA and honoured by the RA | Yes |
+| `revoked` | A client asked for it back | No — `410 Gone` |
+| `quarantined` | The CA issued it; a post-issuance verifier rejected it | **Never** |
+
+**Quarantine exists because rejection happens too late to prevent issuance.** By
+the time the SAN, EKU, and CA-capability verifiers run, ADCS has already signed:
+the certificate has a serial, sits in the CA database, and is trusted
+domain-wide. Recording nothing — the pre-v1.9 behaviour — left a live
+certificate the RA had just refused to honour with no serial anywhere in the
+RA's own records, and therefore invisible to its revocation workflow.
+
+A quarantined row is recorded with its serial, ReqID, bytes, and the violations;
+its order goes terminal-`invalid` so a retried finalize cannot reach a serve
+path; and it is **queued for CA-side revocation through the ordinary pull-agent
+loop** rather than a bespoke mechanism. "Never served" is enforced in the
+response builder itself, not left to each caller to remember.
+
 ## Audit model
 
 Every issuance is recorded in **two independent places**: the RA's own SQLite
 store (request, account, SANs, template, outcome) and the **ADCS CA database**
 (with requester = the gMSA). The RA **emits** each issuance to SIEM, reusing
 cert-watch's export pattern — satisfying "an audit trail for every cert."
+
+Three properties make that claim hold rather than merely state it:
+
+- **The certificate row and its audit row commit in one transaction.** They used
+  to be independent commits, so a fault between them could leave a stored,
+  serveable certificate with zero `certificate-issued` events — precisely the
+  silent issuance the rule exists to prevent. SIEM fan-out happens *after* the
+  commit and stays fail-open: the durable record is the local row.
+- **The off-box requirement asserts the constructed emitter, not the configured
+  sink name.** An emitter that disabled itself (empty syslog host, an unusable
+  HEC URL or token) previously let the app start while the operator believed the
+  off-box gate was satisfied and the only evidence lived on the host an attacker
+  is assumed to control. The RA now refuses to start.
+- **The in-memory delivery queue is bounded.** A slow or unreachable HEC
+  endpoint could otherwise let unauthenticated, request-driven audit events
+  accumulate without limit on an issuance-path host. Overflow drops from the HEC
+  sink only — never from the audit table — and is counted and logged.
+
+## Trusting a CA-side revocation
+
+The RA holds no CA rights, so it cannot ask the CA "did you revoke this?". The
+pull agent runs `certutil -revoke` and then tells the RA it succeeded. Two
+things keep that from being a bare act of faith:
+
+- **Separated authority.** Confirming a revocation asserts an external security
+  event the RA did not observe, so it takes a dedicated credential
+  (`ACME_RA_REVOCATION_CONFIRM_TOKEN`) and **refuses the general admin token**.
+  While the two were shared, any admin-token holder could drop a still-valid
+  certificate off the retry queue and leave a success audit behind. An unset
+  confirm token disables the endpoint rather than falling back.
+- **Optional independent evidence.** A CRL is published by the CA, signed by the
+  CA's own key, and readable without privilege — the one check available to the
+  RA that does not rest on the calling agent's honesty. With
+  `ACME_RA_REVOCATION_CONFIRM_CRL_URL` set, the RA verifies the CRL's signature
+  against the issuing CA certificate **taken from the certificate's own stored
+  chain**, rejects an expired CRL, and records
+  `verification: "crl-verified"` or `"agent-asserted"` accordingly. The audit
+  trail never implies the RA saw more than it did.
+
+## Credentials
+
+EAB MAC keys and the admin/confirm tokens are validated at config load, which is
+the only place that sees them before they become load-bearing: MAC keys must be
+valid base64url decoding to ≥ 32 bytes, tokens ≥ 32 characters. These floors
+accept everything `scripts/eab.py` generates and reject hand-typed values.
+A MAC key decoding to *zero* bytes was previously treated as a present key,
+which let anyone who knew the kid forge the binding with an empty HMAC key —
+an authentication bypass, not merely a weak credential.
 
 ## Deliberate deviation from the family
 

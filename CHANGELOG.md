@@ -4,38 +4,6 @@ All notable changes to acme-adcs-ra are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-
-- **`Set-OfficerRights.ps1` aborted on a *successful* single-officer
-  provisioning.** `Get-ExistingAces` returns an array, but PowerShell unwraps a
-  single-element array across a function boundary, and a bare `[pscustomobject]`
-  has **no `.Count` under Windows PowerShell 5.1** (pwsh 7 yields 1, which is
-  why the Pester suite was green). With exactly one ACE — the default, documented
-  single-officer deployment — the script reported an in-force restriction as
-  "absent — unrestricted", then failed its own readback assertion and exited 1
-  after correctly writing and loading the restriction. An operator, or any
-  automation treating a non-zero exit as failure, would conclude the CA-side
-  least-privilege control had not been applied. The library now always returns an
-  array and both call sites wrap defensively. Found by the live lab re-proof of
-  v1.9.0; the assertion itself shipped in v1.9.0 (2026-08-13 review, finding 8).
-
-- **`Sync-Revocations.ps1` aborted the whole batch on the first failed revoke.**
-  `& $pwshExe @revokeArgs 2>&1` turns the child's stderr into ErrorRecords, and
-  under the script's own `$ErrorActionPreference='Stop'` the first one is a
-  *terminating* error — so the per-serial "log it and continue" handling, the
-  requester-mismatch abort (exit 5) and the partial-failure exit code (2) were
-  all unreachable, and a single bad serial silently stranded every serial behind
-  it while the script exited 1. The child invocation moved to
-  `SyncLib.ps1::Invoke-ChildScript`, which suppresses `Stop` for the duration of
-  the call. Pre-existing (not introduced in v1.9.0); it only bites when a revoke
-  fails, which no previous re-proof had provoked. **Note:** this cannot be
-  regression-tested on Linux CI — pwsh defaults
-  `$PSNativeCommandUseErrorActionPreference` to `$false`, so a "does not throw"
-  assertion passes with the fix reverted (verified by mutation). See the note in
-  `tests/pester/Sync.Tests.ps1`.
-
 ## [1.9.0] — 2026-08-13
 
 **Security hardening (2026-08-13 external scan).** Ten findings — nine medium,
@@ -43,6 +11,12 @@ one low — from an external static scan of v1.8.0. Every one was independently
 reproduced against the shipped build before any code changed, and every new
 test was mutation-checked. See `docs/security-review-2026-08-13.md`, which also
 records what this review did **not** prove.
+
+The live lab re-proof of these fixes then found **two further defects that Linux
+CI structurally cannot see** — both Windows PowerShell 5.1 language semantics
+that `pwsh` 7 silently differs on, one of them inside this review's own
+finding-8 fix. They are in the **Fixed** section below and are the reason this
+release is worth reading past the security summary.
 
 > ### ⚠️ Upgrade requirements — read before deploying
 >
@@ -118,6 +92,47 @@ records what this review did **not** prove.
   asserts the target officer's ACE landed (or is gone, for `-Remove`) instead of
   merely printing it. `Get-OfficerRightsBytes` reads the registry provider
   first rather than regex-scanning `certutil` console text.
+
+### Fixed
+
+- **`Set-OfficerRights.ps1` aborted on a *successful* single-officer
+  provisioning.** `Get-ExistingAces` returns an array, but PowerShell unwraps a
+  single-element array across a function boundary, and a bare `[pscustomobject]`
+  has **no `.Count` under Windows PowerShell 5.1** (pwsh 7 yields 1, which is
+  why the Pester suite was green). With exactly one ACE — the default, documented
+  single-officer deployment — the script reported an in-force restriction as
+  "absent — unrestricted", then failed its own readback assertion and exited 1
+  after correctly writing and loading the restriction. An operator, or any
+  automation treating a non-zero exit as failure, would conclude the CA-side
+  least-privilege control had not been applied. The library now always returns an
+  array and both call sites wrap defensively. Found by the live lab re-proof of
+  v1.9.0; the assertion itself shipped in v1.9.0 (2026-08-13 review, finding 8).
+
+- **`Sync-Revocations.ps1` aborted the whole batch on the first failed revoke.**
+  `& $pwshExe @revokeArgs 2>&1` turns the child's stderr into ErrorRecords, and
+  under the script's own `$ErrorActionPreference='Stop'` the first one is a
+  *terminating* error — so the per-serial "log it and continue" handling, the
+  requester-mismatch abort (exit 5) and the partial-failure exit code (2) were
+  all unreachable, and a single bad serial silently stranded every serial behind
+  it while the script exited 1. The child invocation moved to
+  `SyncLib.ps1::Invoke-ChildScript`, which suppresses `Stop` for the duration of
+  the call. Pre-existing (not introduced in v1.9.0); it only bites when a revoke
+  fails, which no previous re-proof had provoked. **Note:** this cannot be
+  regression-tested on Linux CI — pwsh defaults
+  `$PSNativeCommandUseErrorActionPreference` to `$false`, so a "does not throw"
+  assertion passes with the fix reverted (verified by mutation). See the note in
+  `tests/pester/Sync.Tests.ps1`.
+
+- **`Assert-SafeRaUrl` never recognised an IPv6 literal loopback.**
+  `[System.Uri].Host` renders IPv6 in bracketed form (`[::1]`), so comparing it
+  against `::1` meant `-AllowInsecureUrl` silently did not apply to an IPv6
+  loopback lab. Fail-closed, so not exploitable — but wrong, and it would have
+  read as a mysterious rejection during a lab setup.
+
+- **`__version__` reported `0.1.0`.** The literal in `acme_adcs_ra/__init__.py`
+  had never been updated because nothing read it; it now derives from the
+  installed distribution metadata, so it cannot drift from `pyproject.toml`
+  again. A test asserts the two agree.
 
 ### Changed
 

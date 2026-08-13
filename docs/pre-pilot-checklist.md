@@ -207,12 +207,21 @@ engineered to. Until then it has not — regardless of a green local test run.
   - [x] §A re-cleared on the deployed commit (live issue + denial + revocation).
   - [x] §F revocation runbook re-exercised (`Sync-Revocations.ps1` +
         `Revoke-Cert.ps1` requester check, live at the CA).
-  - [ ] **The proven artifact is NOT yet the shipped artifact.** The two fixes
-        above landed *after* `26eae31`; the issuance leg is unchanged by them,
-        but `Set-OfficerRights.ps1` and `Sync-Revocations.ps1` are not the bytes
-        that were re-proved end-to-end from a clean start. Both were re-run
-        live after the fix; a fresh full pass on the final commit is the
-        conservative next step before a v1.9.1 tag.
+  - [ ] **The proven artifact is NOT the shipped artifact — a fresh full pass is
+        required before the v1.9.0 tag.** Everything above ran against
+        `26eae31`. The two fixes landed after it, as did the release-preparation
+        changes (docs, an IPv6-loopback fix in `Assert-SafeRaUrl`, and
+        `__version__`). The issuance leg is untouched by all of them and both
+        defects were re-run live after fixing, but `Set-OfficerRights.ps1` and
+        `Sync-Revocations.ps1` are not the bytes that were proved end-to-end
+        from a clean start.
+
+        This is not a formality. The runbook's cadence rule — *a full live
+        re-proof at every release, on the exact commit being shipped* — is
+        precisely what caught these two defects, and both were invisible to a
+        green Linux CI run. Waiving it for the commit that fixes them would draw
+        the wrong lesson. **Re-run §A, §A.1 and §C on the final commit and add a
+        second validation-log entry before tagging.**
   - **Still open before pilot:** the operator-owned items in §B–§E, unchanged.
   - **Lab returned to its pre-run state:** CA `OfficerRights` removed and the CA
     security descriptor restored byte-for-byte, the temporary group membership
