@@ -6,9 +6,81 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.9.0] — 2026-08-13
 
-> **Release candidate (`v1.9.0-rc1`).** Awaiting the full live lab re-proof on
+> **Release candidate (`v1.9.0-rc2`).** Awaiting the full live lab re-proof on
 > this commit; the `v1.9.0` tag follows it. See the open item in the
 > [validation log](docs/pre-pilot-checklist.md#validation-log).
+
+### Security — 2026-08-14 external scan (seventeen findings)
+
+A second external scan, of `v1.9.0-rc1`. Every finding was reproduced before any
+code changed; every new test was mutation-checked and has a negative control.
+See `docs/security-review-2026-08-14.md`, which also records what it did **not**
+prove and the one place the stricter default was deliberately not taken.
+
+> ### ⚠️ Additional upgrade requirements
+>
+> **5. ACME reason 8 (`removeFromCRL`) is rejected.** It is the inverse of
+> revocation and reached `certutil -revoke <serial> 8` verbatim, so a revokeCert
+> carrying it recorded a *successful* revocation in the RA while asking the CA
+> to take the certificate back off the CRL. Plan 004 confirmed the CA-side
+> effect against the lab: the certificate ends up "off the CRL and valid".
+> Tooling that submitted reason 8 now gets a 400 (or exit 3 from
+> `Revoke-Cert.ps1`); there is no replacement.
+>
+> **6. `deploy/requirements.lock.txt` is required by the Windows installer.**
+> Dependencies now install from a hash-pinned closure with `--require-hashes`,
+> not a live resolve. An incomplete copy fails rather than silently resolving
+> from the index.
+>
+> **7. `admin_token` and `revocation_confirm_token` must differ**, and
+> **`siem_hec_queue_max` must be ≥ 1.** Both now refuse startup.
+>
+> **8. `Verify-TemplateEnrollment.ps1` exits 3** when principals outside
+> `-ExpectedEnrollee` hold enroll. Pass `-AllowAdditionalEnrollees` to accept
+> them deliberately.
+
+- **Certificates orphaned by a post-issuance *transport* failure are now
+  quarantined.** The 2026-08-13 review covered the three post-issuance verifier
+  rejections but not the window after `certfnsh.asp` returns "issued" with a
+  ReqID — the leaf fetch, the chain fetch, and the chain-binds-to-leaf check. A
+  failure there recorded only an error string (no serial, no ReqID) and returned
+  503 with the order left `processing`, leaving a live domain-trusted
+  certificate untracked at the CA. The error now carries what the CA committed
+  to, and finalize quarantines it; where only the ReqID is known, that is made
+  loud in the audit row and the log instead.
+- **The enrollment leg refuses redirects.** `requests` strips `Authorization`
+  across a cross-host redirect, but that does not apply here — `NegotiateAuth`
+  registers a 401 *response hook*, so a redirect to a host answering
+  `401 Negotiate` would draw a freshly minted gMSA ticket out of the RA.
+- **Finalize no longer blocks the event loop.** The handler is `async def`, so
+  FastAPI runs it on the loop rather than in a threadpool; the synchronous CA
+  call (30 s default timeout) stalled every other request in the process.
+- **Revocation, its order transition, and its audit row commit in one
+  transaction** (`Store.record_revocation`), matching `record_issuance`.
+- **CRL evidence is freshness-checked and its issuer pinned by signature.** A
+  signed CRL verifies for ever, so a CRL with no `nextUpdate` was accepted
+  indefinitely and `thisUpdate` was never checked. Issuer selection matched on
+  subject DN alone, which picks the wrong generation after a CA key renewal.
+- **The revocation agent no longer needs the admin token** — the pending list
+  accepts the confirm token, so the revocation host stops carrying authority to
+  reclaim orders and drain nonces.
+- **Reclaim refuses an order that may still be enrolling**, closing a
+  double-issuance race its only check ("no certificate row") could not see.
+- **One account per key**, enforced by a partial `UNIQUE` index; the route
+  resolves a lost race by returning the winning account.
+- **The sync agent reports `crl_published` honestly** instead of letting
+  `ca_crl_updated` imply a publication the default least-privilege path
+  deliberately skips, and **counts a failed confirmation** so the exit code
+  reflects a CA/RA disagreement.
+- Enrollment responses are size-capped before parsing.
+
+### Fixed — 2026-08-14
+
+- **`TestHecQueueBound` was flaky.** It relied on `.invalid` DNS *stalling* to
+  pin its workers; a resolver returning NXDOMAIN quickly lets them drain, so the
+  drop count came in under what the test expected. It failed once during a full
+  run. The workers are now pinned with an explicit barrier, making the bound
+  exact on any machine.
 
 **Security hardening (2026-08-13 external scan).** Ten findings — nine medium,
 one low — from an external static scan of v1.8.0. Every one was independently

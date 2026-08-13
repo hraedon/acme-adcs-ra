@@ -66,6 +66,20 @@ The minimum to serve an enterprise client:
 - Transport modes A and C differ only in *where* `/certsrv/` lives and whether
   Kerberos delegation is required — see `certsrv-setup.md`. The ACME server side
   is identical across modes.
+- **Redirects are refused outright.** `requests` strips the `Authorization`
+  header when a redirect crosses hosts, but that protection does not reach this
+  path: `NegotiateAuth` sets no static header, it registers a *response hook*
+  that fires on any 401 and mints a fresh Kerberos token. A redirect to a host
+  answering `401 Negotiate` would therefore draw a freshly minted gMSA ticket
+  out of the RA — channel-bound to the real CA's certificate, so relayable.
+  Nothing in `/certsrv/` legitimately redirects, since every URL is built from
+  the configured host, so refusing costs nothing. Enforced in the session
+  factory rather than per call site.
+- **The CA call runs on a worker thread.** The finalize handler is `async def`,
+  which FastAPI runs on the event loop rather than in its threadpool, so a
+  synchronous multi-second CA round-trip inline would stall every other request
+  in the process. The supported deployment is a single process, so nothing else
+  absorbs it.
 - **Single-backend CBT assumption (WI-006):** the channel-binding token is
   derived from a side-channel TLS probe of the `/certsrv/` host. This is correct
   for Mode A (one CA host) and single-host Mode C. If `/certsrv/` is fronted by
@@ -110,6 +124,16 @@ the certificate has a serial, sits in the CA database, and is trusted
 domain-wide. Recording nothing — the pre-v1.9 behaviour — left a live
 certificate the RA had just refused to honour with no serial anywhere in the
 RA's own records, and therefore invisible to its revocation workflow.
+
+**The same window opens on failure, not just on rejection.** `certfnsh.asp`
+returns an "issued" disposition with a ReqID *before* the RA fetches the leaf,
+fetches the PKCS#7 chain, and checks that the chain binds to the leaf. A failure
+in any of those steps is equally a live certificate at the CA, so it quarantines
+by the same route. Where the failure came before the leaf arrived, there are no
+bytes to store — the store keys on them — so the ReqID is made loud in the audit
+row and the log instead, and the operator revokes by ReqID at the CA by hand.
+That asymmetry is deliberate: it is better to be explicit that the RA cannot
+clean this one up itself than to record a row it cannot act on.
 
 A quarantined row is recorded with its serial, ReqID, bytes, and the violations;
 its order goes terminal-`invalid` so a retried finalize cannot reach a serve
@@ -158,9 +182,24 @@ things keep that from being a bare act of faith:
   RA that does not rest on the calling agent's honesty. With
   `ACME_RA_REVOCATION_CONFIRM_CRL_URL` set, the RA verifies the CRL's signature
   against the issuing CA certificate **taken from the certificate's own stored
-  chain**, rejects an expired CRL, and records
-  `verification: "crl-verified"` or `"agent-asserted"` accordingly. The audit
-  trail never implies the RA saw more than it did.
+  chain**, and records `verification: "crl-verified"` or `"agent-asserted"`
+  accordingly. The audit trail never implies the RA saw more than it did.
+
+  Two properties make that check mean what it says. **Freshness is verified
+  separately from the signature**, because a signed CRL verifies for ever:
+  `nextUpdate` must be present and future, `thisUpdate` must not be future, and
+  an absolute age ceiling bounds staleness independently of `nextUpdate`, which
+  the CA chooses. And **the issuer is selected by signature, not by name** — a
+  CA key renewal keeps the subject DN and changes the key, so name-matching
+  picks the wrong generation from a chain holding both.
+
+- **Publication is reported separately from revocation.** `ca_crl_updated` means
+  the CA revoked; `crl_published` means the CRL was actually republished. On the
+  default least-privilege path the officer *cannot* republish (that needs
+  Manage-CA), so the normal case is revoked-but-not-yet-published — during which
+  relying parties still accept the certificate. Collapsing the two would let a
+  field named `ca_crl_updated` imply a publication that was deliberately
+  skipped.
 
 ## Credentials
 

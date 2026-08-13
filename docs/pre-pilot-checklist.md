@@ -221,10 +221,54 @@ engineered to. Until then it has not — regardless of a green local test run.
         precisely what caught these two defects, and both were invisible to a
         green Linux CI run. Waiving it for the commit that fixes them would draw
         the wrong lesson. **Re-run the full runbook — §A, §A.1, §B or §C, §D,
-        §E — against `v1.9.0-rc1`, from a clean start, and add a second
+        §E — against `v1.9.0-rc2`, from a clean start, and add a second
         validation-log entry before the v1.9.0 tag.** Full scope rather than
         the PowerShell delta: the lesson of this round is exactly that a subset
         does not transfer.
+
+        **The target is now `v1.9.0-rc2`, not rc1.** A second external scan
+        (2026-08-14, `docs/security-review-2026-08-14.md`) found seventeen more
+        findings against rc1, two of them blocking, and all seventeen are fixed
+        in rc2. The re-proof was correctly *not* run against rc1.
+
+- **Additional cases the 2026-08-14 review adds to the re-proof.** These are
+  the fixes whose correctness genuinely cannot be established off a real CA:
+
+  - [ ] **Reason 8 is refused, and never reaches `certutil`.** Submit a
+        `revokeCert` with `reason: 8` → **400 badRevocationReason**, and the
+        certificate must remain valid and absent from the pending list. Then run
+        `Revoke-Cert.ps1 -Reason 8` directly → **exit 3**. Plan 004 recorded
+        that reason 8 leaves a held certificate "off the CRL and valid", so the
+        point is that no path can now emit it.
+  - [ ] **The transport-orphan quarantine, against a real CA.** The fix most in
+        need of live proof, because provoking it means interrupting the RA
+        between the CA's "issued" response and the chain fetch — and the whole
+        question is what the CA is left holding. Confirm the certificate is
+        recorded `quarantined` with its serial and ReqID, is queued for CA-side
+        revocation, is never served, and that the order is terminal. Confirm the
+        ReqID-only branch too (block `certnew.cer`): no row, but a loud audit
+        row carrying the ReqID.
+  - [ ] **The pinned installer runs on Windows.** `--require-hashes` with
+        `--only-binary :all:` is stricter than what the host did before, and the
+        lock file was exported on Linux for Python 3.13 — a platform-specific
+        wheel gap surfaces only here.
+  - [ ] **CRL freshness against the real publication cadence.** The default age
+        ceiling is seven days; a CA publishing less often would start failing
+        evidence checks. Confirm against the lab CA's actual cadence.
+  - [ ] **Does the pilot client need the unauthenticated GET forms?**
+        `allow_unauthenticated_resource_get` was left defaulting to **True**
+        deliberately, because the docs claim these routes were retained for an
+        observed client need and flipping blind risked breaking the proven
+        client. Set it to `false`, run a full Certify the Web round-trip, and
+        record the result. If the client is fine, **the default should become
+        False.** (The test harness already drives a complete order to issuance
+        with the GET form disabled, so the RA itself is complete without it.)
+  - [ ] **The revocation agent runs with only `-ConfirmToken`.** No admin token
+        on the revocation host: confirm the pending-list read still works and
+        the whole loop completes.
+  - [ ] **A failed confirm exits 2.** Point the agent at an RA that will refuse
+        the confirm; the CA-side revocation should succeed, the serial stay
+        pending, and the script exit 2 rather than 0.
   - **Still open before pilot:** the operator-owned items in §B–§E, unchanged.
   - **Lab returned to its pre-run state:** CA `OfficerRights` removed and the CA
     security descriptor restored byte-for-byte, the temporary group membership

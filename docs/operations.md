@@ -567,7 +567,9 @@ running `scripts/Revoke-Cert.ps1`.
    - `serial`: the cert's hex serial (what `Revoke-Cert.ps1` consumes).
    - `req_id`: the ADCS ReqID if the enrollment leg recorded it (the
      preferred identifier for `Revoke-Cert.ps1`).
-   - `reason`: the RFC 8555 reason code (0-6, 8-10; reason 7 is rejected —
+   - `reason`: the RFC 8555 reason code (0-6, 9-10; reason 7 is rejected as
+     "unused" in RFC 5280, and reason 8 (removeFromCRL) is rejected because it
+     un-revokes rather than revokes —
      see below).
 2. **CA-DB operator record**: `scripts/Revoke-Cert.ps1` (run by a CA
    officer, NOT the gMSA) performs `certutil -revoke` against the CA and

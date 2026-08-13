@@ -72,44 +72,17 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**Unreleased on `main`: the 2026-08-13 security review** (10 findings from an
-external static scan of v1.8.0; see `docs/security-review-2026-08-13.md`). Every
-finding was reproduced against the shipped build before any code changed, and
-every new test was mutation-checked. The load-bearing three: the CA-side
-revocation **confirm** endpoint took the caller's word — any admin-token holder
-could drop a still-valid cert off the retry queue and write a success audit for
-a revocation that never happened (now a separate credential, honest
-`agent-asserted`/`crl-verified` labelling, and optional CRL proof); a certificate
-**rejected** by the SAN/EKU/CA-capability verifiers was recorded *nowhere*, not
-even its serial, leaving a live unrevocable cert at the CA (now quarantined and
-queued for CA-side revocation); and issuance committed **separately** from its
-mandatory audit row, so a fault between them left a serveable cert with zero
-`certificate-issued` events (now one transaction).
-**Consequences for operators: `ACME_RA_REVOCATION_CONFIRM_TOKEN` is now required
-for the revocation loop, and weak EAB/admin credentials refuse startup.**
+**Released: v1.9.0-rc2 (2026-08-13) — two external security reviews.** The
+2026-08-14 scan of rc1 found seventeen further findings, two blocking: ACME
+**reason 8 (removeFromCRL) was accepted and reached `certutil`**, so a revokeCert
+carrying it recorded a successful revocation while asking the CA to *un-revoke*
+(Plan 004 recorded the CA-side effect: "off the CRL and valid"); and
+post-issuance **transport** failures orphaned live certificates on a path the
+2026-08-13 quarantine work did not reach. All seventeen are fixed — see
+`docs/security-review-2026-08-14.md`, including the one place the stricter
+default was deliberately not taken and why.
 
-> ⚠️ **This review has NOT been live-proven.** It changed the issuance leg
-> (`record_issuance`, quarantine, the certificate-response gate), which under
-> this repo's own re-entry rules earns a live lab re-proof against a real CA
-> before deployment. The CRL-evidence path has never met a real ADCS CRL, and
-> the PowerShell changes were parse-checked and Pester-tested on Linux only.
-> See the proof-gaps section of the review doc.
-
-**Previously on `main`: the 2026-08-11 security review** (13 findings; see
-`docs/security-review-2026-08-11.md`). The load-bearing two: the JWS **and** EAB
-URL bindings were derived from `str(request.url)` — i.e. the client's `Host`
-header — so they only proved a client was self-consistent and an EAB minted for
-another deployment verified here (which meant the 2026-08-07 EAB-replay fix was
-never actually closed); and `account.status` was never read while the EAB kid was
-re-checked only at finalize, so pulling a kid stopped issuance but left the
-account able to **revoke its own live certificates**. Both are fixed and
-live-proven (26/26 checks, 2026-08-11). Also: nonce token bucket, `/docs`
-disabled, off-box audit gate, the previously-404 order/account resource
-endpoints, and the PKCS#7 chain now bound to the leaf.
-**Consequence for operators: `ACME_RA_BASE_URL` is now security configuration** —
-wrong value ⇒ everything fail-closes.
-
-**Released: v1.9.0 (2026-08-13) — the 2026-08-13 security review.** v1.9 closes
+v1.9 closes
 ten findings from an external static scan of v1.8.0 (separated
 revocation-confirm authority with optional CRL proof, certificate quarantine,
 atomic issuance+audit, read-path nonce rejection, credential floors, bounded
@@ -140,6 +113,8 @@ rules:
   + WI-035/036 (v1.6, 2026-07-23/24) + 2026-08-07 security-hardening (2026-08-08)
   + 2026-08-11 security review (26/26, incl. the new §A.1 front-control checks)
   + **2026-08-13 review (on `26eae31`; found two PowerShell defects)**.
+  The 2026-08-14 review is **not** live-proven at all — it changed the issuance,
+  revocation and deployment legs, so the pending re-proof targets `v1.9.0-rc2`.
   The rule is *on the exact commit being shipped* — a re-proof on an earlier
   commit does not transfer, which is exactly the open item on v1.9.0.
 - **A green cross-platform Pester run is not evidence about the CA host.** The
@@ -195,3 +170,18 @@ only (cert → revoked, GET → 410) with an honest audit
 the loop by running `scripts/Revoke-Cert.ps1` (a CA officer, not the gMSA),
 which runs `certutil -revoke` and republishes the CRL. The enrollment gMSA
 gains no CA-officer rights (threat-model §E).
+
+**Previously on `main`: the 2026-08-11 security review** (13 findings; see
+`docs/security-review-2026-08-11.md`). The load-bearing two: the JWS **and** EAB
+URL bindings were derived from `str(request.url)` — i.e. the client's `Host`
+header — so they only proved a client was self-consistent and an EAB minted for
+another deployment verified here (which meant the 2026-08-07 EAB-replay fix was
+never actually closed); and `account.status` was never read while the EAB kid was
+re-checked only at finalize, so pulling a kid stopped issuance but left the
+account able to **revoke its own live certificates**. Both are fixed and
+live-proven (26/26 checks, 2026-08-11). Also: nonce token bucket, `/docs`
+disabled, off-box audit gate, the previously-404 order/account resource
+endpoints, and the PKCS#7 chain now bound to the leaf.
+**Consequence for operators: `ACME_RA_BASE_URL` is now security configuration** —
+wrong value ⇒ everything fail-closes.
+

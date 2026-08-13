@@ -85,7 +85,7 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **v1.9.0 — release candidate (`v1.9.0-rc1`, 2026-08-13).** The code is
+> **v1.9.0 — release candidate (`v1.9.0-rc2`, 2026-08-13).** The code is
 > complete and CI-green; the final tag follows the live lab re-proof on this
 > exact commit, per the cadence rule below. **v1.8.0 is the latest full
 > release.** Feature-complete for its charter and maintained deliberately rather
@@ -105,7 +105,7 @@ chaining to the **existing root** — no new intermediate.
 | **v1.5–v1.6** | Automated CA-side revocation (two-identity default, opt-in single-identity), self-enforced serverAuth EKU verification, the enrollment-side bound (Finding E-1), a Pester suite, and the live re-proof runbook |
 | **v1.7** | Security hardening — CA-capable CSR/cert rejection, CN→SAN binding, rate-limit TOCTOU, JWS streaming cap, algorithm exactness |
 | **v1.8** | `base_url` URL binding, account eviction, serial re-padding to the CA database form |
-| **v1.9** | The [2026-08-13 review](docs/security-review-2026-08-13.md) — ten findings, including separated revocation-confirm authority with optional CRL proof, certificate quarantine, and atomic issuance+audit |
+| **v1.9** | Two external security reviews. The [2026-08-13 one](docs/security-review-2026-08-13.md) — ten findings, including separated revocation-confirm authority with optional CRL proof, certificate quarantine, and atomic issuance+audit. The [2026-08-14 one](docs/security-review-2026-08-14.md) — seventeen more, including rejecting ACME reason 8 (`removeFromCRL`, which un-revokes), quarantining certificates orphaned by post-issuance *transport* failures, refusing redirects on the gMSA-authenticated enrollment leg, and a hash-pinned install closure |
 
 Each release's live re-proof is recorded in the validation log in
 [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).
@@ -119,15 +119,18 @@ CA-side revocation still work. Only the live re-proof
 required at every release, before any pilot, after any change to the issuance
 leg, and quarterly while deployed.
 
-That distinction is not theoretical. The v1.9.0 re-proof found two defects Linux
-CI **structurally could not see** — both Windows PowerShell 5.1 language
-semantics that `pwsh` 7 on Linux silently differs on, one of them inside the
-review's own fix. See the v1.9.0 entry in the validation log.
+That distinction is not theoretical, and it cuts both ways. The v1.9.0 re-proof
+found two defects Linux CI **structurally could not see** — both Windows
+PowerShell 5.1 language semantics that `pwsh` 7 on Linux silently differs on,
+one of them inside the review's own fix. And a second static scan then found
+seventeen findings that a *green live re-proof* had not surfaced either, two of
+them serious. Neither kind of check substitutes for the other. See the v1.9.0
+entry in the validation log.
 
 ### Before you deploy
 
 This is issuance-path infrastructure. Work through
-[`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md) first. Five items
+[`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md) first. A few items
 are load-bearing enough to call out here:
 
 - **`base_url` is security configuration, not a display value.** Every JWS and
@@ -145,9 +148,15 @@ are load-bearing enough to call out here:
 - **`ACME_RA_REVOCATION_CONFIRM_TOKEN` is required** for the CA-side revocation
   loop, and the general admin token is deliberately refused there. Without it,
   serials revoke at the CA but stay on the RA's pending list.
-- **Credentials have strength floors.** EAB MAC keys must decode to ≥ 32 bytes
-  and admin/confirm tokens must be ≥ 32 characters; generate them with
-  `python scripts/eab.py new`. Weak values refuse startup.
+- **Credentials have strength floors, and must differ.** EAB MAC keys must
+  decode to ≥ 32 bytes and admin/confirm tokens must be ≥ 32 characters;
+  generate them with `python scripts/eab.py new`. Weak values refuse startup, as
+  does setting the admin and confirm tokens to the same string — that would
+  collapse the separation the second credential exists to create.
+- **Install from the pinned closure.** `scripts/install-windows.ps1` installs
+  dependencies from `deploy/requirements.lock.txt` with `--require-hashes`, so
+  the closure on an issuance-path host is the one CI tested rather than whatever
+  the index resolves that day. A missing lock file is fatal, not a fallback.
 
 Apply the enrollment-side bound (Finding E-1) per your estate — move the
 enrollment gMSA off the Domain Computers `Machine`-enroll path and verify it can
