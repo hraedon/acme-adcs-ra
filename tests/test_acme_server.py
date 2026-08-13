@@ -129,10 +129,22 @@ def _backdate_order(store: Store, order_id: str, seconds_ago: int = 60) -> None:
         conn.execute("UPDATE orders SET expires = ? WHERE id = ?", (past, order_id))
 
 
-def _force_order_status(store: Store, order_id: str, status: str) -> None:
-    """Test-only direct write of an order status (simulates a crash mid-flight)."""
+def _force_order_status(
+    store: Store, order_id: str, status: str, *, age_seconds: int = 3600
+) -> None:
+    """Test-only direct write of an order status (simulates a crash mid-flight).
+
+    ``age_seconds`` backdates ``processing_started_at``. The default is an hour
+    because that is what these tests actually depict: an order an operator
+    *found* wedged, long after the enrollment leg's 30s timeout. Reclaim now
+    refuses an order young enough that an enrollment could still be in flight,
+    so a freshly-stamped timestamp would be simulating a different scenario —
+    one the endpoint is supposed to reject.
+    """
     ts = (
-        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (datetime.now(UTC) - timedelta(seconds=age_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         if status == "processing"
         else None
     )

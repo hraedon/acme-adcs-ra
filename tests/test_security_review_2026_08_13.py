@@ -303,24 +303,37 @@ class TestOffboxAuditGate:
 
 class TestHecQueueBound:
     def test_queue_is_bounded_and_drops_are_counted(self) -> None:
-        """A dead HEC endpoint must not let audit events accumulate forever."""
+        """A dead HEC endpoint must not let audit events accumulate forever.
+
+        The workers are pinned with an explicit barrier rather than by pointing
+        at an unresolvable host. Relying on ``.invalid`` to *stall* was flaky:
+        a resolver that returns NXDOMAIN quickly lets workers drain, so more
+        than ``hec_queue_max`` events get accepted and the drop count comes in
+        under what the test expected. Blocking the workers outright makes the
+        bound exact and the assertion meaningful on any machine.
+        """
+        import threading
+
+        release = threading.Event()
         emitter = SiemEmitter(
             SiemConfig(
                 sink="hec",
-                # .invalid never resolves (RFC 6761), so every post stalls.
                 hec_url="https://hec.invalid/services/collector",
                 hec_token="tok",
                 hec_queue_max=25,
             )
         )
+        # Pin every worker so nothing can leave the queue during the probe.
+        emitter._hec_post_inner = lambda event: release.wait(30)  # type: ignore[method-assign]
         try:
             assert emitter.enabled
             for i in range(2000):
                 emitter.export({"event_type": "probe", "n": i})
+            # The bound holds exactly, and everything past it is counted.
             assert emitter._hec_inflight <= 25
-            assert emitter.hec_dropped > 0
-            assert emitter.hec_dropped + 25 >= 2000 - 25
+            assert emitter.hec_dropped == 2000 - 25
         finally:
+            release.set()
             emitter.close()
 
     def test_local_audit_row_survives_hec_backpressure(self, tmp_path: Path) -> None:

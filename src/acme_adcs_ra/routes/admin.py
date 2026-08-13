@@ -165,6 +165,40 @@ async def reclaim_processing_order(
         )
         return JSONResponse(content=_order_to_json(order))
 
+    # A minimum age before an order may be reclaimed.
+    #
+    # The only machine check below is "no certificate row exists" — which is
+    # equally true of an order whose enrollment is still IN FLIGHT, because the
+    # row is not written until the CA answers. Reclaiming such an order flips it
+    # back to `ready`, a client finalize re-enrolls, and the CA issues a SECOND
+    # certificate; the in-flight first one then loses the UNIQUE(order_id) race
+    # and becomes an untracked orphan at the CA. The docstring says the operator
+    # has checked the CA database first, but nothing enforced that, and a
+    # 30-second CA call is exactly when someone reaches for this endpoint.
+    #
+    # The guard is time, because time is the only signal the RA has: an order
+    # cannot still be enrolling long after the enrollment leg's own timeout.
+    age_seconds = ctx.store.processing_age_seconds(order_id)
+    minimum = ctx.config.reclaim_minimum_processing_age_seconds
+    if age_seconds is not None and age_seconds < minimum:
+        _audit(ctx,
+            event_type="admin-order-reclaim-denied",
+            order_id=order_id,
+            account_id=order.account_id,
+            outcome="failed",
+            details={
+                "reason": "still-within-enrollment-window",
+                "processing_age_seconds": round(age_seconds, 1),
+                "minimum_seconds": minimum,
+            },
+        )
+        raise malformed(
+            f"order has only been processing for {age_seconds:.0f}s; an "
+            f"enrollment may still be in flight. Reclaim is refused until "
+            f"{minimum}s have passed, because reclaiming a live enrollment "
+            f"causes double issuance."
+        )
+
     existing_cert = ctx.store.get_certificate_by_order(order_id)
     if existing_cert is not None:
         # Enrollment succeeded but the status flip was missed — close the

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
@@ -171,12 +172,26 @@ async def new_account(
     if not isinstance(contact, list):
         raise malformed("contact must be a list")
 
-    account = ctx.store.create_account(
-        jwk=account_jwk,
-        eab_kid=verified_kid,
-        status="valid",
-        contact=contact,
-    )
+    try:
+        account = ctx.store.create_account(
+            jwk=account_jwk,
+            eab_kid=verified_kid,
+            status="valid",
+            contact=contact,
+        )
+    except sqlite3.IntegrityError:
+        # A concurrent newAccount for the same key won the UNIQUE index. That
+        # is exactly the case the index exists to stop, and the right answer is
+        # the RFC 8555 §7.3 one: return the account that already exists rather
+        # than surfacing a 500 for what is a legitimate idempotent retry.
+        winner = ctx.store.get_account_by_jwk(account_jwk)
+        if winner is None:
+            raise
+        return JSONResponse(
+            status_code=200,
+            content=_account_to_json(ctx, winner),
+            headers={"Location": _account_url(ctx, winner.id)},
+        )
 
     _audit(ctx,
         event_type="account-created",

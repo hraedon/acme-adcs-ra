@@ -362,6 +362,7 @@ class Store:
             self._migrate_orders_table(conn)
             self._migrate_authorizations_table(conn)
             self._migrate_certificates_unique_order_index(conn)
+            self._migrate_accounts_unique_thumbprint_index(conn)
 
     def _migrate_certificates_unique_order_index(
         self, conn: sqlite3.Connection
@@ -393,6 +394,38 @@ class Store:
                 "will run on its CAS-based duplicate-prevention (still safe), "
                 "but the DB-level guarantee is NOT installed. Reconcile the "
                 "duplicate rows and restart to install the index."
+            )
+
+    def _migrate_accounts_unique_thumbprint_index(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """UNIQUE index on accounts(jwk_thumbprint) — one account per key.
+
+        ``newAccount`` reads by thumbprint and returns the existing account
+        (RFC 8555 §7.3 idempotence), then inserts if it found none. Those are
+        two separate transactions, so two concurrent newAccount requests for
+        the same key both read "absent" and both insert. The result is two
+        active accounts for one key, each with its own order history and its
+        own rate-limit accounting — and a kid eviction or deactivation applied
+        to "the" account leaves the twin usable.
+
+        Same defensive pattern as the certificates(order_id) index: created in
+        the migration rather than ``_SCHEMA`` so an already-deployed DB that
+        accumulated duplicates does not fail to start. The RA keeps running on
+        the read-then-insert path; the operator reconciles and restarts.
+        """
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_thumbprint_unique "
+                "ON accounts(jwk_thumbprint) WHERE jwk_thumbprint IS NOT NULL"
+            )
+        except sqlite3.IntegrityError:
+            import logging
+            logging.getLogger(__name__).error(
+                "Cannot create the accounts(jwk_thumbprint) UNIQUE index: the "
+                "existing database holds more than one account for the same "
+                "account key. The RA will run without the DB-level guarantee. "
+                "Reconcile the duplicate accounts and restart to install it."
             )
 
     def _migrate_accounts_table(self, conn: sqlite3.Connection) -> None:
@@ -792,6 +825,24 @@ class Store:
                  OrderStatus.PENDING, OrderStatus.READY),
             )
             return cursor.rowcount == 1
+
+    def processing_age_seconds(self, order_id: str) -> float | None:
+        """Seconds since the order entered ``processing``, or None if unknown.
+
+        None means the order has no ``processing_started_at`` — either it is
+        not processing, or it is a legacy row written before that column
+        existed. Callers must treat None as "cannot tell" rather than as zero.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT processing_started_at FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+        if row is None or not row["processing_started_at"]:
+            return None
+        started = datetime.strptime(
+            row["processing_started_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=UTC)
+        return (datetime.now(UTC) - started).total_seconds()
 
     def transition_processing_to_invalid(self, order_id: str) -> bool:
         """Terminate an order whose enrollment is definitively over.

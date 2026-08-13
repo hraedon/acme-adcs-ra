@@ -20,6 +20,8 @@ from acme_adcs_ra.enrollment import (
 )
 from acme_adcs_ra.store import CertStatus, Store
 
+_ADMIN_TOKEN = "test-admin-token-0123456789abcdef-32+"
+
 
 class _IssuedThenFailedLeg:
     """An enrollment leg where the CA issues and the RA then fails.
@@ -203,6 +205,130 @@ class TestTransportOrphanQuarantine:
 # ---------------------------------------------------------------------------
 
 
+class TestReclaimRefusesLiveEnrollment:
+    """F7 — reclaim must not be able to race an in-flight enrollment.
+
+    The endpoint's only machine check was "no certificate row exists for this
+    order", which is equally true of an order the RA is *still enrolling* — the
+    row is not written until the CA answers. Reclaiming such an order flips it
+    to ``ready``, a client finalize re-enrolls, and the CA issues a second
+    certificate for one order.
+    """
+
+    def _processing_order(
+        self, tmp_path: Path, *, age_seconds: int
+    ) -> tuple[Store, Any, str]:
+        store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        order_id, _account_id = _seed_processing_order(store)
+        _backdate_processing(store, order_id, age_seconds)
+        return store, client, order_id
+
+    def test_a_freshly_processing_order_cannot_be_reclaimed(
+        self, tmp_path: Path
+    ) -> None:
+        store, client, order_id = self._processing_order(tmp_path, age_seconds=5)
+        resp = client.post(
+            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            headers={"Authorization": f"Bearer {_ADMIN_TOKEN}"},
+        )
+        assert resp.status_code == 400
+        # And crucially it is still processing — not flipped to ready, where a
+        # finalize could re-enroll against a request the CA may be serving.
+        order = store.get_order(order_id)
+        assert order is not None
+        assert order.status == "processing"
+
+    def test_an_order_past_the_window_can_still_be_reclaimed(
+        self, tmp_path: Path
+    ) -> None:
+        """The negative control: the endpoint must still do its job. Without
+        this, refusing everything would pass the test above."""
+        store, client, order_id = self._processing_order(tmp_path, age_seconds=3600)
+        resp = client.post(
+            f"/acme/admin/orders/{order_id}/reclaim-processing",
+            headers={"Authorization": f"Bearer {_ADMIN_TOKEN}"},
+        )
+        assert resp.status_code == 200
+        order = store.get_order(order_id)
+        assert order is not None
+        assert order.status == "ready"
+
+
+class TestOneAccountPerKey:
+    """F8 — newAccount's read-then-insert could mint duplicate accounts.
+
+    ``newAccount`` reads by thumbprint and returns any existing account, then
+    inserts if it found none — two separate transactions. Two concurrent
+    requests for the same key both read "absent" and both insert, leaving two
+    active accounts for one key: separate order histories, separate rate-limit
+    accounting, and a kid eviction or deactivation applied to one leaving the
+    twin usable.
+    """
+
+    def test_the_database_refuses_a_second_account_for_one_key(
+        self, tmp_path: Path
+    ) -> None:
+        """Pins the constraint itself, not the route's read-then-insert — the
+        race is by definition not reproducible through the happy path."""
+        import sqlite3
+
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        from .hand_rolled_acme_client import jwk_from_private_key
+
+        store, _client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        jwk = jwk_from_private_key(ec.generate_private_key(ec.SECP256R1()))
+        store.create_account(jwk=jwk, eab_kid="kid-001")
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_account(jwk=jwk, eab_kid="kid-001")
+
+    def test_a_different_key_is_unaffected(self, tmp_path: Path) -> None:
+        """Negative control: the constraint must be per-key, not a global cap."""
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        from .hand_rolled_acme_client import jwk_from_private_key
+
+        store, _client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        for _ in range(3):
+            jwk = jwk_from_private_key(ec.generate_private_key(ec.SECP256R1()))
+            store.create_account(jwk=jwk, eab_kid="kid-001")
+
+    def test_the_route_resolves_the_race_instead_of_500ing(
+        self, tmp_path: Path
+    ) -> None:
+        """A legitimate idempotent retry that loses the race must still get its
+        account back (RFC 8555 §7.3), not a 500 from the constraint."""
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from .hand_rolled_acme_client import HandRolledAcmeClient
+        from .test_revocation import _eab_mac_key, _make_test_config
+
+        store, client = _app_with_leg(tmp_path, FakeEnrollmentLeg())
+        cfg = _make_test_config(tmp_path)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ac = HandRolledAcmeClient(client, "http://testserver", key)
+        mac = _eab_mac_key(cfg, "kid-001")
+        first = ac.new_account("kid-001", mac)
+        assert first.status_code == 201
+        second = ac.new_account("kid-001", mac)
+        assert second.status_code == 200
+        assert second.headers["Location"] == first.headers["Location"]
+
+
+def _backdate_processing(store: Store, order_id: str, seconds: int) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    ts = (datetime.now(UTC) - timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE orders SET processing_started_at = ? WHERE id = ?",
+            (ts, order_id),
+        )
+
+
 def _app_with_leg(tmp_path: Path, leg: Any) -> tuple[Store, Any]:
     """An app whose issuance policy actually permits an order to be driven.
 
@@ -210,6 +336,7 @@ def _app_with_leg(tmp_path: Path, leg: Any) -> tuple[Store, Any]:
     the empty-policy one, because these tests must reach the enrollment leg.
     """
     from fastapi.testclient import TestClient
+    from pydantic import SecretStr
 
     from acme_adcs_ra.app_state import ServerContext
     from acme_adcs_ra.policy import IssuancePolicy
@@ -219,7 +346,9 @@ def _app_with_leg(tmp_path: Path, leg: Any) -> tuple[Store, Any]:
     from .test_revocation import _make_test_config
 
     tmp_path.mkdir(parents=True, exist_ok=True)
-    cfg = _make_test_config(tmp_path)
+    cfg = _make_test_config(tmp_path).model_copy(
+        update={"admin_token": SecretStr(_ADMIN_TOKEN)}
+    )
     store = Store(cfg.db_path)
     ctx = ServerContext(
         config=cfg,

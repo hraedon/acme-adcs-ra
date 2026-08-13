@@ -191,6 +191,13 @@ class RAConfig(BaseSettings):
     # Admin API token for maintenance endpoints (e.g., nonce cleanup)
     admin_token: SecretStr = Field(default_factory=lambda: SecretStr(""))
 
+    # Refuse to reclaim an order that may still be enrolling. The reclaim
+    # endpoint's only machine check is "no certificate row", which is also true
+    # mid-flight, so reclaiming a live enrollment causes double issuance. The
+    # default is twice the enrollment leg's own 30s timeout: past that, an
+    # enrollment cannot still be in progress.
+    reclaim_minimum_processing_age_seconds: int = 60
+
     # --- CA-side revocation confirmation (WI-024 callback) -------------------
     # Confirming that the CA actually revoked a serial is a *different*
     # authority from general maintenance: it asserts an external security event

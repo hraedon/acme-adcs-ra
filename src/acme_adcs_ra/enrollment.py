@@ -20,7 +20,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -202,6 +202,87 @@ class HttpSession(Protocol):
     ) -> HttpResponse: ...
 
 
+class _NoRedirectSession:
+    """Wraps a live ``requests.Session`` so it never follows a redirect.
+
+    ``requests`` strips the ``Authorization`` header when a redirect crosses to
+    another host — but that protection does **not** apply here, because
+    ``NegotiateAuth`` does not set a static header. It registers a *response
+    hook* that fires on any 401 and builds a fresh Kerberos token, so a redirect
+    to an attacker-controlled host that answers 401 Negotiate would draw a
+    freshly minted ticket for the gMSA out of the RA, with a channel-binding
+    token derived from the real CA's TLS certificate — the shape of a relay.
+
+    Nothing in the ``/certsrv/`` flow legitimately redirects: every URL is
+    constructed from the configured host. So refusing outright costs nothing
+    and removes the whole class. Applied in the production session factory
+    rather than at each call site, so a new call cannot forget it, and so the
+    ``HttpSession`` protocol (and every test fake) stays unchanged.
+    """
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    def post(self, url: str, *, data: Mapping[str, str], timeout: float) -> Any:
+        return self._session.post(
+            url, data=data, timeout=timeout, allow_redirects=False
+        )
+
+    def get(self, url: str, *, params: Mapping[str, str], timeout: float) -> Any:
+        return self._session.get(
+            url, params=params, timeout=timeout, allow_redirects=False
+        )
+
+
+def _reject_redirect(resp: HttpResponse, what: str) -> None:
+    """Refuse a 3xx. ``raise_for_status`` treats redirects as success.
+
+    With redirects disabled the redirect itself arrives as the response, so
+    without this check the flow would try to parse a redirect body as a
+    disposition, a certificate, or a PKCS#7 chain.
+    """
+    if 300 <= resp.status_code < 400:
+        location = resp.headers.get("Location", "<none>")
+        raise EnrollmentTransportError(
+            f"{what} returned HTTP {resp.status_code} redirecting to "
+            f"{location!r}; /certsrv/ must not redirect and the RA will not "
+            "follow one while carrying the gMSA's Kerberos identity"
+        )
+
+
+def _capped_body(resp: HttpResponse, max_bytes: int, what: str) -> None:
+    """Refuse an oversized enrollment response before it is parsed.
+
+    The certificate, disposition, and PKCS#7 bodies were read with no size
+    limit at all, so a compromised or simply malfunctioning ``/certsrv/`` could
+    hand the RA an arbitrarily large body to buffer and parse on the issuance
+    path.
+
+    *Residual, stated because it is not obvious:* ``requests`` has already
+    buffered the body by the time this runs, so this bounds *parsing*, and
+    bounds *buffering* only for a response that declares an honest
+    ``Content-Length``. Fully bounding a chunked response would require
+    streaming reads through the ``HttpSession`` protocol. Given the transport
+    is mutually authenticated to the CA with channel binding, that trade is
+    deliberate rather than overlooked.
+    """
+    declared = resp.headers.get("Content-Length")
+    if declared is not None:
+        try:
+            if int(declared) > max_bytes:
+                raise EnrollmentTransportError(
+                    f"{what} declared {declared} bytes, over the "
+                    f"{max_bytes}-byte limit"
+                )
+        except ValueError:
+            pass
+    if len(resp.content) > max_bytes:
+        raise EnrollmentTransportError(
+            f"{what} returned {len(resp.content)} bytes, over the "
+            f"{max_bytes}-byte limit"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Real ADCS enrollment leg — /certsrv/ via Negotiate/SSPI (Mode A)
 # ---------------------------------------------------------------------------
@@ -239,6 +320,7 @@ class CertsrvEnrollmentLeg:
         timeout: float = 30.0,
         session_factory: Callable[[], HttpSession] | None = None,
         locale: str = "en",
+        max_response_bytes: int = 5 * 1024 * 1024,
     ) -> None:
         self._host = host
         self._template = template
@@ -247,6 +329,7 @@ class CertsrvEnrollmentLeg:
         self._timeout = timeout
         self._session_factory = session_factory
         self._locale = locale
+        self._max_response_bytes = max_response_bytes
 
     def _build_session(self) -> HttpSession:
         """Build the live ADCS session: SPNEGO/Negotiate as the ambient gMSA,
@@ -264,7 +347,7 @@ class CertsrvEnrollmentLeg:
         session.auth = NegotiateAuth(self._host, ca_bundle=self._ca_bundle)
         session.headers.update({"User-agent": _CERTFNSH_USER_AGENT})
         session.verify = self._ca_bundle if self._ca_bundle else True
-        return cast(HttpSession, session)
+        return cast(HttpSession, _NoRedirectSession(session))
 
     def _requester(self) -> str:
         """Best-effort capture of the ambient enrollment identity (the gMSA).
@@ -325,7 +408,9 @@ class CertsrvEnrollmentLeg:
                 "SaveCert": "yes",
             }
             resp = session.post(f"{base}/certfnsh.asp", data=form, timeout=timeout)
+            _reject_redirect(resp, "certfnsh.asp")
             resp.raise_for_status()
+            _capped_body(resp, self._max_response_bytes, "certfnsh.asp")
             disposition, detail = _parse_certfnsh_disposition(
                 resp.text, resp.status_code, locale=self._locale
             )
@@ -350,7 +435,9 @@ class CertsrvEnrollmentLeg:
                 params={"ReqID": req_id, "Enc": "b64"},
                 timeout=timeout,
             )
+            _reject_redirect(cert_resp, "certnew.cer")
             cert_resp.raise_for_status()
+            _capped_body(cert_resp, self._max_response_bytes, "certnew.cer")
             # ADCS Web Enrollment is inconsistent about the certnew.cer
             # content-type (observed live: text/html wrapping an Enc=b64 PEM
             # body). Don't gate on the header — parse the body as a certificate
@@ -391,7 +478,9 @@ class CertsrvEnrollmentLeg:
             # 3. Fetch the CA chain (PKCS#7).  First scrape nRenewals from
             #    certcarc.asp, then GET certnew.p7b (mirrors spike_mode_a.py).
             arc_resp = session.get(f"{base}/certcarc.asp", params={}, timeout=timeout)
+            _reject_redirect(arc_resp, "certcarc.asp")
             arc_resp.raise_for_status()
+            _capped_body(arc_resp, self._max_response_bytes, "certcarc.asp")
             nren = re.search(r"var nRenewals=(\d+);", arc_resp.text)
             renewals = nren.group(1) if nren else "0"
             chain_resp = session.get(
@@ -399,7 +488,9 @@ class CertsrvEnrollmentLeg:
                 params={"ReqID": "CACert", "Renewal": renewals, "Enc": "b64"},
                 timeout=timeout,
             )
+            _reject_redirect(chain_resp, "certnew.p7b")
             chain_resp.raise_for_status()
+            _capped_body(chain_resp, self._max_response_bytes, "certnew.p7b")
             chain_pem = _parse_pkcs7_chain(chain_resp.content)
             issued_chain_pem = list(chain_pem)
             _validate_chain_binds_to_leaf(cert_pem, chain_pem)

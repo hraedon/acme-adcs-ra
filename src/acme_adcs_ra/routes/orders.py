@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from acme_adcs_ra.acme_errors import (
     malformed,
@@ -280,8 +281,17 @@ async def finalize_order(
     if race_resp is not None:
         return race_resp
 
-    # Submit to enrollment.
-    enrollment_result = _finalize_submit_enrollment(
+    # Submit to enrollment — on a worker thread, not the event loop.
+    #
+    # This handler is `async def`, so FastAPI runs it ON the loop rather than in
+    # the threadpool it uses for `def` handlers. The enrollment leg is
+    # synchronous `requests` against the CA and routinely takes seconds (its own
+    # default timeout is 30s). Called inline it stalled every other request in
+    # the process for that whole window — new-nonce, revokeCert, the admin
+    # endpoints — turning one slow CA into a service-wide outage. The supported
+    # deployment is a single process, so there is no second worker to absorb it.
+    enrollment_result = await run_in_threadpool(
+        _finalize_submit_enrollment,
         ctx, order_id, account_id, requested_sans,
         csr, csr_subject, decision,
     )
