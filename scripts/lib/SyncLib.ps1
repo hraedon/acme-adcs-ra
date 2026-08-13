@@ -1,7 +1,8 @@
 # Dot-sourceable library: sync-revocation helpers extracted from
 # Sync-Revocations.ps1 for testability. Used by the Pester tests
-# (tests/pester/Sync.Tests.ps1). The production script keeps its logic
-# inline; this lib validates the same logic independently.
+# (tests/pester/Sync.Tests.ps1) AND dot-sourced by the production script, so
+# what CI exercises is what runs -- a test-only copy proves nothing about the
+# shipped path.
 
 # Invoke-RestMethod may unwrap a single-element array into a scalar, and an
 # empty JSON array may deserialize as $null. Force a clean array, filtering
@@ -18,6 +19,28 @@ function Get-PendingRevocations([object]$Response) {
 function Get-SyncExitCode([int]$FailedCount) {
     if ($FailedCount -gt 0) { return 2 }
     return 0
+}
+
+# Run a child script and return its output and exit code WITHOUT letting the
+# child's stderr become a terminating error in the caller.
+#
+# `& native 2>&1` does not do this on its own: it turns each stderr line into
+# an ErrorRecord on the output stream, and under $ErrorActionPreference='Stop'
+# -- which Sync-Revocations.ps1 sets -- the first one throws. That made the
+# per-serial failure handling unreachable: a failed revoke aborted the whole
+# batch instead of being logged and counted, and the script exited 1 rather
+# than the documented 2 (partial failure) or 5 (requester mismatch).
+# Suppressing Stop for the duration of the call is what makes the child's
+# failure handleable. (Found on the lab CA, 2026-08-13.)
+function Invoke-ChildScript([string]$Exe, [string[]]$Arguments) {
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Exe @Arguments 2>&1
+        return [pscustomobject]@{ Output = @($out); ExitCode = $LASTEXITCODE }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
 }
 
 # Validate the RA base URL before any credential is attached to a request.

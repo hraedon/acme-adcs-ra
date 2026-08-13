@@ -132,6 +132,96 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **v1.9.0 live re-proof — PASSED (2026-08-13), with two defects found and
+  fixed.** Run against commit `26eae31` (the 2026-08-13 security review),
+  deployed as a wheel into the gMSA app-pool venv on the lab RA host with
+  `scripts/` and `scripts/lib/` shipped alongside. This closes proof gaps 1–3
+  of `docs/security-review-2026-08-13.md`, which had shipped ten security fixes
+  validated **only against fakes on Linux**.
+
+  **§A — issuance + EKU (real CA).** Full ACME round-trip (new-account EAB →
+  order → challenge → finalize → cert) issued a real certificate: EKU exactly
+  `serverAuth`, `clientAuth` absent, SAN taken from the CSR, chain leaf →
+  issuing CA → existing root (no new intermediate), requester recorded in the CA
+  database as the enrollment gMSA. Out-of-scope SAN rejected at finalize; a CSR
+  whose SANs did not match the order rejected before the CA saw it; reason 7
+  rejected with `badRevocationReason`; revoked certificate → `410 Gone`. The
+  strict chain validator did **not** false-reject — a successful issuance is the
+  only proof of that, and no unit test can give it.
+
+  **§A.1 — ACME front controls.** All passed: JWS `url` naming another host
+  rejected against `base_url` (not the request Host); an EAB or `kid` naming
+  another deployment rejected; account eviction on kid rename — **with the
+  control first** (a new account under the renamed kid must succeed) — old
+  account `newOrder` and `revokeCert` both 401; deactivation then 401;
+  POST-as-GET of order/account/orders resolving while another account's
+  certificate is refused; `/docs`, `/redoc`, `/openapi.json` all 404; the nonce
+  ceiling returning a 204/429 mix with `Retry-After`.
+
+  **§C — automated revocation, single-identity.** The enrollment gMSA was
+  granted Certificate Manager (`0x2`, **not** Manage-CA) plus template-scoped
+  `OfficerRights`, and the registered scheduled task ran as the gMSA: serials
+  revoked at the CA and confirmed back to the RA, pending set draining. The
+  least-privilege bound held live and visibly — `certutil -revoke` **succeeded**
+  while the `-PublishCrl` republish was **denied** `0x80070005` (needs
+  Manage-CA), and a certificate issued from a *different* template was refused
+  `0x80094009 CERTSRV_E_RESTRICTEDOFFICER`.
+
+  **§D — enrollment-side bound.** The gMSA's **live token** carries no Domain
+  Computers membership (the WI-035 / Finding E-1 hardening persists), and
+  issuance continued to work throughout.
+
+  **2026-08-13 review findings, exercised against the deployment:** separated
+  confirm authority — the admin token is refused on the confirm endpoint, the
+  confirm token is accepted, and an unset confirm token disables the endpoint
+  (finding 1); the sync agent refusing a non-https / credential-bearing / path-
+  bearing RA URL **with a listener proving no request carrying the Bearer token
+  left the host**, plus a control showing the listener would have caught one
+  (finding 4); startup refusing an `audit_offbox_required` deployment whose sink
+  cannot emit (finding 5); a certificate the CA issued outside policy
+  **quarantined** — recorded with its serial and ReqID, order terminal-invalid,
+  queued for CA-side revocation, and never served on a retried finalize
+  (finding 6); an unknown nonce answered `400 badNonce` in ~44 ms rather than
+  blocking on the writer lock (finding 7); credential floors refusing startup on
+  short tokens and on an EAB `mac_key` decoding to zero bytes, while accepting
+  every credential `scripts/eab.py` generates (finding 9); malformed JWS field
+  types answered 4xx, not 500 (finding 10).
+
+  **CRL evidence against a real ADCS CRL (closes proof gap 2).** With
+  `revocation_confirm_require_crl_evidence` set, a serial the CA had really
+  revoked confirmed as `verification: "crl-verified"`; the **negative control**
+  — a serial absent from the CRL — was refused, fail-closed; with evidence made
+  optional the same serial confirmed as `agent-asserted`. Note the operational
+  coupling observed live: the serial only reached the CRL after an
+  administrator republished it, because the scoped officer cannot.
+
+  **Two defects found, fixed, and re-verified live** (see the CHANGELOG
+  `[Unreleased]` entry): `Set-OfficerRights.ps1` aborting on a *successful*
+  single-officer provisioning (a Windows PowerShell 5.1 `.Count` semantic the
+  Linux Pester suite structurally cannot see), and `Sync-Revocations.ps1`
+  aborting the whole batch on the first failed revoke instead of logging and
+  continuing. Both were re-run against the CA after fixing: provisioning exits 0
+  and reports the ACE correctly; the batch now continues past a failure and
+  exits 2 (partial), as documented.
+
+  - [x] §A re-cleared on the deployed commit (live issue + denial + revocation).
+  - [x] §F revocation runbook re-exercised (`Sync-Revocations.ps1` +
+        `Revoke-Cert.ps1` requester check, live at the CA).
+  - [ ] **The proven artifact is NOT yet the shipped artifact.** The two fixes
+        above landed *after* `26eae31`; the issuance leg is unchanged by them,
+        but `Set-OfficerRights.ps1` and `Sync-Revocations.ps1` are not the bytes
+        that were re-proved end-to-end from a clean start. Both were re-run
+        live after the fix; a fresh full pass on the final commit is the
+        conservative next step before a v1.9.1 tag.
+  - **Still open before pilot:** the operator-owned items in §B–§E, unchanged.
+  - **Lab returned to its pre-run state:** CA `OfficerRights` removed and the CA
+    security descriptor restored byte-for-byte, the temporary group membership
+    removed, the throwaway template deleted and unpublished, every test
+    certificate revoked and the CRL republished, scheduled tasks unregistered,
+    RA database and dotenv restored from a pre-run backup, app pool left running
+    as found. The RA venv now holds the **v1.9.0** package (it held v1.7.0 before
+    the run).
+
 - **2026-06-24 — §A cleared.** Working tree committed; CI green on the deployed
   commit (`lint-typecheck-test` 3.12/3.13 + `pip-audit`); **live re-issue against
   the deployed commit performed on the lab.** A full ACME round-trip

@@ -153,11 +153,18 @@ function Build-OfficerRightsSD($AceBytesList) {
 # Parse the current OfficerRights SD and return, for each ACE, the trustee SID
 # and the raw ACE bytes. This lets us filter by officer without re-parsing the
 # opaque ApplicationData -- non-matching ACEs are preserved verbatim.
+#
+# ALWAYS returns an array (note the `,` in every return). PowerShell unwraps a
+# single-element array as it crosses a function boundary, and the resulting
+# bare [pscustomobject] has NO .Count under Windows PowerShell 5.1 -- so a
+# caller's `$aces.Count` silently becomes $null in the single-officer case,
+# which is the default deployment. (Under pwsh 7 the same expression yields 1,
+# so Pester on Linux cannot see the difference. Found on the CA, 2026-08-13.)
 function Get-ExistingAces([byte[]]$Bytes) {
     $result = @()
-    if ($null -eq $Bytes -or $Bytes.Length -lt 20) { return $result }
+    if ($null -eq $Bytes -or $Bytes.Length -lt 20) { return ,$result }
     $daclOffset = [BitConverter]::ToUInt32($Bytes, 16)
-    if ($daclOffset -eq 0 -or $daclOffset -ge $Bytes.Length) { return $result }
+    if ($daclOffset -eq 0 -or $daclOffset -ge $Bytes.Length) { return ,$result }
     $aceCount = [BitConverter]::ToUInt16($Bytes, $daclOffset + 4)
     $aceOffset = $daclOffset + 8
     for ($i = 0; $i -lt $aceCount; $i++) {
@@ -175,5 +182,5 @@ function Get-ExistingAces([byte[]]$Bytes) {
         $result += [pscustomobject]@{ OfficerSid = $sid; RawAce = $rawAce }
         $aceOffset += $aceSize
     }
-    return $result
+    return ,$result
 }

@@ -171,6 +171,25 @@ Describe 'Build-OfficerRightsSD' {
 }
 
 Describe 'Get-ExistingAces' {
+    # Regression, found live on the CA 2026-08-13. PowerShell unwraps a
+    # single-element array as it crosses a function boundary; the resulting
+    # bare [pscustomobject] has NO .Count under Windows PowerShell 5.1 (pwsh 7
+    # yields 1, which is why this suite was green while Set-OfficerRights.ps1
+    # aborted on a *successful* single-officer provisioning). Assert the TYPE,
+    # not the count -- the count is precisely the thing that differs by host.
+    It 'Always returns an array, even for a single ACE (PS 5.1 .Count trap)' {
+        $ace = Build-CallbackAce 'S-1-5-21-1004336348-1177238915-682003330-517' '1.3.6.1.4.1.311.21.8.16593888.12298824.5193888.14804498.16898264.10598498.10498398'
+        $aceList = [System.Collections.Generic.List[byte[]]]::new()
+        $aceList.Add($ace)
+        $result = Get-ExistingAces (Build-OfficerRightsSD $aceList)
+        $result -is [array] | Should -BeTrue
+    }
+
+    It 'Always returns an array when there are no ACEs to report' {
+        (Get-ExistingAces $null) -is [array] | Should -BeTrue
+        (Get-ExistingAces ([byte[]]@(1, 2, 3, 4, 5))) -is [array] | Should -BeTrue
+    }
+
     It 'Returns empty array for $null input' {
         $result = Get-ExistingAces $null
         $result.Count | Should -Be 0

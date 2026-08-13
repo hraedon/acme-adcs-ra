@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Set-OfficerRights.ps1` aborted on a *successful* single-officer
+  provisioning.** `Get-ExistingAces` returns an array, but PowerShell unwraps a
+  single-element array across a function boundary, and a bare `[pscustomobject]`
+  has **no `.Count` under Windows PowerShell 5.1** (pwsh 7 yields 1, which is
+  why the Pester suite was green). With exactly one ACE — the default, documented
+  single-officer deployment — the script reported an in-force restriction as
+  "absent — unrestricted", then failed its own readback assertion and exited 1
+  after correctly writing and loading the restriction. An operator, or any
+  automation treating a non-zero exit as failure, would conclude the CA-side
+  least-privilege control had not been applied. The library now always returns an
+  array and both call sites wrap defensively. Found by the live lab re-proof of
+  v1.9.0; the assertion itself shipped in v1.9.0 (2026-08-13 review, finding 8).
+
+- **`Sync-Revocations.ps1` aborted the whole batch on the first failed revoke.**
+  `& $pwshExe @revokeArgs 2>&1` turns the child's stderr into ErrorRecords, and
+  under the script's own `$ErrorActionPreference='Stop'` the first one is a
+  *terminating* error — so the per-serial "log it and continue" handling, the
+  requester-mismatch abort (exit 5) and the partial-failure exit code (2) were
+  all unreachable, and a single bad serial silently stranded every serial behind
+  it while the script exited 1. The child invocation moved to
+  `SyncLib.ps1::Invoke-ChildScript`, which suppresses `Stop` for the duration of
+  the call. Pre-existing (not introduced in v1.9.0); it only bites when a revoke
+  fails, which no previous re-proof had provoked. **Note:** this cannot be
+  regression-tested on Linux CI — pwsh defaults
+  `$PSNativeCommandUseErrorActionPreference` to `$false`, so a "does not throw"
+  assertion passes with the fix reverted (verified by mutation). See the note in
+  `tests/pester/Sync.Tests.ps1`.
+
 ## [1.9.0] — 2026-08-13
 
 **Security hardening (2026-08-13 external scan).** Ten findings — nine medium,

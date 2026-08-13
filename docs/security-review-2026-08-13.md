@@ -250,6 +250,19 @@ in UTF-8, which cannot fail and is equivalent for timing equalisation.
 
 ## Proof gaps — what this review did NOT establish
 
+> **Update, 2026-08-13 (later the same day): gaps 1, 2 and 3 are now closed by a
+> live lab re-proof** against a real ADCS CA — see the v1.9.0 entry in
+> [`pre-pilot-checklist.md`](pre-pilot-checklist.md#validation-log). It also
+> found **two defects that only exist off Linux**, one of them in this review's
+> own finding-8 fix: `Set-OfficerRights.ps1` aborted on a *successful*
+> single-officer provisioning (Windows PowerShell 5.1 gives a bare
+> `[pscustomobject]` no `.Count`; pwsh 7 gives it 1, so the Pester suite was
+> green), and `Sync-Revocations.ps1` aborted its whole batch on the first failed
+> revoke. Both are fixed and re-verified against the CA. **The lesson is gap 3's,
+> sharpened:** the problem is not only Windows-only *APIs*, it is Windows
+> PowerShell 5.1 *language semantics* that Linux `pwsh` silently differs on — a
+> green cross-platform Pester run is not evidence about the CA host.
+
 Stated plainly because the changes touch the issuance and revocation paths:
 
 1. **No live ADCS validation.** All of this was validated on Linux against

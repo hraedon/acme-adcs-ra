@@ -127,3 +127,55 @@ Describe 'Assert-SafeRaUrl' {
         { Assert-SafeRaUrl -Url '' } | Should -Throw -ExpectedMessage '*must not be empty*'
     }
 }
+
+Describe 'Invoke-ChildScript' {
+    BeforeAll {
+        # A child that fails the way Revoke-Cert.ps1 fails: a Die() message on
+        # stderr and a non-zero exit code.
+        $script:childPath = Join-Path ([System.IO.Path]::GetTempPath()) 'sync-child-test.ps1'
+        Set-Content -Path $script:childPath -Encoding ASCII -Value @(
+            '[Console]::Error.WriteLine("ERROR: certutil exited -2146877431")'
+            'Write-Output "some stdout line"'
+            'exit 4'
+        )
+        $script:exe = (Get-Process -Id $PID).Path
+    }
+
+    AfterAll {
+        Remove-Item $script:childPath -Force -ErrorAction SilentlyContinue
+    }
+
+    # NOTE ON WHAT THIS FILE CANNOT COVER.
+    #
+    # The defect this function exists to fix -- found on the lab CA 2026-08-13
+    # -- is that under Windows PowerShell 5.1 a bare `& $exe @args 2>&1` turns
+    # the child's first stderr line into a TERMINATING error when the caller
+    # has $ErrorActionPreference='Stop', so Sync-Revocations.ps1's per-serial
+    # failure handling never ran and the batch aborted on the first failure.
+    #
+    # That is NOT reproducible here. pwsh 7 defaults
+    # $PSNativeCommandUseErrorActionPreference to $false, so a native command's
+    # stderr never becomes a terminating error on this host; a "does not throw"
+    # assertion would pass with the fix reverted -- verified by mutation, which
+    # is why no such test is written. The tests below pin the parts of the
+    # contract that DO bite cross-platform (both mutation-checked). The
+    # stderr/EAP behaviour itself is covered only by the live lab re-proof
+    # (docs/live-reproof-runbook.md).
+    It 'Returns the child exit code so a failure can be handled, not thrown' {
+        $ErrorActionPreference = 'Stop'
+        $run = Invoke-ChildScript $script:exe @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:childPath
+        )
+        $run.ExitCode | Should -Be 4
+    }
+
+    It 'Captures both the stderr message and stdout for logging' {
+        $ErrorActionPreference = 'Stop'
+        $run = Invoke-ChildScript $script:exe @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:childPath
+        )
+        ($run.Output | Out-String) | Should -Match 'certutil exited'
+        ($run.Output | Out-String) | Should -Match 'some stdout line'
+    }
+
+}

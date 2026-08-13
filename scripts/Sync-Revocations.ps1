@@ -297,9 +297,18 @@ foreach ($entry in $pending) {
 
     Write-Output ("[{0}/{1}] Revoking serial {2} (reason {3}, req_id {4})..." -f $index, $total, $serial, $reason, $reqId)
     # Run Revoke-Cert.ps1 in a child PowerShell process so its `exit` code is
-    # captured via $LASTEXITCODE (not propagated as our own). Redirect stderr
-    # to stdout (2>&1) so the child's Die() messages display as output without
-    # triggering the parent's $ErrorActionPreference=Stop as a native error.
+    # captured via $LASTEXITCODE (not propagated as our own).
+    #
+    # `2>&1` alone does NOT make the child's stderr safe: it turns each stderr
+    # line into an ErrorRecord in the output stream, and under this script's
+    # $ErrorActionPreference='Stop' the FIRST one is a terminating error. So
+    # the moment a revoke failed -- exactly when the handling below matters --
+    # the batch aborted here instead, skipping every remaining serial and
+    # exiting 1 rather than the documented 2 (partial failure) or 5 (requester
+    # mismatch). Suppressing Stop for the duration of the call is what actually
+    # lets the child's failure be *handled* rather than thrown.
+    # (Observed live on the lab CA, 2026-08-13.)
+    #
     # By default, skip the CRL republish (certutil -CRL republish requires the
     # Manage-CA role, which a least-privilege revoker/officer identity does NOT
     # hold -- the revocation is recorded at the CA and appears at the next
@@ -313,8 +322,9 @@ foreach ($entry in $pending) {
         '-RequesterName', $RequesterName
     )
     if (-not $PublishCrl) { $revokeArgs += '-SkipPublishCrl' }
-    $revokeOutput = & $pwshExe @revokeArgs 2>&1
-    $revokeExit = $LASTEXITCODE
+    $revokeRun = Invoke-ChildScript $pwshExe $revokeArgs
+    $revokeOutput = $revokeRun.Output
+    $revokeExit = $revokeRun.ExitCode
     $revokeOutput | ForEach-Object { Write-Output $_ }
 
     if ($revokeExit -eq 5) {

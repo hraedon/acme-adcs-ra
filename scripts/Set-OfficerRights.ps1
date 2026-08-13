@@ -197,7 +197,10 @@ Write-Output ""
 
 # Read the current OfficerRights.
 $currentBytes = Get-OfficerRightsBytes $CaConfig
-$existingAces = Get-ExistingAces $currentBytes
+# @() is load-bearing, not decoration: a single existing ACE arrives here as a
+# bare [pscustomobject] whose .Count is $null under Windows PowerShell 5.1, so
+# the count test below would report an in-force restriction as "absent".
+$existingAces = @(Get-ExistingAces $currentBytes)
 if ($existingAces.Count -gt 0) {
     Write-Output ("Current OfficerRights: {0} ACE(s)." -f $existingAces.Count)
     foreach ($a in $existingAces) {
@@ -331,7 +334,7 @@ if ($Remove -and $keptAces.Count -eq 0) {
     if ($null -eq $verifyBytes) {
         Die "Readback: OfficerRights absent after write -- the set did not take effect." 1
     }
-    $verifyAces = Get-ExistingAces $verifyBytes
+    $verifyAces = @(Get-ExistingAces $verifyBytes)
     Write-Output ("Readback: {0} ACE(s) present." -f $verifyAces.Count)
     foreach ($a in $verifyAces) {
         Write-Output ("  officer={0}" -f $a.OfficerSid)
