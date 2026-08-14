@@ -23,6 +23,7 @@ pyspnego is not installed (it is ``sys_platform == 'win32'``-gated).
 from __future__ import annotations
 
 import base64
+import contextlib
 import socket
 import ssl
 from typing import Any
@@ -32,6 +33,36 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 
 _TLS_SERVER_END_POINT = b"tls-server-end-point:"
+
+# A 401 Negotiate challenge body carries nothing the RA reads — it exists only
+# so the connection can be reused for the next leg of the handshake. Draining it
+# with ``response.content`` buffered however much the peer sent, on the issuance
+# path, before any enrollment-layer cap could see it (2026-08-18 wave 3 F4).
+# 64 KiB is far more than any real IIS challenge page and is discarded either way.
+_NEGOTIATE_DRAIN_MAX_BYTES = 64 * 1024
+
+
+def _bounded_drain(response: requests.Response) -> None:
+    """Discard a challenge body without buffering an unbounded amount of it.
+
+    The bytes are thrown away, so there is no need to stop at a limit for
+    correctness — only to stop the peer choosing how much memory this costs.
+    Past the cap the connection is closed instead of drained, which costs a new
+    connection for the next handshake leg and nothing else.
+    """
+    raw = getattr(response, "raw", None)
+    read = getattr(raw, "read", None)
+    if read is None:
+        # Not a streamed response (a test double, or a body already buffered):
+        # touching .content cannot make it worse than it already is.
+        response.content  # noqa: B018 - drain for connection reuse
+        return
+    try:
+        if len(read(_NEGOTIATE_DRAIN_MAX_BYTES + 1)) > _NEGOTIATE_DRAIN_MAX_BYTES:
+            response.close()
+    except Exception:  # noqa: BLE001 - draining must never fail the handshake
+        with contextlib.suppress(Exception):
+            response.close()
 
 
 def tls_server_end_point_digest(cert_der: bytes) -> bytes:
@@ -148,7 +179,7 @@ class NegotiateAuth(requests.auth.AuthBase):
             out_token = client.step(in_token)
             if not out_token:
                 return current
-            current.content  # noqa: B018 - drain so the underlying connection can be reused
+            _bounded_drain(current)
             request = current.request.copy()
             request.headers["Authorization"] = (
                 "Negotiate " + base64.b64encode(out_token).decode("ascii")

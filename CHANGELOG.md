@@ -6,6 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-18 wave 3 (seven findings; two already closed, four fixed, one deferred)
+
+A standard review of `d26b892`, run in parallel with the rescan of the same
+commit — so its CRL-redirect and twin-migration findings were already closed at
+HEAD by `83abd62`. Two medium and three low were new. See
+`docs/security-review-2026-08-18-wave3.md`.
+
+- **ADCS disposition 21 is no longer read as proof of revocation (medium).**
+  `scripts/lib/RevocationLib.ps1` records the lab finding that a certificate
+  given reason 8 (`removeFromCRL`) ends up off the CRL and **valid** while ADCS
+  keeps disposition 21 — but `Test-SerialRevokedAtCa` returned true for any
+  disposition-21 row (making the sync agent exit 6, drain the serial off the
+  pending feed and record `revocation-ca-confirmed`), and the reconciler counted
+  it in sync. Both now check the reason: `Revoke-Cert.ps1` adds a
+  `Request.RevokedReason=8` restrict clause and re-revokes on a match, and
+  `Reconcile-Revocation.ps1` exports the reason so a reason-8 row reports drift.
+  A disposition-21 row with *no* reason is still revoked, so an older export does
+  not turn the estate into drift.
+- **`audit_offbox_required` now proves delivery, not configuration (medium).** It
+  asserted only that a SIEM emitter had been constructed from valid-looking
+  config, so a revoked HEC token or an endpoint answering 403 let the RA issue
+  certificates believing an off-box audit trail was in force. `create_app` now
+  runs a real delivery probe when off-box audit is required and refuses to start
+  if it fails; a UDP syslog probe explicitly reports what it could *not* prove.
+  Off-box delivery failures are counted (`offbox_failures`, `offbox_delivered`,
+  `offbox_last_error`) rather than only logged.
+- **certsrv responses are bounded before buffering (low).** Every call was
+  non-streaming, so the size cap — and the declared `Content-Length` check —
+  ran after `requests` had the whole body resident. `_NoRedirectSession` now
+  streams (same place `allow_redirects=False` lives, so no protocol or test fake
+  changes), oversized declared lengths are refused before a byte is read, and the
+  body is read incrementally to cap+1. The Negotiate 401 challenge drain is
+  bounded to 64 KiB.
+- **The revocation confirmation flag and its audit event commit together (low).**
+  `ca_crl_updated` committed first on a separate connection, and it is what
+  removes the serial from the retry feed — so a crash in between lost the
+  `revocation-ca-confirmed` event permanently, with the route's idempotence check
+  preventing any repair. Now one `BEGIN IMMEDIATE`, with SIEM fan-out after the
+  commit.
+- **Deferred:** unbounded `audit_log` growth from unauthenticated newAccount
+  denials (tracked as WI-014). Retention is already operator-owned in
+  `docs/operations.md`, and the remediation is a subsystem with its own security
+  design rather than an end-of-wave patch.
+
 ### Security — 2026-08-18 rescan (two findings)
 
 A rescan of `d26b892` that **confirmed all five 2026-08-18 fixes closed** and

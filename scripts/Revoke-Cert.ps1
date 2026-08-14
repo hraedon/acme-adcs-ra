@@ -248,6 +248,31 @@ function Test-SerialRevokedAtCa([string]$CaConfig, [string]$SerialHex) {
         Write-Output "         Proceeding with the revocation attempt as though the state were unknown."
         return $false
     }
+    # Disposition 21 is NOT proof of revocation on its own.
+    #
+    # `RevocationLib.ps1` records what the Plan 004 lab spike established: a
+    # certificate placed on hold and then given reason 8 (removeFromCRL) ends up
+    # "off the CRL and valid" while ADCS keeps its DB Disposition at 21. So the
+    # row this function has just matched may describe a certificate that relying
+    # parties still accept (2026-08-18 wave 3 F1).
+    #
+    # That matters here specifically because returning $true makes the caller
+    # exit 6 -- "already revoked, go confirm to the RA" -- which drains the
+    # serial off the RA's pending-revocation feed and records
+    # `revocation-ca-confirmed`. For a reason-8 row that is a containment
+    # failure written down as a success.
+    #
+    # Same technique as the Disposition self-check above: restrict on the
+    # numeric reason rather than parsing a localized column, and treat an
+    # inconclusive answer as "not revoked" so the caller re-revokes. Re-revoking
+    # a genuinely revoked certificate is harmless; skipping a live one is not.
+    $unrevokedOut = & certutil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=21,Request.RevokedReason=8", '-out', 'SerialNumber') 2>&1
+    if ($LASTEXITCODE -eq 0 -and (($unrevokedOut -join "`n") -match $escaped)) {
+        Write-Output ("NOTE: serial {0} is Disposition=21 but its revocation reason is 8 (removeFromCRL)." -f $SerialHex)
+        Write-Output "      That is the UN-revoke state: the certificate is off the CRL and still valid."
+        Write-Output "      Treating it as NOT revoked and proceeding with the revocation."
+        return $false
+    }
     return $true
 }
 

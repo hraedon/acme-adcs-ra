@@ -75,7 +75,10 @@ try {
     # complete answer -- and an export missing rows reads downstream as
     # agreement (2026-08-18 F2). Capture the status and hand it to the
     # reconciler, which refuses to compare anything when it is non-zero.
-    $viewOut = & certutil @('-view', '-config', $CaConfig, '-out', 'SerialNumber,Disposition,RequestID') 2>&1
+    # Request.RevokedReason is exported because Disposition=21 alone does not
+    # prove revocation: reason 8 (removeFromCRL) leaves the disposition at 21
+    # while the certificate is off the CRL and valid (2026-08-18 wave 3 F1).
+    $viewOut = & certutil @('-view', '-config', $CaConfig, '-out', 'SerialNumber,Disposition,RequestID,Request.RevokedReason') 2>&1
     $exportExitCode = $LASTEXITCODE
     $viewOut | Out-File -FilePath $exportPath -Encoding utf8 -ErrorAction Stop
     if ($exportExitCode -ne 0) {

@@ -2189,6 +2189,10 @@ class Store:
 
         Returns True if a row was updated, False if no matching revoked cert
         was found (already confirmed, not revoked, or unknown serial).
+
+        Prefer :meth:`confirm_ca_revocation_with_audit` on the confirmation
+        route: committing this flag without its audit event in the same
+        transaction can lose the event permanently (see that method).
         """
         with self._connect() as conn:
             cursor = conn.execute(
@@ -2201,6 +2205,60 @@ class Store:
                 ),
             )
             return cursor.rowcount == 1
+
+    def confirm_ca_revocation_with_audit(
+        self,
+        serial_hex: str,
+        *,
+        event_type: str,
+        outcome: str,
+        account_id: str | None = None,
+        order_id: str | None = None,
+        sans: Sequence[str] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Flip ``ca_crl_updated`` and record its audit event atomically.
+
+        The two used to be separate transactions on separate connections
+        (2026-08-18 wave 3 F6). The flag committed first, and it is what
+        *removes* the serial from ``list_revoked_certificates`` — so a crash or
+        an audit-insert failure in the window between them left the certificate
+        gone from the retry feed with no ``revocation-ca-confirmed`` event ever
+        recorded. Worse, the route's idempotence check returns early on
+        ``ca_crl_updated``, so a retry could not repair it either: the evidence
+        that the CA-side revocation was confirmed was permanently absent, which
+        is the one thing this route exists to record.
+
+        One ``BEGIN IMMEDIATE`` covers both, so either the serial stays pending
+        and can be retried, or it is confirmed *and* audited. SIEM fan-out stays
+        outside — it is best-effort by design and must not hold the write open.
+
+        Returns ``(won_cas, event)``. ``event`` is None when no row was updated,
+        which is the idempotent/unknown-serial case and carries nothing to audit.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE certificates SET ca_crl_updated = 1 "
+                "WHERE serial_number = ? AND status IN (?, ?) AND ca_crl_updated = 0",
+                (
+                    canonical_serial(serial_hex),
+                    CertStatus.REVOKED,
+                    CertStatus.QUARANTINED,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False, None
+            event = self._record_audit_in_conn(
+                conn,
+                event_type=event_type,
+                account_id=account_id,
+                order_id=order_id,
+                sans=sans,
+                outcome=outcome,
+                details=details,
+            )
+            return True, event
 
     # ------------------------------------------------------------------
     # Audit

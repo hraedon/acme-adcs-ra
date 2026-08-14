@@ -22,6 +22,7 @@ from acme_adcs_ra.app_state import (
     ServerContext,
     _default_nonce_bucket,
     _default_siem_emitter,
+    logger,
 )
 from acme_adcs_ra.routes.acme import router as acme_router
 from acme_adcs_ra.routes.admin import router as admin_router
@@ -65,6 +66,22 @@ def create_app(context: ServerContext) -> FastAPI:
                 "hec_token); the RA is refusing to start rather than run "
                 "without the off-box audit trail it was told to require."
             )
+        if context.config.audit_offbox_required:
+            # Constructed is not the same as working (2026-08-18 wave 3 F2). A
+            # revoked HEC token, a wrong index, or an endpoint that answers 403
+            # to everything passed every check above, so the RA started and
+            # issued certificates believing an off-box trail was in force while
+            # nothing left the host. "Required" has to mean demonstrated.
+            ok, detail = _siem_emitter.probe_offbox_delivery()
+            if not ok:
+                raise RuntimeError(
+                    "audit_offbox_required is set, but the startup delivery "
+                    f"probe to the {context.config.siem_sink!r} sink failed: "
+                    f"{detail}. The RA is refusing to start rather than issue "
+                    "certificates while the off-box audit trail it was told to "
+                    "require is not actually working."
+                )
+            logger.info("off-box audit delivery probe succeeded: %s", detail)
         context.audit_hook = _siem_emitter.export
     if context.nonce_bucket is None:
         context.nonce_bucket = _default_nonce_bucket(context.config)

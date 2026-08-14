@@ -80,6 +80,17 @@ class SiemEmitter:
       * **HEC** / **syslog** — validate that required config fields are present
         and non-empty; a network reachability probe is optional (don't block
         startup on it).
+
+    That last decision stands for the *optional* case and is wrong for the
+    required one (2026-08-18 wave 3 F2). ``audit_offbox_required`` asserted only
+    that an emitter had been constructed from syntactically valid config, so a
+    revoked HEC token, a wrong index, or an endpoint that answers 403 to
+    everything left the RA issuing certificates while believing an off-box audit
+    trail was in force — and the trail is precisely the control meant to survive
+    a compromise of this host. :meth:`probe_offbox_delivery` is therefore called
+    by ``create_app`` **when the operator has required off-box audit**, and
+    refuses startup if delivery cannot be demonstrated. The optional path is
+    unchanged and still never blocks on the network.
     """
 
     SCHEMA_VERSION = "acme-adcs-ra-audit/1"
@@ -93,6 +104,13 @@ class SiemEmitter:
         # Backpressure accounting for BOTH off-box sinks (see _submit_bounded).
         self._sink_inflight = 0
         self._sink_dropped = 0
+        # Delivery health. Dropping events on backpressure was already counted;
+        # events the sink *rejected* were only logged at WARNING, so a sustained
+        # total failure (revoked token, wrong index) was indistinguishable from a
+        # healthy quiet period. Counted so it can be asserted on and surfaced.
+        self._offbox_failures = 0
+        self._offbox_delivered = 0
+        self._offbox_last_error: str | None = None
         self._sink_lock = threading.Lock()
 
         if config.sink == "syslog":
@@ -259,11 +277,18 @@ class SiemEmitter:
 
     def _syslog_send(self, event: dict[str, Any]) -> None:
         try:
-            if self._syslog is not None:
-                self._syslog.info(json.dumps(event, default=str, sort_keys=True))
+            self._syslog_send_inner(event)
+        except Exception as exc:  # noqa: BLE001 - emission must not raise into the pool
+            self._record_offbox_result(f"{type(exc).__name__}: {exc}")
+        else:
+            self._record_offbox_result(None)
         finally:
             with self._sink_lock:
                 self._sink_inflight -= 1
+
+    def _syslog_send_inner(self, event: dict[str, Any]) -> None:
+        if self._syslog is not None:
+            self._syslog.info(json.dumps(event, default=str, sort_keys=True))
 
     def _submit_bounded(
         self, fn: Any, event: dict[str, Any], label: str
@@ -316,6 +341,99 @@ class SiemEmitter:
         with self._sink_lock:
             return self._sink_dropped
 
+    @property
+    def offbox_failures(self) -> int:
+        """Audit events the off-box sink rejected or failed to accept."""
+        with self._sink_lock:
+            return self._offbox_failures
+
+    @property
+    def offbox_delivered(self) -> int:
+        """Audit events the off-box sink acknowledged."""
+        with self._sink_lock:
+            return self._offbox_delivered
+
+    @property
+    def offbox_last_error(self) -> str | None:
+        """The most recent off-box delivery failure, if any."""
+        with self._sink_lock:
+            return self._offbox_last_error
+
+    def _record_offbox_result(self, error: str | None) -> None:
+        """Account for one off-box delivery attempt.
+
+        A sustained rejection used to be a stream of identical WARNINGs with no
+        state behind them. The first failure and every hundredth escalate to
+        ERROR — the same shape as the backpressure counter beside it, so a total
+        outage is visible without the log becoming the flood.
+        """
+        with self._sink_lock:
+            if error is None:
+                self._offbox_delivered += 1
+                self._offbox_failures = 0
+                return
+            self._offbox_failures += 1
+            self._offbox_last_error = error
+            failures = self._offbox_failures
+            delivered = self._offbox_delivered
+        if failures == 1 or failures % 100 == 0:
+            logger.error(
+                "Off-box audit delivery has failed %d time(s) in a row (%d "
+                "delivered since start); last error: %s. The local audit table "
+                "still holds every event, but nothing is leaving this host — "
+                "which is the trail meant to survive a compromise of it.",
+                failures, delivered, error,
+            )
+
+    def probe_offbox_delivery(self) -> tuple[bool, str]:
+        """Demonstrate that an audit event can actually reach the off-box sink.
+
+        Called by ``create_app`` only when ``audit_offbox_required`` is set: the
+        optional path deliberately does not block startup on the network.
+
+        Returns ``(ok, detail)``. ``detail`` explains a failure, or describes what
+        was and was not proven on success — which matters for syslog, where the
+        common UDP transport cannot acknowledge anything and the honest answer is
+        "the socket accepted it".
+        """
+        cfg = self._config
+        if not self._enabled:
+            return False, "the SIEM emitter is disabled"
+        if cfg.sink == "hec":
+            event = {
+                "schema": self.SCHEMA_VERSION,
+                "event_type": "audit-offbox-startup-probe",
+                "outcome": "success",
+                "detail": "startup delivery probe for audit_offbox_required",
+            }
+            try:
+                self._hec_post_inner(event, raise_on_error=True)
+            except Exception as exc:  # noqa: BLE001 - any failure is a failed probe
+                return False, f"HEC rejected the startup probe: {exc}"
+            return True, "HEC acknowledged a probe event with a 2xx"
+        if cfg.sink == "syslog":
+            try:
+                self._syslog_send_inner(
+                    {
+                        "schema": self.SCHEMA_VERSION,
+                        "event_type": "audit-offbox-startup-probe",
+                        "outcome": "success",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                return False, f"syslog refused the startup probe: {exc}"
+            if cfg.syslog_proto.lower() == "udp":
+                # Worth stating rather than implying: UDP cannot acknowledge, so
+                # this proves the socket accepted the datagram and nothing about
+                # whether a collector received it. Use TCP to get more than that.
+                return True, (
+                    "syslog accepted the probe over UDP, which cannot "
+                    "acknowledge delivery; reachability of the collector is "
+                    "NOT proven. Use syslog_proto=tcp for an acknowledged path."
+                )
+            return True, "syslog accepted the probe over TCP"
+        return False, f"sink {cfg.sink!r} is not an off-box sink"
+
     def _hec_post(self, event: dict[str, Any]) -> None:
         try:
             self._hec_post_inner(event)
@@ -323,7 +441,16 @@ class SiemEmitter:
             with self._sink_lock:
                 self._sink_inflight -= 1
 
-    def _hec_post_inner(self, event: dict[str, Any]) -> None:
+    def _hec_post_inner(
+        self, event: dict[str, Any], *, raise_on_error: bool = False
+    ) -> None:
+        """Deliver one event to HEC.
+
+        ``raise_on_error`` is for the startup probe, which needs the failure
+        rather than a log line. The ordinary path keeps swallowing everything:
+        audit emission is fail-open by design because the durable record is the
+        local table row, already committed before this runs.
+        """
         cfg = self._config
         try:
             envelope: dict[str, Any] = {
@@ -345,12 +472,27 @@ class SiemEmitter:
             with urlopen(req, timeout=10) as resp:
                 if not (200 <= resp.status < 300):
                     logger.warning("HEC export non-2xx: %s", resp.status)
+                    self._record_offbox_result(f"HTTP {resp.status}")
+                    if raise_on_error:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    return
         except HTTPError as exc:
             logger.warning("HEC export non-2xx: %s", exc.code)
-        except URLError:
+            self._record_offbox_result(f"HTTP {exc.code}")
+            if raise_on_error:
+                raise
+        except URLError as exc:
             logger.warning("HEC export failed", exc_info=True)
-        except Exception:
+            self._record_offbox_result(f"{type(exc).__name__}: {exc}")
+            if raise_on_error:
+                raise
+        except Exception as exc:
             logger.warning("HEC export failed", exc_info=True)
+            self._record_offbox_result(f"{type(exc).__name__}: {exc}")
+            if raise_on_error:
+                raise
+        else:
+            self._record_offbox_result(None)
 
 
 def build_siem_config(config: RAConfig) -> SiemConfig:

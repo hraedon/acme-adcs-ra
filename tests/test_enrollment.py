@@ -137,7 +137,12 @@ class _FakeResponse:
     ) -> None:
         self.status_code = status_code
         self.text = text
-        self.content = content
+        # A real response derives one from the other; this fake let them drift,
+        # so a test that set only `text` had an empty `content`. That was
+        # invisible while the leg read `.text` for prose bodies and `.content`
+        # for binary ones, and surfaced the moment the bounded reader started
+        # taking bytes for both (2026-08-18 wave 3 F4). Keep them consistent.
+        self.content = content if content else text.encode("utf-8")
         self.headers: Mapping[str, str] = headers if headers is not None else {}
 
     def raise_for_status(self) -> None:

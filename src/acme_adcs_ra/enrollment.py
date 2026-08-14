@@ -251,14 +251,23 @@ class _NoRedirectSession:
     def __init__(self, session: Any) -> None:
         self._session = session
 
+    # ``stream=True`` for the same reason and by the same route as
+    # ``allow_redirects=False``: applied here, in the production factory, so the
+    # ``HttpSession`` protocol and every test fake stay unchanged (2026-08-18
+    # wave 3 F4). Without it ``requests`` buffers the whole body before
+    # returning, so the response cap bounded *parsing* but never *memory* — a
+    # chunked reply from a malfunctioning or compromised certsrv was already
+    # resident by the time anything checked its size. ``_read_capped_body``
+    # does the bounded read; a fake that has no ``raw`` falls back to
+    # ``.content``, which is how the transport-only unit fakes keep working.
     def post(self, url: str, *, data: Mapping[str, str], timeout: float) -> Any:
         return self._session.post(
-            url, data=data, timeout=timeout, allow_redirects=False
+            url, data=data, timeout=timeout, allow_redirects=False, stream=True
         )
 
     def get(self, url: str, *, params: Mapping[str, str], timeout: float) -> Any:
         return self._session.get(
-            url, params=params, timeout=timeout, allow_redirects=False
+            url, params=params, timeout=timeout, allow_redirects=False, stream=True
         )
 
 
@@ -278,21 +287,25 @@ def _reject_redirect(resp: HttpResponse, what: str) -> None:
         )
 
 
-def _capped_body(resp: HttpResponse, max_bytes: int, what: str) -> None:
-    """Refuse an oversized enrollment response before it is parsed.
+def _read_capped_body(resp: HttpResponse, max_bytes: int, what: str) -> bytes:
+    """Read an enrollment response body, refusing to exceed *max_bytes*.
 
     The certificate, disposition, and PKCS#7 bodies were read with no size
     limit at all, so a compromised or simply malfunctioning ``/certsrv/`` could
     hand the RA an arbitrarily large body to buffer and parse on the issuance
     path.
 
-    *Residual, stated because it is not obvious:* ``requests`` has already
-    buffered the body by the time this runs, so this bounds *parsing*, and
-    bounds *buffering* only for a response that declares an honest
-    ``Content-Length``. Fully bounding a chunked response would require
-    streaming reads through the ``HttpSession`` protocol. Given the transport
-    is mutually authenticated to the CA with channel binding, that trade is
-    deliberate rather than overlooked.
+    The first version checked the size *after* ``requests`` had already
+    buffered, so it bounded parsing but not memory — and the declared
+    ``Content-Length`` check was equally late, because the body was resident
+    before the header was ever inspected (2026-08-18 wave 3 F4). With
+    ``stream=True`` set by ``_NoRedirectSession``, both checks now happen before
+    the bytes are taken: the declared length is refused up front, and the body is
+    read incrementally, stopping one byte past the cap.
+
+    Returns the bytes, so callers stop touching ``.content``/``.text`` — with
+    streaming enabled those would read the whole body and reintroduce exactly
+    what this bounds.
     """
     declared = resp.headers.get("Content-Length")
     if declared is not None:
@@ -304,11 +317,42 @@ def _capped_body(resp: HttpResponse, max_bytes: int, what: str) -> None:
                 )
         except ValueError:
             pass
-    if len(resp.content) > max_bytes:
+
+    raw = getattr(resp, "raw", None)
+    read1 = getattr(raw, "read1", None)
+    if read1 is None:
+        # A transport-only test fake, or a session that does not stream. It has
+        # already buffered, so all that is left is to refuse to parse it.
+        body = resp.content
+        if len(body) > max_bytes:
+            raise EnrollmentTransportError(
+                f"{what} returned {len(body)} bytes, over the "
+                f"{max_bytes}-byte limit"
+            )
+        return body
+
+    chunks: list[bytes] = []
+    received = 0
+    while received <= max_bytes:
+        chunk = read1(65536, decode_content=True)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        received += len(chunk)
+    if received > max_bytes:
         raise EnrollmentTransportError(
-            f"{what} returned {len(resp.content)} bytes, over the "
-            f"{max_bytes}-byte limit"
+            f"{what} returned more than the {max_bytes}-byte limit"
         )
+    return b"".join(chunks)
+
+
+def _decode_body(body: bytes, resp: HttpResponse) -> str:
+    """Decode a bounded body the way ``requests`` would decode ``.text``."""
+    encoding = getattr(resp, "encoding", None) or "utf-8"
+    try:
+        return body.decode(encoding, errors="replace")
+    except (LookupError, TypeError):
+        return body.decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -438,9 +482,9 @@ class CertsrvEnrollmentLeg:
             resp = session.post(f"{base}/certfnsh.asp", data=form, timeout=timeout)
             _reject_redirect(resp, "certfnsh.asp")
             resp.raise_for_status()
-            _capped_body(resp, self._max_response_bytes, "certfnsh.asp")
+            body = _read_capped_body(resp, self._max_response_bytes, "certfnsh.asp")
             disposition, detail = _parse_certfnsh_disposition(
-                resp.text, resp.status_code, locale=self._locale
+                _decode_body(body, resp), resp.status_code, locale=self._locale
             )
             if disposition == "pending":
                 # The ReqID travels as a field, not just inside the message:
@@ -468,16 +512,18 @@ class CertsrvEnrollmentLeg:
             )
             _reject_redirect(cert_resp, "certnew.cer")
             cert_resp.raise_for_status()
-            _capped_body(cert_resp, self._max_response_bytes, "certnew.cer")
+            cert_body = _read_capped_body(
+                cert_resp, self._max_response_bytes, "certnew.cer"
+            )
             # ADCS Web Enrollment is inconsistent about the certnew.cer
             # content-type (observed live: text/html wrapping an Enc=b64 PEM
             # body). Don't gate on the header — parse the body as a certificate
             # and fail only if that fails, surfacing a snippet for diagnosis.
             try:
-                cert_pem = _parse_cert_body(cert_resp.content)
+                cert_pem = _parse_cert_body(cert_body)
             except Exception as exc:
                 ct = cert_resp.headers.get("Content-Type")
-                snippet = " ".join(cert_resp.text[:400].split())
+                snippet = " ".join(_decode_body(cert_body, cert_resp)[:400].split())
                 raise EnrollmentTransportError(
                     f"certnew.cer did not return a parseable certificate "
                     f"(content-type {ct!r}): {exc}; body: {snippet}",
@@ -511,8 +557,12 @@ class CertsrvEnrollmentLeg:
             arc_resp = session.get(f"{base}/certcarc.asp", params={}, timeout=timeout)
             _reject_redirect(arc_resp, "certcarc.asp")
             arc_resp.raise_for_status()
-            _capped_body(arc_resp, self._max_response_bytes, "certcarc.asp")
-            nren = re.search(r"var nRenewals=(\d+);", arc_resp.text)
+            arc_body = _read_capped_body(
+                arc_resp, self._max_response_bytes, "certcarc.asp"
+            )
+            nren = re.search(
+                r"var nRenewals=(\d+);", _decode_body(arc_body, arc_resp)
+            )
             renewals = nren.group(1) if nren else "0"
             chain_resp = session.get(
                 f"{base}/certnew.p7b",
@@ -521,8 +571,10 @@ class CertsrvEnrollmentLeg:
             )
             _reject_redirect(chain_resp, "certnew.p7b")
             chain_resp.raise_for_status()
-            _capped_body(chain_resp, self._max_response_bytes, "certnew.p7b")
-            chain_pem = _parse_pkcs7_chain(chain_resp.content)
+            chain_body = _read_capped_body(
+                chain_resp, self._max_response_bytes, "certnew.p7b"
+            )
+            chain_pem = _parse_pkcs7_chain(chain_body)
             issued_chain_pem = list(chain_pem)
             _validate_chain_binds_to_leaf(cert_pem, chain_pem)
         except EnrollmentDenied:

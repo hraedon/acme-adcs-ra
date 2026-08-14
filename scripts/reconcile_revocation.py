@@ -40,6 +40,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # ADCS request dispositions (certsrv `Disposition` column). 20 is issued and 21
 # is revoked; `Revoke-Cert.ps1` restricts on exactly these two values and its
@@ -47,6 +48,14 @@ from pathlib import Path
 # ordinary row, so the parser discarded every issued certificate it saw.
 _ISSUED_DISPOSITION = 20
 _REVOKED_DISPOSITION = 21
+
+# RFC 5280 reason 8, removeFromCRL: the UN-revoke. `scripts/lib/RevocationLib.ps1`
+# records what the lab established — a certificate placed on hold and then given
+# reason 8 ends up off the CRL and valid while **ADCS keeps its Disposition at
+# 21**. So disposition alone cannot decide revocation, and reading it as
+# revoked produces a PASS for a certificate relying parties still accept
+# (2026-08-18 wave 3 F1).
+_REMOVE_FROM_CRL_REASON = 8
 
 # Dispositions that legitimately carry no usable certificate: the request never
 # became one, so a row bearing one is not a coverage gap. Anything *else* that
@@ -185,12 +194,18 @@ def _parse_ca_export(path: Path) -> tuple[dict[str, _CaRecord], list[str]]:
     records: dict[str, _CaRecord] = {}
     problems: list[str] = []
 
-    block = {"request_id": None, "serial": None, "disposition": None}
+    block: dict[str, Any] = {
+        "request_id": None,
+        "serial": None,
+        "disposition": None,
+        "reason": None,
+    }
 
     def _flush_block() -> None:
         request_id = block["request_id"]
         serial = block["serial"]
         disposition = block["disposition"]
+        reason = block["reason"]
         if serial is None:
             # No serial: a denied/failed/pending request, or the export's
             # preamble. Nothing to reconcile against and nothing missing.
@@ -202,7 +217,8 @@ def _parse_ca_export(path: Path) -> tuple[dict[str, _CaRecord], list[str]]:
             )
             return
         if disposition == _REVOKED_DISPOSITION:
-            revoked = True
+            # Disposition 21 with reason 8 is the un-revoke: live at the CA.
+            revoked = reason != _REMOVE_FROM_CRL_REASON
         elif disposition == _ISSUED_DISPOSITION:
             revoked = False
         elif disposition in _NON_CERTIFICATE_DISPOSITIONS:
@@ -228,6 +244,7 @@ def _parse_ca_export(path: Path) -> tuple[dict[str, _CaRecord], list[str]]:
             block["request_id"] = None
             block["serial"] = None
             block["disposition"] = None
+            block["reason"] = None
             continue
 
         rid_match = re.match(r"^\s*Request ID:\s*(\d+)\s*$", line)
@@ -243,6 +260,17 @@ def _parse_ca_export(path: Path) -> tuple[dict[str, _CaRecord], list[str]]:
         disp_match = re.match(r"^\s*Disposition:\s*(\d+)", line)
         if disp_match:
             block["disposition"] = int(disp_match.group(1))
+            continue
+
+        # certutil labels this column "Revocation Reason" (and localizes it), so
+        # match either the schema name or the English label, and tolerate the
+        # trailing "-- Unspecified"-style annotation certutil appends.
+        reason_match = re.match(
+            r"^\s*(?:Request\.RevokedReason|Revocation Reason):\s*(?:0x[0-9a-fA-F]+\s*\()?(\d+)",
+            line,
+        )
+        if reason_match:
+            block["reason"] = int(reason_match.group(1))
 
     _flush_block()
 

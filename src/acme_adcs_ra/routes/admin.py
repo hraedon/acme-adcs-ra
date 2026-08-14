@@ -14,6 +14,7 @@ from acme_adcs_ra.app_state import (
     ServerContext,
     _audit,
     _certificate_url,
+    emit_audit_hook,
     get_context,
     logger,
 )
@@ -610,13 +611,6 @@ async def confirm_ca_revocation(
     # recorded a field named `ca_crl_updated`. The name overclaims. Recording
     # the distinction is the same honesty fix as `verification`, one layer down.
     # (Decoded from the bounded body read at the top of this handler.)
-    flipped = ctx.store.confirm_ca_revocation(serial_upper)
-    if not flipped:
-        return JSONResponse(content={
-            "serial": serial_upper,
-            "ca_crl_updated": True,
-            "verification": verification,
-        })
     details: dict[str, Any] = {
         "serial": serial_upper,
         "certificate_id": cert.id,
@@ -637,13 +631,32 @@ async def confirm_ca_revocation(
             details["crl_number"] = evidence.crl_number
         if evidence.this_update:
             details["crl_this_update"] = evidence.this_update
-    _audit(ctx,
+
+    # The flag and its audit event commit together (2026-08-18 wave 3 F6).
+    # Flipping ca_crl_updated is what removes the serial from
+    # `list_revoked_certificates`, so committing it before the audit meant a
+    # crash in between dropped the certificate off the retry feed with no
+    # `revocation-ca-confirmed` event — and the idempotence check above returns
+    # early on that same flag, so no retry could ever repair it.
+    flipped, event = ctx.store.confirm_ca_revocation_with_audit(
+        serial_upper,
         event_type="revocation-ca-confirmed",
         account_id=cert.account_id,
         order_id=cert.order_id,
         outcome="success",
         details=details,
     )
+    if not flipped:
+        # Lost the race with a concurrent confirmation, which already audited.
+        return JSONResponse(content={
+            "serial": serial_upper,
+            "ca_crl_updated": True,
+            "verification": verification,
+        })
+    # Fan-out only after the write is durable: it is best-effort and must not
+    # hold the transaction open.
+    if event is not None:
+        emit_audit_hook(ctx, event)
     return JSONResponse(content={
         "serial": serial_upper,
         "ca_crl_updated": True,
