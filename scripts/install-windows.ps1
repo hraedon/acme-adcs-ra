@@ -426,18 +426,25 @@ Write-Host "Installing acme-adcs-ra ..."
 # great lengths to hash-verify everything else. The venv's bundled pip is the one
 # CI's flow uses and is sufficient; a floor check is enough to catch a genuinely
 # ancient interpreter without reaching for the network.
-$pipVerRaw = (& $venvPy -m pip --version) 2>&1
-if ($pipVerRaw -match 'pip\s+(\d+)\.') {
-    $pipMajor = [int]$Matches[1]
-    Write-Host "  pip: $pipVerRaw"
+# The parse lives in Get-PipMajorVersion (lib/InstallVerifyLib.ps1) because the
+# inline version was wrong: `pip --version` emits a trailing empty line, the
+# redirected output is therefore a two-element Object[], and `-match` against an
+# ARRAY filters instead of capturing. $Matches stayed unset, $Matches[1] read as
+# $null, [int]$null was 0, and 0 -lt 23 threw "pip is too old" on pip 26.2.1 --
+# blocking every fresh install on Windows, the RA's only production platform.
+$pipVerRaw  = (& $venvPy -m pip --version) 2>&1
+$pipVerText = ((@($pipVerRaw) | ForEach-Object { $_.ToString() }) -join ' ').Trim()
+$pipMajor   = Get-PipMajorVersion $pipVerRaw
+if ($pipMajor -ge 0) {
+    Write-Host "  pip: $pipVerText"
     if ($pipMajor -lt 23) {
         throw ("Bundled pip is too old for --require-hashes with modern wheels " +
-               "(found: $pipVerRaw). Use a newer Python, or supply an approved pip " +
+               "(found: $pipVerText). Use a newer Python, or supply an approved pip " +
                "wheel offline and install it with --no-index. Do NOT upgrade pip " +
                "from a live index on an issuance-path host.")
     }
 } else {
-    Write-Host "  [warn] could not parse pip version: $pipVerRaw"
+    Write-Host "  [warn] could not parse pip version: $pipVerText"
 }
 
 # Dependencies come from the hash-pinned closure, NOT from a live resolve.

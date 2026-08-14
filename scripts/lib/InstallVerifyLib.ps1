@@ -99,3 +99,23 @@ function Test-MsiSignatureAcceptable {
     return $SignerSubject.IndexOf(
         $ExpectedPublisher, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
 }
+
+
+# --- pip floor check (2026-08-14 live re-proof) ------------------------------
+# `pip --version` writes one line plus a trailing empty one, so
+# `(& $py -m pip --version) 2>&1` is a two-element Object[]. `-match` against an
+# ARRAY filters the collection and never populates $Matches, so the inline
+# version of this check read $Matches[1] as $null, made it 0, and threw
+# "pip is too old" on pip 26.2.1 -- blocking every fresh install on Windows,
+# the RA's only production platform. Taking the raw output as an object here
+# keeps the flattening and the capture in one tested place.
+#
+# Returns the major version, or -1 when the output cannot be parsed (the caller
+# warns rather than blocking on that: an unparseable banner is not evidence of
+# an ancient pip).
+function Get-PipMajorVersion {
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()]$PipVersionOutput)
+    $text = (@($PipVersionOutput) | ForEach-Object { if ($null -eq $_) { "" } else { $_.ToString() } }) -join ' '
+    if ($text -match 'pip\s+(\d+)\.') { return [int]$Matches[1] }
+    return -1
+}

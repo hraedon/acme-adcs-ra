@@ -131,3 +131,32 @@ Describe 'Test-MsiSignatureAcceptable' {
             -ExpectedPublisher $expected | Should -BeTrue
     }
 }
+
+# 2026-08-14 live re-proof. The inline form of this check threw "pip is too old"
+# on pip 26.2.1 and blocked every fresh install on Windows. The shape below --
+# a two-element Object[] whose second element is the empty trailing line -- is
+# what `(& $py -m pip --version) 2>&1` actually returns on the RA host; it was
+# captured there, not imagined. Feeding the helper a plain string would pass
+# even against the broken implementation, which is precisely why it must not.
+Describe 'Get-PipMajorVersion' {
+    It 'parses the real two-element array PowerShell returns for pip --version' {
+        $real = @('pip 26.2.1 from C:\ProgramData\acme-adcs-ra\venv\Lib\site-packages\pip (python 3.14)', '')
+        Get-PipMajorVersion $real | Should -Be 26
+    }
+
+    It 'parses a plain single-line string' {
+        Get-PipMajorVersion 'pip 23.0.1 from /usr/lib/pip (python 3.12)' | Should -Be 23
+    }
+
+    It 'still recognises a genuinely ancient pip, so the floor can fire' {
+        Get-PipMajorVersion @('pip 9.0.1 from C:\py\lib\pip (python 3.6)', '') | Should -Be 9
+    }
+
+    It 'reports -1 rather than 0 when the banner cannot be parsed' {
+        # 0 would look like an ancient pip and block the install; -1 is the
+        # caller's signal to warn and continue.
+        Get-PipMajorVersion @('', '') | Should -Be -1
+        Get-PipMajorVersion 'command not found' | Should -Be -1
+        Get-PipMajorVersion $null | Should -Be -1
+    }
+}
