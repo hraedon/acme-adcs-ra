@@ -74,11 +74,26 @@ function Assert-SafeRaUrl {
         throw ("RaBaseUrl '{0}' is not an absolute URL." -f $Url)
     }
 
-    # [System.Uri] returns an IPv6 host in its bracketed literal form ("[::1]"),
-    # so compare against the unbracketed address or the opt-out silently never
-    # applies to an IPv6 loopback lab. Deliberately an explicit allowlist rather
-    # than $uri.IsLoopback, which also accepts the whole of 127.0.0.0/8.
+    # [System.Uri] returns an IPv6 host in its bracketed literal form, so strip
+    # the brackets or the opt-out silently never applies to an IPv6 loopback lab.
+    #
+    # Stripping is not enough on its own. The two runtimes disagree on the
+    # TEXTUAL form: .NET Core (pwsh 7) gives the compressed "[::1]", while .NET
+    # Framework — Windows PowerShell 5.1, which is what actually ships — gives
+    # the fully expanded "[0000:0000:0000:0000:0000:0000:0000:0001]". Comparing
+    # strings therefore passed on the dev shell and failed on the production
+    # one, producing exactly the silent never-applies this comment was already
+    # warning about (found 2026-08-19 by the new 5.1 CI job, confirmed on a real
+    # 5.1 host).
+    #
+    # Parse to an IPAddress and compare its normalized ToString(), which is
+    # "::1" on both runtimes. Still an explicit allowlist rather than
+    # $uri.IsLoopback, which would also accept the whole of 127.0.0.0/8.
     $hostName = $uri.Host.ToLowerInvariant().Trim('[', ']')
+    $parsedIp = $null
+    if ([System.Net.IPAddress]::TryParse($hostName, [ref]$parsedIp)) {
+        $hostName = $parsedIp.ToString()
+    }
     $loopback = @('localhost', '127.0.0.1', '::1') -contains $hostName
 
     if ($uri.Scheme -ne 'https') {

@@ -94,7 +94,11 @@ Describe 'Build-CallbackAce' {
         $aceList = [System.Collections.Generic.List[byte[]]]::new()
         $aceList.Add($script:ace)
         $sd = Build-OfficerRightsSD $aceList
-        $parsed = Get-ExistingAces $sd
+        # @() at the call site, exactly as every SHIPPED caller does: with one
+        # ACE this returns a scalar PSCustomObject, and Windows PowerShell 5.1
+        # gives that no .Count at all (pwsh 7 does, which hid this until the 5.1
+        # CI job ran). Product code is correct here; the test was not.
+        $parsed = @(Get-ExistingAces $sd)
         $parsed.Count | Should -Be 1
         $parsed[0].OfficerSid | Should -Be $script:officerSid
     }
@@ -235,7 +239,7 @@ Describe 'Get-ExistingAces' {
         $aceList = [System.Collections.Generic.List[byte[]]]::new()
         $aceList.Add($ace)
         $sd = Build-OfficerRightsSD $aceList
-        $result = Get-ExistingAces $sd
+        $result = @(Get-ExistingAces $sd)
         $result.Count | Should -Be 1
         $result[0].OfficerSid | Should -Be 'S-1-5-21-1004336348-1177238915-682003330-517'
     }

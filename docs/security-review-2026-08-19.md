@@ -161,13 +161,35 @@ a weaker form than suggested, on purpose.
   `FakeRevocationLeg` — an RA that answers ACME, looks healthy and issues
   nothing real. It now refuses to start unless
   `ACME_RA_ALLOW_FAKE_ADCS_BACKENDS=true` says so out loud.
-- **Run Pester under Windows PowerShell 5.1.** Applied, as a two-runner matrix
-  (pwsh 7 on Linux for speed, Windows PowerShell 5.1 for truth). Every one of
-  these scripts *ships* on 5.1 — `install-windows.ps1` says so in its own style
-  header — and 5.1 differs in ways this suite is exactly the wrong size to catch
-  by inspection. The 2026-08-14 live re-proof found two defects in this same
-  PowerShell that CI could not see; this is the cheapest part of closing that
-  gap.
+- **Run Pester under Windows PowerShell 5.1.** Applied, as a second explicit
+  job (a matrix was tried first and rejected: `shell:` does not take a matrix
+  expression). Every one of these scripts *ships* on 5.1 —
+  `install-windows.ps1` says so in its own style header — and 5.1 differs in
+  ways this suite is exactly the wrong size to catch by inspection.
+
+  **It found three failures on its first run, and one was a real product
+  defect.** All three were invisible to pwsh 7:
+
+  1. **`Assert-SafeRaUrl` refused an IPv6 loopback URL on 5.1** — a product bug
+     on the shipping platform. `[System.Uri].Host` returns the *compressed*
+     `[::1]` on .NET Core and the *fully expanded*
+     `[0000:0000:0000:0000:0000:0000:0000:0001]` on .NET Framework, so the
+     string comparison failed and `-AllowInsecureUrl` silently never applied to
+     an IPv6 loopback lab — precisely the failure the existing code comment said
+     it was written to prevent. Confirmed on a real 5.1 host, then fixed by
+     normalizing through `[System.Net.IPAddress]`, whose `ToString()` is `::1`
+     on both runtimes.
+  2. **Two `OfficerRights` tests counted a scalar.** `Get-ExistingAces` returns
+     a bare `PSCustomObject` for a single ACE; pwsh 7 gives every object a
+     `.Count`, 5.1 does not, so the assertion read `$null`. Test-only — every
+     *shipped* call site already wraps in `@()`, and `OfficerRightsLib.ps1`
+     documents that requirement from an earlier bug.
+  3. **Six `TaskAction` tests bound a parameter twice** (splat plus explicit
+     argument). 5.1 refuses that outright; pwsh 7 accepts it. Test-only, and
+     introduced by this round.
+
+  The suite now passes 148/148 under Windows PowerShell 5.1, verified on a real
+  5.1 host as well as in CI.
 - **Reconcile release metadata.** Applied as an honest note rather than a tag.
   `pyproject.toml` and the CHANGELOG say `1.9.1`, but no `v1.9.0`/`v1.9.1` tag
   or release exists — the newest release is `v1.8.0`. The CHANGELOG now records
