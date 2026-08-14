@@ -30,9 +30,15 @@ This module fetches and verifies that evidence. It is deliberately strict:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any, TypeVar, cast
 from urllib.parse import urlparse
 
 import requests
@@ -119,10 +125,18 @@ def fetch_crl_evidence(
     timeout_seconds: float = 10.0,
     max_bytes: int = 10 * 1024 * 1024,
     max_age_seconds: int = 7 * 24 * 3600,
+    total_timeout_seconds: float = 30.0,
 ) -> CrlEvidence:
     """Check whether *serial_number* is on the CA's published CRL.
 
     Never raises: any failure is reported as ``checked=False`` with a reason.
+
+    ``timeout_seconds`` is what ``requests`` understands: a bound on the
+    connect and on each individual socket read. ``total_timeout_seconds`` is
+    the wall-clock bound on the whole retrieval, and it is the one that
+    matters for availability — a server that emits one byte just before every
+    read timeout never trips the per-read bound and can hold the calling
+    worker indefinitely (2026-08-16 rescan F4).
     """
     parsed = urlparse(crl_url)
     # A CRL is signed, so plain HTTP is normal and safe for CDPs; anything
@@ -134,18 +148,33 @@ def fetch_crl_evidence(
             detail=f"CRL URL must be http(s) with a host: {crl_url!r}",
         )
 
+    deadline = time.monotonic() + total_timeout_seconds
     try:
         response = requests.get(crl_url, timeout=timeout_seconds, stream=True)
-        response.raise_for_status()
-        body = b""
-        for chunk in response.iter_content(chunk_size=65536):
-            body += chunk
-            if len(body) > max_bytes:
-                return CrlEvidence(
-                    revoked=False,
-                    checked=False,
-                    detail=f"CRL exceeded {max_bytes} bytes",
-                )
+        # Closed on every exit path, including the deadline and size bail-outs:
+        # with stream=True the transfer is only actually torn down when the
+        # response is closed, so an early `return` that leaks it would keep the
+        # socket — and the trickle — alive.
+        with contextlib.closing(response):
+            response.raise_for_status()
+            body = b""
+            for chunk in response.iter_content(chunk_size=65536):
+                body += chunk
+                if len(body) > max_bytes:
+                    return CrlEvidence(
+                        revoked=False,
+                        checked=False,
+                        detail=f"CRL exceeded {max_bytes} bytes",
+                    )
+                if time.monotonic() >= deadline:
+                    return CrlEvidence(
+                        revoked=False,
+                        checked=False,
+                        detail=(
+                            f"CRL retrieval exceeded its {total_timeout_seconds}s "
+                            f"total deadline after {len(body)} bytes"
+                        ),
+                    )
     except requests.RequestException as exc:
         return CrlEvidence(
             revoked=False, checked=False, detail=f"CRL fetch failed: {exc}"
@@ -308,3 +337,96 @@ def fetch_crl_evidence(
         this_update=this_update.isoformat() if this_update else None,
         next_update=next_update.isoformat() if next_update else None,
     )
+
+
+_T = TypeVar("_T")
+
+
+class CrlEvidenceGate:
+    """Run CRL evidence fetches off the shared enrollment worker pool.
+
+    Two separate problems, one owner (2026-08-16 rescan F4):
+
+    *Pool isolation.* ``run_in_threadpool`` hands work to AnyIO's default
+    thread limiter — the same finite set of tokens that ``finalize`` uses for
+    the synchronous ADCS enrollment call. CRL retrieval is an outbound fetch
+    of an operator-configured URL whose duration a third party influences, so
+    letting it draw from that pool means a slow CRL host can queue issuance
+    behind it. This gate owns a small dedicated executor instead: a stalled
+    CRL can exhaust *this* pool, and issuance is unaffected.
+
+    *Single flight.* Confirmations are idempotent but the idempotence check
+    (``ca_crl_updated``) only helps once a reconciliation has committed, so N
+    concurrent confirmations for one serial all passed the check and all
+    fetched. Concurrent callers for the same key now share one retrieval, and
+    a flood of confirmations for a single serial costs exactly one fetch.
+
+    Cancellation-safe: a caller that disconnects does not cancel the shared
+    retrieval out from under the callers still waiting on it.
+    """
+
+    def __init__(self, max_workers: int = 2) -> None:
+        self._max_workers = max_workers
+        self._executor: ThreadPoolExecutor | None = None
+        self._inflight: dict[str, asyncio.Future[Any]] = {}
+        self._closed = False
+
+    def set_max_workers(self, max_workers: int) -> None:
+        """Size the pool from config, before it is first used.
+
+        ``ServerContext`` builds a gate eagerly so a directly-constructed
+        context is always usable; ``create_app`` calls this to apply the
+        operator's setting. Once the pool exists the size is fixed — resizing
+        under live confirmations would be a needless race, and the RA reads
+        config once at startup anyway.
+        """
+        if self._executor is None:
+            self._max_workers = max_workers
+
+    def _pool(self) -> ThreadPoolExecutor:
+        # Lazy: an RA with no CRL configured never spawns the threads.
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix="ra-crl-evidence",
+            )
+        return self._executor
+
+    async def run(
+        self, key: str, fn: Callable[..., _T], /, *args: Any
+    ) -> _T:
+        """Run ``fn(*args)`` on the dedicated pool, single-flighted on *key*."""
+        if self._closed:
+            raise RuntimeError("CrlEvidenceGate is closed")
+        pending = self._inflight.get(key)
+        # A *finished* entry is not a flight to join. ``add_done_callback`` on
+        # a Future is dispatched through ``call_soon``, so between a retrieval
+        # completing and its cleanup callback running there is a window in
+        # which the key is still mapped to a settled future — and a caller that
+        # arrived in that window would be handed the previous fetch's result as
+        # if it were fresh. Confirmations are exactly the workload that arrives
+        # in bursts, so this is reachable, not theoretical.
+        if pending is not None and pending.done():
+            self._inflight.pop(key, None)
+            pending = None
+        if pending is None:
+            pending = asyncio.wrap_future(self._pool().submit(fn, *args))
+            self._inflight[key] = pending
+            # Clear on completion rather than in a caller's ``finally``: the
+            # first caller may be cancelled while later ones still await the
+            # same retrieval, and popping the key early would let a third
+            # caller start a duplicate fetch. Single-threaded event loop, so
+            # no lock is needed around the dict.
+            pending.add_done_callback(
+                lambda finished, k=key: self._inflight.pop(k, None)  # type: ignore[misc]
+            )
+        # shield() so that one caller's cancellation (a client disconnect)
+        # leaves the shared retrieval running for the others.
+        return cast("_T", await asyncio.shield(pending))
+
+    def close(self) -> None:
+        """Stop accepting work and release the threads, if any were started."""
+        self._closed = True
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None

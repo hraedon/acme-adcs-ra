@@ -7,7 +7,6 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from starlette.concurrency import run_in_threadpool
 
 from acme_adcs_ra.acme_errors import malformed, not_found, unauthorized
 from acme_adcs_ra.app_state import (
@@ -53,6 +52,9 @@ def _crl_evidence_for(
             timeout_seconds=ctx.config.revocation_confirm_crl_timeout_seconds,
             max_bytes=ctx.config.revocation_confirm_crl_max_bytes,
             max_age_seconds=ctx.config.revocation_confirm_crl_max_age_seconds,
+            total_timeout_seconds=(
+                ctx.config.revocation_confirm_crl_total_timeout_seconds
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - evidence gathering must never 500
         logger.warning("CRL evidence check failed", exc_info=True)
@@ -437,7 +439,16 @@ async def confirm_ca_revocation(
     # other request in the process for the whole timeout — the same
     # single-process event-loop starvation the enrollment leg was moved off the
     # loop to avoid, on a path that had been missed.
-    evidence = await run_in_threadpool(_crl_evidence_for, ctx, cert)
+    #
+    # On the RA's OWN worker pool, not Starlette's. `run_in_threadpool` draws
+    # from the same AnyIO limiter that ADCS enrollment uses, so moving the
+    # fetch off the event loop only relocated the contention: enough slow CRL
+    # fetches in flight and issuance queues behind them (2026-08-16 rescan F4).
+    # The gate also single-flights on serial, so a flood of confirmations for
+    # one certificate costs one retrieval rather than one per request.
+    evidence = await ctx.crl_evidence_gate.run(
+        serial_upper, _crl_evidence_for, ctx, cert
+    )
     if ctx.config.revocation_confirm_require_crl_evidence and not (
         evidence is not None and evidence.revoked
     ):

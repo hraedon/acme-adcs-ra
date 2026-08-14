@@ -92,3 +92,45 @@ Describe "Get-CaSerialForm" {
         Get-CaSerialForm "" | Should -Be ""
     }
 }
+
+Describe 'Get-RevocationCompletionMessage' {
+    # 2026-08-16 rescan F2. The default batch path passes -SkipPublishCrl, and
+    # the old unconditional trailer told the operator the CRL was published
+    # anyway -- in the same output that had just said publication was skipped.
+    # Closing containment on that line leaves a revoked certificate accepted by
+    # relying parties until the next scheduled CRL.
+
+    It 'never claims publication on the skip path' {
+        $lines = Get-RevocationCompletionMessage -Serial '6AB1C2' -SkipPublishCrl
+        $text = $lines -join ' '
+        $text | Should -Not -Match 'CRL is published'
+        $text | Should -Not -Match 'has been republished'
+        $text | Should -Match 'NOT republished'
+    }
+
+    It 'says containment is not complete on the skip path' {
+        $text = (Get-RevocationCompletionMessage -Serial '6AB1C2' -SkipPublishCrl) -join ' '
+        $text | Should -Match 'PARTIALLY complete'
+        $text | Should -Match 'Do NOT close containment'
+    }
+
+    It 'claims publication only on the publish path' {
+        $text = (Get-RevocationCompletionMessage -Serial '6AB1C2') -join ' '
+        $text | Should -Match 'the CRL is published'
+        $text | Should -Match 'has been republished'
+        $text | Should -Not -Match 'PARTIALLY complete'
+    }
+
+    It 'gives the two branches distinct completion text' {
+        $skip = (Get-RevocationCompletionMessage -Serial '6AB1C2' -SkipPublishCrl) -join "`n"
+        $publish = (Get-RevocationCompletionMessage -Serial '6AB1C2') -join "`n"
+        $skip | Should -Not -Be $publish
+    }
+
+    It 'names the serial it acted on in both branches' {
+        ((Get-RevocationCompletionMessage -Serial '6AB1C2' -SkipPublishCrl) -join ' ') |
+            Should -Match '6AB1C2'
+        ((Get-RevocationCompletionMessage -Serial '6AB1C2') -join ' ') |
+            Should -Match '6AB1C2'
+    }
+}

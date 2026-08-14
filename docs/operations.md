@@ -435,6 +435,28 @@ up. The serial simply stays pending and the next sync cycle confirms it.
 **This path has not yet been exercised against a real ADCS CRL** — see
 `docs/security-review-2026-08-13.md`.
 
+The retrieval is bounded on both axes, because the CRL host is an
+operator-configured third party on a path a scoped confirmation credential can
+drive:
+
+```ini
+# Per-read bound (connect, and each socket read).
+ACME_RA_REVOCATION_CONFIRM_CRL_TIMEOUT_SECONDS=10
+# Wall-clock bound on the WHOLE retrieval. The per-read timeout above cannot
+# stop a server that trickles one byte before each read deadline; this can.
+# Must be >= the per-read timeout (validated at config load).
+ACME_RA_REVOCATION_CONFIRM_CRL_TOTAL_TIMEOUT_SECONDS=30
+# Size of the dedicated CRL-evidence thread pool. Deliberately NOT the shared
+# pool that runs ADCS enrollment: a stalled CRL host may exhaust this one
+# without touching the issuance path. Created lazily — an RA with no CRL URL
+# configured never spawns these threads.
+ACME_RA_REVOCATION_CONFIRM_CRL_MAX_WORKERS=2
+```
+
+Concurrent confirmations for the **same serial** share a single retrieval, so a
+retry loop or a burst on the revocation host costs one CRL fetch rather than one
+per request. See `docs/security-review-2026-08-16-rescan.md` finding 4.
+
 ### The reclaim endpoint (double-issuance gate)
 
 `POST /acme/admin/orders/{id}/reclaim-processing` (admin-token-gated)
@@ -683,12 +705,23 @@ out-of-band revocation loop: an accepted reason 7 would cause
 
    (Run as a CA officer, NOT the gMSA — the gMSA holds no CA-officer
    rights, by design.)
-3. **Verify the CRL republished.** `Revoke-Cert.ps1` runs
-   `certutil -CRL republish` and prints the outcome. Confirm the CRL
-   publication succeeded before considering the revocation complete — the RA
-   audit cannot see the CA side.
-4. Update the incident record to note the out-of-band step is done and the
-   CRL is published.
+3. **Verify the CRL republished.** Invoked as above (no `-SkipPublishCrl`),
+   `Revoke-Cert.ps1` runs `certutil -CRL republish` and prints the outcome.
+   Confirm the publication succeeded before considering the revocation
+   complete — the RA audit cannot see the CA side.
+
+   **On the `-SkipPublishCrl` path the certificate is NOT yet contained.**
+   That is the default for the batch agent (`Sync-Revocations.ps1`), because a
+   least-privilege officer holds no Manage-CA right and cannot republish. The
+   CA database records the revocation, but no published CRL lists the serial,
+   so relying parties keep accepting the certificate until the next scheduled
+   publication. The script's completion text says so explicitly on that
+   branch — read it rather than assuming the manual-path wording.
+4. Update the incident record. Note the out-of-band step is done, and record
+   **which** state was reached: CRL republished (contained now), or CA database
+   updated with publication pending (contained at the next scheduled CRL). Do
+   not close containment on the second without waiting for that publication and
+   verifying the serial appears on the CRL.
 
 ### What the RA cannot see
 
@@ -1039,6 +1072,33 @@ do without making any change.
 3. Re-register without `-DryRun` to arm the task. The first cycle after arming
    should revoke the pending serials and confirm them back to the RA
    (`ca_crl_updated=true` in the audit).
+
+## Upgrading: the schema migration can refuse to start
+
+The RA migrates its schema on startup, in one transaction. Most migrations
+degrade gracefully — if a UNIQUE index cannot be created because the existing
+data violates it, the RA logs an operator-actionable error and keeps running on
+its primary (CAS-based) defence.
+
+**One migration is deliberately fatal instead: the certificate serial
+backfill.** `serial_number` is the only key `revokeCert` resolves a certificate
+by, so a row without one is a certificate its owner cannot revoke through the
+RA — with no fallback path and no signal (it is skipped by the
+pending-revocation feed too). Coming up in that state is worse than not coming
+up, so the RA raises `StoreMigrationError` and exits when it cannot derive a
+serial for every row:
+
+- **`cannot derive serial numbers for legacy certificate rows [...]`** — those
+  rows' `cert_pem` does not parse. Inspect them
+  (`SELECT id, cert_pem FROM certificates WHERE id IN (...)`) and either repair
+  the PEM or delete the corrupt rows.
+- **`legacy certificate rows derive conflicting serial numbers`** — two rows for
+  one account derive the same serial, so revocation could not resolve them
+  unambiguously. Reconcile the duplicates.
+
+The migration is transactional: a refused start leaves the database exactly as
+it was, so it is safe to inspect, fix, and restart. Back up the DB before an
+upgrade as usual (below).
 
 ## Backup and restore
 

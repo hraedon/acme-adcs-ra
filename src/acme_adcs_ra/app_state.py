@@ -15,6 +15,7 @@ from fastapi import Request
 
 from acme_adcs_ra.acme_errors import unauthorized
 from acme_adcs_ra.config import RAConfig
+from acme_adcs_ra.crl_evidence import CrlEvidenceGate
 from acme_adcs_ra.enrollment import EnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.rate_limit import TokenBucket
@@ -136,6 +137,10 @@ class ServerContext:
     # enrollment (which would double-issue at the CA). Process-local by
     # design; see ActiveEnrollments.
     active_enrollments: ActiveEnrollments = field(default_factory=ActiveEnrollments)
+    # Dedicated, bounded, single-flight execution for CRL evidence fetches so
+    # that a slow CRL host cannot queue behind — or ahead of — enrollment on
+    # the shared worker pool. Closed by the app lifespan.
+    crl_evidence_gate: CrlEvidenceGate = field(default_factory=CrlEvidenceGate)
     # Optional extension hook for SIEM emission (Phase 3).  Called after the
     # audit row is persisted, unconditionally, for every issuance event.
     # When None, create_app wires the default SIEM emitter from config.

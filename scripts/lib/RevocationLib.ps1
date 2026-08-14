@@ -51,3 +51,39 @@ function Get-CaSerialForm([string]$Serial) {
     if ($s.Length % 2 -eq 1) { $s = "0" + $s }
     return $s
 }
+
+# The operator-facing completion text for a single revocation.
+#
+# 2026-08-16 rescan F2: this used to be an unconditional trailer on
+# Revoke-Cert.ps1 ending "...and the CRL is published." That is false on the
+# DEFAULT path. Sync-Revocations.ps1 passes -SkipPublishCrl because the
+# least-privilege revocation officer cannot republish a CRL (that needs
+# Manage-CA), and the batch relays this script's output verbatim -- so the
+# containment record showed "Skipping CRL publication" and "the CRL is
+# published" for the same certificate, minutes apart. An operator who closes
+# containment on the second line leaves relying parties accepting a revoked
+# certificate until the next scheduled publication.
+#
+# Returned as an array of lines so the Pester tests can assert the two branches
+# never share a claim.
+function Get-RevocationCompletionMessage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [switch]$SkipPublishCrl
+    )
+    if ($SkipPublishCrl) {
+        return @(
+            ("Out-of-band revocation PARTIALLY complete: serial {0} is revoked in the CA" -f $Serial),
+            "database, but the CRL was NOT republished, so no published CRL lists it yet.",
+            "Relying parties will keep accepting this certificate until the next scheduled",
+            "CRL publication. Do NOT close containment on this step alone -- either wait for",
+            "that publication and verify the serial appears, or re-run with -PublishCrl as an",
+            "identity holding Manage-CA."
+        )
+    }
+    return @(
+        ("Out-of-band revocation complete: serial {0} is revoked in the CA database" -f $Serial),
+        "and the CRL has been republished. Update the incident record to note that the",
+        "out-of-band step is done and the CRL is published."
+    )
+}

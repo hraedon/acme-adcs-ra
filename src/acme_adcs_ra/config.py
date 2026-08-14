@@ -228,6 +228,15 @@ class RAConfig(BaseSettings):
     # Bound the CRL fetch so a slow/hostile endpoint cannot pin a worker.
     revocation_confirm_crl_timeout_seconds: float = 10.0
     revocation_confirm_crl_max_bytes: int = 10 * 1024 * 1024
+    # Wall-clock ceiling on the whole retrieval. The timeout above is per-read
+    # (that is all `requests` offers), so a server trickling one byte before
+    # each read timeout never trips it and holds the worker indefinitely. This
+    # is the bound that actually terminates such a transfer.
+    revocation_confirm_crl_total_timeout_seconds: float = 30.0
+    # Size of the dedicated CRL-evidence thread pool. Deliberately small and
+    # deliberately NOT the shared pool that runs ADCS enrollment: a stalled CRL
+    # host may exhaust this pool without touching the issuance path.
+    revocation_confirm_crl_max_workers: int = 2
     # An absolute ceiling on how stale a CRL the RA will act on. A signed CRL
     # never stops verifying, and `nextUpdate` is chosen by the CA, so neither
     # bounds replay of a pre-revocation view on its own.
@@ -349,6 +358,35 @@ class RAConfig(BaseSettings):
                 "revocation_confirm_require_crl_evidence is set but "
                 "revocation_confirm_crl_url is empty: the RA would have no way "
                 "to obtain the evidence it is required to check."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _crl_timeouts_are_coherent(self) -> RAConfig:
+        """The total deadline must leave room for at least one read.
+
+        A total below the per-read timeout would cancel a perfectly healthy
+        CRL fetch mid-transfer, which withholds evidence — and under
+        ``require_crl_evidence`` that wedges confirmation entirely. Catching
+        it at load beats discovering it during an incident.
+        """
+        if self.revocation_confirm_crl_total_timeout_seconds <= 0:
+            raise ValueError(
+                "revocation_confirm_crl_total_timeout_seconds must be positive"
+            )
+        if self.revocation_confirm_crl_max_workers < 1:
+            raise ValueError("revocation_confirm_crl_max_workers must be at least 1")
+        if (
+            self.revocation_confirm_crl_total_timeout_seconds
+            < self.revocation_confirm_crl_timeout_seconds
+        ):
+            raise ValueError(
+                "revocation_confirm_crl_total_timeout_seconds "
+                f"({self.revocation_confirm_crl_total_timeout_seconds}) is below "
+                "revocation_confirm_crl_timeout_seconds "
+                f"({self.revocation_confirm_crl_timeout_seconds}): the total "
+                "deadline would abort a healthy CRL fetch before its first read "
+                "could even time out."
             )
         return self
 

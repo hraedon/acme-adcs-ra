@@ -272,8 +272,14 @@ if ($SkipPublishCrl) {
     Write-Output "PASS: CRL republished."
 }
 
+# 4. Completion text that matches the branch actually taken.
+#
+# This block used to end with an unconditional "...and the CRL is published",
+# which is false on the DEFAULT path (-SkipPublishCrl, which Sync-Revocations
+# passes because a least-privilege officer cannot republish). See
+# Get-RevocationCompletionMessage in scripts/lib/RevocationLib.ps1 for why the
+# distinction matters and tests/pester/Revocation.Tests.ps1 for its coverage.
 Write-Output ""
-Write-Output ("Out-of-band revocation complete. The RA audit log recorded this cert as")
-Write-Output ("revocation_scope=ra-store-only, ca_crl_updated=false -- update the incident")
-Write-Output ("record to note the out-of-band step is now done and the CRL is published.")
+Get-RevocationCompletionMessage -Serial $targetSerial -SkipPublishCrl:$SkipPublishCrl |
+    ForEach-Object { Write-Output $_ }
 exit 0

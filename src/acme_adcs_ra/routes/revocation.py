@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509 import DNSName
 from cryptography.x509.oid import ExtensionOID
 from fastapi import APIRouter, Depends, Request
@@ -28,6 +29,18 @@ from acme_adcs_ra.jws import _base64url_decode
 from acme_adcs_ra.store import CertStatus, _now_iso, canonical_serial
 
 router = APIRouter()
+
+
+def _dns_sans(cert: x509.Certificate) -> list[str]:
+    """The certificate's dNSName SANs, or an empty list when it has none."""
+    try:
+        san_ext = cert.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+        )
+    except x509.ExtensionNotFound:
+        return []
+    san_value = cast(x509.SubjectAlternativeName, san_ext.value)
+    return [str(v) for v in san_value.get_values_for_type(DNSName)]
 
 
 @router.post(_ACME_PATHS["revokeCert"])
@@ -87,14 +100,6 @@ async def revoke_cert(
 
     serial_hex = canonical_serial(format(cert.serial_number, "x"))
 
-    try:
-        san_ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-    except x509.ExtensionNotFound:
-        cert_sans: list[str] = []
-    else:
-        san_value = cast(x509.SubjectAlternativeName, san_ext.value)
-        cert_sans = [str(v) for v in san_value.get_values_for_type(DNSName)]
-
     # C-1: scope the serial lookup to (serial, account_id) so that a
     # serial collision cannot return another account's row.  Merging the
     # not-found and unauthorised outcomes into a single 404 avoids
@@ -102,6 +107,45 @@ async def revoke_cert(
     cert_record = ctx.store.get_certificate_by_serial(serial_hex, account_id)
     if cert_record is None:
         raise not_found("certificate not found in RA store")
+
+    try:
+        stored_cert = x509.load_pem_x509_certificate(
+            cert_record.cert_pem.encode("utf-8")
+        )
+    except ValueError as exc:
+        raise server_internal(
+            f"the stored certificate for serial {serial_hex} does not parse"
+        ) from exc
+
+    # 2026-08-16 rescan F3: bind the *whole* submitted certificate to the
+    # stored one, not just its serial.
+    #
+    # The lookup above matches on (serial, account_id), and both of those come
+    # from the request. An owner could therefore submit a self-signed
+    # certificate carrying the same serial and any SANs it liked: the lookup
+    # still found the authoritative row, the right certificate was revoked —
+    # and the mandatory `certificate-revoked` audit event recorded the
+    # attacker's SAN list as if it were the issued one. The audit trail is the
+    # authoritative record of a containment action, so letting the subject of
+    # that action choose part of its contents is a defect even when the
+    # security-relevant fields (id, serial, account) stay honest.
+    #
+    # Byte equality is the right bar here rather than a lenient re-check:
+    # RFC 8555 §7.6 has the client submit the certificate it was issued, and
+    # that is exactly the DER the RA stored and served back. Comparing
+    # re-encoded DER (rather than the raw request bytes) normalises the
+    # PEM/DER round trip without loosening anything.
+    if cert.public_bytes(Encoding.DER) != stored_cert.public_bytes(Encoding.DER):
+        raise malformed(
+            "the submitted certificate does not match the certificate the RA "
+            f"issued for serial {serial_hex}"
+        )
+
+    # Derived from the stored PEM, never from the request. Redundant now that
+    # the bodies must match byte-for-byte, and deliberately so: this is the
+    # field that reaches the audit row, and it should not depend on the
+    # equality check above staying correct.
+    cert_sans = _dns_sans(stored_cert)
 
     if cert_record.status == CertStatus.REVOKED:
         # H-4: RFC 8555 §7.6 says an already-revoked cert returns 200 OK

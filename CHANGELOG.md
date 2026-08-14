@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-16 rescan (four findings)
+
+A rescan (Codex, with Daybreak Blue) of `fb3a14e` that **confirmed all four
+2026-08-16 fixes** and found four more: one medium, three low, all real, all
+fixed. See `docs/security-review-2026-08-16-rescan.md`.
+
+- **Legacy certificate rows are backfilled with their serial (medium).**
+  `serial_number` is the only key `revokeCert` resolves a certificate by, and
+  the migration that introduced it left every pre-existing row `NULL` — so on
+  any upgraded deployment, every certificate issued before that point answered
+  its owner's revocation request with 404 and stayed trusted until expiry, with
+  no signal (the pending-revocation feed skips those rows too). The migration
+  now re-derives each missing serial from the row's own `cert_pem`, and a
+  post-migration invariant runs on every start. Deliberately strict: an
+  unparseable PEM or two rows deriving one serial for one account raise
+  `StoreMigrationError` and the RA refuses to start, because an underived
+  serial has no fallback path.
+- **The default revocation script no longer claims a publication it skipped
+  (low).** `Sync-Revocations.ps1` passes `-SkipPublishCrl` by default (a
+  least-privilege officer cannot republish), and `Revoke-Cert.ps1` honoured it
+  and then said "the CRL is published" anyway — contradictory containment
+  evidence in one operator-facing log. The completion text moved to
+  `Get-RevocationCompletionMessage` with two distinct branches; the skip path
+  reports `PARTIALLY complete` and says not to close containment on it alone.
+- **Revocation audit metadata comes from the stored certificate (low).**
+  `revokeCert` bound the request to state by `(serial, account_id)` only, so an
+  owner could submit a same-serial self-signed certificate and have its SANs
+  recorded in the mandatory `certificate-revoked` event. The submitted
+  certificate must now match the stored one byte for byte (RFC 8555 §7.6 has
+  the client submit the certificate it was issued, so this costs a compliant
+  client nothing), and audit SANs are derived from the stored PEM regardless.
+- **CRL retrieval is bounded and isolated from enrollment (low).** `requests`'
+  timeout is per-read, so a trickling server never tripped it and held a worker
+  indefinitely — a worker drawn from the same pool as ADCS enrollment. Adds a
+  wall-clock `revocation_confirm_crl_total_timeout_seconds` (default 30s), a
+  dedicated `revocation_confirm_crl_max_workers` pool (default 2, created
+  lazily), and single-flight per serial so a burst of confirmations for one
+  certificate costs one retrieval.
+
 ### Security — 2026-08-16 external scan (four findings)
 
 First **full-repository** scan since the enrollment-lease work (the two before it

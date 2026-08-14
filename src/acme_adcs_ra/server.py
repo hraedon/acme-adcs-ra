@@ -68,6 +68,9 @@ def create_app(context: ServerContext) -> FastAPI:
         context.audit_hook = _siem_emitter.export
     if context.nonce_bucket is None:
         context.nonce_bucket = _default_nonce_bucket(context.config)
+    context.crl_evidence_gate.set_max_workers(
+        context.config.revocation_confirm_crl_max_workers
+    )
 
     # H-3: shut down the SIEM emitter pool on app shutdown via lifespan.
     @asynccontextmanager
@@ -75,6 +78,9 @@ def create_app(context: ServerContext) -> FastAPI:
         yield
         if _siem_emitter is not None:
             _siem_emitter.close()
+        # Same reason: the CRL-evidence pool is the RA's own, so nothing else
+        # reclaims its threads at shutdown.
+        context.crl_evidence_gate.close()
 
     app = FastAPI(
         title="acme-adcs-ra",

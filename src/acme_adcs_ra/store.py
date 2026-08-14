@@ -99,6 +99,16 @@ def _load_json(text: str | None) -> Any:
     return json.loads(text)
 
 
+class StoreMigrationError(RuntimeError):
+    """A schema migration could not complete safely, so the RA must not start.
+
+    Reserved for migrations whose failure would leave a *security* control
+    silently inoperative — the serial backfill, whose absence makes
+    certificates unrevokable. Migrations that only lose a redundant defence
+    log and continue instead.
+    """
+
+
 def canonical_serial(serial_hex: str) -> str:
     """Normalize a hex serial to the single form the store keys on.
 
@@ -482,6 +492,113 @@ class Store:
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE certificates ADD COLUMN {column} {ddl}")
+        self._backfill_certificate_serials(conn)
+
+    def _backfill_certificate_serials(self, conn: sqlite3.Connection) -> None:
+        """Derive ``serial_number`` for rows that predate the column.
+
+        ``ALTER TABLE ... ADD COLUMN serial_number TEXT`` gives every existing
+        row NULL, and nothing else ever filled it in. That is not a cosmetic
+        gap: ``serial_number`` is the **only** key ``revokeCert`` resolves a
+        certificate by (:meth:`get_certificate_by_serial`), and SQL equality
+        against NULL never matches. So on any deployment upgraded across the
+        column's introduction, every pre-migration certificate answered
+        revocation with 404 — its owner could not revoke it through the RA at
+        all, and a compromised key stayed trusted until expiry or until an
+        operator went to the CA by hand. The pending-revocation feed skips
+        NULL-serial rows too (``routes/admin.py``), so the gap was silent.
+
+        The serial is not lost, only underived: it is in the row's own
+        ``cert_pem``. Backfilling is a pure re-derivation of data already held,
+        which is why it can run unattended at startup.
+
+        **Strict, not best-effort.** A row whose PEM will not parse, or two
+        rows for one account that derive the same serial, leave the store in
+        exactly the ambiguous state the lookup cannot resolve safely — so the
+        migration raises and the RA refuses to start rather than come up with a
+        subset of certificates quietly unrevokable. This differs deliberately
+        from the two UNIQUE-index migrations above, which degrade to a warning:
+        those lose a *secondary* defence while the primary (CAS) still holds,
+        whereas an underived serial has no fallback path at all. The whole
+        migration runs in the caller's transaction, so a raise rolls back.
+        """
+        rows = conn.execute(
+            "SELECT id, account_id, cert_pem FROM certificates "
+            "WHERE serial_number IS NULL OR serial_number = ''"
+        ).fetchall()
+        if not rows:
+            return
+
+        derived: list[tuple[str, str, str]] = []
+        unparseable: list[str] = []
+        for row in rows:
+            try:
+                serial = _serial_from_pem(row["cert_pem"])
+            except (ValueError, TypeError, AttributeError):
+                unparseable.append(str(row["id"]))
+                continue
+            derived.append((serial, str(row["id"]), str(row["account_id"])))
+
+        if unparseable:
+            raise StoreMigrationError(
+                "cannot derive serial numbers for legacy certificate rows "
+                f"{sorted(unparseable)}: their cert_pem does not parse as a "
+                "certificate. Those certificates would be unrevokable through "
+                "ACME, so the RA refuses to start. Inspect them with "
+                "\"SELECT id, cert_pem FROM certificates WHERE id IN (...)\" "
+                "and either repair the PEM or delete the corrupt rows."
+            )
+
+        # A serial must resolve to at most one row per account, because that
+        # pair is the revocation lookup key. Check against both the rows this
+        # backfill is about to write and the rows already carrying a serial.
+        seen: dict[tuple[str, str], str] = {}
+        conflicts: list[str] = []
+        for serial, cert_id, account_id in derived:
+            key = (serial, account_id)
+            twin = seen.get(key)
+            if twin is not None:
+                conflicts.append(
+                    f"rows {twin} and {cert_id} both derive serial {serial} "
+                    f"for account {account_id}"
+                )
+                continue
+            seen[key] = cert_id
+            clash = conn.execute(
+                "SELECT id FROM certificates "
+                "WHERE serial_number = ? AND account_id = ? AND id != ?",
+                (serial, account_id, cert_id),
+            ).fetchone()
+            if clash is not None:
+                conflicts.append(
+                    f"row {cert_id} derives serial {serial}, already held by "
+                    f"row {clash['id']} for account {account_id}"
+                )
+        if conflicts:
+            raise StoreMigrationError(
+                "legacy certificate rows derive conflicting serial numbers, so "
+                "revocation could not resolve them unambiguously: "
+                + "; ".join(sorted(conflicts))
+                + ". The RA refuses to start; reconcile the duplicate rows."
+            )
+
+        conn.executemany(
+            "UPDATE certificates SET serial_number = ? WHERE id = ?",
+            [(serial, cert_id) for serial, cert_id, _ in derived],
+        )
+
+        # Post-migration invariant. Cheap, and it runs on every start: an
+        # insert path that ever forgets the serial reproduces the same
+        # unrevokable-certificate bug, and this is where it surfaces.
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM certificates "
+            "WHERE serial_number IS NULL OR serial_number = ''"
+        ).fetchone()[0]
+        if remaining:
+            raise StoreMigrationError(
+                f"{remaining} certificate row(s) still have no serial_number "
+                "after the backfill; they would be unrevokable through ACME."
+            )
 
     def _migrate_orders_table(self, conn: sqlite3.Connection) -> None:
         """Add the processing-lease columns to orders if they are missing."""
