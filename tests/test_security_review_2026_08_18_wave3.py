@@ -28,7 +28,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -358,7 +358,7 @@ class TestCertsrvBodiesAreBoundedBeforeBuffering:
 
         class _Buffered:
             status_code = 200
-            headers: dict[str, str] = {}
+            headers: ClassVar[dict[str, str]] = {}
             content = b"hello"
             encoding = "utf-8"
 
