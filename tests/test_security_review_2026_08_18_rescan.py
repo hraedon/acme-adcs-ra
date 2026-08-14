@@ -453,6 +453,109 @@ class TestRedirectsAreOffByDefault:
         assert "neither valid DER nor PEM" in evidence.detail
 
 
+class TestDeadlineReasonIsPlatformIndependent:
+    """Two mechanisms terminate a transfer at the deadline, and they race.
+
+    The watchdog tears the socket down and sets its flag; the per-hop socket
+    timeout also expires on its own, because it is clamped to the wall-clock
+    remaining. Nothing set the flag in the second case, so the outcome was
+    reported as a generic "CRL read failed" — the exact thing the flag exists to
+    prevent. Linux happened to win the race with the watchdog and Windows CI did
+    not, which is how a green suite hid it.
+    """
+
+    def _silent_peer(self) -> tuple[str, Any]:
+        """A server that sends headers promising a body, then nothing, ever."""
+        stop = threading.Event()
+        held: list[socket.socket] = []
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+
+        def serve() -> None:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+            except OSError:
+                return
+            held.append(conn)
+            stop.wait(10)
+
+        threading.Thread(target=serve, daemon=True).start()
+
+        def shutdown() -> None:
+            stop.set()
+            for conn in held:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+        return f"http://127.0.0.1:{srv.getsockname()[1]}/ca.crl", shutdown
+
+    def test_the_clamped_read_timeout_is_still_reported_as_a_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neutralize the watchdog: the deadline must still be the stated reason.
+
+        This is the Windows condition made deterministic. With `_abort_live`
+        doing nothing, the only thing that ends the read is the socket timeout
+        clamped to the remaining wall clock — and the reported reason must not
+        depend on which of the two got there first.
+        """
+        import acme_adcs_ra.crl_evidence as mod
+
+        monkeypatch.setattr(mod, "_abort_live", lambda *_args, **_kwargs: None)
+        url, stop = self._silent_peer()
+        try:
+            evidence = fetch_crl_evidence(
+                crl_url=url,
+                serial_number=0x1234,
+                cert_pem="",
+                chain_pem=[],
+                timeout_seconds=8.0,
+                total_timeout_seconds=0.5,
+            )
+        finally:
+            stop()
+
+        assert evidence.checked is False
+        assert "total deadline" in evidence.detail
+        # The underlying transport error is kept, not discarded.
+        assert "timed out" in evidence.detail.lower()
+
+    def test_a_genuine_error_before_the_deadline_keeps_its_own_reason(self) -> None:
+        """The deadline must not become a catch-all that swallows real errors."""
+        # Nothing listening: connection refused, immediately, well inside the
+        # generous deadline.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        evidence = fetch_crl_evidence(
+            crl_url=f"http://127.0.0.1:{port}/ca.crl",
+            serial_number=0x1234,
+            cert_pem="",
+            chain_pem=[],
+            timeout_seconds=5.0,
+            total_timeout_seconds=30.0,
+        )
+
+        assert evidence.checked is False
+        assert "total deadline" not in evidence.detail
+        assert "CRL fetch failed" in evidence.detail
+
+
 def test_the_config_default_is_off() -> None:
     """Strict by default, per the standing project preference."""
     from acme_adcs_ra.config import RAConfig

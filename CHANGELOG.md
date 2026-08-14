@@ -35,6 +35,14 @@ fixed. See `docs/security-review-2026-08-18-rescan.md`.
   must equal the origin's bar one documented http:80 → https:443 upgrade, and the
   host must keep resolving inside the address set seen at the start of the
   retrieval.
+- **The CRL deadline reason no longer depends on which mechanism won the race
+  (found while landing the rescan, not a scan finding).** Clamping the per-hop
+  socket timeout to the wall-clock remaining made it expire at the same moment
+  the watchdog fires — and when the socket timeout won, nothing set the
+  watchdog's flag, so the outcome was reported as a generic "CRL read failed"
+  instead of a deadline. Linux won the race one way and Windows the other. The
+  reason is now the flag *or* the clock, with the underlying transport error kept
+  in the detail; a genuine error before the deadline still reports itself.
 
 ### Security — 2026-08-18 scan (five findings)
 

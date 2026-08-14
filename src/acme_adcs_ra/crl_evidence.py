@@ -287,6 +287,29 @@ class _LiveTransfer:
         self.response: requests.Response | None = None
 
 
+def _past_deadline(timed_out: threading.Event, deadline: float) -> bool:
+    """Whether a failed retrieval should be reported as a deadline expiry.
+
+    Two mechanisms can terminate a transfer at the deadline and they race
+    (2026-08-18 rescan, found on Windows CI):
+
+    * the watchdog tears the socket down and sets *timed_out* — definitive; and
+    * the per-hop socket timeout expires on its own, because it is **clamped to
+      the wall-clock remaining**. Nothing sets the flag in that case, so the
+      outcome used to be reported as a generic "CRL read failed" — which is what
+      the flag exists to prevent, and which made the reason nondeterministic
+      between platforms. Linux happened to lose the race the other way.
+
+    The clock comparison is exact rather than approximate, and does not need a
+    tolerance: the clamped timeout is ``deadline - t0`` for some ``t0`` taken
+    before the read begins at ``t1 >= t0``, so it cannot expire before
+    ``t1 + (deadline - t0) >= deadline``. When the clamp is *not* what bound the
+    read (``timeout_seconds`` was the smaller of the two), expiry says nothing
+    about the deadline and the real transport error is reported instead.
+    """
+    return timed_out.is_set() or time.monotonic() >= deadline
+
+
 def _abort_live(live: _LiveTransfer, timed_out: threading.Event) -> None:
     """Deadline expiry: flag it, and tear down the transfer if one is up."""
     response = live.response
@@ -344,15 +367,17 @@ def fetch_crl_evidence(
             detail=f"CRL URL must be http(s) with a host: {crl_url!r}",
         )
 
-    def deadline_evidence(received: int) -> CrlEvidence:
-        return CrlEvidence(
-            revoked=False,
-            checked=False,
-            detail=(
-                f"CRL retrieval exceeded its {total_timeout_seconds}s total "
-                f"deadline after {received} bytes"
-            ),
+    def deadline_evidence(received: int, cause: str | None = None) -> CrlEvidence:
+        detail = (
+            f"CRL retrieval exceeded its {total_timeout_seconds}s total "
+            f"deadline after {received} bytes"
         )
+        if cause:
+            # Keep the underlying transport error visible: the deadline is the
+            # right *reason*, but which mechanism actually tore the transfer
+            # down is worth having when diagnosing a CDP.
+            detail += f" ({cause})"
+        return CrlEvidence(revoked=False, checked=False, detail=detail)
 
     origin = parsed
     # Resolved once, before the first request, and only when a redirect could
@@ -487,8 +512,8 @@ def fetch_crl_evidence(
     except requests.RequestException as exc:
         # A watchdog teardown surfaces here as a broken/incomplete read on a
         # Content-Length response. Report what actually happened.
-        if timed_out.is_set():
-            return deadline_evidence(len(body))
+        if _past_deadline(timed_out, deadline):
+            return deadline_evidence(len(body), str(exc))
         return CrlEvidence(
             revoked=False, checked=False, detail=f"CRL fetch failed: {exc}"
         )
@@ -500,8 +525,8 @@ def fetch_crl_evidence(
         # here (via requests), so catching its hierarchy by name would mean
         # importing something this project does not declare. Everything is "no
         # evidence" either way; the caller decides whether that is fatal.
-        if timed_out.is_set():
-            return deadline_evidence(len(body))
+        if _past_deadline(timed_out, deadline):
+            return deadline_evidence(len(body), str(exc))
         logger.warning("CRL read failed", exc_info=True)
         return CrlEvidence(
             revoked=False, checked=False, detail=f"CRL read failed: {exc}"

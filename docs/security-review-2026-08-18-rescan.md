@@ -114,9 +114,47 @@ still win the race. Closing it properly means connecting to a validated address
 and verifying the peer, which needs a custom transport adapter — noted rather
 than done, at low severity, behind a default-off flag.
 
+## Found while landing the rescan — the deadline reason raced
+
+Not a scan finding either. With the Windows socket close in place, the Windows
+job failed differently:
+
+```
+assert 'total deadline' in
+  "CRL read failed: HTTPConnectionPool(host='127.0.0.1', port=56612): Read timed out."
+```
+
+The teardown now worked; the *reported reason* was wrong. Two mechanisms
+terminate a transfer at the deadline and they race:
+
+- the watchdog tears the socket down and sets `timed_out` — definitive; and
+- the per-hop socket timeout expires on its own, because the 2026-08-18 F1 fix
+  **clamped it to the wall-clock remaining**. Nothing sets the flag in that case,
+  so the outcome fell through to a generic "CRL read failed" — which is exactly
+  what the flag exists to prevent.
+
+Before the clamp, the per-read bound was the full `timeout_seconds` (8s against
+a 0.5s deadline), so the watchdog always won and the flag was always set. The
+clamp made the two coincide and the winner platform-dependent. So this was a
+latent nondeterminism introduced by an earlier fix in this same round, and it
+was invisible on Linux.
+
+**Fixed** with `_past_deadline(timed_out, deadline)`: the flag *or* the clock.
+The comparison needs no tolerance — the clamped timeout is `deadline - t0` for a
+`t0` taken before the read begins at `t1 >= t0`, so it cannot expire before
+`t1 + (deadline - t0) >= deadline`. When the clamp is not what bound the read
+(`timeout_seconds` was the smaller), expiry says nothing about the deadline and
+the real transport error is reported instead — so the deadline does not become a
+catch-all. The underlying error is appended to the detail either way, so nothing
+is lost for diagnosis.
+
+Both properties are pinned by tests that neutralize `_abort_live`, making the
+"watchdog lost the race" condition deterministic on any platform rather than a
+Windows accident.
+
 ## Verification
 
-`tests/test_security_review_2026_08_18_rescan.py` — 23 tests. Each was
+`tests/test_security_review_2026_08_18_rescan.py` — 25 tests. Each was
 mutation-checked; notably, reverting the collision refusal reproduces the
 report's exact `sqlite3.IntegrityError: UNIQUE constraint failed:
 accounts.jwk_thumbprint`, and reverting the refusal *and* the post-migration
@@ -124,9 +162,11 @@ invariant together reproduces the fail-open half (7 tests fail).
 
 Mutations exercised: collision refusal removed; collision refusal and
 post-migration invariant both removed; the scheme-default-port alternative
-restored; address pinning disabled; `follow_redirects` defaulted to true.
+restored; address pinning disabled; `follow_redirects` defaulted to true;
+`_past_deadline` reduced to the flag alone (which reproduces the Windows CI
+failure string verbatim on Linux).
 
-Suite after the fixes: 733 pytest + 1 skipped, ruff clean, mypy clean. The
+Suite after the fixes: 735 pytest + 1 skipped, ruff clean, mypy clean. The
 2026-08-18 redirect tests were updated to opt into `follow_redirects=True` —
 their subject is the opt-in path, which still needs covering.
 
