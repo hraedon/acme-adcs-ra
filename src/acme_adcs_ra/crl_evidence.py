@@ -34,6 +34,7 @@ import asyncio
 import contextlib
 import logging
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -133,11 +134,20 @@ def _abort_transfer(
     ``response.close()`` alone is not enough: it releases the connection back
     to the pool and closes the buffered reader, but a thread already parked
     inside a socket read is not woken by that. ``shutdown(SHUT_RDWR)`` on the
-    socket itself is — the pending ``recv`` returns end-of-stream immediately.
-    Reaching the socket means going through urllib3's internals, so every step
-    is guarded: failing to abort must never raise into the timer thread, where
-    nothing could handle it. The flag is set first so the reader reports a
-    deadline rather than a fetch failure either way.
+    socket itself is — on POSIX the pending ``recv`` returns end-of-stream
+    immediately. Reaching the socket means going through urllib3's internals,
+    so every step is guarded: failing to abort must never raise into the timer
+    thread, where nothing could handle it. The flag is set first so the reader
+    reports a deadline rather than a fetch failure either way.
+
+    **Windows needs the close as well, and that is not a detail** (2026-08-18).
+    Winsock does not wake a ``recv`` parked in another thread on ``shutdown``;
+    only ``closesocket`` does. So on the RA's *production* platform this
+    watchdog set its flag and then achieved nothing: the read stayed parked
+    until the per-read timeout expired. CI measured a 0.5s total deadline
+    overshooting to 8.0s — exactly the per-read bound, i.e. precisely the
+    behaviour the watchdog was added to eliminate. The control existed on Linux
+    and was absent where the RA actually runs.
     """
     timed_out.set()
     raw = getattr(response, "raw", None)
@@ -146,12 +156,22 @@ def _abort_transfer(
     if sock is not None:
         with contextlib.suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
+        if sys.platform == "win32":
+            # The blocked ``recv`` fails immediately with an OSError once the
+            # handle is gone; the reader sees ``timed_out`` set and reports a
+            # deadline, so the exact error does not matter.
+            with contextlib.suppress(OSError):
+                sock.close()
         # Deliberately NOT response.close() here as well. Closing from this
         # thread while the worker is inside ``read1`` frees the file object
         # out from under it, which surfaces as an AttributeError deep in
         # http.client rather than a clean end-of-stream. The shutdown is
-        # sufficient, and the reader's own ``contextlib.closing`` does the
-        # closing on the thread that owns the read.
+        # sufficient on POSIX, and the reader's own ``contextlib.closing``
+        # does the closing on the thread that owns the read.
+        #
+        # Closing the *socket* on POSIX is avoided for a different reason:
+        # retiring an fd that another thread is blocked in ``read()`` on
+        # invites an fd-reuse race, and ``shutdown`` already works there.
         return
     # No socket to reach (a mock, or urllib3 internals moved): fall back to
     # the blunt instrument, which at least stops a fresh read from starting.

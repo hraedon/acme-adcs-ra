@@ -196,6 +196,38 @@ describes; consolidating them automatically would silently merge two accounts'
 order histories and rate-limit accounting, so the migration logs the pair loudly
 and leaves the decision to the operator.
 
+## Found while landing this round — the watchdog did not work on Windows
+
+Not a scan finding. Fast-forwarding `main` to `8a4baca` gave that commit its
+first CI run, and the Windows job failed:
+
+```
+test_a_peer_that_goes_silent_is_cut_at_the_total_deadline
+E  assert 8.002635599999849 < 4.0
+```
+
+8.0s is the *per-read* timeout. The 0.5s total deadline did nothing — which is
+the exact behaviour the 2026-08-17 F3 watchdog was added to eliminate.
+
+**Winsock does not wake a `recv` parked in another thread on `shutdown()`.**
+Only `closesocket()` does. So `_abort_transfer` set its flag and achieved
+nothing on Windows: a hostile CRL server that sends headers and then goes
+silent held the worker for the full per-read timeout regardless of the
+configured total deadline.
+
+The RA's production platform **is** Windows. So this control existed on Linux,
+was verified on Linux, and was absent where the RA actually runs — for the whole
+of the 08-17 round. `_abort_transfer` now also closes the socket on `win32`
+(POSIX keeps shutdown-only: retiring an fd another thread is blocked in `read()`
+on invites an fd-reuse race, and shutdown already works there).
+
+**The process gap that hid it.** `.github/workflows/ci.yml` triggers on pushes
+to `main` and on pull requests. The per-round rhythm pushes a dated review
+branch for Daybreak to scan and opens no PR — so review branches never get a CI
+run, and a Windows-only regression stays invisible until `main` moves. Worth
+either adding `security-review-**` to the push trigger or opening a PR per
+round.
+
 ## Test fixtures
 
 Enforcing canonical JWK encodings invalidated a number of placeholder JWKs

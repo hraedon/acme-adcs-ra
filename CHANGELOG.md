@@ -49,6 +49,13 @@ Two medium, three low; all real, all fixed. See
   Stored account JWKs are re-encoded in place on upgrade (same key, canonical
   spelling); two rows normalizing to one key are logged for the operator rather
   than merged.
+- **The CRL deadline watchdog now works on Windows (found while landing this
+  round, not a scan finding).** Winsock does not wake a `recv` parked in another
+  thread on `shutdown()` — only `closesocket()` does — so the 2026-08-17
+  watchdog set its flag and achieved nothing on the RA's production platform: CI
+  measured a 0.5s total deadline overshooting to 8.0s, the per-read bound.
+  `_abort_transfer` now also closes the socket on `win32`; POSIX keeps
+  shutdown-only.
 - **A stale CRL single-flight callback can no longer evict its successor
   (low).** Cleanup popped by key unconditionally, so a callback arriving after a
   successor had taken the key removed the live successor — letting further
