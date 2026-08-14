@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — 2026-08-14 full E2E lab validation (two defects CI could not see)
+
+The first full live pass over the whole 2026-08-15 → 2026-08-18-wave-3 series.
+Both defects are in PowerShell that CI never executes: the Windows job runs
+`pytest`, and it never invokes the installer or the revocation scripts. See the
+validation log in `docs/pre-pilot-checklist.md`.
+
+- **The pinned installer could not install on Windows at all (blocker).**
+  `install-windows.ps1` rejected pip 26.2.1 as "too old for `--require-hashes`".
+  `(& $venvPy -m pip --version) 2>&1` is a two-element `Object[]` — the banner
+  plus pip's trailing empty line — and `-match` against an array *filters* it
+  rather than capturing, so `$Matches` stayed unset, `$Matches[1]` read as
+  `$null`, `[int]$null` was `0`, and the `-lt 23` floor fired. Live from
+  `fb3a14e`, which added the floor check, so every fresh install on the RA's only
+  production platform was broken for the whole series. The parse moves to
+  `Get-PipMajorVersion` in `scripts/lib/InstallVerifyLib.ps1` and returns `-1`,
+  not `0`, for an unparseable banner so "cannot tell" can never read as
+  "ancient".
+
+- **The 2026-08-18 wave-3 F1 fix was inert in exactly the case it existed for.**
+  `Test-SerialRevokedAtCa` detected a disposition-21/reason-8 row correctly and
+  was then defeated by its own diagnostics: a PowerShell function returns
+  everything written to the success stream, so three `Write-Output` calls before
+  `return $false` yielded `@(three strings, $false)` — and the call site,
+  `if (Test-SerialRevokedAtCa ...)`, reads a non-empty array as **true**. Against
+  the real CA, a certificate taken off the CRL and left **valid** was reported
+  "ALREADY revoked" and exited 6, which drains the serial off the RA's pending
+  feed and records `revocation-ca-confirmed` — a containment failure booked as a
+  success. Both branches of the function were affected. Diagnostics now go to
+  `[Console]::Error.WriteLine`, the idiom this file already documents for
+  values that must not become a return value. The function lives in
+  `Revoke-Cert.ps1` rather than `lib/`, so nothing covered it; the new tests
+  AST-extract the shipped text and assert the caller's truthiness rather than
+  `-Be $false`, which the defect would have passed.
+
 ### Security — 2026-08-18 wave 3 (seven findings; two already closed, four fixed, one deferred)
 
 A standard review of `d26b892`, run in parallel with the rescan of the same

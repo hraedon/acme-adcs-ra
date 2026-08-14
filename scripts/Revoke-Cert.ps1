@@ -243,9 +243,14 @@ function Test-SerialRevokedAtCa([string]$CaConfig, [string]$SerialHex) {
     # It claims revoked. Prove the filter actually filters before acting on it.
     $issuedOut = & certutil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=20", '-out', 'SerialNumber') 2>&1
     if ($LASTEXITCODE -eq 0 -and (($issuedOut -join "`n") -match $escaped)) {
-        Write-Output ("WARNING: the CA returned serial {0} for BOTH Disposition=21 (revoked) and Disposition=20 (issued)." -f $SerialHex)
-        Write-Output "         The Disposition restriction is not discriminating, so its answer is not trusted."
-        Write-Output "         Proceeding with the revocation attempt as though the state were unknown."
+        # stderr, NOT Write-Output: this function's value is consumed as a
+        # boolean by `if (Test-SerialRevokedAtCa ...)`, and anything written to
+        # the success stream becomes part of the return value. Three strings
+        # plus $false is a non-empty array, which PowerShell evaluates as TRUE
+        # -- inverting the answer. See the reason-8 branch below.
+        [Console]::Error.WriteLine(("WARNING: the CA returned serial {0} for BOTH Disposition=21 (revoked) and Disposition=20 (issued)." -f $SerialHex))
+        [Console]::Error.WriteLine("         The Disposition restriction is not discriminating, so its answer is not trusted.")
+        [Console]::Error.WriteLine("         Proceeding with the revocation attempt as though the state were unknown.")
         return $false
     }
     # Disposition 21 is NOT proof of revocation on its own.
@@ -268,9 +273,19 @@ function Test-SerialRevokedAtCa([string]$CaConfig, [string]$SerialHex) {
     # a genuinely revoked certificate is harmless; skipping a live one is not.
     $unrevokedOut = & certutil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=21,Request.RevokedReason=8", '-out', 'SerialNumber') 2>&1
     if ($LASTEXITCODE -eq 0 -and (($unrevokedOut -join "`n") -match $escaped)) {
-        Write-Output ("NOTE: serial {0} is Disposition=21 but its revocation reason is 8 (removeFromCRL)." -f $SerialHex)
-        Write-Output "      That is the UN-revoke state: the certificate is off the CRL and still valid."
-        Write-Output "      Treating it as NOT revoked and proceeding with the revocation."
+        # stderr, NOT Write-Output. The 2026-08-14 live re-proof caught this
+        # branch firing correctly and then being defeated by its own
+        # diagnostics: a PowerShell function returns everything written to the
+        # success stream, so `return $false` after three Write-Output calls
+        # yields @(three strings, $false). The call site is
+        # `if (Test-SerialRevokedAtCa ...)`, a non-empty array is truthy, and
+        # the caller therefore read "already revoked" for a certificate that is
+        # off the CRL and still VALID -- exiting 6, draining the serial off the
+        # RA's pending feed and recording `revocation-ca-confirmed`. The fix for
+        # wave-3 F1 was inert in exactly the case it existed to catch.
+        [Console]::Error.WriteLine(("NOTE: serial {0} is Disposition=21 but its revocation reason is 8 (removeFromCRL)." -f $SerialHex))
+        [Console]::Error.WriteLine("      That is the UN-revoke state: the certificate is off the CRL and still valid.")
+        [Console]::Error.WriteLine("      Treating it as NOT revoked and proceeding with the revocation.")
         return $false
     }
     return $true

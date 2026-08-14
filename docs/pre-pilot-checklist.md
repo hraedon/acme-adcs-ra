@@ -163,6 +163,95 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Full E2E lab validation — PASSED (2026-08-14) on `b028b96` + two fixes it
+  produced, with one claim still NOT established.** The first full pass over the
+  whole 2026-08-15 → 2026-08-18-wave-3 security series; every one of those
+  rounds had landed on `main` without a live run. Deployed by the ordinary
+  installer and asserted on the *installed* package. **Two defects found, both
+  invisible to CI, both in PowerShell that CI never executes.**
+
+  **Defect 1 — the pinned installer could not install at all.** `install-windows.ps1`
+  aborted with "Bundled pip is too old for --require-hashes" against pip 26.2.1.
+  `(& $venvPy -m pip --version) 2>&1` returns a two-element `Object[]` (the
+  banner plus pip's trailing empty line), and `-match` against an ARRAY filters
+  the collection instead of capturing, so `$Matches` was never set, `$Matches[1]`
+  read as `$null`, `[int]$null` was 0, and `0 -lt 23` threw. Live from `fb3a14e`
+  (2026-08-16), which introduced the floor check — **every fresh install on
+  Windows, the RA's only production platform, was broken for the whole series.**
+  Fixed by `Get-PipMajorVersion` in `lib/InstallVerifyLib.ps1`, covered by tests
+  fed the real two-element array captured on the host.
+
+  **Defect 2 — the wave-3 F1 fix was inert in exactly the case it existed for.**
+  `Test-SerialRevokedAtCa` correctly detected a disposition-21/reason-8 row, then
+  defeated itself: its three `Write-Output` diagnostics joined the return value,
+  because a PowerShell function returns its whole success stream. The call site
+  is `if (Test-SerialRevokedAtCa ...)`, `@(three strings, $false)` is a non-empty
+  array, and a non-empty array is truthy. Proven end to end against the real CA:
+  a certificate placed off the CRL and **still valid** was reported "ALREADY
+  revoked", exiting 6 — which drains the serial off the RA's pending feed and
+  records `revocation-ca-confirmed`, booking a containment failure as a success.
+  Diagnostics moved to `[Console]::Error.WriteLine` (the file's own idiom for
+  exactly this reason); re-run live afterwards, exit 0 and a real re-revocation.
+  Both branches of the function had the defect. Nothing covered this function —
+  it lives in `Revoke-Cert.ps1`, not `lib/`, so the Pester suite never saw it;
+  it is now covered by AST-extracting the shipped text.
+
+  **What passed.** §A issuance 14/14 (EKU exactly `serverAuth`, SAN from CSR,
+  chain to root, CA policy denial mapped, reasons 7/8 refused). §A1 front
+  controls 13/13 (JWS/EAB URL pinning, kid locality, deactivation, cross-account
+  401, nonce ceiling). §G 5/5 — the removed GET routes answer **405, not 401**.
+  Both transport-orphan branches 6/6 each: leaf-in-hand quarantined with serial
+  and ReqID and queued; ReqID-only leaves no row, only the audit record. The
+  revocation round trip drained three times through the registered task running
+  as the gMSA. Least privilege, live: the gMSA is **denied** CRL publication
+  (`0x80070005`) and **denied** an out-of-template revocation
+  (`CERTSRV_E_RESTRICTEDOFFICER`), and its token carries **no domain groups at
+  all** (E-1 hardening). Agent authority: admin-token-only exits 2 with the
+  confirm 401'd, confirm-token-only completes with no admin token present. CRL
+  evidence fails closed (`crl-evidence-required-but-absent`) until an
+  administrator republishes, then records `crl-verified` with CRL number 87.
+  The account-JWK twin migration applied to the real 21-account store: every row
+  canonical, zero duplicate thumbprints, the UNIQUE index present, integrity
+  `ok`. The lease: 9/9 and 8/8, the queue gap reproduced and refused
+  `enrollment-in-flight` with the age floor at 0 so it cannot have answered.
+  The hash-pinned closure installs clean into a throwaway venv on Windows/3.14.
+
+  **The Windows CRL watchdog, proven where it was previously absent.** A hostile
+  server that sends headers and goes silent is cut at **3.01 s** against a 30 s
+  per-read timeout, on `win32`, reporting the deadline rather than a bare read
+  timeout, and fails closed (`checked=False`). This is the control that existed
+  on Linux and was missing on Windows for the whole of the 08-17 round.
+
+  **STILL NOT established: the durable lease stopping a stale worker.** Same
+  outcome and same evidence as the 2026-08-14 run, reached independently: the
+  contested order's two `finalize-enrollment-transport-failed` rows are
+  **sequential** (21:23:18 then 21:23:19), so the gen-1 worker returned before
+  the gen-2 re-finalize began and no stale worker ever survived a generation
+  bump. Neither confirmed nor refuted; still unit-tested and mutation-proven
+  only. It needs a CA stand-in that accepts the connection and stalls.
+
+  **Observation 1 of the previous run is confirmed, and is by design.** Orders
+  wedge in `processing` after a connect-level transport failure (43/43 here) and
+  nothing ever retires them: `Store.sweep_expired_orders` sweeps only
+  `pending`/`ready` and documents `processing` as "operator-reconcilable". A
+  client retry does take a fresh lease, so orders are not bricked — but a CA
+  outage still turns every in-flight order into operator work.
+
+  **The CRL cadence finding stands unchanged.** This CA's 7d 12h 20m validity
+  window still exceeds the 7-day default ceiling. The override is plumbed and
+  works (`ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=691200` reads back as
+  691200 against a 604800 default), so this is configuration, not a code gap.
+
+  **Teardown verified, not assumed.** CA back to 224 bytes / 4 ACEs /
+  `OfficerRights: ABSENT`, `denyUrlSequences` empty (checked via the full
+  `appcmd` path after a PATH miss made a first check meaningless), all five
+  certificates this run caused the CA to issue revoked — including the
+  ReqID-only orphan that nothing tracks — and the CRL republished. The RA store
+  restored and **verified against the pre-run fingerprint**: integrity `ok` and
+  every row count identical. Tasks unregistered, dotenv restored, web.config
+  back to its exact pristine 10-variable set. Ten ACME-template certificates
+  from *earlier* sessions remain issued at the CA — pre-existing, not this run.
+
 - **Enrollment-lease live re-proof — PASSED (2026-08-14) on `1832163`, with one
   claim explicitly NOT established and three observations opened.** Targeted at
   the 2026-08-15 rescan fix rather than a full pass: §A issuance regression, the
