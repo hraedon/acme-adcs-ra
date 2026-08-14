@@ -55,8 +55,12 @@ class SiemConfig:
     hec_token: str = ""
     hec_index: str = ""
     hec_sourcetype: str = "acme-adcs-ra"
-    # Maximum audit events held in memory awaiting HEC delivery. See
-    # SiemEmitter._to_hec for why an unbounded queue was a liability.
+    # Seconds a TCP syslog send may block before it is abandoned. Without a
+    # deadline a stalled receiver parks the sender indefinitely.
+    syslog_timeout_seconds: float = 5.0
+    # Maximum audit events held in memory awaiting OFF-BOX delivery (syslog
+    # or HEC). See SiemEmitter._submit_bounded for why an unbounded queue
+    # was a liability.
     hec_queue_max: int = 1000
 
 
@@ -86,14 +90,19 @@ class SiemEmitter:
         self._syslog: logging.Logger | None = None
         self._pool: ThreadPoolExecutor | None = None
         self._enabled: bool = False
-        # HEC backpressure accounting (see _to_hec).
-        self._hec_inflight = 0
-        self._hec_dropped = 0
-        self._hec_lock = threading.Lock()
+        # Backpressure accounting for BOTH off-box sinks (see _submit_bounded).
+        self._sink_inflight = 0
+        self._sink_dropped = 0
+        self._sink_lock = threading.Lock()
 
         if config.sink == "syslog":
             if config.syslog_host:
                 self._setup_syslog()
+                if self._syslog is not None:
+                    # One worker, so syslog records stay in submission order.
+                    self._pool = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="ra-siem-syslog"
+                    )
             else:
                 logger.error(
                     "SIEM syslog sink enabled but syslog_host is empty; disabling"
@@ -174,6 +183,15 @@ class SiemEmitter:
                 address=(self._config.syslog_host, self._config.syslog_port),
                 socktype=socktype,
             )
+            # A TCP syslog socket with no timeout blocks indefinitely once the
+            # receiver stops reading: `SysLogHandler` does a plain `sendall`,
+            # and a full send buffer parks the caller until the peer drains it.
+            # UDP cannot block this way, but the timeout is harmless there.
+            # `SysLogHandler.socket` exists at runtime for both socket types but
+            # is not declared in typeshed, hence getattr.
+            sock: socket.socket | None = getattr(handler, "socket", None)
+            if socktype == socket.SOCK_STREAM and sock is not None:
+                sock.settimeout(self._config.syslog_timeout_seconds)
             handler.setFormatter(logging.Formatter("acme-adcs-ra: %(message)s"))
             lg = logging.getLogger("acme_adcs_ra.siem.syslog")
             lg.setLevel(logging.INFO)
@@ -219,68 +237,91 @@ class SiemEmitter:
             fh.write(line + "\n")
 
     def _to_syslog(self, event: dict[str, Any]) -> None:
+        """Hand the event to the bounded worker, or drop it under backpressure.
+
+        Previously this called ``Logger.info`` inline, which for a TCP sink is a
+        blocking ``sendall`` on the calling thread — and the calling thread is
+        the event loop, because ``_audit`` runs on the issuance request path.
+        A syslog receiver that stops reading (or a network path that stalls)
+        therefore stalled *issuance itself*, in the single-process deployment,
+        with no timeout and no bound. TCP syslog is the shipped production
+        setting in ``deploy/iis/web.config``, so this was the default posture.
+
+        The HEC sink already had exactly this treatment for exactly this reason;
+        syslog simply never got it. Both now share one bounded queue: the local
+        audit row is already durable before this runs, so dropping the newest
+        event under sustained backpressure bounds memory deterministically and
+        is counted rather than silent.
+        """
         if self._syslog is None:
             return
-        self._syslog.info(json.dumps(event, default=str, sort_keys=True))
+        self._submit_bounded(self._syslog_send, event, "syslog")
 
-    def _to_hec(self, event: dict[str, Any]) -> None:
-        """Hand the event to the HEC worker pool, or drop it under backpressure.
+    def _syslog_send(self, event: dict[str, Any]) -> None:
+        try:
+            if self._syslog is not None:
+                self._syslog.info(json.dumps(event, default=str, sort_keys=True))
+        finally:
+            with self._sink_lock:
+                self._sink_inflight -= 1
 
-        ``ThreadPoolExecutor``'s work queue is a ``SimpleQueue`` — unbounded.
-        With two workers each able to block for the full ``urlopen`` timeout,
-        a slow or unreachable HEC endpoint let the queue grow without limit
-        while audit events kept arriving; unauthenticated account-creation
-        denials alone can generate them faster than delivery (measured: 5000
-        events submitted against a dead endpoint left 4987 queued). That is an
-        unauthenticated peer turning the audit path into memory exhaustion on
-        an issuance-path host.
+    def _submit_bounded(
+        self, fn: Any, event: dict[str, Any], label: str
+    ) -> None:
+        """Queue off-box delivery with a hard ceiling on outstanding work.
 
-        The queue is now explicitly bounded. On overflow the event is dropped
-        *from the HEC sink only* — the durable record is the audit table row,
-        which is already committed by the time this runs — and counted, so the
-        loss is visible rather than silent. Dropping the newest event is the
-        right trade here: it bounds memory deterministically, and the RA-store
-        audit row plus the CA database remain the authoritative trail.
+        Shared by both off-box sinks. ``ThreadPoolExecutor``'s work queue is a
+        ``SimpleQueue`` — unbounded — so a stalled receiver otherwise lets the
+        backlog grow without limit while audit events keep arriving. Measured
+        on the HEC path before it was bounded: 5000 events submitted against a
+        dead endpoint left 4987 queued, which is an unauthenticated peer turning
+        the audit path into memory exhaustion on an issuance-path host.
+
+        On overflow the event is dropped *from the off-box sink only* — the
+        durable record is the audit table row, already committed by the time
+        this runs — and counted, so the loss is visible rather than silent.
         """
         if self._pool is None:
             return
-        with self._hec_lock:
-            if self._hec_inflight >= self._config.hec_queue_max:
-                self._hec_dropped += 1
-                dropped = self._hec_dropped
-                # Log the first drop and then every 100th, so a sustained
-                # outage is visible without the log itself becoming the flood.
-                should_log = dropped == 1 or dropped % 100 == 0
-                if should_log:
+        with self._sink_lock:
+            if self._sink_inflight >= self._config.hec_queue_max:
+                self._sink_dropped += 1
+                dropped = self._sink_dropped
+                # First drop, then every 100th: a sustained outage stays visible
+                # without the log itself becoming the flood.
+                if dropped == 1 or dropped % 100 == 0:
                     logger.error(
-                        "SIEM HEC queue full (%d in flight, max %d); dropped %d "
-                        "audit event(s) from the HEC sink so far. The local audit "
-                        "table still holds every event. Check HEC reachability.",
-                        self._hec_inflight,
-                        self._config.hec_queue_max,
-                        dropped,
+                        "SIEM %s queue full (%d in flight, max %d); dropped %d "
+                        "audit event(s) from the %s sink so far. The local audit "
+                        "table still holds every event. Check sink reachability.",
+                        label, self._sink_inflight, self._config.hec_queue_max,
+                        dropped, label,
                     )
                 return
-            self._hec_inflight += 1
+            self._sink_inflight += 1
         try:
-            self._pool.submit(self._hec_post, event)
+            self._pool.submit(fn, event)
         except RuntimeError:
             # Pool already shut down (close() raced with a late event).
-            with self._hec_lock:
-                self._hec_inflight -= 1
+            with self._sink_lock:
+                self._sink_inflight -= 1
+
+    def _to_hec(self, event: dict[str, Any]) -> None:
+        """Hand the event to the bounded HEC worker pool."""
+        self._submit_bounded(self._hec_post, event, "HEC")
 
     @property
-    def hec_dropped(self) -> int:
-        """Audit events dropped from the HEC sink due to backpressure."""
-        with self._hec_lock:
-            return self._hec_dropped
+    def sink_dropped(self) -> int:
+        """Audit events dropped from the off-box sink due to backpressure."""
+        with self._sink_lock:
+            return self._sink_dropped
 
     def _hec_post(self, event: dict[str, Any]) -> None:
         try:
             self._hec_post_inner(event)
         finally:
-            with self._hec_lock:
-                self._hec_inflight -= 1
+            with self._sink_lock:
+                self._sink_inflight -= 1
 
     def _hec_post_inner(self, event: dict[str, Any]) -> None:
         cfg = self._config
@@ -324,6 +365,7 @@ def build_siem_config(config: RAConfig) -> SiemConfig:
         syslog_host=config.siem_syslog_host,
         syslog_port=config.siem_syslog_port,
         syslog_proto=config.siem_syslog_proto,
+        syslog_timeout_seconds=config.siem_syslog_timeout_seconds,
         hec_url=config.siem_hec_url,
         hec_token=hec_token,
         hec_index=config.siem_hec_index,

@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-16 external scan (four findings)
+
+First **full-repository** scan since the enrollment-lease work (the two before it
+were diff-scoped). Three medium, one low; all four real, all four fixed, none
+reclassified. See `docs/security-review-2026-08-16.md`.
+
+- **CRL retrieval no longer blocks the event loop (finding 1).** The confirm
+  handler is `async def` and fetched the CRL inline, so a slow endpoint stalled
+  every ACME route in the single-process deployment — the same defect the
+  enrollment leg was fixed for, on a path that was missed. It now runs via
+  `run_in_threadpool`, and an already-confirmed serial short-circuits **before**
+  any network work instead of refetching on every retry.
+- **Syslog delivery is bounded like HEC (finding 2).** TCP syslog — the shipped
+  production setting — emitted synchronously on the issuance path with no socket
+  deadline and no queue bound, so a stalled receiver blocked issuance. Both
+  off-box sinks now share one bounded queue with drop accounting, and the TCP
+  handler has a socket timeout. New `ACME_RA_SIEM_SYSLOG_TIMEOUT_SECONDS`
+  (default 5s).
+- **The installer no longer resolves anything live (finding 3).** It
+  hash-verified the runtime closure while upgrading pip from a live index and
+  building through PEP 517 isolation with an unpinned `hatchling`, both elevated
+  on an issuance-path host. The pip upgrade is removed (replaced by a version
+  floor check), a hash-pinned `deploy/build-requirements.lock.txt` carries the
+  build closure, and the project builds with `--no-build-isolation`. Verified to
+  build with `--no-index`.
+- **`removeFromCRL` is no longer proof of revocation (finding 4).** CRL evidence
+  read entry existence only, so a validly signed `removeFromCRL` entry — which
+  means a certificate came OFF hold — could satisfy `require_crl_evidence`, drain
+  a live certificate from the pending-revocation queue, and record
+  `crl-verified`. Reason 8 now returns "not revoked", and a delta CRL
+  (`DeltaCRLIndicator`) is refused as standalone evidence. An absent reason still
+  counts as revoked (`unspecified`).
+
 ### Security — 2026-08-15 hardening rescan (one finding)
 
 A rescan (Codex, with Daybreak Blue) of the two commits below, `5468e0f..f1fd80a`

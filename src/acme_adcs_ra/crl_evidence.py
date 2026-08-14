@@ -239,12 +239,68 @@ def fetch_crl_evidence(
     except x509.ExtensionNotFound:
         pass
 
+    # A delta CRL is not standalone evidence. It carries only the CHANGES since
+    # its base CRL, and it is the one document where `removeFromCRL` is allowed
+    # to appear (RFC 5280 §5.3.1) — an entry there can mean "this certificate
+    # came OFF the revocation list". Treating a delta as a base CRL therefore
+    # gets the answer backwards in exactly the case that matters. The RA has no
+    # base CRL to apply it to, so it refuses to draw a conclusion.
+    try:
+        crl.extensions.get_extension_for_class(x509.DeltaCRLIndicator)
+    except x509.ExtensionNotFound:
+        pass
+    else:
+        return CrlEvidence(
+            revoked=False,
+            checked=False,
+            detail=(
+                "CRL is a delta CRL (DeltaCRLIndicator present); it lists only "
+                "changes since a base CRL and cannot prove a serial's current "
+                "revocation state. Point revocation_confirm_crl_url at the base CRL."
+            ),
+            crl_number=crl_number,
+            this_update=this_update.isoformat() if this_update else None,
+            next_update=next_update.isoformat() if next_update else None,
+        )
+
     entry = crl.get_revoked_certificate_by_serial_number(serial_number)
+
+    # Presence on a CRL is not the same as being revoked. `removeFromCRL`
+    # (reason 8) means the opposite: a certificate that was on hold has been
+    # REINSTATED, and relying parties should stop treating it as revoked. The
+    # RA already refuses reason 8 on the ACME revoke route for this reason
+    # (2026-08-14 F3); accepting it as *evidence* of revocation is the same
+    # defect facing the other way, and it would drain a still-valid certificate
+    # off the pending-revocation queue while recording `crl-verified`.
+    #
+    # This state is reachable in practice, not hypothetically: `certutil
+    # -revoke <serial> 8` after a hold is the documented un-hold, and it is how
+    # this project's own lab has released test certificates.
+    reason: x509.ReasonFlags | None = None
+    if entry is not None:
+        try:
+            reason = entry.extensions.get_extension_for_class(x509.CRLReason).value.reason
+        except x509.ExtensionNotFound:
+            reason = None  # absent reason means unspecified, which IS a revocation
+
+    if entry is not None and reason is x509.ReasonFlags.remove_from_crl:
+        return CrlEvidence(
+            revoked=False,
+            checked=True,
+            detail=(
+                "serial is listed on the CRL with reason removeFromCRL, which "
+                "means the certificate was taken OFF hold and is NOT revoked"
+            ),
+            crl_number=crl_number,
+            this_update=this_update.isoformat() if this_update else None,
+            next_update=next_update.isoformat() if next_update else None,
+        )
+
     return CrlEvidence(
         revoked=entry is not None,
         checked=True,
         detail=(
-            "serial is listed on the CRL"
+            f"serial is listed on the CRL (reason={reason.name if reason else 'unspecified'})"
             if entry is not None
             else "serial is NOT listed on the CRL"
         ),

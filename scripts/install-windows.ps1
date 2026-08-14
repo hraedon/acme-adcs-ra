@@ -365,7 +365,27 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "  venv verified: $venvProbe"
 
 Write-Host "Installing acme-adcs-ra ..."
-& $venvPy -m pip install --upgrade pip | Out-Null
+
+# NO `pip install --upgrade pip` here, deliberately.
+#
+# It fetched and executed an unpinned, unhashed pip from a live index, as
+# Administrator, on an issuance-path host — while the very next commands went to
+# great lengths to hash-verify everything else. The venv's bundled pip is the one
+# CI's flow uses and is sufficient; a floor check is enough to catch a genuinely
+# ancient interpreter without reaching for the network.
+$pipVerRaw = (& $venvPy -m pip --version) 2>&1
+if ($pipVerRaw -match 'pip\s+(\d+)\.') {
+    $pipMajor = [int]$Matches[1]
+    Write-Host "  pip: $pipVerRaw"
+    if ($pipMajor -lt 23) {
+        throw ("Bundled pip is too old for --require-hashes with modern wheels " +
+               "(found: $pipVerRaw). Use a newer Python, or supply an approved pip " +
+               "wheel offline and install it with --no-index. Do NOT upgrade pip " +
+               "from a live index on an issuance-path host.")
+    }
+} else {
+    Write-Host "  [warn] could not parse pip version: $pipVerRaw"
+}
 
 # Dependencies come from the hash-pinned closure, NOT from a live resolve.
 #
@@ -385,7 +405,29 @@ if (Test-Path $lockFile) {
                "an unpinned install on an issuance-path host: regenerate the lock file " +
                "(uv export --locked ...) for this platform and Python version instead.")
     }
-    & $venvPy -m pip install --no-deps --upgrade $repoRoot
+    # The BUILD closure is pinned too, not just the runtime one.
+    #
+    # `pip install <repoRoot>` builds through PEP 517 isolation by default,
+    # which resolves `[build-system] requires = ["hatchling"]` from the index at
+    # install time — unversioned, unhashed, running as Administrator. The
+    # runtime pinning above made that easy to miss: everything in the install
+    # log was hash-verified, and the build closure never appeared in the log.
+    # Preinstall it by hash, then build with isolation OFF so nothing is fetched.
+    $buildLock = Join-Path $repoRoot "deploy\build-requirements.lock.txt"
+    if (-not (Test-Path $buildLock)) {
+        throw ("deploy/build-requirements.lock.txt is missing. It pins the PEP 517 " +
+               "build closure by hash and is required for an issuance-path install. " +
+               "Copy the full repository, or regenerate it (see the file header).")
+    }
+    Write-Host "  Installing pinned build closure from deploy/build-requirements.lock.txt ..."
+    & $venvPy -m pip install --require-hashes --only-binary :all: -r $buildLock
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Pinned build-closure install failed (exit $LASTEXITCODE). Do NOT fall " +
+               "back to an isolated build on an issuance-path host: that resolves the " +
+               "build backend from the index unpinned. Regenerate the lock for this " +
+               "platform and Python version instead.")
+    }
+    & $venvPy -m pip install --no-deps --no-build-isolation --upgrade $repoRoot
     if ($LASTEXITCODE -ne 0) { throw "pip install of acme-adcs-ra failed (exit $LASTEXITCODE)." }
 } else {
     # The lock file ships with the repo; its absence means an incomplete copy.

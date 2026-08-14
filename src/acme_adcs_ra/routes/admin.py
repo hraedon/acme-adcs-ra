@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from acme_adcs_ra.acme_errors import malformed, not_found, unauthorized
 from acme_adcs_ra.app_state import (
@@ -413,11 +414,30 @@ async def confirm_ca_revocation(
         )
         raise malformed("certificate is not revoked in the RA store")
 
+    # Idempotence BEFORE any external I/O. A repeat confirmation for a serial
+    # that is already reconciled has nothing to learn from the CRL, and fetching
+    # anyway turned a retry loop on the revocation host into repeated outbound
+    # requests on the issuance path.
+    if cert.ca_crl_updated:
+        return JSONResponse(content={
+            "serial": serial_upper,
+            "ca_crl_updated": True,
+            "verification": AGENT_ASSERTED,
+        })
+
     # Independent evidence, where the operator has configured it. The RA cannot
     # ask the CA whether it revoked something, but a CRL is signed by the CA and
     # readable by anyone — it is the one check that does not rest on the calling
     # agent's honesty.
-    evidence = _crl_evidence_for(ctx, cert)
+    #
+    # On a worker thread, never inline. This handler is `async def`, so FastAPI
+    # runs it ON the event loop, and the evidence check is a synchronous
+    # `requests` fetch of an operator-configured URL followed by signature and
+    # parse work. Called inline, a slow or trickling CRL endpoint stalled every
+    # other request in the process for the whole timeout — the same
+    # single-process event-loop starvation the enrollment leg was moved off the
+    # loop to avoid, on a path that had been missed.
+    evidence = await run_in_threadpool(_crl_evidence_for, ctx, cert)
     if ctx.config.revocation_confirm_require_crl_evidence and not (
         evidence is not None and evidence.revoked
     ):

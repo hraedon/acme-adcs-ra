@@ -178,6 +178,9 @@ class RAConfig(BaseSettings):
     siem_syslog_host: str = ""
     siem_syslog_port: int = 514
     siem_syslog_proto: Literal["udp", "tcp"] = "udp"
+    # Seconds a TCP syslog send may block before being abandoned. A stalled
+    # receiver would otherwise park the sender indefinitely; see SiemEmitter.
+    siem_syslog_timeout_seconds: float = Field(default=5.0, gt=0)
     siem_hec_url: str = ""
     siem_hec_token: SecretStr = Field(default_factory=lambda: SecretStr(""))
     siem_hec_index: str = ""

@@ -330,8 +330,8 @@ class TestHecQueueBound:
             for i in range(2000):
                 emitter.export({"event_type": "probe", "n": i})
             # The bound holds exactly, and everything past it is counted.
-            assert emitter._hec_inflight <= 25
-            assert emitter.hec_dropped == 2000 - 25
+            assert emitter._sink_inflight <= 25
+            assert emitter.sink_dropped == 2000 - 25
         finally:
             release.set()
             emitter.close()
