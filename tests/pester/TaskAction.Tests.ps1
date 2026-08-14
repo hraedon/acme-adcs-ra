@@ -2,165 +2,203 @@ BeforeAll {
     . "$PSScriptRoot/../../scripts/lib/TaskActionLib.ps1"
 }
 
+# 2026-08-19 F2/F4 rewrote how these actions carry credentials and values.
+# Tokens are no longer interpolated into the task text at all -- the action
+# loads them from the ACL'd dotenv at run time -- so the tests that used to
+# assert a token IS present now assert the opposite, which is the property that
+# matters. Every field is escaped for its single-quoted literal.
 Describe 'Build-SyncActionCommand' {
     BeforeAll {
         $script:baseUrl = 'https://ra.WORK-DOMAIN.local'
-        $script:token = 'test-admin-token-abc123'
         $script:caConfig = 'CA01\WORK-DOMAIN-CA'
         $script:scriptPath = '/opt/scripts/Sync-Revocations.ps1'
         $script:requester = 'WORK-DOMAIN\gMSA-acme-ra$'
+        $script:dotenv = 'C:\ProgramData\acme-adcs-ra\acme-ra.env'
+        $script:common = @{
+            BaseUrl = $script:baseUrl; CaConfigStr = $script:caConfig
+            Local = $false; DryRunMode = $false; ScriptPath = $script:scriptPath
+            Requester = $script:requester; PublishCrlMode = $false
+            DotEnvPath = $script:dotenv
+        }
     }
 
     It 'Output contains NO double quotes (single-quote-only invariant)' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
+        $cmd = Build-SyncActionCommand @script:common
         $cmd | Should -Not -Match '"'
     }
 
-    It 'Routes the token via $env:ACME_ADMIN_TOKEN (never -AdminToken)' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
-        $cmd | Should -Match '\$env:ACME_ADMIN_TOKEN'
+    It 'Never passes a token as a parameter' {
+        $cmd = Build-SyncActionCommand @script:common -LoadAdminToken $true -LoadConfirmToken $true
         $cmd | Should -Not -Match '-AdminToken'
+        $cmd | Should -Not -Match '-ConfirmToken'
+    }
+
+    It 'Loads the admin token from the dotenv rather than embedding it' {
+        $cmd = Build-SyncActionCommand @script:common -LoadAdminToken $true
+        $cmd | Should -Match '\$env:ACME_ADMIN_TOKEN'
+        $cmd | Should -Match 'ACME_RA_ADMIN_TOKEN='
+        $cmd.Contains($script:dotenv) | Should -BeTrue
+    }
+
+    It 'Loads the confirm token from the dotenv' {
+        $cmd = Build-SyncActionCommand @script:common -LoadConfirmToken $true
+        $cmd | Should -Match '\$env:ACME_CONFIRM_TOKEN'
+        $cmd | Should -Match 'ACME_RA_REVOCATION_CONFIRM_TOKEN='
     }
 
     It 'Contains -RequesterName with the passed requester' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
+        $cmd = Build-SyncActionCommand @script:common
         $cmd.Contains("-RequesterName 'WORK-DOMAIN\gMSA-acme-ra`$'") | Should -BeTrue
     }
 
     It 'With -LocalMode: contains -LocalMode' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $true -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
+        $cmd = Build-SyncActionCommand @script:common -Local $true
         $cmd | Should -Match '-LocalMode'
     }
 
     It 'Without -LocalMode: does NOT contain -LocalMode' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
-        $cmd | Should -Not -Match '-LocalMode'
+        (Build-SyncActionCommand @script:common) | Should -Not -Match '-LocalMode'
     }
 
     It 'With -DryRun: contains -DryRun and does NOT contain -Execute' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $true -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
+        $cmd = Build-SyncActionCommand @script:common -DryRunMode $true
         $cmd | Should -Match '-DryRun'
         $cmd | Should -Not -Match '-Execute'
     }
 
     It 'With -Execute (not DryRun): contains -Execute and does NOT contain -DryRun' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
+        $cmd = Build-SyncActionCommand @script:common
         $cmd | Should -Match '-Execute'
         $cmd | Should -Not -Match '-DryRun'
     }
 
     It 'With -PublishCrl: contains -PublishCrl' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $true
-        $cmd | Should -Match '-PublishCrl'
+        (Build-SyncActionCommand @script:common -PublishCrlMode $true) | Should -Match '-PublishCrl'
     }
 
     It 'Without -PublishCrl: does NOT contain -PublishCrl' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
-        $cmd | Should -Not -Match '-PublishCrl'
+        (Build-SyncActionCommand @script:common) | Should -Not -Match '-PublishCrl'
     }
 
     It 'Contains -CaConfig with the passed config' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
-        $cmd.Contains("-CaConfig 'CA01\WORK-DOMAIN-CA'") | Should -BeTrue
+        (Build-SyncActionCommand @script:common).Contains("-CaConfig 'CA01\WORK-DOMAIN-CA'") | Should -BeTrue
     }
 
     It 'Contains exit $LASTEXITCODE at the end' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
-        $cmd | Should -Match 'exit \$LASTEXITCODE$'
+        (Build-SyncActionCommand @script:common) | Should -Match 'exit \$LASTEXITCODE$'
     }
 
     It 'The script path is single-quoted in the output' {
-        $cmd = Build-SyncActionCommand -BaseUrl $script:baseUrl -Token $script:token -CaConfigStr $script:caConfig -Local $false -DryRunMode $false -ScriptPath $script:scriptPath -Requester $script:requester -PublishCrlMode $false
-        $cmd.Contains("& '/opt/scripts/Sync-Revocations.ps1'") | Should -BeTrue
+        (Build-SyncActionCommand @script:common).Contains("& '/opt/scripts/Sync-Revocations.ps1'") | Should -BeTrue
     }
 }
 
 Describe 'Build-ActionScriptBlock' {
     BeforeAll {
-        $script:endpointUrl = 'https://ra.WORK-DOMAIN.local/acme/admin/nonces'
-        $script:token = 'test-admin-token-xyz789'
-        $script:result = Build-ActionScriptBlock -EndpointUrl $script:endpointUrl -Token $script:token
+        $script:url = 'https://ra.WORK-DOMAIN.local/acme/admin/nonces'
+        $script:dotenv = 'C:\ProgramData\acme-adcs-ra\acme-ra.env'
     }
 
     It 'Output contains the endpoint URL' {
-        $script:result.Contains($script:endpointUrl) | Should -BeTrue
+        (Build-ActionScriptBlock $script:url $script:dotenv).Contains($script:url) | Should -BeTrue
     }
 
-    It 'Output contains Bearer followed by the token' {
-        $script:result | Should -Match "Bearer $script:token"
+    It 'Reads the bearer token from the dotenv instead of embedding it' {
+        $s = Build-ActionScriptBlock $script:url $script:dotenv
+        $s | Should -Match 'ACME_RA_ADMIN_TOKEN='
+        $s.Contains($script:dotenv) | Should -BeTrue
+        # The header is built from the runtime variable, not a literal.
+        $s | Should -Match 'Bearer \$tok'
     }
 
     It 'Output contains Invoke-RestMethod -Method Delete' {
-        $script:result | Should -Match 'Invoke-RestMethod -Method Delete'
+        (Build-ActionScriptBlock $script:url $script:dotenv) | Should -Match 'Invoke-RestMethod -Method Delete'
     }
 
     It 'Output contains -TimeoutSec 60' {
-        $script:result | Should -Match '-TimeoutSec 60'
+        (Build-ActionScriptBlock $script:url $script:dotenv) | Should -Match '-TimeoutSec 60'
+    }
+
+    It 'Fails closed when the dotenv has no admin token' {
+        (Build-ActionScriptBlock $script:url $script:dotenv) | Should -Match 'exit 1'
     }
 }
 
-Describe 'Build-SyncActionCommand confirm token' {
-    # 2026-08-13 review, finding 1: the RA refuses the general admin token on
-    # the confirm endpoint, so the sync task must carry a dedicated credential.
-
-    It 'Injects ACME_CONFIRM_TOKEN when a confirm token is supplied' {
-        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token 'admin-tok' `
-            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
-            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
-            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
-        $cmd | Should -BeLike "*`$env:ACME_CONFIRM_TOKEN = 'confirm-tok'*"
-        $cmd | Should -BeLike "*`$env:ACME_ADMIN_TOKEN = 'admin-tok'*"
+# 2026-08-19 F2 (medium, CWE-214). The task definition is persisted by Task
+# Scheduler and handed to powershell.exe -Command, so anything interpolated into
+# it is readable by a local task/process observer. These assert the absence of
+# the secret, which is the only assertion that actually protects it.
+Describe 'Build-SyncActionCommand credential secrecy' {
+    BeforeAll {
+        $script:secret = 'S3CR3T-admin-token-do-not-leak-abc123'
+        $script:confirmSecret = 'S3CR3T-confirm-token-do-not-leak-xyz789'
+        $script:args2 = @{
+            BaseUrl = 'https://ra.WORK-DOMAIN.local'; CaConfigStr = 'CA01\WORK-DOMAIN-CA'
+            Local = $true; DryRunMode = $false; ScriptPath = '/opt/s.ps1'
+            Requester = 'WORK-DOMAIN\gMSA$'; PublishCrlMode = $false
+            DotEnvPath = 'C:\ProgramData\acme-adcs-ra\acme-ra.env'
+        }
     }
 
-    It 'Omits ACME_CONFIRM_TOKEN when no confirm token is supplied' {
-        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token 'admin-tok' `
-            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
-            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
-            -PublishCrlMode $false
-        $cmd | Should -Not -BeLike '*ACME_CONFIRM_TOKEN*'
+    It 'Contains no bytes of any token, because none is passed to the builder' {
+        # The builder has no token parameter at all now -- the strongest form of
+        # this guarantee. Splatting a token key would be a parameter-binding
+        # error, so the secret cannot reach the action even by mistake.
+        $cmd = Build-SyncActionCommand @script:args2 -LoadAdminToken $true -LoadConfirmToken $true
+        $cmd.Contains($script:secret) | Should -BeFalse
+        $cmd.Contains($script:confirmSecret) | Should -BeFalse
+        (Get-Command Build-SyncActionCommand).Parameters.Keys | Should -Not -Contain 'Token'
+        (Get-Command Build-SyncActionCommand).Parameters.Keys | Should -Not -Contain 'ConfirmTokenValue'
     }
 
-    It 'Still contains no double quotes with the confirm token present' {
-        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token 'admin-tok' `
-            -CaConfigStr 'CA01\TEST-CA' -Local $true -DryRunMode $false `
-            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
-            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
-        $cmd | Should -Not -BeLike '*"*'
+    It 'Omits the admin-token load entirely in confirm-only mode' {
+        $cmd = Build-SyncActionCommand @script:args2 -LoadAdminToken $false -LoadConfirmToken $true
+        $cmd | Should -Not -Match 'ACME_ADMIN_TOKEN'
+        $cmd | Should -Match 'ACME_CONFIRM_TOKEN'
+    }
+
+    It 'Still contains no double quotes with both loads present' {
+        (Build-SyncActionCommand @script:args2 -LoadAdminToken $true -LoadConfirmToken $true) |
+            Should -Not -Match '"'
     }
 }
 
-Describe 'Build-SyncActionCommand confirm-only least privilege' {
-    # 2026-08-15 review, finding 3: a dedicated revocation host registered with
-    # only a confirm token must get a task action carrying ZERO admin-token
-    # bytes. The confirm token alone is sufficient authority for the whole sync
-    # workflow; embedding the admin token would grant unrelated maintenance
-    # authority (order reclaim, nonce drain) on the separate host.
-
-    It 'Omits ACME_ADMIN_TOKEN entirely when no admin token is supplied' {
-        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token '' `
-            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
-            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
-            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
-        $cmd | Should -Not -BeLike '*ACME_ADMIN_TOKEN*'
+# 2026-08-19 F4 (low, CWE-78). Values were pasted between bare single quotes
+# under an "assume no single quote" comment that nothing enforced.
+Describe 'ConvertTo-PsSingleQuotedLiteral' {
+    It 'wraps an ordinary value' {
+        ConvertTo-PsSingleQuotedLiteral 'plain' | Should -Be "'plain'"
     }
 
-    It 'Contains no bytes of a would-be admin token in confirm-only mode' {
-        $adminSecret = 'super-secret-admin-token-deadbeef'
-        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token '' `
-            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
-            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
-            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
-        # The confirm token IS present; the admin secret must not be.
-        $cmd | Should -BeLike "*`$env:ACME_CONFIRM_TOKEN = 'confirm-tok'*"
-        $cmd.Contains($adminSecret) | Should -BeFalse
+    It 'doubles an embedded single quote so the literal cannot be closed' {
+        ConvertTo-PsSingleQuotedLiteral "it's" | Should -Be "'it''s'"
     }
 
-    It 'Still invokes the sync script with -Execute in confirm-only mode' {
-        $cmd = Build-SyncActionCommand -BaseUrl 'https://ra.example.local' -Token '' `
-            -CaConfigStr 'CA01\TEST-CA' -Local $false -DryRunMode $false `
-            -ScriptPath 'C:\s\Sync-Revocations.ps1' -Requester 'CONTOSO\gMSA-acme-ra$' `
-            -PublishCrlMode $false -ConfirmTokenValue 'confirm-tok'
-        $cmd.Contains("& 'C:\s\Sync-Revocations.ps1'") | Should -BeTrue
-        $cmd | Should -Match '-Execute'
+    It 'neutralises a quote-break injection payload' {
+        # Without escaping this closes the literal and runs Stop-Service.
+        $evil = "x'; Stop-Service certsvc; '"
+        $lit = ConvertTo-PsSingleQuotedLiteral $evil
+        $lit | Should -Be "'x''; Stop-Service certsvc; '''"
+        # Round-trip: PowerShell must parse it back to the ORIGINAL string,
+        # which is what proves it became data rather than code.
+        (Invoke-Expression $lit) | Should -Be $evil
+    }
+
+    It 'handles empty and null' {
+        ConvertTo-PsSingleQuotedLiteral '' | Should -Be "''"
+        ConvertTo-PsSingleQuotedLiteral $null | Should -Be "''"
+    }
+}
+
+Describe 'Build-SyncActionCommand injection resistance' {
+    It 'keeps an injected quote inside the literal for every field' {
+        $evil = "x'; Stop-Service certsvc; '"
+        $cmd = Build-SyncActionCommand -BaseUrl $evil -CaConfigStr $evil -Local $false `
+            -DryRunMode $false -ScriptPath '/opt/s.ps1' -Requester $evil -PublishCrlMode $false `
+            -DotEnvPath 'C:\ProgramData\acme-adcs-ra\acme-ra.env'
+        # The payload must never appear as bare, parseable source.
+        $cmd | Should -Not -Match "x'; Stop-Service certsvc; ';"
+        # Each occurrence must be the escaped form.
+        $cmd | Should -Match "x''; Stop-Service certsvc; ''"
     }
 }

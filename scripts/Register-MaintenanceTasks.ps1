@@ -10,11 +10,14 @@
       - acme-adcs-ra-nonce-cleanup        -> DELETE /acme/admin/nonces
       - acme-adcs-ra-expired-order-sweep -> DELETE /acme/admin/expired-orders
 
-    Both endpoints require the admin Bearer token (ACME_RA_ADMIN_TOKEN). The
-    token is passed as a SecureString parameter and embedded in the task
-    action's Invoke-RestMethod headers -- it is NOT written to a file the
-    task reads, and it is NOT logged. Treat the token like an EAB MAC key
-    (see docs/operations.md ## Admin token and reclaim runbook).
+    Both endpoints require the admin Bearer token (ACME_RA_ADMIN_TOKEN).
+    Since 2026-08-19 F2 the token is NOT written into the task definition:
+    the action reads it at run time from the RA's dotenv (-DotEnvPath), which
+    the installer ACLs to Administrators/SYSTEM full and the task's gMSA
+    read-only. A task definition therefore carries a file path, not a
+    credential, and the secret never reaches a process command line. Treat the
+    token like an EAB MAC key (see docs/operations.md ## Admin token and
+    reclaim runbook).
 
     Optionally (-RegisterRevocationSync), a third task --
     acme-adcs-ra-sync-revocations -- runs the CA-side revocation pull agent
@@ -33,13 +36,13 @@
     Must match ACME_RA_BASE_URL -- the admin endpoints are under /acme/admin/.
 
 .PARAMETER AdminToken
-    The admin Bearer token (high-entropy, >=256 bits). Passed as a plain
-    string or SecureString. For the nonce/sweep tasks it is embedded in the
-    task action's Invoke-RestMethod headers; for the revocation-sync task
-    (-RegisterRevocationSync) it is set as the ACME_ADMIN_TOKEN environment
-    variable in the task action (so it never lands on Sync-Revocations.ps1's
-    process command line). Either way it lives in the registered task, not in
-    a file the task reads. Do NOT commit this value -- supply it at install time.
+    The admin Bearer token (high-entropy, >=256 bits). Since 2026-08-19 F2 the
+    VALUE is no longer embedded anywhere: supplying it declares that this host
+    should have admin authority, and the generated task action loads
+    ACME_RA_ADMIN_TOKEN from -DotEnvPath at run time. Omitting it emits no
+    admin-token load at all, which is how a dedicated revocation host keeps
+    least privilege. The value must already be present in the RA's dotenv.
+    Do NOT commit this value -- supply it at install time.
 
 .PARAMETER IntervalMinutes
     Cadence in minutes for both tasks (default 15).
@@ -149,7 +152,13 @@ param(
     [switch]$LocalMode,
     [switch]$DryRun,
     [switch]$PublishCrl,
-    [switch]$AllowInsecureUrl
+    [switch]$AllowInsecureUrl,
+    # Where the task reads its credentials AT RUN TIME (2026-08-19 F2). The
+    # tokens are no longer written into the task definition; the action loads
+    # them from this file, which the installer ACLs to Administrators/SYSTEM
+    # full and the task's gMSA read-only. -AdminToken / -ConfirmToken are still
+    # accepted, but now only declare WHICH keys the action should load.
+    [string]$DotEnvPath = "C:\ProgramData\acme-adcs-ra\acme-ra.env"
 )
 
 $ErrorActionPreference = "Stop"
@@ -245,7 +254,7 @@ function Register-OrUpdate-Task([hashtable]$TaskDef) {
     $taskName = $TaskDef.Name
     $fullName = "$TaskFolder$taskName"
     $url = "$base$($TaskDef.Path)"
-    $actionScript = Build-ActionScriptBlock $url $AdminToken
+    $actionScript = Build-ActionScriptBlock $url $DotEnvPath
 
     if ($PSCmdlet.ShouldProcess($fullName, "Register scheduled task")) {
         # Idempotent: unregister the existing task if present, then register.
@@ -306,7 +315,13 @@ function Register-RevocationSyncTask {
         exit 1
     }
 
-    $actionScript = Build-SyncActionCommand -BaseUrl $base -Token $AdminToken -CaConfigStr $CaConfig -Local $LocalMode -DryRunMode $DryRun -ScriptPath $syncScriptPath -Requester $RequesterName -PublishCrlMode $PublishCrl -ConfirmTokenValue $ConfirmToken
+    # Which KEYS the action loads is what preserves least privilege now -- the
+    # secrets themselves never enter the task definition (2026-08-19 F2).
+    $actionScript = Build-SyncActionCommand -BaseUrl $base -CaConfigStr $CaConfig `
+        -Local $LocalMode -DryRunMode $DryRun -ScriptPath $syncScriptPath `
+        -Requester $RequesterName -PublishCrlMode $PublishCrl -DotEnvPath $DotEnvPath `
+        -LoadAdminToken (-not [string]::IsNullOrWhiteSpace($AdminToken)) `
+        -LoadConfirmToken (-not [string]::IsNullOrWhiteSpace($ConfirmToken))
 
     if ([string]::IsNullOrWhiteSpace($ConfirmToken)) {
         Write-Warning ("No -ConfirmToken supplied. The RA refuses the general admin token on the " +

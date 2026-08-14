@@ -39,6 +39,18 @@ def main() -> int:
         max_authorizations_per_order=config.max_identifiers_per_order,
     )
     policy = _build_policy(config)
+    # Fake ADCS legs are a dev/CI convenience and must never be selected by
+    # accident on a host that thinks it is production (2026-08-19, additional
+    # improvement). Below, a non-Windows platform silently gets FakeEnrollmentLeg
+    # -- an RA that answers ACME and issues nothing real, while looking healthy.
+    # Require the operator to say so out loud.
+    if sys.platform != "win32" and not config.allow_fake_adcs_backends:
+        raise SystemExit(
+            "Refusing to start: this is not Windows, so the ADCS enrollment and "
+            "revocation legs would be FAKE -- the RA would answer ACME and issue "
+            "nothing real. Set ACME_RA_ALLOW_FAKE_ADCS_BACKENDS=true for dev/CI, "
+            "or run on the supported Windows/IIS platform."
+        )
     # Use the real ADCS legs on Windows (Negotiate/SSPI as the gMSA), otherwise
     # the fake legs.  For dev/CI on Linux this always selects Fake*Leg.
     enrollment: FakeEnrollmentLeg | CertsrvEnrollmentLeg = (
@@ -95,6 +107,11 @@ def main() -> int:
         ssl_keyfile=ssl_keyfile,
         proxy_headers=config.trust_proxy,
         forwarded_allow_ips=config.forwarded_allow_ips,
+        # Bound concurrent requests (2026-08-19 F3). Uvicorn answers 503 past
+        # this instead of accepting unboundedly; behind IIS the proxy's own
+        # limit applies first, so this only binds in the direct-TLS topology
+        # that previously had no ceiling at all.
+        limit_concurrency=config.server_max_concurrency,
     )
     return 0
 

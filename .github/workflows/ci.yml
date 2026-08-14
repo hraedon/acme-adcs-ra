@@ -133,8 +133,27 @@ jobs:
   pester:
     # PowerShell pure-logic tests (WI-037): golden-bytes blob builder,
     # action-string builder, reason/requester validation, exit-code contract.
-    # Runs on the Linux runner under pwsh — no Windows/CA needed.
-    runs-on: ubuntu-latest
+    #
+    # Two runners, deliberately (2026-08-19). pwsh 7 on Linux is the fast
+    # feedback loop, but every one of these scripts RUNS on Windows PowerShell
+    # 5.1 in production -- install-windows.ps1 says so in its own style header,
+    # and 5.1 differs in ways this suite is exactly the wrong size to notice by
+    # inspection (no ternary, no ??, different native-stderr handling, ANSI
+    # codepage parsing). The 2026-08-14 live re-proof found two defects in this
+    # very code that CI could not see; running the suite where it ships is the
+    # cheapest part of closing that gap.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            shell: pwsh
+            label: pwsh7-linux
+          - runner: windows-latest
+            shell: powershell
+            label: winps5.1
+    name: pester (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -143,7 +162,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Pester
-        shell: pwsh
+        shell: ${{ matrix.shell }}
         # Pinned (not -MinimumVersion): a floating linter/test-framework version
         # is the same non-determinism WI-039 removed for ruff/mypy. 5.7.1 is the
         # mature stable; the suite is verified green on 5.7.1 and 6.0.0. Bump
@@ -151,7 +170,7 @@ jobs:
         run: Install-Module -Name Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
 
       - name: Run Pester tests
-        shell: pwsh
+        shell: ${{ matrix.shell }}
         run: |
           Import-Module Pester -RequiredVersion 5.7.1 -Force
           $config = New-PesterConfiguration

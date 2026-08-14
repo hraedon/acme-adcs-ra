@@ -1169,6 +1169,83 @@ class Store:
         with self._connect() as conn:
             return conn.execute(sql, params).rowcount == 1
 
+    def reclaim_processing_order(
+        self,
+        order_id: str,
+        *,
+        to_valid_certificate_url: str | None = None,
+        expected_generation: int | None = None,
+        pending_req_id: str | None = None,
+        audit_event_type: str,
+        audit_account_id: str | None = None,
+        audit_outcome: str,
+        audit_details: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Reclaim a wedged order: transition, marker clear and audit, atomically.
+
+        2026-08-19 F5 (low, CWE-362). The admin reclaim route used to call
+        ``transition_processing_to_ready``/``_to_valid``, then
+        ``clear_pending_ca_request``, then ``record_audit`` — three separate
+        commits. An interruption between them left the order reopened with the
+        CA-request marker still set (so the next operator sees a pending ReqID
+        that has already been discharged), or reopened with **no
+        ``admin-order-reclaimed`` event at all** — an administrative state
+        change to an issuance-path order with nothing in the audit trail saying
+        who did it or why. This is the same shape, and the same fix, as the
+        revocation-confirm path above.
+
+        One ``BEGIN IMMEDIATE`` covers all three, so either the order stays
+        wedged and the operator retries, or it is reclaimed *and* the marker is
+        cleared *and* the action is audited. SIEM fan-out stays outside, as it
+        does everywhere else: best-effort, and must not hold the write open.
+
+        ``to_valid_certificate_url`` selects the destination: supplied means the
+        certificate exists and the order becomes ``valid``; omitted means it
+        becomes ``ready`` for re-enrollment. The CAS is scoped to
+        ``expected_generation`` exactly as the individual transitions were.
+
+        Returns ``(won_cas, event)``; ``event`` is None when the CAS was lost,
+        which is the caller's "audit a denial and return current state" path.
+        """
+        updated_at = _now_iso()
+        if to_valid_certificate_url is not None:
+            sql, params = _processing_cas(
+                "UPDATE orders SET status = ?, certificate_url = ?, "
+                "processing_started_at = NULL, updated_at = ? "
+                "WHERE id = ? AND status = ?",
+                (OrderStatus.VALID, to_valid_certificate_url, updated_at,
+                 order_id, OrderStatus.PROCESSING),
+                expected_generation,
+            )
+        else:
+            sql, params = _processing_cas(
+                "UPDATE orders SET status = ?, processing_started_at = NULL, "
+                "updated_at = ? WHERE id = ? AND status = ?",
+                (OrderStatus.READY, updated_at, order_id, OrderStatus.PROCESSING),
+                expected_generation,
+            )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(sql, params).rowcount != 1:
+                return False, None
+            if pending_req_id:
+                # Still keyed on the ReqID: a marker replaced since the
+                # operator's assertion must survive, exactly as before.
+                conn.execute(
+                    "UPDATE orders SET pending_ca_request_id = NULL, updated_at = ? "
+                    "WHERE id = ? AND pending_ca_request_id = ?",
+                    (updated_at, order_id, pending_req_id),
+                )
+            event = self._record_audit_in_conn(
+                conn,
+                event_type=audit_event_type,
+                account_id=audit_account_id,
+                order_id=order_id,
+                outcome=audit_outcome,
+                details=audit_details,
+            )
+            return True, event
+
     def transition_processing_to_valid(
         self,
         order_id: str,

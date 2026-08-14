@@ -6,6 +6,7 @@ All values use placeholders (CA01, WORK-DOMAIN.local, etc.).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 
@@ -25,6 +26,9 @@ from acme_adcs_ra.policy import validate_dns_name
 # hand-typed ones.
 MIN_EAB_MAC_KEY_BYTES = 32
 MIN_ADMIN_TOKEN_CHARS = 32
+
+
+logger = logging.getLogger("acme_adcs_ra.config")
 
 
 class EABEntry(BaseModel):
@@ -93,6 +97,12 @@ class RAConfig(BaseSettings):
     # those heuristics and relies on locale-independent signals (ReqID,
     # certnew.cer URL) only — failing loudly if none match.
     adcs_locale: str = "en"
+
+    # --- Dev/CI escape hatch -------------------------------------------------
+    # Off by default. The entrypoint refuses to start on a non-Windows platform
+    # unless this is set, because the fake ADCS legs otherwise get selected
+    # silently and the RA looks healthy while issuing nothing real.
+    allow_fake_adcs_backends: bool = False
 
     # --- ACME server surface -------------------------------------------------
     base_url: str = "http://localhost:8000"
@@ -254,6 +264,13 @@ class RAConfig(BaseSettings):
     # never stops verifying, and `nextUpdate` is chosen by the CA, so neither
     # bounds replay of a pre-revocation view on its own.
     revocation_confirm_crl_max_age_seconds: int = 7 * 24 * 3600
+    # Ceiling on concurrently-served requests when the RA runs Uvicorn directly
+    # (2026-08-19 F3, CWE-400). Behind IIS the proxy imposes its own limit, but
+    # the direct-TLS topology is supported and had none: every slow client got a
+    # task, without bound. Uvicorn sheds past this with 503 rather than
+    # accumulating, which is the fail-closed direction for an issuance host.
+    server_max_concurrency: int = 256
+
     # Follow HTTP redirects when fetching the CRL. **Off by default** (2026-08-18
     # rescan F2). A `Location` is chosen by whoever answers the configured CDP,
     # so every redirect is attacker-influenced input, and a CDP that redirects at
@@ -274,6 +291,61 @@ class RAConfig(BaseSettings):
     # load-bearing. Set this to True ONLY for a lab or CI fixture; production
     # deployments must leave it False.
     allow_weak_credentials: bool = False
+
+    @model_validator(mode="after")
+    def _base_url_is_a_bare_origin(self) -> RAConfig:
+        """`base_url` must be a bare origin, and HTTPS off the loopback.
+
+        2026-08-19, additional improvement. Every ACME URL the RA hands out is
+        built from this value, and the JWS `url` check compares against it, so a
+        malformed one is not cosmetic: a path or query component silently
+        produces directory/order URLs the client then binds its signatures to,
+        and a plaintext origin publishes an issuance API over HTTP.
+
+        Loopback stays permissive — the committed default is
+        `http://localhost:8000` and the lab/dev flows depend on it — but any
+        other host must be HTTPS. This is a configuration guard, not a claim
+        about an attacker-controlled path.
+        """
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(self.base_url)
+        if parts.scheme not in ("http", "https"):
+            raise ValueError(
+                f"base_url must be http or https, got {parts.scheme!r}: {self.base_url}"
+            )
+        if not parts.netloc:
+            raise ValueError(f"base_url has no host: {self.base_url}")
+        # A trailing slash is the only path allowed; anything else changes every
+        # URL derived from it.
+        if parts.path not in ("", "/"):
+            raise ValueError(
+                "base_url must be a bare origin with no path component "
+                f"(got path {parts.path!r} in {self.base_url}). Every ACME URL "
+                "is derived from this value."
+            )
+        if parts.query or parts.fragment:
+            raise ValueError(
+                f"base_url must carry no query or fragment: {self.base_url}"
+            )
+        # The plaintext-origin check WARNS rather than refuses, deliberately.
+        # A structural defect (path/query/fragment) corrupts every URL derived
+        # from this value and is always wrong, so those raise. A plaintext
+        # scheme is a deployment mistake this cannot distinguish from a
+        # deliberate one: the whole test suite legitimately runs on
+        # `http://testserver`, and an operator terminating TLS elsewhere may
+        # have reasons the RA cannot see. Loud at startup, not fatal.
+        host = (parts.hostname or "").lower()
+        is_loopback = host in ("localhost", "127.0.0.1", "::1", "testserver")
+        if parts.scheme != "https" and not is_loopback:
+            logger.warning(
+                "base_url %s is not https. The RA publishes an issuance API and "
+                "every ACME URL it hands out will be plaintext. Set "
+                "ACME_RA_BASE_URL to the public https origin unless TLS is "
+                "terminated in front of this process.",
+                self.base_url,
+            )
+        return self
 
     @model_validator(mode="after")
     def _no_duplicate_eab_kids(self) -> RAConfig:

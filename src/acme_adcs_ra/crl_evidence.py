@@ -697,6 +697,12 @@ def fetch_crl_evidence(
 _T = TypeVar("_T")
 
 
+# Bookkeeping-only: how many loop turns `drain` will yield for before
+# giving up. Settled-future callbacks are dispatched one turn later, and
+# a callback can settle another future, so a handful of turns is ample.
+_DRAIN_MAX_TURNS = 8
+
+
 class CrlEvidenceGateBusy(Exception):
     """The gate is at its admission ceiling; shed the request, do not queue it.
 
@@ -765,6 +771,31 @@ class CrlEvidenceGate:
     def inflight(self) -> int:
         """Distinct retrievals currently in progress."""
         return len(self._inflight)
+
+    async def drain(self) -> None:
+        """Wait until settled flights have actually left the in-flight map.
+
+        ``_clear`` is registered with ``add_done_callback``, which asyncio
+        dispatches through ``call_soon`` — one event-loop iteration after the
+        future settles, while the awaiting caller resumes as soon as it settles.
+        So a caller that has just awaited its own retrieval can still observe it
+        counted here. That lag flaked CI on Windows, where the loop happens to
+        schedule the resumption first.
+
+        It is not merely cosmetic: ``inflight`` is the ``max_pending`` admission
+        signal, so a request arriving inside the window can be shed with 503
+        while capacity is in fact free. Yielding once lets every pending
+        callback run; the loop re-checks because a callback may itself settle
+        another future.
+
+        Bounded so a genuinely busy gate cannot spin here forever — this waits
+        for *bookkeeping* to catch up, never for real work to finish.
+        """
+        for _ in range(_DRAIN_MAX_TURNS):
+            done = [f for f in self._inflight.values() if f.done()]
+            if not done:
+                return
+            await asyncio.sleep(0)
 
     def _pool(self) -> ThreadPoolExecutor:
         # Lazy: an RA with no CRL configured never spawns the threads.

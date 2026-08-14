@@ -226,6 +226,40 @@ function Install-Prerequisites {
     Write-Host ""
 }
 
+# --- Claim the install root BEFORE anything under it is inspected (F1) -------
+#
+# 2026-08-19 F1 (high, CWE-426). This block used to run ~250 lines later, and
+# the Python discovery below preferred and EXECUTED
+# `$InstallDir\python\python.exe` before it. ProgramData\acme-adcs-ra is a
+# predictable path; a local user who pre-creates it plants an interpreter that
+# the elevated installer then runs as Administrator on an issuance host.
+#
+# So: create the directory (or validate an existing one), apply the restrictive
+# ACL, and only then let any later step read, trust or execute what is inside.
+# The gMSA's Modify grant is still applied later, once its SID is resolved --
+# this pass establishes Administrators/SYSTEM ownership of the namespace, which
+# is what makes the contents trustworthy.
+$script:installRootSecured = $false
+Write-Host "Claiming install root $InstallDir (before inspecting its contents) ..."
+$existing = Get-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue
+if ($null -ne $existing) {
+    if (-not (Test-InstallRootAttributesAcceptable $existing.Attributes)) {
+        throw ("Refusing to install into $InstallDir : it is a reparse point or not a directory " +
+               "(attributes: $($existing.Attributes)). A junction here would redirect every " +
+               "subsequent write, ACL and probe. Remove or relocate it and re-run.")
+    }
+} else {
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+}
+
+# Restrictive ACL first, gMSA added later. inheritance:r drops any inherited
+# grant a pre-created directory may have carried (the whole point: a tree the
+# attacker made is a tree whose ACL the attacker chose).
+icacls $InstallDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Failed to secure $InstallDir (icacls exit $LASTEXITCODE); refusing to continue." }
+$script:installRootSecured = $true
+Write-Host "  [ok]   install root secured (Administrators/SYSTEM full; contents now trustworthy)"
+
 if ($InstallPrereqs) { Install-Prerequisites }
 
 # Read-only prerequisite report (always) -- a quick green/red of what the app pool
@@ -283,8 +317,21 @@ function Invoke-PyProbe {
 }
 
 $launchers = @()
+# The destination-local interpreter is only a candidate once the install root
+# has been claimed and re-ACL'd above (2026-08-19 F1). Without that, this is an
+# attacker-plantable path being executed elevated; with it, the namespace is
+# Administrators/SYSTEM-only and its contents are ours. The interpreter itself
+# is still refused if it is a reparse point.
 $sharedCandidate = Join-Path $InstallDir "python\python.exe"
-if (Test-Path $sharedCandidate) { $launchers += @{ Exe = $sharedCandidate; Args = @() } }
+$sharedItem = Get-Item -LiteralPath $sharedCandidate -Force -ErrorAction SilentlyContinue
+if ($null -ne $sharedItem) {
+    if (Test-DestinationInterpreterTrusted -RootSecured $script:installRootSecured `
+                                           -InterpreterAttributes $sharedItem.Attributes) {
+        $launchers += @{ Exe = $sharedCandidate; Args = @() }
+    } else {
+        Write-Host "  [skip] $sharedCandidate -- destination interpreter not trusted (root secured: $($script:installRootSecured))"
+    }
+}
 $imRoot = Join-Path $env:LOCALAPPDATA "Python"
 foreach ($pc in (Get-ChildItem $imRoot -Filter "pythoncore-*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
     $p = Join-Path $pc.FullName "python.exe"
@@ -529,6 +576,13 @@ ACME_RA_SAN_SCOPES={"REPLACE-WITH-UUID":{"dns_patterns":["*.work-domain.local"]}
 }
 
 # --- ACLs: the worker runs AS THE gMSA, so grant the gMSA (not a virtual acct) -
+#
+# The root was already claimed with the Administrators/SYSTEM-only ACL at the
+# top of the run (2026-08-19 F1) -- that is what made everything under it
+# trustworthy. This pass re-asserts the same ACL and adds the gMSA's Modify,
+# which could not be granted earlier because the SID is resolved after the
+# prerequisite check. Deliberately the same icacls line plus one grant, so the
+# two cannot drift apart.
 Write-Host "Securing $InstallDir (Administrators/SYSTEM full; gMSA modify) ..."
 icacls $InstallDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "${GmsaAccount}:(OI)(CI)M" | Out-Null
 # The env file: gMSA read-only (it should never rewrite its own secrets).

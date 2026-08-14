@@ -318,11 +318,7 @@ async def reclaim_processing_order(
         # loop safely (no re-enrollment, no double-issuance). Always allowed:
         # a recorded certificate is authoritative proof issuance happened.
         certificate_url = _certificate_url(ctx, existing_cert.id)
-        applied = ctx.store.transition_processing_to_valid(
-            order_id,
-            certificate_url,
-            expected_generation=order.processing_generation,
-        )
+        reclaim_to_url = certificate_url
         new_status = OrderStatus.VALID
         had_certificate = True
     else:
@@ -356,11 +352,29 @@ async def reclaim_processing_order(
         # if its lease has moved since, every one of those judgements is stale
         # and the CAS must lose rather than reopen an order that is now in
         # flight under a different enrollment.
-        applied = ctx.store.transition_processing_to_ready(
-            order_id, expected_generation=order.processing_generation
-        )
+        reclaim_to_url = None
         new_status = OrderStatus.READY
         had_certificate = False
+
+    # One BEGIN IMMEDIATE for the transition, the marker clear and the audit
+    # event (2026-08-19 F5). Previously three separate commits, so an
+    # interruption could reopen an issuance-path order with the CA-request
+    # marker still set, or with no `admin-order-reclaimed` event at all.
+    applied, event = ctx.store.reclaim_processing_order(
+        order_id,
+        to_valid_certificate_url=reclaim_to_url,
+        expected_generation=order.processing_generation,
+        pending_req_id=pending_req_id or None,
+        audit_event_type="admin-order-reclaimed",
+        audit_account_id=order.account_id,
+        audit_outcome="success",
+        audit_details={
+            "new_status": new_status,
+            "had_certificate": had_certificate,
+            "ca_verified_no_issuance": ca_verified_no_issuance,
+            "ca_request_resolved": pending_req_id or None,
+        },
+    )
 
     if not applied:
         # Lost a race with a concurrent finalize/reclaim; audit + return state.
@@ -374,24 +388,10 @@ async def reclaim_processing_order(
         )
         return JSONResponse(content=_order_to_json(refreshed))
 
-    # The reclaim won its CAS, so the operator's assertion about this ReqID has
-    # been acted on: drop the marker (keyed on the ReqID, so a marker replaced
-    # in the meantime survives) and the order starts clean.
-    if pending_req_id:
-        ctx.store.clear_pending_ca_request(order_id, pending_req_id)
-
-    _audit(ctx,
-        event_type="admin-order-reclaimed",
-        order_id=order_id,
-        account_id=order.account_id,
-        outcome="success",
-        details={
-            "new_status": new_status,
-            "had_certificate": had_certificate,
-            "ca_verified_no_issuance": ca_verified_no_issuance,
-            "ca_request_resolved": pending_req_id or None,
-        },
-    )
+    # The durable write is done and committed as one unit; SIEM fan-out is
+    # best-effort and deliberately outside the transaction, as everywhere else.
+    if event is not None:
+        emit_audit_hook(ctx, event)
     refreshed = _refresh_order_or_500(ctx, order_id, "after reclaim")
     return JSONResponse(content=_order_to_json(refreshed))
 

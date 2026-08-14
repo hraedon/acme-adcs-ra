@@ -119,3 +119,46 @@ function Get-PipMajorVersion {
     if ($text -match 'pip\s+(\d+)\.') { return [int]$Matches[1] }
     return -1
 }
+
+
+# --- install-root trust (2026-08-19 F1) --------------------------------------
+# The installer runs elevated against a PREDICTABLE path under ProgramData, and
+# it used to prefer and EXECUTE `$InstallDir\python\python.exe` roughly 250
+# lines before it created that directory or applied an ACL to it. A local user
+# who pre-creates the tree plants an interpreter that then runs as
+# Administrator on an issuance host (CWE-426).
+#
+# The ordering fix lives in install-windows.ps1; the two decisions worth
+# testing in isolation live here.
+#
+# A reparse point is refused outright rather than followed: a junction placed at
+# the install root redirects every subsequent write, ACL and probe somewhere the
+# installer never checked, and "is the target safe" is not a question this
+# script can answer cheaply or race-free.
+function Test-InstallRootAttributesAcceptable {
+    param([Parameter(Mandatory = $true)][AllowNull()]$Attributes)
+    if ($null -eq $Attributes) { return $false }
+    $a = [System.IO.FileAttributes]$Attributes
+    if ($a.HasFlag([System.IO.FileAttributes]::ReparsePoint)) { return $false }
+    if (-not $a.HasFlag([System.IO.FileAttributes]::Directory)) { return $false }
+    return $true
+}
+
+# Whether a destination-local interpreter may be trusted enough to execute.
+#
+# Only once the root is provably ours: the directory existed with acceptable
+# attributes AND we have (re)asserted the restrictive ACL on it. `$RootSecured`
+# is the installer's assertion that the second step completed. Passing $false
+# means "we have not claimed this directory yet", and the answer is always no --
+# which is precisely the window the finding exploited.
+function Test-DestinationInterpreterTrusted {
+    param(
+        [Parameter(Mandatory = $true)][bool]$RootSecured,
+        [Parameter(Mandatory = $true)][AllowNull()]$InterpreterAttributes
+    )
+    if (-not $RootSecured) { return $false }
+    if ($null -eq $InterpreterAttributes) { return $false }
+    $a = [System.IO.FileAttributes]$InterpreterAttributes
+    if ($a.HasFlag([System.IO.FileAttributes]::ReparsePoint)) { return $false }
+    return $true
+}

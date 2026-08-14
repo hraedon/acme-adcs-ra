@@ -6,6 +6,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-19 review (six findings; five fixed, one deferred)
+
+An independent source review of `c8ad4c2`. One high, one medium, four low. The
+verdict was "fix the installer issue before recommending production
+deployment", which is right: F1 is the only one that crosses a privilege
+boundary. See `docs/security-review-2026-08-19.md`.
+
+- **The elevated installer executed a destination-local interpreter before
+  securing the destination (high, CWE-426).** `install-windows.ps1` probed — by
+  executing — `$InstallDir\python\python.exe` at line 286, but did not create
+  that directory until line 382 or ACL it until line 533.
+  `C:\ProgramData\acme-adcs-ra` is predictable, so a local user who pre-creates
+  the tree got their binary run as Administrator on the issuance host, no race
+  required. The install root is now claimed and ACL'd (`/inheritance:r`, so an
+  attacker-chosen inherited ACL is dropped) before anything beneath it is read
+  or executed; a reparse point at the root is refused rather than followed; and
+  the destination interpreter is a candidate only after that claim succeeds.
+- **Maintenance credentials no longer live in scheduled-task arguments
+  (medium, CWE-214).** The admin and confirm tokens were interpolated into the
+  `-Command` text that Task Scheduler persists and `powershell.exe` receives,
+  so they were readable from the task definition and visible in process
+  arguments. The action now carries a *path*: it loads the tokens from the
+  ACL'd `acme-ra.env` at run time into the environment variables
+  `Sync-Revocations.ps1` already read. Least privilege is expressed by which
+  keys the action loads, and `Build-SyncActionCommand` has no token parameter
+  at all — passing one is now a binding error.
+- **Generated task source escapes its inputs (low, CWE-78).** Base URL, CA
+  config, requester and script path were pasted between bare single quotes
+  under an "assume no single quote" comment that nothing enforced. All fields
+  now go through `ConvertTo-PsSingleQuotedLiteral`; the test asserts the
+  escaped literal round-trips through `Invoke-Expression` to the original
+  string, which is what proves it became data rather than code.
+- **Order reclaim is one atomic transition (low, CWE-362).** The status change,
+  the CA-request marker clear and the mandatory `admin-order-reclaimed` audit
+  event were three separate commits, so an interruption could reopen an
+  issuance-path order with a discharged marker still set, or with no audit
+  event at all. `Store.reclaim_processing_order` now covers all three in one
+  `BEGIN IMMEDIATE`, with SIEM fan-out outside it as everywhere else.
+- **Request bodies have a read deadline, and Uvicorn has a concurrency ceiling
+  (low, CWE-400).** Bytes were bounded; time was not, so a one-byte-per-interval
+  peer held a worker indefinitely. Each chunk pull is now bounded by a deadline
+  computed from one fixed start instant (default 30s), and
+  `server_max_concurrency` (default 256) is passed to Uvicorn as
+  `limit_concurrency` for the direct-TLS topology that had no ceiling.
+- **Unbounded audit growth from unauthenticated denials stays deferred (low).**
+  Same decision as wave 3, same reasoning: auditing pre-auth denials is a
+  requirement, and the fix is retention/quota policy on an operator-owned disk.
+  Still WI-014.
+
+### Changed — 2026-08-19 hardening and hygiene
+
+- **The RA refuses to start on a non-Windows platform** unless
+  `ACME_RA_ALLOW_FAKE_ADCS_BACKENDS=true`. Previously a non-Windows host
+  silently selected the fake ADCS legs, producing an RA that answered ACME,
+  looked healthy and issued nothing real.
+- **`base_url` is validated as a bare origin.** A path, query or fragment
+  component now fails at load time — every ACME URL, including the ones a client
+  binds its JWS signatures to, is derived from this value. The plaintext-scheme
+  check logs loudly rather than refusing; the reasoning is in the review doc.
+- **Pester runs on Windows PowerShell 5.1 as well as pwsh 7.** These scripts
+  ship on 5.1, and the 2026-08-14 live re-proof found two defects in exactly
+  this PowerShell that CI could not see.
+- **The CRL evidence gate gained `drain()`**, and the test that flaked
+  `windows-import-check` uses it. `_clear` is dispatched via `call_soon` one
+  loop turn after a flight settles, so a caller could observe stale `inflight`
+  — which matters because `inflight` is the `max_pending` admission signal.
+- **Release metadata reconciled in the CHANGELOG.** `pyproject.toml` says
+  `1.9.1` but no `v1.9.0`/`v1.9.1` tag or release exists; the newest release is
+  `v1.8.0`. Recorded rather than silently tagged — cutting it is an owner
+  decision.
+
 ### Fixed — 2026-08-14 full E2E lab validation (two defects CI could not see)
 
 The first full live pass over the whole 2026-08-15 → 2026-08-18-wave-3 series.
@@ -355,6 +426,17 @@ including the one finding whose stated DoS impact did not survive measurement.
   relying on the crypto backend to reject oversized values.
 
 ## [1.9.1] — 2026-08-14
+
+> **NOT YET TAGGED (recorded 2026-08-19).** `pyproject.toml` declares `1.9.1`
+> and this section is written, but no `v1.9.1` (or `v1.9.0`) tag or GitHub
+> release exists: the newest release is **v1.8.0**, with `v1.9.0-rc1` and
+> `v1.9.0-rc2` as pre-releases. The 2026-08-19 review flagged the mismatch —
+> anyone reading the releases page sees a project that stopped at 1.8.0 while
+> the source calls itself 1.9.1. The 1.9 line is *ready* rather than *shipped*:
+> the live re-proof that gates the tag passed on 2026-08-14, but several
+> security waves have landed since and the tag is an owner decision, not an
+> automated one. Cut `v1.9.1` from a commit that has been live-re-proven, or
+> renumber, but do not leave the two disagreeing.
 
 > **The release of the 1.9 line.** 1.9.0 never shipped: it existed only as
 > `v1.9.0-rc1` and `v1.9.0-rc2`, and the live re-proof that gates the tag found

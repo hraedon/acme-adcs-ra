@@ -160,3 +160,49 @@ Describe 'Get-PipMajorVersion' {
         Get-PipMajorVersion $null | Should -Be -1
     }
 }
+
+# 2026-08-19 F1 (high, CWE-426). The elevated installer preferred and executed
+# $InstallDir\python\python.exe ~250 lines before it created that directory or
+# applied an ACL to it, so a local user who pre-creates the predictable
+# ProgramData tree got their interpreter run as Administrator.
+Describe 'Test-InstallRootAttributesAcceptable' {
+    It 'accepts an ordinary directory' {
+        Test-InstallRootAttributesAcceptable ([System.IO.FileAttributes]::Directory) | Should -BeTrue
+    }
+
+    It 'refuses a reparse point, which would redirect every later write and ACL' {
+        $junction = [System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint
+        Test-InstallRootAttributesAcceptable $junction | Should -BeFalse
+    }
+
+    It 'refuses a file standing where the directory should be' {
+        Test-InstallRootAttributesAcceptable ([System.IO.FileAttributes]::Normal) | Should -BeFalse
+    }
+
+    It 'refuses null rather than treating "cannot tell" as acceptable' {
+        Test-InstallRootAttributesAcceptable $null | Should -BeFalse
+    }
+}
+
+Describe 'Test-DestinationInterpreterTrusted' {
+    It 'refuses the destination interpreter while the root is unclaimed' {
+        # This is the finding itself: before the ACL is applied, a planted
+        # python.exe must never be a candidate no matter how ordinary it looks.
+        Test-DestinationInterpreterTrusted -RootSecured $false `
+            -InterpreterAttributes ([System.IO.FileAttributes]::Normal) | Should -BeFalse
+    }
+
+    It 'accepts it once the root has been claimed and re-ACLd' {
+        Test-DestinationInterpreterTrusted -RootSecured $true `
+            -InterpreterAttributes ([System.IO.FileAttributes]::Normal) | Should -BeTrue
+    }
+
+    It 'still refuses a reparse-point interpreter inside a secured root' {
+        $link = [System.IO.FileAttributes]::Normal -bor [System.IO.FileAttributes]::ReparsePoint
+        Test-DestinationInterpreterTrusted -RootSecured $true -InterpreterAttributes $link | Should -BeFalse
+    }
+
+    It 'refuses when the interpreter cannot be stat-ed' {
+        Test-DestinationInterpreterTrusted -RootSecured $true -InterpreterAttributes $null | Should -BeFalse
+    }
+}
