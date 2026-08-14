@@ -21,6 +21,31 @@ honest: check a box only when the thing is actually true, not when it's planned.
       live proof and are validated by unit tests only. Re-run a real end-to-end
       issue on the lab against the current commit before pilot. **The proven
       artifact and the shipped artifact must be the same commit.**
+- [ ] **Live-only checks accumulated by the scan series.** Each of these is
+      unit-tested as far as it can be on a Linux dev host and genuinely unproven
+      against a real CA/host. They are cheap to fold into the next live
+      re-proof, and two of them decide whether a *revocation* proceeds:
+  - [ ] **`Test-SerialRevokedAtCa` (2026-08-17 F4).** `certutil -view -restrict
+        "SerialNumber=<s>,Disposition=21"` is assumed to select only revoked
+        rows. Confirm against the lab CA that a revoked serial matches and an
+        issued one does not — and that the self-check (serial appearing under
+        both 20 and 21) does not fire. Fails safe either way, so a mismatch
+        means "no worse than before", not "broken".
+  - [ ] **End-to-end confirmation retry (2026-08-17 F4).** Revoke at the CA,
+        make the RA callback fail (block it / stop the pool), then re-run
+        `Sync-Revocations.ps1 -Execute` and confirm it reports
+        `already-revoked-at-CA`, reaches the confirm POST, and drains the
+        pending set. This is the whole point of exit 6, and only a live run
+        exercises the wiring.
+  - [ ] **Installer MSI verification (2026-08-17 F1).** With a real
+        HttpPlatformHandler MSI: correct `-HttpPlatformHandlerSha256` installs;
+        a wrong digest aborts before `msiexec`; an `http://` URL is refused.
+        The decision functions are unit-tested, the `Get-FileHash` /
+        `Get-AuthenticodeSignature` calls around them are not.
+  - [ ] **POST-as-GET-only RA (2026-08-15 F4).** Plain `GET /acme/cert/{id}`
+        and `/acme/authz/{id}` now return 405. Prove Certify the Web renews
+        against it; any breakage is a CtW bug to file, not a reason to restore
+        the forms.
 
 ## B. ADCS enrollment leg (the gMSA chokepoint — §4.A)
 

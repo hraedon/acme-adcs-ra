@@ -68,8 +68,9 @@ def create_app(context: ServerContext) -> FastAPI:
         context.audit_hook = _siem_emitter.export
     if context.nonce_bucket is None:
         context.nonce_bucket = _default_nonce_bucket(context.config)
-    context.crl_evidence_gate.set_max_workers(
-        context.config.revocation_confirm_crl_max_workers
+    context.crl_evidence_gate.set_limits(
+        max_workers=context.config.revocation_confirm_crl_max_workers,
+        max_pending=context.config.revocation_confirm_crl_max_pending,
     )
 
     # H-3: shut down the SIEM emitter pool on app shutdown via lifespan.

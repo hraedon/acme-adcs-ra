@@ -451,11 +451,40 @@ ACME_RA_REVOCATION_CONFIRM_CRL_TOTAL_TIMEOUT_SECONDS=30
 # without touching the issuance path. Created lazily — an RA with no CRL URL
 # configured never spawns these threads.
 ACME_RA_REVOCATION_CONFIRM_CRL_MAX_WORKERS=2
+# Admission ceiling on distinct retrievals in progress. MAX_WORKERS bounds what
+# RUNS; the executor's work queue is unbounded and every waiting caller also
+# pins a suspended request, so this is the bound that provides backpressure.
+# Must be >= MAX_WORKERS (validated at config load).
+ACME_RA_REVOCATION_CONFIRM_CRL_MAX_PENDING=32
 ```
 
-Concurrent confirmations for the **same serial** share a single retrieval, so a
-retry loop or a burst on the revocation host costs one CRL fetch rather than one
-per request. See `docs/security-review-2026-08-16-rescan.md` finding 4.
+Concurrent confirmations for the **same certificate** share a single retrieval,
+so a retry loop or a burst on the revocation host costs one CRL fetch rather
+than one per request. Serials are canonicalized at route entry, so `A`, `0A` and
+`00A` are one certificate for this purpose as well as for the store lookup.
+
+Past the admission ceiling the endpoint responds **429 with `Retry-After`**
+rather than queueing the work. That is not a statement about the certificate:
+the RA was too busy to fetch the CRL, which is different from the CRL not
+proving the revocation, and it is deliberately never recorded as absent
+evidence. The serial stays on the pending list and the next sync sweep picks it
+up. If you see these regularly, the CRL host is slow or the ceiling is too low
+for your confirmation volume — raise `MAX_PENDING`, and check
+`MAX_WORKERS`/`TOTAL_TIMEOUT_SECONDS` before assuming the ceiling is the
+problem.
+
+See `docs/security-review-2026-08-16-rescan.md` finding 4 and
+`docs/security-review-2026-08-17.md` finding 3.
+
+Request bodies on the token-gated admin routes are bounded too:
+
+```ini
+# The confirmation callback carries one boolean; this is generous for it. Both
+# a declared Content-Length over the cap and a stream that exceeds it while
+# arriving are refused (a chunked request declares no length, and a declared
+# length is a claim by the sender, not a limit on it).
+ACME_RA_MAX_ADMIN_BODY_SIZE_BYTES=4096
+```
 
 ### The reclaim endpoint (double-issuance gate)
 
@@ -916,14 +945,26 @@ Alert on:
     pending).
   - `1` = RA unreachable — the agent could not fetch the pending set.
     Investigate network / RA health.
-  - `2` = partial failure — one or more serials failed to revoke. The
-    per-serial log lines name the failing serial and the `Revoke-Cert.ps1`
-    exit code; investigate (common causes: requester mismatch = exit 5 =
-    the serial was not issued by the RA's gMSA; certutil error = CA-side
-    issue).
+  - `2` = partial failure — one or more serials failed to revoke **or to
+    confirm**. The per-serial log lines name the failing serial and the
+    `Revoke-Cert.ps1` exit code; investigate (common causes: requester mismatch
+    = exit 5 = the serial was not issued by the RA's gMSA; certutil error =
+    CA-side issue).
+- **`already-revoked-at-CA` in the batch summary** is *not* an error. It counts
+  serials the CA had already revoked, whose RA confirmation was retried — the
+  self-healing path for a confirmation callback that failed on an earlier run
+  (`Revoke-Cert.ps1` exit 6). A steady nonzero count with no accompanying
+  `confirm-failed` means the loop is repairing itself as designed. A count that
+  keeps growing alongside `confirm-failed` means the callback is persistently
+  failing: check RA reachability and the confirm token, not the CA.
 - **RA audit events**: `certificate-revoked` with
   `ca_crl_updated=false` lingering longer than the agent interval × 2
   means the loop is stuck (the agent is not closing the confirm callback).
+- **`admin-revocation-confirm-deferred`** means the RA shed a confirmation at
+  its CRL-evidence admission ceiling (429). Occasional entries under burst are
+  expected and self-correcting — the serial stays pending. Sustained entries mean
+  the CRL host is slow or the ceiling is too low; see the CRL-evidence settings
+  above.
 - **The `revoked_in_ra_active_at_ca` reconciliation bucket** (run
   `Reconcile-Revocation.ps1` periodically) — if it grows, the agent is
   not keeping up or is failing silently. This is the independent
@@ -1057,7 +1098,9 @@ recommended posture for both topologies.
   identity.
 - The `revoked_in_ra_active_at_ca` bucket still works as the independent
   cross-check (it reads the CA DB directly, not the agent's self-report).
-- Agent exit codes are the same as the two-identity design (0/1/2/5).
+- Agent exit codes are the same as the two-identity design (0/1/2/5), and
+  `Revoke-Cert.ps1` exit 6 (already revoked at the CA, confirmation retried)
+  behaves identically.
 
 ##### Dry-run → execute promotion
 

@@ -109,3 +109,39 @@ function Assert-SafeRaUrl {
 
     return $Url.TrimEnd('/')
 }
+
+# Classify a Revoke-Cert.ps1 exit code into what the batch should do next.
+#
+# 2026-08-17 F4. This used to be inline as "5 aborts, any other non-zero is a
+# failure, continue" -- and that lumped together two situations that need
+# opposite handling. A serial the CA has ALREADY revoked is not a failure: the
+# CA side is exactly what was wanted, and the only outstanding work is the RA
+# confirmation callback that failed on an earlier run. Treating it as a failure
+# meant `continue` fired before the callback was retried, so one dropped HTTPS
+# request left the RA audit permanently out of step with the CA and required a
+# human to repair. `Revoke-Cert.ps1` now exits 6 for that state.
+#
+# Returns one of:
+#   'revoked'            0 -- revoked now; confirm it
+#   'already-revoked'    6 -- no CA-side change was needed; confirm it anyway
+#   'requester-mismatch' 5 -- policy violation; abort the WHOLE batch
+#   'failed'             anything else -- log, count, skip this serial
+function Get-RevokeOutcome([int]$ExitCode) {
+    switch ($ExitCode) {
+        0       { return 'revoked' }
+        6       { return 'already-revoked' }
+        5       { return 'requester-mismatch' }
+        default { return 'failed' }
+    }
+}
+
+# Does this outcome mean the RA confirmation callback should be attempted?
+#
+# Deliberately a separate predicate rather than `-ne 'failed'`: the answer for
+# 'requester-mismatch' must be NO even though it is also not a plain failure,
+# and stating that explicitly keeps a future outcome from defaulting into
+# "confirm it" by omission. Confirming is an assertion that the CA revoked the
+# certificate; nothing may claim it without grounds.
+function Test-ShouldConfirmWithRa([string]$Outcome) {
+    return ($Outcome -eq 'revoked' -or $Outcome -eq 'already-revoked')
+}

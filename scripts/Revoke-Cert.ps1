@@ -49,6 +49,10 @@
       4  = cert not found at the CA (serial or ReqID does not resolve)
       5  = requester mismatch (cert was not issued by the expected enrollment
            identity -- WI-022)
+      6  = already revoked at the CA; no CA-side change was made. NOT a failure:
+           the CA state is what was wanted. Sync-Revocations.ps1 treats this as
+           "retry the RA confirmation", which is what makes a dropped callback
+           recoverable instead of permanent (2026-08-17 F4).
       N  = certutil exit code (transport / CA-side failure)
 
 .PARAMETER Serial
@@ -207,6 +211,46 @@ function Confirm-SerialAtCa([string]$CaConfig, [string]$SerialHex, [string]$Expe
     Write-Output ("PASS: requester confirmed: {0}" -f $actualRequester)
 }
 
+# Is this serial already revoked in the CA database?
+#
+# Locale-independent by the same technique Confirm-SerialAtCa uses and this
+# project already trusts: restrict the view and look for the serial VALUE in the
+# output rather than parsing a localized column header or status word. The extra
+# restriction is `Disposition=21`, ADCS's numeric code for a revoked row (20 is
+# issued) -- a number, so no locale enters into it.
+#
+# Two deliberate safety properties, because this decides whether to skip a
+# revocation:
+#
+#   * `Invoke-CertUtil` is NOT used, because a restriction that matches no rows
+#     can exit non-zero and that is a normal answer here, not a fatal error. Any
+#     non-zero exit means "could not establish it" and returns $false, so the
+#     script falls through to attempting the revoke exactly as it did before.
+#   * The Disposition restriction is self-checked. If the serial also comes back
+#     under `Disposition=20` (issued), the CA is not honouring the restriction
+#     the way this assumes, so its answer is not trusted and the result is
+#     $false. Skipping a revocation that was actually needed is the one outcome
+#     here that would be worse than the bug being fixed, so it takes a filter
+#     that demonstrably discriminates -- not an assumption about certutil's
+#     behaviour that this host cannot verify.
+function Test-SerialRevokedAtCa([string]$CaConfig, [string]$SerialHex) {
+    $escaped = [regex]::Escape($SerialHex)
+
+    $revokedOut = & certutil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=21", '-out', 'SerialNumber') 2>&1
+    if ($LASTEXITCODE -ne 0) { return $false }
+    if (($revokedOut -join "`n") -notmatch $escaped) { return $false }
+
+    # It claims revoked. Prove the filter actually filters before acting on it.
+    $issuedOut = & certutil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=20", '-out', 'SerialNumber') 2>&1
+    if ($LASTEXITCODE -eq 0 -and (($issuedOut -join "`n") -match $escaped)) {
+        Write-Output ("WARNING: the CA returned serial {0} for BOTH Disposition=21 (revoked) and Disposition=20 (issued)." -f $SerialHex)
+        Write-Output "         The Disposition restriction is not discriminating, so its answer is not trusted."
+        Write-Output "         Proceeding with the revocation attempt as though the state were unknown."
+        return $false
+    }
+    return $true
+}
+
 # Look up the serial from a ReqID via certutil -view, locale-independently.
 # certutil -view output pairs the column with its value; the SerialNumber
 # value is a hex string (locale-independent). Parse it with a hex regex.
@@ -246,6 +290,44 @@ if ($PSCmdlet.ParameterSetName -eq "Serial") {
     }
     $targetSerial = Get-SerialFromReqId $CaConfig $rid
     Confirm-SerialAtCa $CaConfig $targetSerial $RequesterName
+}
+
+# 1b. Is the CA already holding this serial as revoked?
+#
+# 2026-08-17 F4. The sync agent revokes at the CA and THEN calls the RA back.
+# If that callback failed (a transient network fault is enough), the serial
+# stayed pending, the next sweep re-ran this script, `certutil -revoke` returned
+# non-zero for an already-revoked certificate, and the agent booked that as a
+# failure and skipped the callback -- for ever. One dropped HTTPS request
+# permanently desynchronized the RA's audit from the CA, and recovery required a
+# human. The CA side was already correct the whole time; only the callback was
+# outstanding, and nothing would retry it.
+#
+# So: ask the CA whether it has already revoked this serial, and if so exit with
+# a distinct code that tells the agent "no change needed here, go retry your
+# callback" instead of re-attempting a mutation that cannot succeed.
+#
+# The requester check above has already run, so a certificate that is not ours
+# still exits 5 on this path -- being already revoked does not buy an unknown or
+# mis-requested certificate a pass.
+if (Test-SerialRevokedAtCa $CaConfig $targetSerial) {
+    Write-Output ("NOTE: serial {0} is ALREADY revoked in the CA database; not re-revoking." -f $targetSerial)
+    if ($SkipPublishCrl) {
+        Write-Output "Skipping CRL publication (-SkipPublishCrl)."
+    } else {
+        # Still worth doing: the certificate may be revoked in the CA database
+        # while no published CRL lists it yet, which is exactly the state the
+        # default least-privilege path leaves behind.
+        Write-Output ("Publishing CRL at CA '{0}'..." -f $CaConfig)
+        $publishOut = Invoke-CertUtil @('-config', $CaConfig, '-CRL', 'republish')
+        $publishOut | ForEach-Object { Write-Output $_ }
+        Write-Output "PASS: CRL republished."
+    }
+    Write-Output ""
+    Write-Output ("Serial {0} was already revoked at the CA. No CA-side change was made." -f $targetSerial)
+    Write-Output "If the RA still lists it as pending, its confirmation callback never landed --"
+    Write-Output "that is what exit code 6 tells the sync agent to retry."
+    exit 6
 }
 
 # 2. Revoke by serial. certutil -revoke accepts serials only (not ReqIDs).

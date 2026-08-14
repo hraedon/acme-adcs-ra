@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hmac
+import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from acme_adcs_ra.acme_errors import malformed, not_found, unauthorized
+from acme_adcs_ra.acme_errors import malformed, not_found, rate_limited, unauthorized
 from acme_adcs_ra.app_state import (
     ServerContext,
     _audit,
@@ -16,12 +17,45 @@ from acme_adcs_ra.app_state import (
     get_context,
     logger,
 )
-from acme_adcs_ra.crl_evidence import AGENT_ASSERTED, CrlEvidence, fetch_crl_evidence
+from acme_adcs_ra.crl_evidence import (
+    AGENT_ASSERTED,
+    CrlEvidence,
+    CrlEvidenceGateBusy,
+    fetch_crl_evidence,
+)
 from acme_adcs_ra.finalize import _refresh_order_or_500
+from acme_adcs_ra.http_body import read_body_limited
 from acme_adcs_ra.serializers import _order_to_admin_json, _order_to_json
-from acme_adcs_ra.store import CertificateRecord, CertStatus, OrderStatus
+from acme_adcs_ra.store import (
+    CertificateRecord,
+    CertStatus,
+    OrderStatus,
+    canonical_serial,
+)
 
 router = APIRouter()
+
+# Canonical serials are uppercase hex with no prefix and no leading zeros.
+# Checked with a character set rather than a compiled pattern: the no-signing-key
+# architecture test bans `compile(...)` anywhere under src/ (dynamic code
+# execution), and `re.compile` matches that ban. A set is clearer here anyway.
+_HEX_DIGITS = frozenset("0123456789ABCDEF")
+
+
+def _crl_published_from(raw_body: bytes) -> bool:
+    """Decode the confirmation body's one field: did the agent republish?
+
+    An absent, empty, or unparseable body means **no** — the conservative
+    answer, since claiming publication that did not happen is the failure mode
+    that matters here (it is what `ca_crl_updated` already overclaims).
+    """
+    if not raw_body:
+        return False
+    try:
+        body = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(body, dict) and body.get("crl_published") is True
 
 
 def _crl_evidence_for(
@@ -397,9 +431,33 @@ async def confirm_ca_revocation(
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
     _require_revocation_confirm_token(request, ctx)
-    serial_upper = serial.strip().upper().removeprefix("0X").removeprefix("0x")
-    if not serial_upper:
+
+    # Read the body FIRST, bounded (2026-08-17 F2). It carries one boolean, and
+    # it used to be decoded with `request.json()` — which buffers the whole
+    # body — after the CRL fetch had already been paid for. Bounded and up
+    # front: the cheapest rejection, before any external work.
+    crl_published = _crl_published_from(
+        await read_body_limited(
+            request,
+            max_bytes=ctx.config.max_admin_body_size_bytes,
+            what="confirmation request",
+        )
+    )
+
+    # Canonicalize BEFORE anything keys off the serial (2026-08-17 F3). The
+    # store canonicalizes inside its lookup, so `A`, `0A` and `00A` all select
+    # the same row — but the route kept its own half-normalized spelling
+    # (uppercase, `0x` stripped, leading zeros NOT stripped) and used that as
+    # the single-flight key, so the aliases of one certificate each started a
+    # separate CRL retrieval. Same normalization as the store, one spelling
+    # from here on, and it is the form that reaches the audit trail too.
+    serial_upper = canonical_serial(serial)
+    if not serial.strip():
         raise malformed("serial must not be empty")
+    # Hex-validate rather than pass arbitrary path text into audit details and
+    # `int(..., 16)` further down.
+    if not set(serial_upper) <= _HEX_DIGITS:
+        raise malformed("serial must be hexadecimal")
     cert = ctx.store.get_certificate_by_serial(serial_upper)
     if cert is None:
         _audit(ctx,
@@ -444,11 +502,38 @@ async def confirm_ca_revocation(
     # from the same AnyIO limiter that ADCS enrollment uses, so moving the
     # fetch off the event loop only relocated the contention: enough slow CRL
     # fetches in flight and issuance queues behind them (2026-08-16 rescan F4).
-    # The gate also single-flights on serial, so a flood of confirmations for
-    # one certificate costs one retrieval rather than one per request.
-    evidence = await ctx.crl_evidence_gate.run(
-        serial_upper, _crl_evidence_for, ctx, cert
-    )
+    # The gate also single-flights, so a flood of confirmations for one
+    # certificate costs one retrieval rather than one per request, and sheds
+    # rather than queues once too many distinct retrievals are in progress.
+    #
+    # Keyed by the certificate ROW ID, not by the serial. The row is what the
+    # retrieval is actually about, and an id cannot be spelled two ways — which
+    # is the failure the canonicalization above also closes, belt and braces
+    # (2026-08-17 F3).
+    try:
+        evidence = await ctx.crl_evidence_gate.run(
+            cert.id, _crl_evidence_for, ctx, cert
+        )
+    except CrlEvidenceGateBusy as exc:
+        # Not "no evidence" — being too busy to look says nothing about the
+        # certificate, and recording it as absent evidence would be a false
+        # statement in the audit trail. Shed, and let the agent retry: the
+        # serial stays pending, so the next sweep picks it up.
+        _audit(ctx,
+            event_type="admin-revocation-confirm-deferred",
+            account_id=cert.account_id,
+            order_id=cert.order_id,
+            outcome="failed",
+            details={
+                "serial": serial_upper,
+                "reason": "crl-evidence-capacity",
+                "detail": str(exc),
+            },
+        )
+        raise rate_limited(
+            f"too many CRL evidence retrievals in progress: {exc}",
+            retry_after=30,
+        ) from exc
     if ctx.config.revocation_confirm_require_crl_evidence and not (
         evidence is not None and evidence.revoked
     ):
@@ -481,13 +566,7 @@ async def confirm_ca_revocation(
     # certificate — while the RA drained the serial off its pending list and
     # recorded a field named `ca_crl_updated`. The name overclaims. Recording
     # the distinction is the same honesty fix as `verification`, one layer down.
-    crl_published = False
-    try:
-        body = await request.json()
-        if isinstance(body, dict):
-            crl_published = body.get("crl_published") is True
-    except Exception:  # noqa: BLE001 - an absent or unparseable body means "no"
-        crl_published = False
+    # (Decoded from the bounded body read at the top of this handler.)
     flipped = ctx.store.confirm_ca_revocation(serial_upper)
     if not flipped:
         return JSONResponse(content={

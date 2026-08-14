@@ -211,11 +211,27 @@ via [`docs/certsrv-setup.md`](docs/certsrv-setup.md).
 | **A gMSA installed on this host** | `Install-ADServiceAccount`; `Test-ADServiceAccount` must return `True` |
 | **CA: Web Enrollment + `ACME-ServerAuth` template** (server-auth-only EKU, subject from request, gMSA granted Enroll only) | one-time per CA — see [`docs/certsrv-setup.md`](docs/certsrv-setup.md) |
 
-> **HttpPlatformHandler is never auto-downloaded.** It is a separate Microsoft
-> module whose download has historically been unreliable, and this is
-> issuance-path infrastructure — so the installer detects it and, if missing,
-> installs it **only** from an MSI you point at (`-HttpPlatformHandlerMsi`),
-> rather than fetching an unverified binary from the internet.
+> **HttpPlatformHandler is never auto-downloaded, and never installed
+> unverified.** It is a separate Microsoft module whose download has
+> historically been unreliable, and this is issuance-path infrastructure — so
+> the installer detects it and, if missing, installs it **only** from an MSI you
+> point at (`-HttpPlatformHandlerMsi`).
+>
+> Whatever the source, it is the one third-party executable this installer runs,
+> and it runs as Administrator on the host holding the RA's gMSA context — so it
+> is verified before `msiexec` sees it:
+>
+> - a **local path** must carry a `Valid` Authenticode signature whose publisher
+>   matches `-HttpPlatformHandlerPublisher` (default `CN=Microsoft
+>   Corporation`); pass `-HttpPlatformHandlerSha256` to pin the bytes as well;
+> - an **`https://` URL** additionally *requires* `-HttpPlatformHandlerSha256`,
+>   because TLS authenticates the origin, not the artifact;
+> - **plaintext `http://` is refused outright** — a digest delivered over a
+>   channel an attacker controls proves nothing.
+>
+> Any failure aborts the install rather than proceeding. See
+> [`docs/security-review-2026-08-17.md`](docs/security-review-2026-08-17.md)
+> finding 1.
 
 ### Install
 
@@ -223,10 +239,14 @@ Run from an **elevated** PowerShell on the RA host, from the repo root:
 
 ```powershell
 # 1. (optional) install the native prereqs first — IIS features + Python.
-#    HttpPlatformHandler is installed too if you point at its MSI.
+#    HttpPlatformHandler is installed too if you point at its MSI. The MSI's
+#    Authenticode signature and publisher are always checked; -...Sha256 pins
+#    the bytes too, and is REQUIRED if you pass an https:// URL instead of a
+#    local path (Get-FileHash -Algorithm SHA256 gives you the digest).
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
     -GmsaAccount "WORK-DOMAIN\gMSA-acme-ra$" -InstallPrereqs `
-    -HttpPlatformHandlerMsi "C:\path\to\HttpPlatformHandler_amd64.msi"
+    -HttpPlatformHandlerMsi "C:\path\to\HttpPlatformHandler_amd64.msi" `
+    -HttpPlatformHandlerSha256 "<expected-sha256-of-that-msi>"
 
 # 2. install + configure IIS (app pool as the gMSA, TLS, site on :443 by SNI).
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `

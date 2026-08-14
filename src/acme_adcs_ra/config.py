@@ -138,6 +138,12 @@ class RAConfig(BaseSettings):
     # streaming, before JSON/base64 decoding, so an unauthenticated peer cannot
     # make the worker buffer an arbitrarily large body.
     max_jws_body_size_bytes: int = 65536
+    # Maximum body on the token-gated admin routes. Enforced the same way, and
+    # present for the same reason: the confirmation callback carries one boolean
+    # and had no bound at all, so a holder of the scoped confirm credential
+    # could make the single RA process buffer arbitrarily large bodies
+    # (2026-08-17 F2). Generous for its purpose — the real body is ~60 bytes.
+    max_admin_body_size_bytes: int = 4096
 
     # --- In-app rate limiting (WI-016) --------------------------------------
     # Per-account (per-kid) order creation ceiling per rolling window.
@@ -237,6 +243,13 @@ class RAConfig(BaseSettings):
     # deliberately NOT the shared pool that runs ADCS enrollment: a stalled CRL
     # host may exhaust this pool without touching the issuance path.
     revocation_confirm_crl_max_workers: int = 2
+    # Admission ceiling on distinct CRL retrievals in progress. max_workers
+    # bounds what RUNS; the executor's work queue is unbounded and every waiting
+    # caller also pins a suspended request, so without this a stream of distinct
+    # serials grows memory without limit. Past the ceiling the confirm endpoint
+    # sheds with 429 + Retry-After rather than queueing — the serial stays
+    # pending, so the next sync sweep picks it up.
+    revocation_confirm_crl_max_pending: int = 32
     # An absolute ceiling on how stale a CRL the RA will act on. A signed CRL
     # never stops verifying, and `nextUpdate` is chosen by the CA, so neither
     # bounds replay of a pre-revocation view on its own.
@@ -376,6 +389,21 @@ class RAConfig(BaseSettings):
             )
         if self.revocation_confirm_crl_max_workers < 1:
             raise ValueError("revocation_confirm_crl_max_workers must be at least 1")
+        if self.revocation_confirm_crl_max_pending < 1:
+            raise ValueError("revocation_confirm_crl_max_pending must be at least 1")
+        if (
+            self.revocation_confirm_crl_max_pending
+            < self.revocation_confirm_crl_max_workers
+        ):
+            raise ValueError(
+                "revocation_confirm_crl_max_pending "
+                f"({self.revocation_confirm_crl_max_pending}) is below "
+                "revocation_confirm_crl_max_workers "
+                f"({self.revocation_confirm_crl_max_workers}): the admission "
+                "ceiling would shed work the pool has idle capacity for."
+            )
+        if self.max_admin_body_size_bytes < 1:
+            raise ValueError("max_admin_body_size_bytes must be at least 1")
         if (
             self.revocation_confirm_crl_total_timeout_seconds
             < self.revocation_confirm_crl_timeout_seconds

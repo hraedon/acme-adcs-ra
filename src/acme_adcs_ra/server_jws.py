@@ -17,6 +17,7 @@ from acme_adcs_ra.acme_errors import (
     malformed,
     unauthorized,
 )
+from acme_adcs_ra.http_body import read_body_limited
 from acme_adcs_ra.jws import (
     JWSValidationError,
     _base64url_decode,
@@ -113,29 +114,9 @@ def _consume_nonce(store: Store, header: dict[str, Any], request_url: str) -> No
 async def _parse_jws_body(
     request: Request, *, max_body_size_bytes: int = 65536
 ) -> dict[str, Any]:
-    if max_body_size_bytes < 1:
-        raise malformed("server JWS body-size limit is invalid")
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError as exc:
-            raise malformed("invalid Content-Length header") from exc
-        if declared_length < 0 or declared_length > max_body_size_bytes:
-            raise malformed(
-                f"JWS request body too large (max {max_body_size_bytes} bytes)"
-            )
-
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > max_body_size_bytes:
-            raise malformed(
-                f"JWS request body too large (max {max_body_size_bytes} bytes)"
-            )
-        chunks.append(chunk)
-    body = b"".join(chunks)
+    body = await read_body_limited(
+        request, max_bytes=max_body_size_bytes, what="JWS request"
+    )
     if not body:
         raise malformed("empty request body")
     try:

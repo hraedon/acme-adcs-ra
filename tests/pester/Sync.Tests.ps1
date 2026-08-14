@@ -187,3 +187,57 @@ Describe 'Invoke-ChildScript' {
     }
 
 }
+
+Describe 'Get-RevokeOutcome' {
+    # 2026-08-17 F4. "Any non-zero is a failure" conflated a genuine revoke
+    # failure with a serial the CA had already revoked. The second is not a
+    # failure -- the CA side is correct and only the RA callback is outstanding
+    # -- but it took the `continue` branch, so the callback was never retried
+    # and one dropped HTTPS request desynchronized the two sides for good.
+
+    It 'classifies 0 as revoked' {
+        Get-RevokeOutcome 0 | Should -Be 'revoked'
+    }
+
+    It 'classifies 6 as already revoked at the CA' {
+        Get-RevokeOutcome 6 | Should -Be 'already-revoked'
+    }
+
+    It 'classifies 5 as a requester mismatch (batch-aborting)' {
+        Get-RevokeOutcome 5 | Should -Be 'requester-mismatch'
+    }
+
+    It 'classifies every other code as a failure' {
+        foreach ($code in @(1, 2, 3, 4, 7, 8, 87, 255)) {
+            Get-RevokeOutcome $code | Should -Be 'failed'
+        }
+    }
+}
+
+Describe 'Test-ShouldConfirmWithRa' {
+    It 'confirms a fresh revocation' {
+        Test-ShouldConfirmWithRa 'revoked' | Should -BeTrue
+    }
+
+    It 'confirms an already-revoked serial -- this is the F4 recovery path' {
+        # The whole point: the CA-side state is right and the callback is the
+        # only thing left to do, so the retry must reach it.
+        Test-ShouldConfirmWithRa 'already-revoked' | Should -BeTrue
+    }
+
+    It 'does NOT confirm a requester mismatch' {
+        # Confirming asserts the CA revoked the cert. A cert that failed the
+        # requester check was never revoked, and must never be claimed as such.
+        Test-ShouldConfirmWithRa 'requester-mismatch' | Should -BeFalse
+    }
+
+    It 'does NOT confirm a failure' {
+        Test-ShouldConfirmWithRa 'failed' | Should -BeFalse
+    }
+
+    It 'does NOT confirm an unrecognized outcome' {
+        # Fail closed: a future outcome must not default into "confirm it".
+        Test-ShouldConfirmWithRa 'something-new' | Should -BeFalse
+        Test-ShouldConfirmWithRa '' | Should -BeFalse
+    }
+}

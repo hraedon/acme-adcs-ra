@@ -33,6 +33,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import socket
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -116,6 +118,40 @@ def _issuer_public_key(cert_pem: str, chain_pem: list[str]) -> object | None:
     return None
 
 
+def _abort_transfer(
+    response: requests.Response, timed_out: threading.Event
+) -> None:
+    """Tear the transport down so a worker blocked in ``recv`` returns.
+
+    ``response.close()`` alone is not enough: it releases the connection back
+    to the pool and closes the buffered reader, but a thread already parked
+    inside a socket read is not woken by that. ``shutdown(SHUT_RDWR)`` on the
+    socket itself is — the pending ``recv`` returns end-of-stream immediately.
+    Reaching the socket means going through urllib3's internals, so every step
+    is guarded: failing to abort must never raise into the timer thread, where
+    nothing could handle it. The flag is set first so the reader reports a
+    deadline rather than a fetch failure either way.
+    """
+    timed_out.set()
+    raw = getattr(response, "raw", None)
+    connection = getattr(raw, "_connection", None)
+    sock = getattr(connection, "sock", None)
+    if sock is not None:
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        # Deliberately NOT response.close() here as well. Closing from this
+        # thread while the worker is inside ``read1`` frees the file object
+        # out from under it, which surfaces as an AttributeError deep in
+        # http.client rather than a clean end-of-stream. The shutdown is
+        # sufficient, and the reader's own ``contextlib.closing`` does the
+        # closing on the thread that owns the read.
+        return
+    # No socket to reach (a mock, or urllib3 internals moved): fall back to
+    # the blunt instrument, which at least stops a fresh read from starting.
+    with contextlib.suppress(Exception):
+        response.close()
+
+
 def fetch_crl_evidence(
     *,
     crl_url: str,
@@ -148,17 +184,66 @@ def fetch_crl_evidence(
             detail=f"CRL URL must be http(s) with a host: {crl_url!r}",
         )
 
+    def deadline_evidence(received: int) -> CrlEvidence:
+        return CrlEvidence(
+            revoked=False,
+            checked=False,
+            detail=(
+                f"CRL retrieval exceeded its {total_timeout_seconds}s total "
+                f"deadline after {received} bytes"
+            ),
+        )
+
     deadline = time.monotonic() + total_timeout_seconds
+    # Set by the watchdog below, and the reason a torn-down transfer is
+    # reported as a deadline rather than as a fetch failure.
+    timed_out = threading.Event()
+    watchdog: threading.Timer | None = None
+    body = b""
     try:
         response = requests.get(crl_url, timeout=timeout_seconds, stream=True)
         # Closed on every exit path, including the deadline and size bail-outs:
         # with stream=True the transfer is only actually torn down when the
-        # response is closed, so an early `return` that leaks it would keep the
-        # socket — and the trickle — alive.
+        # response is closed, so an early `return` that leaked it would keep
+        # the socket — and the trickle — alive.
         with contextlib.closing(response):
             response.raise_for_status()
-            body = b""
-            for chunk in response.iter_content(chunk_size=65536):
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return deadline_evidence(0)
+            # 2026-08-17 F3: the deadline needs an enforcer that does not
+            # depend on this loop getting to run.
+            #
+            # The previous version checked the clock once per ``iter_content``
+            # chunk, which is only as prompt as the chunks are. For a
+            # **non-chunked, Content-Length** response that is not prompt at
+            # all: the underlying read waits for the full 64 KiB, and a peer
+            # dribbling a byte every 20ms satisfies each socket read (so the
+            # per-read timeout keeps resetting) while never delivering enough
+            # to yield a chunk. The loop body — and therefore the deadline
+            # check — is simply never reached. Measured: a 0.3s total deadline
+            # ran past 20s against exactly that server.
+            #
+            # So: shut the socket down from a timer thread. ``shutdown()``
+            # makes an in-progress ``recv`` on the worker return immediately,
+            # which is the only thing that reliably interrupts a blocked read
+            # we are not the ones performing.
+            watchdog = threading.Timer(
+                remaining, _abort_transfer, args=(response, timed_out)
+            )
+            watchdog.daemon = True
+            watchdog.start()
+
+            # ``read1`` returns as soon as the socket has data, rather than
+            # waiting to fill a chunk, so the deadline check below also runs
+            # once per socket read instead of once per 64 KiB. Belt and
+            # braces with the watchdog: this exits cleanly on the common
+            # trickle, the watchdog guarantees the pathological one.
+            while not timed_out.is_set():
+                chunk = response.raw.read1(65536, decode_content=True)
+                if not chunk:
+                    break
                 body += chunk
                 if len(body) > max_bytes:
                     return CrlEvidence(
@@ -167,18 +252,34 @@ def fetch_crl_evidence(
                         detail=f"CRL exceeded {max_bytes} bytes",
                     )
                 if time.monotonic() >= deadline:
-                    return CrlEvidence(
-                        revoked=False,
-                        checked=False,
-                        detail=(
-                            f"CRL retrieval exceeded its {total_timeout_seconds}s "
-                            f"total deadline after {len(body)} bytes"
-                        ),
-                    )
+                    return deadline_evidence(len(body))
+            if timed_out.is_set():
+                return deadline_evidence(len(body))
     except requests.RequestException as exc:
+        # A watchdog teardown surfaces here as a broken/incomplete read on a
+        # Content-Length response. Report what actually happened.
+        if timed_out.is_set():
+            return deadline_evidence(len(body))
         return CrlEvidence(
             revoked=False, checked=False, detail=f"CRL fetch failed: {exc}"
         )
+    except Exception as exc:
+        # Reading through ``response.raw`` means urllib3's exceptions, not
+        # requests' — a transport torn down mid-read surfaces as
+        # ``ProtocolError``/``IncompleteRead``, and http.client can contribute
+        # its own low-level errors. urllib3 is only a transitive dependency
+        # here (via requests), so catching its hierarchy by name would mean
+        # importing something this project does not declare. Everything is "no
+        # evidence" either way; the caller decides whether that is fatal.
+        if timed_out.is_set():
+            return deadline_evidence(len(body))
+        logger.warning("CRL read failed", exc_info=True)
+        return CrlEvidence(
+            revoked=False, checked=False, detail=f"CRL read failed: {exc}"
+        )
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
 
     crl: x509.CertificateRevocationList | None = None
     for loader in (x509.load_der_x509_crl, x509.load_pem_x509_crl):
@@ -342,6 +443,16 @@ def fetch_crl_evidence(
 _T = TypeVar("_T")
 
 
+class CrlEvidenceGateBusy(Exception):
+    """The gate is at its admission ceiling; shed the request, do not queue it.
+
+    Raised rather than returning "no evidence" on purpose. Absent evidence is a
+    statement about the CRL, and under ``require_crl_evidence`` it would be
+    recorded as one — but being too busy to look says nothing about whether the
+    certificate is revoked. The caller turns this into a retryable status.
+    """
+
+
 class CrlEvidenceGate:
     """Run CRL evidence fetches off the shared enrollment worker pool.
 
@@ -361,27 +472,45 @@ class CrlEvidenceGate:
     fetched. Concurrent callers for the same key now share one retrieval, and
     a flood of confirmations for a single serial costs exactly one fetch.
 
+    *Admission control* (2026-08-17 F3). ``max_workers`` bounds how many
+    retrievals *run*, not how many are accepted. ``ThreadPoolExecutor``'s work
+    queue is an unbounded ``SimpleQueue``, and every waiting caller also
+    retains a suspended request task, so distinct keys arriving faster than
+    they complete grow both without limit. ``max_pending`` is the ceiling on
+    distinct flights in progress; past it, :meth:`run` raises
+    :class:`CrlEvidenceGateBusy` and the caller sheds the request instead of
+    queueing it. Callers joining an *existing* flight are never rejected —
+    they cost nothing new.
+
     Cancellation-safe: a caller that disconnects does not cancel the shared
     retrieval out from under the callers still waiting on it.
     """
 
-    def __init__(self, max_workers: int = 2) -> None:
+    def __init__(self, max_workers: int = 2, max_pending: int = 32) -> None:
         self._max_workers = max_workers
+        self._max_pending = max_pending
         self._executor: ThreadPoolExecutor | None = None
         self._inflight: dict[str, asyncio.Future[Any]] = {}
         self._closed = False
 
-    def set_max_workers(self, max_workers: int) -> None:
-        """Size the pool from config, before it is first used.
+    def set_limits(self, *, max_workers: int, max_pending: int) -> None:
+        """Size the gate from config, before the pool is first used.
 
         ``ServerContext`` builds a gate eagerly so a directly-constructed
         context is always usable; ``create_app`` calls this to apply the
-        operator's setting. Once the pool exists the size is fixed — resizing
+        operator's settings. Once the pool exists its size is fixed — resizing
         under live confirmations would be a needless race, and the RA reads
-        config once at startup anyway.
+        config once at startup anyway. The admission ceiling is not tied to the
+        pool, so it always takes effect.
         """
+        self._max_pending = max_pending
         if self._executor is None:
             self._max_workers = max_workers
+
+    @property
+    def inflight(self) -> int:
+        """Distinct retrievals currently in progress."""
+        return len(self._inflight)
 
     def _pool(self) -> ThreadPoolExecutor:
         # Lazy: an RA with no CRL configured never spawns the threads.
@@ -410,6 +539,14 @@ class CrlEvidenceGate:
             self._inflight.pop(key, None)
             pending = None
         if pending is None:
+            # Admission control before submission, and only for work that is
+            # genuinely new — a caller joining an existing flight adds nothing
+            # to shed.
+            if len(self._inflight) >= self._max_pending:
+                raise CrlEvidenceGateBusy(
+                    f"{len(self._inflight)} CRL evidence retrievals already in "
+                    f"progress (limit {self._max_pending})"
+                )
             pending = asyncio.wrap_future(self._pool().submit(fn, *args))
             self._inflight[key] = pending
             # Clear on completion rather than in a caller's ``finally``: the

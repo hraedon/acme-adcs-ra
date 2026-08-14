@@ -64,12 +64,30 @@ param(
     # (IIS role + features via Install-WindowsFeature; Python 3.12+ via winget).
     # HttpPlatformHandler is a third-party MSI with an unreliable download, so it
     # is NEVER auto-fetched from the internet: pass a vetted local path (or an
-    # explicit URL you trust) via -HttpPlatformHandlerMsi to have it installed.
+    # https:// URL plus -HttpPlatformHandlerSha256) via -HttpPlatformHandlerMsi
+    # to have it installed. Whatever the source, the MSI is verified by digest
+    # and Authenticode publisher before msiexec sees it -- it is the one
+    # third-party executable this installer runs, and it runs elevated.
     [switch]$InstallPrereqs,
-    [string]$HttpPlatformHandlerMsi = ""
+    [string]$HttpPlatformHandlerMsi = "",
+    # Expected SHA-256 of the MSI. REQUIRED when -HttpPlatformHandlerMsi is a
+    # URL: TLS authenticates the origin, not the bytes, and this artifact is run
+    # by msiexec as Administrator on the issuance host. Optional (but checked
+    # when given) for a local path the operator has already vetted.
+    [string]$HttpPlatformHandlerSha256 = "",
+    # Expected Authenticode publisher, matched as a substring of the signer
+    # certificate's Subject. HttpPlatformHandler is a Microsoft IIS module; a
+    # deployment that repackages it under its own code-signing certificate
+    # overrides this.
+    [string]$HttpPlatformHandlerPublisher = "CN=Microsoft Corporation"
 )
 
 $ErrorActionPreference = "Stop"
+
+# Artifact-authenticity decisions for the prerequisite MSI (2026-08-17 F1).
+# Pure functions, so tests/pester/InstallVerify.Tests.ps1 covers the matrix
+# without a signed file or a live download.
+. "$PSScriptRoot/lib/InstallVerifyLib.ps1"
 
 # --- Must be elevated (we write under ProgramData, set ACLs, configure IIS) ---
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -131,14 +149,49 @@ function Install-Prerequisites {
     if (Test-HttpPlatformHandler) {
         Write-Host "  [ok]   HttpPlatformHandler already registered."
     } elseif ($HttpPlatformHandlerMsi) {
+        # 2026-08-17 F1: nothing reaches msiexec unverified. This is the only
+        # third-party executable the installer runs, it runs elevated, and it
+        # runs on the host that holds the RA's gMSA context.
         $msi = $HttpPlatformHandlerMsi
-        if ($msi -match "^https?://") {
+        $sourceKind = Assert-MsiSourceAcceptable -Source $msi -Sha256 $HttpPlatformHandlerSha256
+
+        if ($sourceKind -eq 'https') {
             $dest = Join-Path $env:TEMP "HttpPlatformHandler.msi"
             Write-Host "  [..]   Downloading HttpPlatformHandler from $msi ..."
             try { Invoke-WebRequest -Uri $msi -OutFile $dest -UseBasicParsing } catch { throw "Download failed: $($_.Exception.Message)" }
             $msi = $dest
         }
         if (-not (Test-Path $msi)) { throw "HttpPlatformHandler MSI not found: $msi" }
+
+        # 1. Digest, when one was supplied (always, for a downloaded artifact --
+        #    Assert-MsiSourceAcceptable refuses a remote source without it).
+        if ($HttpPlatformHandlerSha256) {
+            $actualHash = (Get-FileHash -Algorithm SHA256 -Path $msi).Hash
+            if (-not (Test-Sha256Match -Actual $actualHash -Expected $HttpPlatformHandlerSha256)) {
+                throw ("HttpPlatformHandler MSI SHA-256 mismatch. Expected {0}, got {1}. " -f
+                       $HttpPlatformHandlerSha256, $actualHash) +
+                      "NOT installing. Delete the downloaded copy and obtain the artifact again."
+            }
+            Write-Host "  [ok]   MSI SHA-256 matches the expected digest."
+        } else {
+            Write-Host "  [..]   No -HttpPlatformHandlerSha256 given for this local MSI; relying on the Authenticode check below."
+        }
+
+        # 2. Authenticode signature and publisher. The digest proves the bytes
+        #    are the ones the operator named; this proves who made them, which
+        #    is what catches a wrong-but-consistently-hashed artifact.
+        $sig = Get-AuthenticodeSignature -FilePath $msi
+        $signerSubject = ""
+        if ($sig.SignerCertificate) { $signerSubject = $sig.SignerCertificate.Subject }
+        if (-not (Test-MsiSignatureAcceptable -Status ([string]$sig.Status) `
+                    -SignerSubject $signerSubject `
+                    -ExpectedPublisher $HttpPlatformHandlerPublisher)) {
+            throw ("HttpPlatformHandler MSI failed Authenticode verification. Status '{0}', signer '{1}', expected publisher '{2}'. " -f
+                   $sig.Status, $signerSubject, $HttpPlatformHandlerPublisher) +
+                  "NOT installing. If your deployment repackages this module, pass -HttpPlatformHandlerPublisher."
+        }
+        Write-Host ("  [ok]   MSI Authenticode signature valid, signed by {0}." -f $signerSubject)
+
         Write-Host "  [..]   Installing HttpPlatformHandler from $msi ..."
         $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
         if ($p.ExitCode -ne 0) { throw "msiexec failed installing HttpPlatformHandler (exit $($p.ExitCode))." }

@@ -43,17 +43,22 @@
     Pass -Execute to arm it. Every auto-revoke lands in the CA DB (under the
     revoker identity) and the RA audit (via the confirm callback).
 
-    The script is safe to run repeatedly: `Revoke-Cert.ps1` rejects reason 7,
-    and a serial that is already revoked at the CA surfaces as a non-zero
-    exit from `Revoke-Cert.ps1`, which the agent logs and continues past
-    (fail-visible, does not abort the whole batch).
+    The script is safe to run repeatedly, and repeating it REPAIRS a partial
+    run. `Revoke-Cert.ps1` rejects reason 7, and a serial the CA has already
+    revoked exits 6 (already revoked, no change made) -- which the agent treats
+    as "the CA side is done, retry the RA confirmation" rather than as a
+    failure. That is what makes a dropped confirmation callback self-healing:
+    before, the retry re-revoked, saw certutil's non-zero already-revoked
+    result, booked it as a failure and skipped the callback for ever, so one
+    transient network fault desynchronized the RA audit from the CA permanently
+    (2026-08-17 F4).
 
     Exit codes:
-      0  = success (all pending serials revoked-and-confirmed, or dry-run
-           completed, or no pending revocations)
+      0  = success (all pending serials revoked-and-confirmed, already revoked
+           at the CA and confirmed, or dry-run completed, or nothing pending)
       1  = the RA was unreachable or the pending endpoint returned an error
-      2  = partial failure (one or more serials failed to revoke; see the
-           per-serial log lines above)
+      2  = partial failure (one or more serials failed to revoke or to confirm;
+           see the per-serial log lines above)
 
 .PARAMETER RaBaseUrl
     The RA's base URL (e.g. "https://ra.WORK-DOMAIN.local"). The admin
@@ -291,6 +296,10 @@ $revoked = 0
 $failed = 0
 $confirmFailed = 0
 $dryRunCount = 0
+# Serials the CA had already revoked, whose RA confirmation is being retried
+# (2026-08-17 F4). Counted separately from $revoked: no CA-side change was made
+# for these, and conflating the two would misreport what the batch did.
+$alreadyRevoked = 0
 $index = 0
 
 foreach ($entry in $pending) {
@@ -342,18 +351,30 @@ foreach ($entry in $pending) {
     $revokeExit = $revokeRun.ExitCode
     $revokeOutput | ForEach-Object { Write-Output $_ }
 
-    if ($revokeExit -eq 5) {
+    # See Get-RevokeOutcome in scripts/lib/SyncLib.ps1 for why exit 6
+    # (already revoked at the CA) must NOT be handled as a failure — it is the
+    # recovery path for a confirmation callback that failed on an earlier run
+    # (2026-08-17 F4).
+    $outcome = Get-RevokeOutcome $revokeExit
+
+    if ($outcome -eq 'requester-mismatch') {
         $failed++
         [Console]::Error.WriteLine(("CRITICAL: Revoke-Cert.ps1 exited 5 (requester mismatch) for serial {0} -- the cert was NOT issued by the expected enrollment gMSA. This is a policy violation. Aborting the batch." -f $serial))
         exit 5
     }
-    if ($revokeExit -ne 0) {
+    if (-not (Test-ShouldConfirmWithRa $outcome)) {
         $failed++
         [Console]::Error.WriteLine(("WARNING: Revoke-Cert.ps1 exited {0} for serial {1} -- logged, continuing to next serial." -f $revokeExit, $serial))
         continue
     }
 
-    Write-Output ("PASS: revoked serial {0} at the CA. Confirming with the RA..." -f $serial)
+    $alreadyRevokedAtCa = ($outcome -eq 'already-revoked')
+    if ($alreadyRevokedAtCa) {
+        $alreadyRevoked++
+        Write-Output ("NOTE: serial {0} was already revoked at the CA (no change made). Retrying the RA confirmation..." -f $serial)
+    } else {
+        Write-Output ("PASS: revoked serial {0} at the CA. Confirming with the RA..." -f $serial)
+    }
 
     # 3. Confirm with the RA so the audit flips ca_crl_updated=true and the
     #    serial drops out of the pending set. A confirm failure does NOT undo
@@ -378,20 +399,26 @@ foreach ($entry in $pending) {
         [Console]::Error.WriteLine(("WARNING: confirm POST for serial {0} failed: {1}" -f $serial, $_.Exception.Message))
         [Console]::Error.WriteLine("         The CA-side revocation SUCCEEDED, but the RA audit was not updated.")
         [Console]::Error.WriteLine("         The serial will reappear on the next pull until the confirm succeeds.")
-        # Count it. The CA and the RA now disagree, and the next run will
-        # re-revoke an already-revoked serial (certutil returns non-zero) and
-        # book THAT as the failure. Exiting 0 here told the scheduler
-        # everything was fine while the two sides drifted apart -- exactly the
-        # state an operator needs to be told about.
+        # Count it: the CA and the RA now disagree, and exiting 0 would tell
+        # the scheduler everything was fine while the two sides drifted apart.
+        # The next run now RECOVERS this rather than compounding it -- the
+        # serial is still pending, Revoke-Cert exits 6 (already revoked at the
+        # CA, no change made), and the agent retries just this callback.
         $confirmFailed++
     }
-    $revoked++
+    if (-not $alreadyRevokedAtCa) { $revoked++ }
     Write-Output ""
 }
 
 # 4. Summary.
 Write-Output ""
-Write-Output ("SYNC COMPLETE: {0} pending, {1} revoked, {2} failed, {3} confirm-failed, {4} dry-run" -f $total, $revoked, $failed, $confirmFailed, $dryRunCount)
+Write-Output ("SYNC COMPLETE: {0} pending, {1} revoked, {2} already-revoked-at-CA, {3} failed, {4} confirm-failed, {5} dry-run" -f $total, $revoked, $alreadyRevoked, $failed, $confirmFailed, $dryRunCount)
+
+if ($alreadyRevoked -gt 0) {
+    Write-Output ("NOTE: {0} serial(s) were already revoked at the CA -- their RA confirmation was retried" -f $alreadyRevoked)
+    Write-Output "      rather than being booked as a revoke failure. That is the recovery path for a"
+    Write-Output "      confirmation callback that failed on an earlier run (2026-08-17 F4)."
+}
 
 if ($confirmFailed -gt 0) {
     [Console]::Error.WriteLine(("WARNING: {0} serial(s) were revoked at the CA but NOT confirmed back to the RA." -f $confirmFailed))

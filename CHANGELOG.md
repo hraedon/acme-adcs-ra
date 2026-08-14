@@ -6,6 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-17 scan (four findings)
+
+A scan of `38f2638` that **closed three of the four preceding findings** and
+reported the CRL work as only partially done. One medium, three low; all real,
+all fixed. See `docs/security-review-2026-08-17.md`.
+
+- **The elevated installer no longer runs an unverified MSI (medium).**
+  `install-windows.ps1` hash-pinned its whole Python runtime and build closure,
+  then accepted `-HttpPlatformHandlerMsi http://…` and handed the downloaded
+  bytes to `msiexec /i` as Administrator with no digest and no signature check —
+  every Python artifact pinned, the one executable artifact not. Plaintext HTTP
+  is now refused outright; a remote source requires the new
+  `-HttpPlatformHandlerSha256`; and every source, local included, must carry a
+  `Valid` Authenticode signature whose publisher matches
+  `-HttpPlatformHandlerPublisher` (default `CN=Microsoft Corporation`). Nothing
+  reaches msiexec if any check fails.
+- **The confirmation body is bounded (low).** The route consumes one boolean and
+  read it with `request.json()`, which buffers the whole body before decoding —
+  the only attacker-reachable body in the codebase without the streaming cap the
+  JWS routes already had. The cap moved to a shared
+  `acme_adcs_ra.http_body.read_body_limited` used by both, and the read moved to
+  the top of the handler so an oversized body is rejected before any external
+  work. New `ACME_RA_MAX_ADMIN_BODY_SIZE_BYTES` (default 4096).
+- **Three ways past the CRL resource controls, closed (low).** (a) The store
+  canonicalizes serials internally, so `A`/`0A`/`00A` are one certificate — but
+  the route kept its own half-normalized spelling as the single-flight key, so
+  each alias started its own retrieval. The route now canonicalizes with the
+  store's own function and keys the gate by `cert.id`. (b) `max_workers` bounds
+  what runs, not what is admitted, and the executor's queue is unbounded: new
+  `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_PENDING` (default 32) sheds with 429 +
+  Retry-After instead of queueing. (c) A **non-chunked** trickle never reached
+  the per-chunk deadline check at all — a 0.3s deadline ran past 20s. Retrieval
+  now reads per socket read and a watchdog shuts the socket down at the
+  deadline, which also bounds a peer that goes silent after its headers (8.01s
+  → 0.50s).
+- **A failed confirmation callback no longer wedges reconciliation for ever
+  (low).** The sync agent revokes at the CA then confirms to the RA; if that
+  POST failed, the next sweep re-revoked, saw certutil's non-zero
+  already-revoked result, booked it as a failure and skipped the confirmation —
+  permanently, from one transient network fault. `Revoke-Cert.ps1` now
+  recognizes an already-revoked CA state, makes no change, and exits **6**,
+  which the agent treats as "confirm it anyway". The requester check still runs
+  first, so a mis-requested certificate still fails closed.
+
 ### Security — 2026-08-16 rescan (four findings)
 
 A rescan (Codex, with Daybreak Blue) of `fb3a14e` that **confirmed all four
