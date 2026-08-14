@@ -426,58 +426,113 @@ class Store:
         rewritten in place and its thumbprint recomputed. The account URL is the
         row id, so clients see nothing.
 
-        Second, **consolidate**: if two rows normalize to the same thumbprint
-        they are the twin this finding describes. Merging them automatically
-        would silently join two accounts' order histories and rate-limit
-        accounting, so this refuses to guess and leaves them for the operator —
-        the UNIQUE index migration that runs next logs the same condition and
-        the RA keeps running on its read-then-insert path.
+        Second, **refuse to serve a twin**. Two rows that normalize to the same
+        key are the deactivation bypass F5 exists to close, and merging them
+        automatically would silently join two accounts' order histories and
+        rate-limit accounting.
+
+        **Two passes, and nothing is written until the whole picture is known**
+        (2026-08-18 rescan F1). The first version canonicalized row by row with
+        only advisory duplicate detection, which failed both ways depending on
+        row order and on whether the UNIQUE index already existed:
+
+        * index present — rewriting a non-canonical row to its canonical twin's
+          thumbprint raised ``UNIQUE constraint failed`` out of ``Store``
+          construction. An uncaught ``IntegrityError`` during startup, from a
+          migration whose job was to *repair* the database.
+        * index absent — the twin was logged, the index creation then failed and
+          was suppressed, and the RA served with **both rows holding the same
+          canonical key**. Deactivating one still left the other usable, so the
+          migration preserved exactly the bypass it was written to remove.
+
+        So: read and canonicalize everything in memory, group by the thumbprint
+        each row *will* have, and refuse startup on any collision before a single
+        UPDATE runs. A duplicate account key is a security-invariant violation
+        and an operator decision, not something to log past.
         """
+        log = logging.getLogger(__name__)
         rows = conn.execute("SELECT id, jwk_json, jwk_thumbprint FROM accounts").fetchall()
-        canonical_seen: dict[str, str] = {}
-        rewritten = 0
-        for row in rows:
-            account_id, jwk_json, stored_thumbprint = row[0], row[1], row[2]
+
+        # --- Pass 1: canonicalize in memory. No writes. ---
+        # Keyed by the thumbprint the row will hold once this migration is done,
+        # which is the canonical one for a readable JWK and the stored one for a
+        # row we cannot parse. Both have to take part in the collision check, or
+        # the UNIQUE index could still fail after we declared the DB clean.
+        planned: dict[str, list[str]] = {}
+        updates: list[tuple[str, str, str]] = []
+        unreadable: list[str] = []
+        for account_id, jwk_json, stored_thumbprint in rows:
             try:
                 jwk = json.loads(jwk_json)
                 canonical_jwk = canonicalize_jwk(jwk)
                 thumbprint = jwk_thumbprint(canonical_jwk)
-            except Exception:  # noqa: BLE001 - a row we cannot normalize is left alone
-                logging.getLogger(__name__).error(
-                    "Account %s has a stored JWK that cannot be normalized; it "
-                    "is left as-is and will fail authentication. Inspect it.",
-                    account_id,
-                )
+            except Exception:  # noqa: BLE001 - an unparseable row is inert, not a twin
+                # It cannot authenticate either way: `authenticate_account`
+                # rebuilds the key from this same JSON and the strict decoder
+                # rejects it. So it is not a deactivation-bypass risk and does
+                # not justify refusing startup on its own — but it is still
+                # loud, and it still has to be counted below.
+                unreadable.append(account_id)
+                planned.setdefault(str(stored_thumbprint), []).append(account_id)
                 continue
-            twin = canonical_seen.get(thumbprint)
-            if twin is not None:
-                logging.getLogger(__name__).error(
-                    "Accounts %s and %s hold the SAME account key under "
-                    "different JWK encodings. Deactivating one does NOT disable "
-                    "the other. Reconcile them (and disable the EAB kid) before "
-                    "relying on account deactivation.",
-                    twin,
-                    account_id,
-                )
-                continue
-            canonical_seen[thumbprint] = account_id
+            planned.setdefault(thumbprint, []).append(account_id)
             # Compare the parsed JWKs, not the serialized text: rewriting a row
             # whose members are already canonical just because `json.dumps`
             # ordered the keys differently would churn every account on every
             # start. `_dump_json` is what `create_account` writes with, so a
             # rescued row is byte-identical to a freshly registered one.
-            canonical_json = _dump_json(canonical_jwk)
             if canonical_jwk != jwk or thumbprint != stored_thumbprint:
-                conn.execute(
-                    "UPDATE accounts SET jwk_json = ?, jwk_thumbprint = ? WHERE id = ?",
-                    (canonical_json, thumbprint, account_id),
-                )
-                rewritten += 1
-        if rewritten:
-            logging.getLogger(__name__).warning(
+                updates.append((_dump_json(canonical_jwk), thumbprint, account_id))
+
+        # --- Collision policy, before any mutation. ---
+        collisions = {tp: ids for tp, ids in planned.items() if len(ids) > 1}
+        if collisions:
+            detail = "; ".join(
+                f"accounts {', '.join(sorted(ids))} share one account key"
+                for ids in collisions.values()
+            )
+            raise StoreMigrationError(
+                f"{len(collisions)} duplicate account key(s) found: {detail}. "
+                "These rows hold the SAME key under different JWK encodings, so "
+                "deactivating one would NOT disable the other — the bypass this "
+                "migration exists to close. Nothing has been modified. Reconcile "
+                "them offline (keep one account, delete or deactivate the rest, "
+                "and disable the EAB kid if the key is suspect), then restart."
+            )
+
+        for account_id in unreadable:
+            log.error(
+                "Account %s has a stored JWK that cannot be parsed; it is left "
+                "as-is and CANNOT authenticate. Inspect or remove the row.",
+                account_id,
+            )
+
+        # --- Pass 2: apply. Every thumbprint below is known unique. ---
+        if updates:
+            conn.executemany(
+                "UPDATE accounts SET jwk_json = ?, jwk_thumbprint = ? WHERE id = ?",
+                updates,
+            )
+            log.warning(
                 "Re-encoded %d stored account JWK(s) into canonical form; the "
                 "keys are unchanged.",
-                rewritten,
+                len(updates),
+            )
+
+        # Post-migration invariant, in the same migration that established it.
+        # Cheap, runs on every start, and it is the check that would catch a
+        # future insert path forgetting to canonicalize.
+        duplicate_count = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT jwk_thumbprint FROM accounts "
+            "WHERE jwk_thumbprint IS NOT NULL "
+            "GROUP BY jwk_thumbprint HAVING COUNT(*) > 1)"
+        ).fetchone()[0]
+        if duplicate_count:
+            raise StoreMigrationError(
+                f"{duplicate_count} account thumbprint(s) are still duplicated "
+                "after canonicalization. One account key would map to several "
+                "accounts, so account deactivation is not enforceable. Refusing "
+                "to serve."
             )
 
     def _migrate_certificates_unique_order_index(

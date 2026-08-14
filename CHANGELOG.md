@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-18 rescan (two findings)
+
+A rescan of `d26b892` that **confirmed all five 2026-08-18 fixes closed** and
+found two more — both introduced by those fixes. One medium, one low, both
+fixed. See `docs/security-review-2026-08-18-rescan.md`.
+
+- **The legacy JWK canonicalization migration no longer crashes startup or
+  preserves a duplicate key (medium).** It canonicalized rows one at a time with
+  only advisory duplicate detection, so a database holding one key under two
+  encodings either raised an uncaught `UNIQUE constraint failed` out of `Store`
+  construction (index present) or came up serving **both** rows with the same
+  canonical key (index absent) — preserving the exact deactivation bypass the
+  migration existed to remove. Now two passes: canonicalize in memory, group by
+  the thumbprint each row will hold, and raise `StoreMigrationError` naming the
+  colliding accounts before any write. A post-migration SQL invariant re-checks
+  for duplicates on every start. Note the operational consequence: **a database
+  containing a staged twin will refuse to start**, by design; audit for
+  canonical-thumbprint collisions before deploying.
+- **CRL redirects are off by default, and the origin check is exact (low).** The
+  port rule accepted the target scheme's default port as an alternative to the
+  configured one, so `http://host:8080` could redirect to `http://host:80` and
+  `https://host:8443` to `https://host:443` — same host, different service, which
+  is what the check claimed to forbid. Hostname equality also did not bind the
+  resolved address, so DNS could rebind a later hop. New
+  `ACME_RA_REVOCATION_CONFIRM_CRL_FOLLOW_REDIRECTS` (**default false**) removes
+  the hop entirely unless a deployment needs it; when enabled, the effective port
+  must equal the origin's bar one documented http:80 → https:443 upgrade, and the
+  host must keep resolving inside the address set seen at the start of the
+  retrieval.
+
 ### Security — 2026-08-18 scan (five findings)
 
 A standard scan of `8a4baca`, the branch that closed the 2026-08-17 findings.

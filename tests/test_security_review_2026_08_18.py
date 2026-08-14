@@ -110,6 +110,7 @@ class TestCrlRedirectsAreNotFollowedOffHost:
                 cert_pem="",
                 chain_pem=[],
                 total_timeout_seconds=10.0,
+                follow_redirects=True,
             )
         finally:
             stop_crl()
@@ -160,6 +161,7 @@ class TestCrlRedirectsAreNotFollowedOffHost:
                 cert_pem="",
                 chain_pem=[],
                 total_timeout_seconds=10.0,
+                follow_redirects=True,
             )
         finally:
             stop()
@@ -187,6 +189,7 @@ class TestCrlRedirectsAreNotFollowedOffHost:
                 cert_pem="",
                 chain_pem=[],
                 total_timeout_seconds=10.0,
+                follow_redirects=True,
             )
         finally:
             stop()
@@ -262,6 +265,7 @@ class TestRedirectHeadersCountAgainstTheDeadline:
                 chain_pem=[],
                 timeout_seconds=8.0,
                 total_timeout_seconds=0.6,
+                follow_redirects=True,
             )
         finally:
             stop()

@@ -186,8 +186,20 @@ def _effective_port(parsed: ParseResult) -> int | None:
     return _DEFAULT_PORTS.get(parsed.scheme)
 
 
+def _resolve_addresses(host: str, port: int | None) -> frozenset[str]:
+    """The set of IP addresses *host* currently resolves to, or empty on failure."""
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return frozenset()
+    return frozenset(str(info[4][0]) for info in infos)
+
+
 def _vet_redirect(
-    location: str, current_url: str, origin: ParseResult
+    location: str,
+    current_url: str,
+    origin: ParseResult,
+    pinned_addresses: frozenset[str] = frozenset(),
 ) -> tuple[str | None, str]:
     """Resolve a ``Location`` and decide whether it may be followed.
 
@@ -198,10 +210,24 @@ def _vet_redirect(
     ``Location`` header is picked by whoever *answers* that CDP — a hostile or
     on-path CRL server — so following it wherever it points turns the RA into a
     blind SSRF probe against anything its network can reach. The rule is
-    therefore: a redirect may move around **within the configured host** and may
-    upgrade http to https, and may do nothing else. That keeps ordinary
-    path-level and scheme-upgrade redirects working without ever letting the
-    destination be chosen off-host.
+    therefore: a redirect may change only the **path** of the configured origin,
+    plus the one documented http→https upgrade.
+
+    Two ways the first version of this was too loose (2026-08-18 rescan F2):
+
+    * **The port.** It accepted the target scheme's default port as an
+      alternative to the origin's, which was meant to allow 80→443 on an upgrade
+      but also allowed the reverse move: a CDP configured on
+      ``http://host:8080`` could redirect to ``http://host:80``, and
+      ``https://host:8443`` to ``https://host:443``. Same host, different port,
+      different service — exactly what the check claimed to forbid. The upgrade
+      is now spelled out as precisely that one transition.
+    * **The name.** Comparing hostname text does not bind the address the hop
+      actually connects to, and each hop resolves the name again. An attacker
+      controlling DNS for the configured CDP name can answer the second lookup
+      with any address. *pinned_addresses* is what the host resolved to at the
+      start of the retrieval; a hop whose resolution has moved outside that set
+      is refused.
     """
     target = urljoin(current_url, location)
     parsed = urlparse(target)
@@ -215,11 +241,35 @@ def _vet_redirect(
         )
     if origin.scheme == "https" and parsed.scheme == "http":
         return None, "target downgrades https to http"
+
+    origin_port = _effective_port(origin)
+    allowed_ports = {origin_port}
+    if (
+        origin.scheme == "http"
+        and parsed.scheme == "https"
+        and origin_port == _DEFAULT_PORTS["http"]
+    ):
+        # The one documented transition: a CDP on plain http's default port
+        # redirecting to https on *its* default port. Nothing else.
+        allowed_ports.add(_DEFAULT_PORTS["https"])
     port = _effective_port(parsed)
-    if port not in (_effective_port(origin), _DEFAULT_PORTS[parsed.scheme]):
-        # Same host, different port is still a different service — exactly the
-        # move an internal port scan would make.
-        return None, f"target changes the port to {port}"
+    if port not in allowed_ports:
+        return None, (
+            f"target changes the port ({origin_port} -> {port}); same host, "
+            "different service"
+        )
+
+    if pinned_addresses:
+        now = _resolve_addresses(parsed.hostname, port)
+        if not now:
+            return None, f"target host {parsed.hostname!r} no longer resolves"
+        if not now <= pinned_addresses:
+            # DNS moved under us between the first request and this hop.
+            return None, (
+                f"target host {parsed.hostname!r} now resolves outside the "
+                f"addresses seen at the start of this retrieval "
+                f"({sorted(now - pinned_addresses)} not in {sorted(pinned_addresses)})"
+            )
     return target, ""
 
 
@@ -264,6 +314,7 @@ def fetch_crl_evidence(
     max_bytes: int = 10 * 1024 * 1024,
     max_age_seconds: int = 7 * 24 * 3600,
     total_timeout_seconds: float = 30.0,
+    follow_redirects: bool = False,
 ) -> CrlEvidence:
     """Check whether *serial_number* is on the CA's published CRL.
 
@@ -275,6 +326,13 @@ def fetch_crl_evidence(
     matters for availability — a server that emits one byte just before every
     read timeout never trips the per-read bound and can hold the calling
     worker indefinitely (2026-08-16 rescan F4).
+
+    ``follow_redirects`` defaults to **False** (2026-08-18 rescan F2). Every
+    redirect is a destination chosen by whoever answers the configured CDP, and
+    a CDP that redirects at all is unusual — so the default removes the hop
+    rather than policing it. Enabled, hops are held to the configured origin:
+    same host, same port (bar one documented http:80 → https:443 upgrade), and
+    the host must keep resolving inside the address set seen at the start.
     """
     parsed = urlparse(crl_url)
     # A CRL is signed, so plain HTTP is normal and safe for CDPs; anything
@@ -297,6 +355,14 @@ def fetch_crl_evidence(
         )
 
     origin = parsed
+    # Resolved once, before the first request, and only when a redirect could
+    # actually use it — this is what a later hop's resolution is held against so
+    # DNS cannot move the destination mid-chain. An empty set (resolution failed
+    # here) means the check below is skipped rather than blocking the fetch: the
+    # request itself is about to fail on the same lookup and will say so.
+    pinned_addresses: frozenset[str] = frozenset()
+    if follow_redirects:
+        pinned_addresses = _resolve_addresses(parsed.hostname, _effective_port(parsed))
     deadline = time.monotonic() + total_timeout_seconds
     # Set by the watchdog below, and the reason a torn-down transfer is
     # reported as a deadline rather than as a fetch failure.
@@ -351,6 +417,19 @@ def fetch_crl_evidence(
                     return deadline_evidence(len(body))
 
                 if 300 <= response.status_code < 400:
+                    if not follow_redirects:
+                        return CrlEvidence(
+                            revoked=False,
+                            checked=False,
+                            detail=(
+                                f"CRL fetch returned {response.status_code} and "
+                                "redirects are disabled. Point "
+                                "revocation_confirm_crl_url at the final CRL URL, "
+                                "or set "
+                                "revocation_confirm_crl_follow_redirects=true if "
+                                "this CDP must redirect."
+                            ),
+                        )
                     location = response.headers.get("Location")
                     if not location:
                         return CrlEvidence(
@@ -361,7 +440,9 @@ def fetch_crl_evidence(
                                 "with no Location header"
                             ),
                         )
-                    target, refusal = _vet_redirect(location, url, origin)
+                    target, refusal = _vet_redirect(
+                        location, url, origin, pinned_addresses
+                    )
                     if target is None:
                         return CrlEvidence(
                             revoked=False,

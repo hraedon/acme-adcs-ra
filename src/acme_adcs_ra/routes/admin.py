@@ -89,6 +89,9 @@ def _crl_evidence_for(
             total_timeout_seconds=(
                 ctx.config.revocation_confirm_crl_total_timeout_seconds
             ),
+            follow_redirects=(
+                ctx.config.revocation_confirm_crl_follow_redirects
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - evidence gathering must never 500
         logger.warning("CRL evidence check failed", exc_info=True)

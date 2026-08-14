@@ -254,6 +254,16 @@ class RAConfig(BaseSettings):
     # never stops verifying, and `nextUpdate` is chosen by the CA, so neither
     # bounds replay of a pre-revocation view on its own.
     revocation_confirm_crl_max_age_seconds: int = 7 * 24 * 3600
+    # Follow HTTP redirects when fetching the CRL. **Off by default** (2026-08-18
+    # rescan F2). A `Location` is chosen by whoever answers the configured CDP,
+    # so every redirect is attacker-influenced input, and a CDP that redirects at
+    # all is unusual — the default therefore removes the hop rather than trying
+    # to police it. When enabled, a hop must keep the same host and port (only an
+    # http:80 → https:443 upgrade is allowed) and the host must still resolve to
+    # the address set seen at the start of the retrieval. If a deployment's CDP
+    # genuinely redirects, prefer pointing this at the final URL; enable this only
+    # when that is not possible.
+    revocation_confirm_crl_follow_redirects: bool = False
 
     # --- Credential strength -------------------------------------------------
     # EAB MAC keys and the admin token had no strength validation at all: a
