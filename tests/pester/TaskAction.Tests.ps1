@@ -14,10 +14,13 @@ Describe 'Build-SyncActionCommand' {
         $script:scriptPath = '/opt/scripts/Sync-Revocations.ps1'
         $script:requester = 'WORK-DOMAIN\gMSA-acme-ra$'
         $script:dotenv = 'C:\ProgramData\acme-adcs-ra\acme-ra.env'
+        # Only the invariant fields live here. Windows PowerShell 5.1 refuses
+        # to bind a parameter supplied by BOTH a splat and an explicit argument
+        # ("specified more than once"); pwsh 7 accepts it silently, which is
+        # exactly the divergence the 5.1 CI job exists to catch.
         $script:common = @{
             BaseUrl = $script:baseUrl; CaConfigStr = $script:caConfig
-            Local = $false; DryRunMode = $false; ScriptPath = $script:scriptPath
-            Requester = $script:requester; PublishCrlMode = $false
+            ScriptPath = $script:scriptPath; Requester = $script:requester
             DotEnvPath = $script:dotenv
         }
     }
@@ -134,8 +137,7 @@ Describe 'Build-SyncActionCommand credential secrecy' {
         $script:confirmSecret = 'S3CR3T-confirm-token-do-not-leak-xyz789'
         $script:args2 = @{
             BaseUrl = 'https://ra.WORK-DOMAIN.local'; CaConfigStr = 'CA01\WORK-DOMAIN-CA'
-            Local = $true; DryRunMode = $false; ScriptPath = '/opt/s.ps1'
-            Requester = 'WORK-DOMAIN\gMSA$'; PublishCrlMode = $false
+            ScriptPath = '/opt/s.ps1'; Requester = 'WORK-DOMAIN\gMSA$'
             DotEnvPath = 'C:\ProgramData\acme-adcs-ra\acme-ra.env'
         }
     }
