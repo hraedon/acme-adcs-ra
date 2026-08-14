@@ -122,7 +122,13 @@ async def key_change(
     if old_key_thumbprint != jwk_thumbprint(json.loads(account.jwk_json)):
         raise unauthorized("oldKey in inner JWS does not match account key")
 
-    new_key_thumbprint = jwk_thumbprint(new_jwk)
+    # Same treatment as ``oldKey`` above: ``newKey`` is attacker-supplied, and
+    # jwk_thumbprint now also refuses non-canonical member encodings (F5), which
+    # is a client error rather than a 500.
+    try:
+        new_key_thumbprint = jwk_thumbprint(new_jwk)
+    except (KeyError, TypeError, JWSValidationError) as exc:
+        raise malformed(f"inner JWS newKey is not a usable JWK: {exc}") from exc
     if new_key_thumbprint == old_key_thumbprint:
         raise malformed("new key must differ from the current account key")
 

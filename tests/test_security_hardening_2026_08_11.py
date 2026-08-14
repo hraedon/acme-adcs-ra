@@ -30,6 +30,7 @@ from acme_adcs_ra.rate_limit import TokenBucket
 from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import Store, canonical_serial
+from tests.conftest import placeholder_ec_jwk
 
 # ---------------------------------------------------------------------------
 # Nonce rate limiting
@@ -384,7 +385,7 @@ def test_key_change_malformed_oldkey_is_a_client_error(tmp_path: Path) -> None:
 
 
 def _jwk() -> dict[str, str]:
-    return {"kty": "EC", "crv": "P-256", "x": "AA", "y": "BB"}
+    return placeholder_ec_jwk("hardening-2026-08-11")
 
 
 def _self_signed_pem(*, serial: int, common_name: str = "Test") -> str:

@@ -34,6 +34,7 @@ from acme_adcs_ra.csr_validation import (
 )
 from acme_adcs_ra.enrollment import (
     EnrollmentDenied,
+    EnrollmentPending,
     EnrollmentResult,
     EnrollmentTransportError,
 )
@@ -395,6 +396,56 @@ def _submit_enrollment_inner(
             )
             return JSONResponse(content=_order_to_json(refreshed))
         raise rejected_identifier(str(exc)) from exc
+    except EnrollmentPending as exc:
+        # The CA accepted the request and has not decided it. That is neither
+        # "issued" (there is no certificate to quarantine) nor "the CA was
+        # unreachable" (there is a live request that may still become one), and
+        # collapsing it into the latter is what allowed a second submission
+        # (2026-08-18 F4).
+        #
+        # The order stays in `processing`, so no client retry can re-enroll;
+        # the ReqID is persisted so the only route that *can* reopen the order
+        # — administrative reclaim — knows exactly which CA request has to be
+        # accounted for first.
+        recorded = ctx.store.record_pending_ca_request(
+            order_id, exc.req_id, expected_generation=generation
+        )
+        _audit(ctx,
+            event_type="finalize-enrollment-pending",
+            account_id=account_id,
+            order_id=order_id,
+            sans=requested_sans,
+            template=decision.template,
+            outcome="failed",
+            details={
+                "error": str(exc),
+                "ca_issued": False,
+                "req_id": exc.req_id,
+                "pending_recorded": recorded,
+            },
+        )
+        if not recorded:
+            logger.error(
+                "The CA has ACCEPTED request %s for order %s but the pending "
+                "marker could not be written (the lease moved to a different "
+                "generation). That request is live at the CA and this order can "
+                "now be reclaimed without accounting for it — resolve ReqID %s "
+                "at the CA by hand.",
+                exc.req_id, order_id, exc.req_id,
+            )
+        else:
+            logger.warning(
+                "CA request %s for order %s is PENDING (awaiting a decision at "
+                "the CA). The order stays in 'processing' and cannot be "
+                "reclaimed until that request is resolved.",
+                exc.req_id, order_id,
+            )
+        order = _refresh_order_or_500(ctx, order_id, "during a pending CA request")
+        return JSONResponse(
+            status_code=503,
+            content=_order_to_json(order),
+            headers={"Retry-After": "300"},
+        )
     except EnrollmentTransportError as exc:
         if exc.ca_issued:
             # The CA issued and then something downstream failed — the leaf

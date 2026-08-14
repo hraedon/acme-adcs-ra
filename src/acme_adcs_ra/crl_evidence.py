@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar, cast
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urljoin, urlparse
 
 import requests
 from cryptography import x509
@@ -55,6 +55,13 @@ _CLOCK_SKEW = timedelta(minutes=5)
 # Verification outcomes recorded in the audit trail.
 CRL_VERIFIED = "crl-verified"
 AGENT_ASSERTED = "agent-asserted"
+
+# How many ``Location`` hops a CRL retrieval will follow. A CDP that needs more
+# than a couple is misconfigured; the cap is here because the chain is chosen by
+# whoever answers the CDP, not by the operator.
+_MAX_CRL_REDIRECTS = 4
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 @dataclass(frozen=True)
@@ -152,6 +159,81 @@ def _abort_transfer(
         response.close()
 
 
+def _effective_port(parsed: ParseResult) -> int | None:
+    """The port a URL actually connects to, filling in the scheme default."""
+    if parsed.port is not None:
+        return parsed.port
+    return _DEFAULT_PORTS.get(parsed.scheme)
+
+
+def _vet_redirect(
+    location: str, current_url: str, origin: ParseResult
+) -> tuple[str | None, str]:
+    """Resolve a ``Location`` and decide whether it may be followed.
+
+    Returns ``(url, "")`` when the hop is allowed and ``(None, reason)`` when it
+    is not.
+
+    The operator picked the configured CDP, so that URL is trusted. A
+    ``Location`` header is picked by whoever *answers* that CDP — a hostile or
+    on-path CRL server — so following it wherever it points turns the RA into a
+    blind SSRF probe against anything its network can reach. The rule is
+    therefore: a redirect may move around **within the configured host** and may
+    upgrade http to https, and may do nothing else. That keeps ordinary
+    path-level and scheme-upgrade redirects working without ever letting the
+    destination be chosen off-host.
+    """
+    target = urljoin(current_url, location)
+    parsed = urlparse(target)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None, f"target is not an http(s) URL with a host: {target!r}"
+    origin_host = (origin.hostname or "").lower()
+    if parsed.hostname.lower() != origin_host:
+        return None, (
+            f"target leaves the configured CRL host "
+            f"({origin_host!r} -> {parsed.hostname.lower()!r})"
+        )
+    if origin.scheme == "https" and parsed.scheme == "http":
+        return None, "target downgrades https to http"
+    port = _effective_port(parsed)
+    if port not in (_effective_port(origin), _DEFAULT_PORTS[parsed.scheme]):
+        # Same host, different port is still a different service — exactly the
+        # move an internal port scan would make.
+        return None, f"target changes the port to {port}"
+    return target, ""
+
+
+class _LiveTransfer:
+    """The response the deadline watchdog should tear down, if one exists yet.
+
+    The watchdog is armed *before* the first request so that DNS, connect, TLS
+    and the status/header exchange count against the total deadline as well —
+    previously the clock only started once a final response object was in hand,
+    which left everything before that point outside every control the function
+    advertises. Each hop registers its response here as soon as it has one.
+    """
+
+    def __init__(self) -> None:
+        self.response: requests.Response | None = None
+
+
+def _abort_live(live: _LiveTransfer, timed_out: threading.Event) -> None:
+    """Deadline expiry: flag it, and tear down the transfer if one is up."""
+    response = live.response
+    if response is None:
+        # No response object yet, so there is no socket to reach: requests is
+        # still inside its own connect/header read and does not hand back a
+        # handle until that completes. Setting the flag is what is available,
+        # and every check after that point sees it and bails without reading a
+        # byte of body. The residual — a peer that never finishes sending
+        # headers — is bounded by the per-read timeout, by http.client's
+        # header-size caps, and by the gate's dedicated executor and admission
+        # ceiling, which keep it off the issuance path entirely.
+        timed_out.set()
+        return
+    _abort_transfer(response, timed_out)
+
+
 def fetch_crl_evidence(
     *,
     crl_url: str,
@@ -194,67 +276,113 @@ def fetch_crl_evidence(
             ),
         )
 
+    origin = parsed
     deadline = time.monotonic() + total_timeout_seconds
     # Set by the watchdog below, and the reason a torn-down transfer is
     # reported as a deadline rather than as a fetch failure.
     timed_out = threading.Event()
-    watchdog: threading.Timer | None = None
+    live = _LiveTransfer()
+    # 2026-08-17 F3 established that the deadline needs an enforcer that does
+    # not depend on the read loop getting to run: for a **non-chunked,
+    # Content-Length** response the underlying read waits for a full 64 KiB, and
+    # a peer dribbling a byte every 20ms satisfies each socket read (so the
+    # per-read timeout keeps resetting) while never delivering enough to yield a
+    # chunk. Shutting the socket down from a timer thread is the only thing that
+    # reliably interrupts a blocked read we are not the ones performing.
+    #
+    # 2026-08-18 F1 moved the arming to *here*, before the first request, rather
+    # than after a final response object existed. Connect, TLS and the header
+    # exchange are attacker-influenced work too, and a redirect chain used to
+    # happen entirely inside `requests.get` — outside this deadline, outside the
+    # byte budget, and against destinations nothing had validated.
+    watchdog = threading.Timer(
+        total_timeout_seconds, _abort_live, args=(live, timed_out)
+    )
+    watchdog.daemon = True
+    watchdog.start()
     body = b""
+    url = crl_url
     try:
-        response = requests.get(crl_url, timeout=timeout_seconds, stream=True)
-        # Closed on every exit path, including the deadline and size bail-outs:
-        # with stream=True the transfer is only actually torn down when the
-        # response is closed, so an early `return` that leaked it would keep
-        # the socket — and the trickle — alive.
-        with contextlib.closing(response):
-            response.raise_for_status()
-
+        for _hop in range(_MAX_CRL_REDIRECTS + 1):
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return deadline_evidence(0)
-            # 2026-08-17 F3: the deadline needs an enforcer that does not
-            # depend on this loop getting to run.
-            #
-            # The previous version checked the clock once per ``iter_content``
-            # chunk, which is only as prompt as the chunks are. For a
-            # **non-chunked, Content-Length** response that is not prompt at
-            # all: the underlying read waits for the full 64 KiB, and a peer
-            # dribbling a byte every 20ms satisfies each socket read (so the
-            # per-read timeout keeps resetting) while never delivering enough
-            # to yield a chunk. The loop body — and therefore the deadline
-            # check — is simply never reached. Measured: a 0.3s total deadline
-            # ran past 20s against exactly that server.
-            #
-            # So: shut the socket down from a timer thread. ``shutdown()``
-            # makes an in-progress ``recv`` on the worker return immediately,
-            # which is the only thing that reliably interrupts a blocked read
-            # we are not the ones performing.
-            watchdog = threading.Timer(
-                remaining, _abort_transfer, args=(response, timed_out)
-            )
-            watchdog.daemon = True
-            watchdog.start()
-
-            # ``read1`` returns as soon as the socket has data, rather than
-            # waiting to fill a chunk, so the deadline check below also runs
-            # once per socket read instead of once per 64 KiB. Belt and
-            # braces with the watchdog: this exits cleanly on the common
-            # trickle, the watchdog guarantees the pathological one.
-            while not timed_out.is_set():
-                chunk = response.raw.read1(65536, decode_content=True)
-                if not chunk:
-                    break
-                body += chunk
-                if len(body) > max_bytes:
-                    return CrlEvidence(
-                        revoked=False,
-                        checked=False,
-                        detail=f"CRL exceeded {max_bytes} bytes",
-                    )
-                if time.monotonic() >= deadline:
-                    return deadline_evidence(len(body))
-            if timed_out.is_set():
+            if timed_out.is_set() or remaining <= 0:
                 return deadline_evidence(len(body))
+            # allow_redirects=False is the load-bearing part. With the default,
+            # requests resolves the whole chain inside this one call: it reads
+            # each redirect's body and issues each subsequent request itself,
+            # so neither the destination check below nor the byte budget nor
+            # the deadline ever saw any of it.
+            response = requests.get(
+                url,
+                # Clamp to what is left, so no single hop can be granted more
+                # socket patience than the whole retrieval has remaining.
+                timeout=min(timeout_seconds, remaining),
+                stream=True,
+                allow_redirects=False,
+            )
+            live.response = response
+            # Closed on every exit path, including the deadline and size
+            # bail-outs: with stream=True the transfer is only actually torn
+            # down when the response is closed, so an early `return` that
+            # leaked it would keep the socket — and the trickle — alive. It is
+            # also what discards a redirect's body unread.
+            with contextlib.closing(response):
+                if timed_out.is_set():
+                    return deadline_evidence(len(body))
+
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("Location")
+                    if not location:
+                        return CrlEvidence(
+                            revoked=False,
+                            checked=False,
+                            detail=(
+                                f"CRL fetch returned {response.status_code} "
+                                "with no Location header"
+                            ),
+                        )
+                    target, refusal = _vet_redirect(location, url, origin)
+                    if target is None:
+                        return CrlEvidence(
+                            revoked=False,
+                            checked=False,
+                            detail=f"CRL fetch refused a redirect: {refusal}",
+                        )
+                    url = target
+                    continue
+
+                response.raise_for_status()
+
+                # ``read1`` returns as soon as the socket has data, rather than
+                # waiting to fill a chunk, so the deadline check below also runs
+                # once per socket read instead of once per 64 KiB. Belt and
+                # braces with the watchdog: this exits cleanly on the common
+                # trickle, the watchdog guarantees the pathological one.
+                while not timed_out.is_set():
+                    chunk = response.raw.read1(65536, decode_content=True)
+                    if not chunk:
+                        break
+                    body += chunk
+                    if len(body) > max_bytes:
+                        return CrlEvidence(
+                            revoked=False,
+                            checked=False,
+                            detail=f"CRL exceeded {max_bytes} bytes",
+                        )
+                    if time.monotonic() >= deadline:
+                        return deadline_evidence(len(body))
+                if timed_out.is_set():
+                    return deadline_evidence(len(body))
+                break
+        else:
+            return CrlEvidence(
+                revoked=False,
+                checked=False,
+                detail=(
+                    f"CRL fetch exceeded {_MAX_CRL_REDIRECTS} redirects "
+                    f"without reaching a document"
+                ),
+            )
     except requests.RequestException as exc:
         # A watchdog teardown surfaces here as a broken/incomplete read on a
         # Content-Length response. Report what actually happened.
@@ -554,9 +682,21 @@ class CrlEvidenceGate:
             # same retrieval, and popping the key early would let a third
             # caller start a duplicate fetch. Single-threaded event loop, so
             # no lock is needed around the dict.
-            pending.add_done_callback(
-                lambda finished, k=key: self._inflight.pop(k, None)  # type: ignore[misc]
-            )
+            #
+            # The identity check is what makes this safe against its own
+            # lateness (2026-08-18 F3). ``add_done_callback`` is dispatched
+            # through ``call_soon``, so a caller can observe the settled future
+            # in the branch above, pop it, and install a *successor* under the
+            # same key before this callback ever runs. An unconditional
+            # ``pop(key)`` would then evict that live successor: further callers
+            # would submit duplicates for a serial already being fetched, and
+            # the successor would drop out of the ``max_pending`` accounting
+            # while still holding a worker.
+            def _clear(finished: asyncio.Future[Any], k: str = key) -> None:
+                if self._inflight.get(k) is finished:
+                    del self._inflight[k]
+
+            pending.add_done_callback(_clear)
         # shield() so that one caller's cancellation (a client disconnect)
         # leaves the shared retrieval running for the others.
         return cast("_T", await asyncio.shield(pending))

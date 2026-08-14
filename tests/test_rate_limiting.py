@@ -18,6 +18,7 @@ from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import OrderRateLimitExceeded, Store
+from tests.conftest import placeholder_rsa_jwk
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
 
@@ -261,7 +262,7 @@ class TestStoreCounting:
         config = _make_rate_limit_config(tmp_path, per_kid=1)
         _, store, _ = _make_app(config)
         account = store.create_account(
-            jwk={"kty": "RSA", "n": "parallel", "e": "AQAB"},
+            jwk=placeholder_rsa_jwk("parallel"),
             eab_kid="kid-001",
         )
 
@@ -295,7 +296,7 @@ class TestStoreCounting:
         _, store, _ = _make_app(config)
 
         account = store.create_account(
-            jwk={"kty": "RSA", "n": "x", "e": "AQAB"},
+            jwk=placeholder_rsa_jwk("x"),
             eab_kid="kid-001",
         )
 
@@ -327,10 +328,10 @@ class TestStoreCounting:
         now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         a1 = store.create_account(
-            jwk={"kty": "RSA", "n": "x1", "e": "AQAB"}, eab_kid="kid-001",
+            jwk=placeholder_rsa_jwk("x1"), eab_kid="kid-001",
         )
         a2 = store.create_account(
-            jwk={"kty": "RSA", "n": "x2", "e": "AQAB"}, eab_kid="kid-002",
+            jwk=placeholder_rsa_jwk("x2"), eab_kid="kid-002",
         )
         for acct in (a1, a2):
             store.create_order_with_authz(
@@ -359,7 +360,7 @@ class TestStoreCounting:
         now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         for i in range(3):
             acct = store.create_account(
-                jwk={"kty": "RSA", "n": f"x{i}", "e": "AQAB"}, eab_kid="kid-001",
+                jwk=placeholder_rsa_jwk(f"x{i}"), eab_kid="kid-001",
             )
             store.create_order_with_authz(
                 account_id=acct.id,

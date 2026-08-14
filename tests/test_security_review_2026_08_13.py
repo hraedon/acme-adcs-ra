@@ -26,6 +26,7 @@ from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.siem import SiemConfig, SiemEmitter, build_siem_config
 from acme_adcs_ra.store import CertStatus, Store
+from tests.conftest import placeholder_ec_jwk
 
 from .hand_rolled_acme_client import b64url_encode, jwk_from_private_key, sign_jws
 
@@ -377,7 +378,7 @@ def test_issuance_and_its_audit_row_are_atomic(tmp_path: Path) -> None:
     """
     store = Store(tmp_path / "ra.db")
     account = store.create_account(
-        jwk={"kty": "EC", "crv": "P-256", "x": "a", "y": "b"},
+        jwk=placeholder_ec_jwk("review-2026-08-13"),
         eab_kid="k",
         status="valid",
         contact=[],
@@ -428,7 +429,7 @@ def test_a_failed_audit_write_rolls_back_the_certificate_row(
     """The atomicity claim, tested the only way that proves it: inject a fault."""
     store = Store(tmp_path / "ra.db")
     account = store.create_account(
-        jwk={"kty": "EC", "crv": "P-256", "x": "a", "y": "b"},
+        jwk=placeholder_ec_jwk("review-2026-08-13"),
         eab_kid="k",
         status="valid",
         contact=[],
@@ -487,7 +488,7 @@ def _revoked_cert(store: Store, status: str = CertStatus.REVOKED) -> Any:
         resources.files("acme_adcs_ra.fixtures").joinpath("fake_cert.pem").read_text()
     )
     account = store.create_account(
-        jwk={"kty": "EC", "crv": "P-256", "x": "a", "y": "b"},
+        jwk=placeholder_ec_jwk("review-2026-08-13"),
         eab_kid="k",
         status="valid",
         contact=[],
@@ -684,7 +685,7 @@ class TestQuarantineIsNotServable:
             .read_text()
         )
         account = store.create_account(
-            jwk={"kty": "EC", "crv": "P-256", "x": "a", "y": "b"},
+            jwk=placeholder_ec_jwk("review-2026-08-13"),
             eab_kid="k",
             status="valid",
             contact=[],

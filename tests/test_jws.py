@@ -417,17 +417,23 @@ class TestJwkThumbprint:
         }
         assert jwk_thumbprint(jwk) == "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
 
+    # Full-width P-256 coordinates. Short placeholders used to do here, but
+    # jwk_thumbprint now enforces the RFC 7518 §6.2.1.2 fixed width (F5) —
+    # a JWK with several accepted spellings is a key with several accounts.
+    _EC_X = "kUm9uR-yiOQA2rZV6LVg1yKLBKu4PbJlxggQfYcdY8A"
+    _EC_Y = "ee9pb8ELn0dH9t_3S8-ZnJgNjisKfV66YFp6XWc1Zjw"
+
     def test_key_order_independent(self) -> None:
         from acme_adcs_ra.jws import jwk_thumbprint
 
-        a = {"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}
-        b = {"y": "def", "x": "abc", "kty": "EC", "crv": "P-256"}
+        a = {"kty": "EC", "crv": "P-256", "x": self._EC_X, "y": self._EC_Y}
+        b = {"y": self._EC_Y, "x": self._EC_X, "kty": "EC", "crv": "P-256"}
         assert jwk_thumbprint(a) == jwk_thumbprint(b)
 
     def test_alg_member_ignored(self) -> None:
         from acme_adcs_ra.jws import jwk_thumbprint
 
-        base = {"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}
+        base = {"kty": "EC", "crv": "P-256", "x": self._EC_X, "y": self._EC_Y}
         with_alg = {**base, "alg": "ES256"}
         assert jwk_thumbprint(base) == jwk_thumbprint(with_alg)
 

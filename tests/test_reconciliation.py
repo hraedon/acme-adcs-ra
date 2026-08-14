@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import subprocess
@@ -22,9 +23,14 @@ _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "reconcile_revoca
 
 
 def _jwk(idx: int) -> dict[str, Any]:
+    # `n` has to be canonical unpadded base64url with no leading zero octet:
+    # jwk_thumbprint enforces that now, because a key with several accepted
+    # spellings is a key with several accounts (2026-08-18 F5). The store only
+    # needs these to be distinct, not to be real moduli.
+    modulus = bytes([0x80]) + b"x" * 30 + bytes([idx])
     return {
         "kty": "RSA",
-        "n": f"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4-{idx}",
+        "n": base64.urlsafe_b64encode(modulus).rstrip(b"=").decode("ascii"),
         "e": "AQAB",
     }
 
@@ -152,13 +158,15 @@ class TestReconciliationBuckets:
         account_id, order_id = _create_account_and_order(store, 2)
         _insert_cert(store, order_id, account_id, "11223344", revoked=False)
         export_path = tmp_path / "ca.txt"
-        export_path.write_text(_ca_export_text([(2, "11223344", 3)]))
+        export_path.write_text(_ca_export_text([(2, "11223344", 20)]))
 
         result = _run_reconcile(store._db_path, export_path)
 
         assert result.returncode == 0
         assert "In sync: 1" in result.stdout
-        assert "PASS: revocation state is in sync." in result.stdout
+        # PASS now names the coverage it is asserting over, because "no
+        # disagreement" only means something once every RA serial was checked.
+        assert "PASS: revocation state is in sync across all 1 RA certificates." in result.stdout
 
     def test_revoked_at_ca_valid_in_ra_is_drift(
         self,
@@ -184,7 +192,7 @@ class TestReconciliationBuckets:
         account_id, order_id = _create_account_and_order(store, 4)
         _insert_cert(store, order_id, account_id, "CAFEBABE", revoked=True)
         export_path = tmp_path / "ca.txt"
-        export_path.write_text(_ca_export_text([(4, "CAFEBABE", 3)]))
+        export_path.write_text(_ca_export_text([(4, "CAFEBABE", 20)]))
 
         result = _run_reconcile(store._db_path, export_path)
 
@@ -209,20 +217,30 @@ class TestReconciliationRobustness:
         assert result.returncode == 0
         assert "In sync: 1" in result.stdout
 
-    def test_unknown_ca_disposition_is_skipped(
+    def test_unknown_ca_disposition_is_indeterminate_not_skipped(
         self,
         store: Store,
         tmp_path: Path,
     ) -> None:
+        """A disposition the parser does not understand must not read as PASS.
+
+        This test used to assert the opposite — that the row was silently
+        dropped and the run exited 0 with "In sync: 0". Dropping it is
+        indistinguishable from "the CA has no such certificate", which is the
+        fail-open path the 2026-08-18 scan (F2) found: a live certificate the RA
+        had revoked could sit behind an unparsed row and the tool would still
+        say PASS.
+        """
         account_id, order_id = _create_account_and_order(store, 6)
-        _insert_cert(store, order_id, account_id, "AABBCCDD", revoked=False)
+        _insert_cert(store, order_id, account_id, "AABBCCDD", revoked=True)
         export_path = tmp_path / "ca.txt"
-        export_path.write_text(_ca_export_text([(6, "AABBCCDD", 20)]))
+        export_path.write_text(_ca_export_text([(6, "AABBCCDD", 777)]))
 
         result = _run_reconcile(store._db_path, export_path)
 
-        assert result.returncode == 0
-        assert "In sync: 0" in result.stdout
+        assert result.returncode == 2
+        assert "unrecognized Disposition 777" in result.stdout
+        assert "PASS" not in result.stdout
 
 
 class TestReconciliationModes:
@@ -247,9 +265,9 @@ class TestReconciliationModes:
         export_path.write_text(
             _ca_export_text([
                 (1, "B00B0001", 21),
-                (2, "B00B0002", 3),
+                (2, "B00B0002", 20),
                 (3, "CA000001", 21),
-                (4, "CA000002", 3),
+                (4, "CA000002", 20),
             ])
         )
 
@@ -290,7 +308,7 @@ class TestReconciliationExitCodes:
         account_id, order_id = _create_account_and_order(store, 8)
         _insert_cert(store, order_id, account_id, "BAD0C0DE", revoked=False)
         export_path = tmp_path / "ca.txt"
-        export_path.write_text(_ca_export_text([(1, "BAD0C0DE", 3)]))
+        export_path.write_text(_ca_export_text([(1, "BAD0C0DE", 20)]))
 
         result = _run_reconcile(store._db_path, export_path)
 
@@ -304,7 +322,7 @@ class TestReconciliationExitCodes:
         account_id, order_id = _create_account_and_order(store, 9)
         _insert_cert(store, order_id, account_id, "C0FFEE00", revoked=True)
         export_path = tmp_path / "ca.txt"
-        export_path.write_text(_ca_export_text([(1, "C0FFEE00", 3)]))
+        export_path.write_text(_ca_export_text([(1, "C0FFEE00", 20)]))
 
         result = _run_reconcile(store._db_path, export_path)
 
@@ -315,7 +333,7 @@ class TestReconciliationExitCodes:
         tmp_path: Path,
     ) -> None:
         export_path = tmp_path / "ca.txt"
-        export_path.write_text(_ca_export_text([(1, "NOSUCHDB", 3)]))
+        export_path.write_text(_ca_export_text([(1, "NOSUCHDB", 20)]))
 
         result = _run_reconcile(tmp_path / "does-not-exist.db", export_path)
 

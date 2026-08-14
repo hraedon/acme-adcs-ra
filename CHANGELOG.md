@@ -6,6 +6,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-18 scan (five findings)
+
+A standard scan of `8a4baca`, the branch that closed the 2026-08-17 findings.
+Two medium, three low; all real, all fixed. See
+`docs/security-review-2026-08-18.md`.
+
+- **CRL retrieval no longer follows redirects off-host, and its deadline now
+  covers connection setup (medium).** `fetch_crl_evidence` validated only the
+  configured URL and then let `requests` resolve the whole redirect chain inside
+  one call — reading redirect bodies outside the byte budget, against
+  destinations nothing revalidated, before the watchdog was armed. Redirects are
+  now followed by hand with a four-hop cap; every hop must stay on the
+  configured host (path redirects and http→https upgrades still work, a
+  different host/port, an https→http downgrade, or a non-HTTP(S) scheme is
+  refused); and the watchdog is armed before the first request so connect, TLS
+  and header time count against the total deadline.
+- **Revocation reconciliation can no longer report PASS with certificates live
+  at the CA (medium).** `reconcile_revocation.py` used disposition 3 as "issued"
+  where ADCS uses 20, dropped unparseable rows silently, compared only the set
+  intersection of the two inventories, and ignored `quarantined` certificates —
+  which are live at the CA. `Reconcile-Revocation.ps1` also ignored `certutil`'s
+  exit status. PASS now requires full coverage: every RA serial must be
+  accounted for in the export, the export must parse cleanly, and a new exit
+  code **2 (INDETERMINATE)** covers everything else. Quarantined rows count as
+  must-be-revoked.
+- **A pending CA request is now durable state that blocks retry (low).**
+  `certfnsh.asp` returns a pending disposition with a ReqID; the leg raised it
+  as a generic transport error with the ReqID only in the message, so nothing
+  recorded which request was outstanding and administrative reclaim could reopen
+  the order on an operator's "no certificate was issued" assertion — true when
+  made, false once an officer approves. New `EnrollmentPending` exception
+  carrying the ReqID, a new `orders.pending_ca_request_id` column written before
+  finalize returns, and reclaim refuses until the operator names that exact
+  ReqID via `?ca_request_resolved=<id>`.
+- **Equivalent JWK encodings no longer produce separate accounts (low).**
+  Verification accepted padded base64url and non-minimal leading-zero integers
+  into an identical key while `jwk_thumbprint` hashed the member strings, so one
+  key could hold several accounts and deactivating the observed one left a twin
+  usable. JWK integer members must now be canonical: unpadded base64url, no
+  trailing bits, minimal for RSA `n`/`e`, exact curve width for EC `x`/`y`.
+  Stored account JWKs are re-encoded in place on upgrade (same key, canonical
+  spelling); two rows normalizing to one key are logged for the operator rather
+  than merged.
+- **A stale CRL single-flight callback can no longer evict its successor
+  (low).** Cleanup popped by key unconditionally, so a callback arriving after a
+  successor had taken the key removed the live successor — letting further
+  callers submit duplicates and dropping the successor out of the admission
+  count. Cleanup is now identity-checked.
+
 ### Security — 2026-08-17 scan (four findings)
 
 A scan of `38f2638` that **closed three of the four preceding findings** and

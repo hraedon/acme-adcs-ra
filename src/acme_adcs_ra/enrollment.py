@@ -57,6 +57,34 @@ class EnrollmentDenied(Exception):
     """The ADCS CA explicitly denied the request (policy violation)."""
 
 
+class EnrollmentPending(Exception):
+    """The CA accepted the request but has not decided it yet.
+
+    ``certfnsh.asp`` returns a "pending" disposition — with a **ReqID** — when
+    the template requires manager approval, or when CA policy defers. The
+    request now exists in the CA database and may become an issued, live,
+    domain-trusted certificate at any later moment, at an officer's discretion.
+
+    This used to be raised as a plain :class:`EnrollmentTransportError` with the
+    ReqID left in the message string (2026-08-18 F4). That put it in the same
+    bucket as "the CA was unreachable", so ``ca_issued`` was false, nothing
+    durable recorded which request was outstanding, and administrative recovery
+    could reopen the order on an operator's "no certificate was issued"
+    assertion — an assertion that is *true at the time it is made* and becomes
+    false when the officer approves. The retry then submits a second request and
+    the order ends up with two live certificates, which is precisely the
+    invariant the lifecycle exists to hold.
+
+    Distinct type, ReqID carried structurally: the finalize path persists it on
+    the order, and reclaim refuses to reopen until that exact request is
+    accounted for.
+    """
+
+    def __init__(self, message: str, *, req_id: str) -> None:
+        super().__init__(message)
+        self.req_id = req_id
+
+
 class EnrollmentTransportError(Exception):
     """A transport / connectivity error when contacting the ADCS CA.
 
@@ -415,10 +443,13 @@ class CertsrvEnrollmentLeg:
                 resp.text, resp.status_code, locale=self._locale
             )
             if disposition == "pending":
-                raise EnrollmentTransportError(
-                    f"certificate pending or not issued (ReqID={detail}); "
+                # The ReqID travels as a field, not just inside the message:
+                # the order cannot be safely reopened without it (F4).
+                raise EnrollmentPending(
+                    f"certificate pending at the CA (ReqID={detail}); "
                     "check the CA — manager approval may be on, "
-                    "or the template policy denied the request"
+                    "or the template policy deferred the request",
+                    req_id=detail,
                 )
             if disposition == "denied":
                 raise EnrollmentDenied(f"CA denied the request: {detail}")
@@ -495,6 +526,13 @@ class CertsrvEnrollmentLeg:
             issued_chain_pem = list(chain_pem)
             _validate_chain_binds_to_leaf(cert_pem, chain_pem)
         except EnrollmentDenied:
+            raise
+        except EnrollmentPending:
+            # Must pass through untouched. The catch-all below re-wraps
+            # unexpected exceptions as EnrollmentTransportError, which would
+            # strip the ReqID off and put a pending CA request straight back
+            # into the bucket that lets recovery retry it (F4). Nothing has been
+            # issued at this point, so there is nothing to attach either.
             raise
         except EnrollmentTransportError as exc:
             # Attach what the CA already issued, unless a raise site already

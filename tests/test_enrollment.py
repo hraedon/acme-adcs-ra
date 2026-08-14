@@ -20,6 +20,7 @@ from acme_adcs_ra.enrollment import (
     CertsrvEnrollmentLeg,
     EnrollmentDenied,
     EnrollmentLeg,
+    EnrollmentPending,
     EnrollmentResult,
     EnrollmentTransportError,
     FakeEnrollmentLeg,
@@ -269,7 +270,14 @@ class TestCertsrvEnrollmentLeg:
         assert result.template == _TEMPLATE
         assert result.requester  # non-empty
 
-    def test_pending_raises_transport_error(self) -> None:
+    def test_pending_raises_enrollment_pending_carrying_the_req_id(self) -> None:
+        """Pending is its own type, and the ReqID travels as a field.
+
+        It used to be an `EnrollmentTransportError` with the ReqID buried in the
+        message — the same bucket as "the CA was unreachable" — so nothing
+        durable recorded which CA request was outstanding and administrative
+        recovery could reopen the order into a second issuance (2026-08-18 F4).
+        """
         fake = _FakeSession(
             routes={
                 "certfnsh.asp": _FakeResponse(
@@ -280,8 +288,11 @@ class TestCertsrvEnrollmentLeg:
         leg = CertsrvEnrollmentLeg(
             host=_HOST, template=_TEMPLATE, session_factory=lambda: fake
         )
-        with pytest.raises(EnrollmentTransportError, match="manager approval"):
+        with pytest.raises(EnrollmentPending, match="manager approval") as caught:
             leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
+        assert caught.value.req_id == "7"
+        # Not a transport error: the two are handled differently downstream.
+        assert not isinstance(caught.value, EnrollmentTransportError)
 
     def test_denied_raises_enrollment_denied(self) -> None:
         fake = _FakeSession(

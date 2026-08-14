@@ -8,6 +8,7 @@ carries no signing primitives.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from collections.abc import Callable, Sequence
@@ -19,7 +20,7 @@ from typing import Any, NamedTuple
 
 from cryptography import x509
 
-from acme_adcs_ra.jws import jwk_thumbprint
+from acme_adcs_ra.jws import canonicalize_jwk, jwk_thumbprint
 
 # ---------------------------------------------------------------------------
 # Status enums — replace bare string literals throughout the codebase
@@ -189,6 +190,9 @@ class OrderRecord:
     # admitted under generation N must not touch the CA once the row has moved
     # on. See Store.acquire_processing_lease / holds_processing_lease.
     processing_generation: int = 0
+    # ADCS ReqID of an accepted-but-undecided CA request, or None. See the
+    # schema comment and Store.record_pending_ca_request.
+    pending_ca_request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -301,7 +305,12 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     processing_started_at TEXT,
-    processing_generation INTEGER NOT NULL DEFAULT 0
+    processing_generation INTEGER NOT NULL DEFAULT 0,
+    -- The ADCS ReqID of a request the CA accepted but has not decided.
+    -- Non-NULL means a live request exists in the CA database that may still
+    -- become a certificate; reopening the order for a retry while it is set
+    -- risks a second issuance. See Store.record_pending_ca_request.
+    pending_ca_request_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status_created
     ON orders (status, created_at);
@@ -397,7 +406,79 @@ class Store:
             self._migrate_orders_table(conn)
             self._migrate_authorizations_table(conn)
             self._migrate_certificates_unique_order_index(conn)
+            self._migrate_accounts_canonical_jwk(conn)
             self._migrate_accounts_unique_thumbprint_index(conn)
+
+    def _migrate_accounts_canonical_jwk(self, conn: sqlite3.Connection) -> None:
+        """Rewrite stored account JWKs into their one canonical encoding.
+
+        Until the 2026-08-18 F5 fix, ``n``/``e``/``x``/``y`` were decoded
+        leniently: padded base64url and non-minimal leading-zero integers built
+        the same key but hashed to a *different* thumbprint, so one key could
+        hold several accounts and deactivating the observed one left a twin
+        usable. The verifier is now strict, which leaves two jobs for an
+        already-deployed database.
+
+        First, **rescue**: a legacy account whose stored JWK is non-canonical
+        would otherwise stop authenticating outright, because
+        ``authenticate_account`` rebuilds its key from ``jwk_json``. Re-encoding
+        the members changes no key material — only its spelling — so the row is
+        rewritten in place and its thumbprint recomputed. The account URL is the
+        row id, so clients see nothing.
+
+        Second, **consolidate**: if two rows normalize to the same thumbprint
+        they are the twin this finding describes. Merging them automatically
+        would silently join two accounts' order histories and rate-limit
+        accounting, so this refuses to guess and leaves them for the operator —
+        the UNIQUE index migration that runs next logs the same condition and
+        the RA keeps running on its read-then-insert path.
+        """
+        rows = conn.execute("SELECT id, jwk_json, jwk_thumbprint FROM accounts").fetchall()
+        canonical_seen: dict[str, str] = {}
+        rewritten = 0
+        for row in rows:
+            account_id, jwk_json, stored_thumbprint = row[0], row[1], row[2]
+            try:
+                jwk = json.loads(jwk_json)
+                canonical_jwk = canonicalize_jwk(jwk)
+                thumbprint = jwk_thumbprint(canonical_jwk)
+            except Exception:  # noqa: BLE001 - a row we cannot normalize is left alone
+                logging.getLogger(__name__).error(
+                    "Account %s has a stored JWK that cannot be normalized; it "
+                    "is left as-is and will fail authentication. Inspect it.",
+                    account_id,
+                )
+                continue
+            twin = canonical_seen.get(thumbprint)
+            if twin is not None:
+                logging.getLogger(__name__).error(
+                    "Accounts %s and %s hold the SAME account key under "
+                    "different JWK encodings. Deactivating one does NOT disable "
+                    "the other. Reconcile them (and disable the EAB kid) before "
+                    "relying on account deactivation.",
+                    twin,
+                    account_id,
+                )
+                continue
+            canonical_seen[thumbprint] = account_id
+            # Compare the parsed JWKs, not the serialized text: rewriting a row
+            # whose members are already canonical just because `json.dumps`
+            # ordered the keys differently would churn every account on every
+            # start. `_dump_json` is what `create_account` writes with, so a
+            # rescued row is byte-identical to a freshly registered one.
+            canonical_json = _dump_json(canonical_jwk)
+            if canonical_jwk != jwk or thumbprint != stored_thumbprint:
+                conn.execute(
+                    "UPDATE accounts SET jwk_json = ?, jwk_thumbprint = ? WHERE id = ?",
+                    (canonical_json, thumbprint, account_id),
+                )
+                rewritten += 1
+        if rewritten:
+            logging.getLogger(__name__).warning(
+                "Re-encoded %d stored account JWK(s) into canonical form; the "
+                "keys are unchanged.",
+                rewritten,
+            )
 
     def _migrate_certificates_unique_order_index(
         self, conn: sqlite3.Connection
@@ -611,6 +692,7 @@ class Store:
         for column, ddl in (
             ("processing_started_at", "TEXT"),
             ("processing_generation", "INTEGER NOT NULL DEFAULT 0"),
+            ("pending_ca_request_id", "TEXT"),
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE orders ADD COLUMN {column} {ddl}")
@@ -679,7 +761,45 @@ class Store:
             updated_at=row["updated_at"],
             processing_started_at=row["processing_started_at"],
             processing_generation=row["processing_generation"],
+            pending_ca_request_id=row["pending_ca_request_id"],
         )
+
+    def record_pending_ca_request(
+        self, order_id: str, req_id: str, *, expected_generation: int
+    ) -> bool:
+        """Durably record that the CA accepted a request it has not decided.
+
+        Written before the finalize path returns, so an accepted ADCS request
+        is never left knowable only from a log line (2026-08-18 F4). The
+        generation is checked so a worker whose lease has already been reclaimed
+        cannot stamp its stale ReqID onto an order now owned by a different
+        enrollment.
+
+        Returns True when the row was updated.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE orders SET pending_ca_request_id = ?, updated_at = ? "
+                "WHERE id = ? AND processing_generation = ?",
+                (req_id, _now_iso(), order_id, expected_generation),
+            )
+            return cursor.rowcount == 1
+
+    def clear_pending_ca_request(self, order_id: str, req_id: str) -> bool:
+        """Drop the pending marker once *req_id* has been accounted for.
+
+        Keyed on the ReqID as well as the order: clearing "whatever is pending"
+        would let a stale operator assertion discharge a request that had been
+        replaced since, which is the same fail-open shape the marker exists to
+        prevent.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE orders SET pending_ca_request_id = NULL, updated_at = ? "
+                "WHERE id = ? AND pending_ca_request_id = ?",
+                (_now_iso(), order_id, req_id),
+            )
+            return cursor.rowcount == 1
 
 
     # ------------------------------------------------------------------

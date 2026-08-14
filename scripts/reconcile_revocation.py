@@ -1,5 +1,35 @@
 #!/usr/bin/env python3
-"""Read-only revocation reconciliation (WI-017)."""
+"""Read-only revocation reconciliation (WI-017).
+
+This tool answers one question: **is everything the RA believes is revoked
+actually revoked at the CA?** It is the control an operator leans on to close a
+revocation incident, so the way it fails matters as much as the way it passes.
+
+The 2026-08-18 scan (F2) found it could report PASS while live, domain-trusted
+certificates the RA had revoked were still active at the CA. Four separate
+reasons, all of which turned missing information into apparent agreement:
+
+* the issued disposition was wrong (3, where ADCS uses 20 — see the comment on
+  ``Test-SerialRevokedAtCa`` in ``Revoke-Cert.ps1``), so every ordinary issued
+  row was silently dropped;
+* rows with any other disposition were dropped too, including rows the parser
+  simply failed to read;
+* the comparison ran over the *intersection* of the two inventories, so an RA
+  serial absent from the export was not compared and not counted;
+* only RA status ``revoked`` was treated as needing CA revocation, although
+  ``quarantined`` certificates are equally live at the CA and travel the same
+  pull-agent path (see ``Store.list_revoked_certificates``).
+
+The rule now is the opposite one: **PASS requires proof, not the absence of
+disagreement.** Every serial the RA knows about must be accounted for in the
+export, the export must parse cleanly, and only then can zero drift mean
+anything. Anything less exits 2 (indeterminate) rather than 0.
+
+Exit codes:
+    0  PASS   — full coverage, no drift.
+    1  DRIFT  — the two sides disagree about at least one serial.
+    2  ERROR  — the comparison could not be completed, so PASS is unprovable.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +38,40 @@ import json
 import re
 import sqlite3
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-_ISSUED_DISPOSITION = 3
+# ADCS request dispositions (certsrv `Disposition` column). 20 is issued and 21
+# is revoked; `Revoke-Cert.ps1` restricts on exactly these two values and its
+# comments record the same mapping. The previous value here (3) matched no
+# ordinary row, so the parser discarded every issued certificate it saw.
+_ISSUED_DISPOSITION = 20
 _REVOKED_DISPOSITION = 21
+
+# Dispositions that legitimately carry no usable certificate: the request never
+# became one, so a row bearing one is not a coverage gap. Anything *else* that
+# is unrecognized is treated as a parse problem rather than skipped, because a
+# disposition this tool does not understand is exactly the case where guessing
+# "not revoked" is the dangerous answer.
+_NON_CERTIFICATE_DISPOSITIONS = frozenset(
+    {
+        2,  # denied
+        3,  # pending (under submission)
+        9,  # pending (awaiting manager approval)
+        30,  # failed
+        31,  # denied
+    }
+)
+
+# RA certificate statuses that mean "this certificate must not be usable" and
+# therefore must be revoked at the CA. `quarantined` belongs here: the CA issued
+# it, a post-issuance verifier rejected it, and it is live at the CA until the
+# pull agent revokes it.
+_MUST_BE_REVOKED_STATUSES = frozenset({"revoked", "quarantined"})
+
+
+class ReconciliationError(Exception):
+    """The comparison could not be completed, so PASS cannot be claimed."""
 
 
 @dataclass(frozen=True)
@@ -23,14 +82,33 @@ class _CaRecord:
 
 
 @dataclass(frozen=True)
+class _RaRecord:
+    serial: str
+    status: str
+
+    @property
+    def must_be_revoked(self) -> bool:
+        return self.status in _MUST_BE_REVOKED_STATUSES
+
+
+@dataclass(frozen=True)
 class _ReconciliationResult:
     in_sync: list[str]
     revoked_at_ca_valid_in_ra: list[str]
     revoked_in_ra_active_at_ca: list[str]
+    # Serials the RA holds that the export does not mention at all. Not
+    # "agreement" — the export did not cover them, so nothing was checked.
+    ra_serials_absent_from_ca: list[str]
+    # Blocks the parser could not turn into a usable record.
+    parse_problems: list[str] = field(default_factory=list)
 
     @property
     def drift_count(self) -> int:
         return len(self.revoked_at_ca_valid_in_ra) + len(self.revoked_in_ra_active_at_ca)
+
+    @property
+    def coverage_complete(self) -> bool:
+        return not self.ra_serials_absent_from_ca and not self.parse_problems
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -43,6 +121,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--json", action="store_true", help="Emit a JSON report instead of human-readable text."
+    )
+    parser.add_argument(
+        "--ca-export-exit-code",
+        type=int,
+        default=0,
+        help=(
+            "certutil's exit status from producing --ca-export. A non-zero value "
+            "means the export is untrustworthy and the run exits 2 without "
+            "comparing anything."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -57,8 +145,13 @@ def _canonical_serial(value: str) -> str:
     return serial
 
 
-def _load_ra_serials(db_path: Path) -> dict[str, bool]:
-    """Return a mapping of serial number to RA revocation state (True = revoked)."""
+def _load_ra_records(db_path: Path) -> dict[str, _RaRecord]:
+    """Return a mapping of serial number to the RA's view of that certificate.
+
+    Where two rows share a serial and disagree, the one demanding revocation
+    wins: this decides whether an operator goes looking for a live certificate,
+    and the failure that costs nothing is the one that sends them looking.
+    """
     uri = f"file:{db_path.resolve()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as conn:
         conn.row_factory = sqlite3.Row
@@ -66,91 +159,137 @@ def _load_ra_serials(db_path: Path) -> dict[str, bool]:
             "SELECT serial_number, status FROM certificates WHERE serial_number IS NOT NULL"
         ).fetchall()
 
-    result: dict[str, bool] = {}
+    result: dict[str, _RaRecord] = {}
     for row in rows:
         raw_serial = row["serial_number"]
         if not raw_serial:
             continue
         serial = _canonical_serial(str(raw_serial))
-        result[serial] = str(row["status"]).lower() == "revoked"
+        record = _RaRecord(serial=serial, status=str(row["status"]).lower())
+        existing = result.get(serial)
+        if existing is not None and existing.must_be_revoked and not record.must_be_revoked:
+            continue
+        result[serial] = record
     return result
 
 
-def _parse_ca_export(path: Path) -> dict[str, _CaRecord]:
-    """Parse a certutil -view text export into a serial -> CA record mapping."""
+def _parse_ca_export(path: Path) -> tuple[dict[str, _CaRecord], list[str]]:
+    """Parse a ``certutil -view`` text export.
+
+    Returns ``(records, problems)``. A block that carries a serial but whose
+    disposition is missing or unrecognized becomes a *problem*, not a silent
+    omission — the old behaviour dropped it, which is indistinguishable from
+    "the CA has no such certificate" and reads downstream as agreement.
+    """
     text = path.read_text(encoding="utf-8", errors="replace")
     records: dict[str, _CaRecord] = {}
+    problems: list[str] = []
 
-    request_id: str | None = None
-    serial: str | None = None
-    disposition: int | None = None
+    block = {"request_id": None, "serial": None, "disposition": None}
 
     def _flush_block() -> None:
-        if request_id is None or serial is None or disposition is None:
+        request_id = block["request_id"]
+        serial = block["serial"]
+        disposition = block["disposition"]
+        if serial is None:
+            # No serial: a denied/failed/pending request, or the export's
+            # preamble. Nothing to reconcile against and nothing missing.
+            return
+        canonical = _canonical_serial(serial)
+        if disposition is None:
+            problems.append(
+                f"serial {canonical} appears with no Disposition value"
+            )
             return
         if disposition == _REVOKED_DISPOSITION:
             revoked = True
         elif disposition == _ISSUED_DISPOSITION:
             revoked = False
-        else:
+        elif disposition in _NON_CERTIFICATE_DISPOSITIONS:
+            # A serial on a denied/failed/pending row is not a live
+            # certificate; recording it as "active" would invent drift.
             return
-        canonical = _canonical_serial(serial)
+        else:
+            problems.append(
+                f"serial {canonical} has unrecognized Disposition {disposition}"
+            )
+            return
         records[canonical] = _CaRecord(
-            request_id=request_id,
+            request_id=request_id or "",
             serial=canonical,
             revoked=revoked,
         )
 
+    saw_any_row = False
     for line in text.splitlines():
         if re.match(r"^\s*Row Index:\s*\d+", line):
+            saw_any_row = True
             _flush_block()
-            request_id = None
-            serial = None
-            disposition = None
+            block["request_id"] = None
+            block["serial"] = None
+            block["disposition"] = None
             continue
 
         rid_match = re.match(r"^\s*Request ID:\s*(\d+)\s*$", line)
         if rid_match:
-            request_id = rid_match.group(1)
+            block["request_id"] = rid_match.group(1)
             continue
 
         serial_match = re.match(r"^\s*Serial Number:\s*([0-9A-Fa-f\s]+?)\s*$", line)
         if serial_match:
-            serial = serial_match.group(1)
+            block["serial"] = serial_match.group(1)
             continue
 
         disp_match = re.match(r"^\s*Disposition:\s*(\d+)", line)
         if disp_match:
-            disposition = int(disp_match.group(1))
+            block["disposition"] = int(disp_match.group(1))
 
     _flush_block()
-    return records
+
+    if not saw_any_row and not records:
+        problems.append(
+            "the export contains no certutil rows at all; it is empty, "
+            "truncated, or was not produced by `certutil -view`"
+        )
+    return records, problems
 
 
 def _reconcile(
-    ra_serials: dict[str, bool],
+    ra_records: dict[str, _RaRecord],
     ca_records: dict[str, _CaRecord],
+    parse_problems: list[str],
 ) -> _ReconciliationResult:
-    """Classify certificates into in-sync or drift buckets."""
+    """Classify certificates into in-sync, drift, and not-covered buckets.
+
+    Iterates the RA's inventory rather than the intersection: a serial the RA
+    knows about and the export does not is the single most important thing this
+    tool can report, and the intersection could not express it. CA serials with
+    no RA row are *not* reported — the CA legitimately issues certificates this
+    RA never requested.
+    """
     in_sync: list[str] = []
     revoked_at_ca_valid_in_ra: list[str] = []
     revoked_in_ra_active_at_ca: list[str] = []
+    absent_from_ca: list[str] = []
 
-    for serial in set(ra_serials) & set(ca_records):
-        ra_revoked = ra_serials[serial]
-        ca_revoked = ca_records[serial].revoked
-
-        if ra_revoked == ca_revoked:
+    for serial, ra_record in ra_records.items():
+        ca_record = ca_records.get(serial)
+        if ca_record is None:
+            absent_from_ca.append(serial)
+            continue
+        if ra_record.must_be_revoked == ca_record.revoked:
             in_sync.append(serial)
-        elif ca_revoked and not ra_revoked:
+        elif ca_record.revoked:
             revoked_at_ca_valid_in_ra.append(serial)
-        elif ra_revoked and not ca_revoked:
+        else:
             revoked_in_ra_active_at_ca.append(serial)
 
     return _ReconciliationResult(
         in_sync=sorted(in_sync),
         revoked_at_ca_valid_in_ra=sorted(revoked_at_ca_valid_in_ra),
         revoked_in_ra_active_at_ca=sorted(revoked_in_ra_active_at_ca),
+        ra_serials_absent_from_ca=sorted(absent_from_ca),
+        parse_problems=list(parse_problems),
     )
 
 
@@ -160,9 +299,12 @@ def _json_report(result: _ReconciliationResult, ra_count: int, ca_count: int) ->
         "ra_certificate_count": ra_count,
         "ca_certificate_count": ca_count,
         "drift_count": result.drift_count,
+        "coverage_complete": result.coverage_complete,
         "in_sync": result.in_sync,
         "revoked_at_ca_valid_in_ra": result.revoked_at_ca_valid_in_ra,
         "revoked_in_ra_active_at_ca": result.revoked_in_ra_active_at_ca,
+        "ra_serials_absent_from_ca": result.ra_serials_absent_from_ca,
+        "parse_problems": result.parse_problems,
     }
     return json.dumps(payload, indent=2)
 
@@ -182,6 +324,7 @@ def _human_report(result: _ReconciliationResult, ra_count: int, ca_count: int) -
             f"  Revoked in RA, active at CA: "
             f"{len(result.revoked_in_ra_active_at_ca)}"
         ),
+        f"  RA serials not covered by the export: {len(result.ra_serials_absent_from_ca)}",
     ]
 
     if result.revoked_at_ca_valid_in_ra:
@@ -196,25 +339,67 @@ def _human_report(result: _ReconciliationResult, ra_count: int, ca_count: int) -
         for serial in result.revoked_in_ra_active_at_ca:
             lines.append(f"  {serial}")
 
-    if result.drift_count == 0:
+    if result.ra_serials_absent_from_ca:
         lines.append("")
-        lines.append("PASS: revocation state is in sync.")
+        lines.append(
+            "Serials the RA holds that the CA export does not mention. These "
+            "were NOT checked; the export does not cover the RA's inventory:"
+        )
+        for serial in result.ra_serials_absent_from_ca:
+            lines.append(f"  {serial}")
+
+    if result.parse_problems:
+        lines.append("")
+        lines.append("Rows that could not be interpreted:")
+        for problem in result.parse_problems:
+            lines.append(f"  {problem}")
+
+    lines.append("")
+    if not result.coverage_complete:
+        lines.append(
+            "INDETERMINATE: the export does not account for every certificate "
+            "the RA knows about, so 'in sync' cannot be established. Re-run the "
+            "export against the correct CA and confirm certutil succeeded."
+        )
+    elif result.drift_count == 0:
+        lines.append(
+            f"PASS: revocation state is in sync across all {len(result.in_sync)} "
+            "RA certificates."
+        )
+    else:
+        lines.append("DRIFT: see the buckets above.")
 
     return "\n".join(lines)
 
 
-def _run(db_path: Path, ca_export_path: Path, *, json_output: bool) -> tuple[str, int]:
+def _run(
+    db_path: Path,
+    ca_export_path: Path,
+    *,
+    json_output: bool,
+    ca_export_exit_code: int = 0,
+) -> tuple[str, int]:
     """Perform the reconciliation and return (report, exit_code)."""
-    ra_serials = _load_ra_serials(db_path)
-    ca_records = _parse_ca_export(ca_export_path)
-    result = _reconcile(ra_serials, ca_records)
+    if ca_export_exit_code != 0:
+        raise ReconciliationError(
+            f"certutil exited {ca_export_exit_code} producing the CA export; "
+            "its contents cannot be trusted, so no comparison was attempted"
+        )
+    ra_records = _load_ra_records(db_path)
+    ca_records, parse_problems = _parse_ca_export(ca_export_path)
+    result = _reconcile(ra_records, ca_records, parse_problems)
 
     if json_output:
-        report = _json_report(result, len(ra_serials), len(ca_records))
+        report = _json_report(result, len(ra_records), len(ca_records))
     else:
-        report = _human_report(result, len(ra_serials), len(ca_records))
+        report = _human_report(result, len(ra_records), len(ca_records))
 
-    exit_code = 0 if result.drift_count == 0 else 1
+    if not result.coverage_complete:
+        exit_code = 2
+    elif result.drift_count:
+        exit_code = 1
+    else:
+        exit_code = 0
     return report, exit_code
 
 
@@ -222,7 +407,12 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
     args = _parse_args(argv)
     try:
-        report, exit_code = _run(args.db, args.ca_export, json_output=args.json)
+        report, exit_code = _run(
+            args.db,
+            args.ca_export,
+            json_output=args.json,
+            ca_export_exit_code=args.ca_export_exit_code,
+        )
     except Exception as exc:  # noqa: BLE001 - CLI top-level: clean error + exit code, not a traceback
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

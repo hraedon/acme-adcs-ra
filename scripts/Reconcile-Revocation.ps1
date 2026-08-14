@@ -70,13 +70,23 @@ $exportPath = "$tempFile.txt"
 
 try {
     Write-Output "Exporting CA revocation view from '$CaConfig'..."
-    $viewOut = certutil -view -config $CaConfig -out SerialNumber,Disposition,RequestID
+    # certutil's exit status was previously ignored, so a failed or partial
+    # export was written out and reconciled against as though it were the CA's
+    # complete answer -- and an export missing rows reads downstream as
+    # agreement (2026-08-18 F2). Capture the status and hand it to the
+    # reconciler, which refuses to compare anything when it is non-zero.
+    $viewOut = & certutil @('-view', '-config', $CaConfig, '-out', 'SerialNumber,Disposition,RequestID') 2>&1
+    $exportExitCode = $LASTEXITCODE
     $viewOut | Out-File -FilePath $exportPath -Encoding utf8 -ErrorAction Stop
+    if ($exportExitCode -ne 0) {
+        Die ("certutil -view exited {0}; the export is incomplete and no comparison was attempted. Check CA connectivity and reader rights on '{1}'." -f $exportExitCode, $CaConfig) 2
+    }
 
     $arguments = @(
         $pythonScript,
         '--db', $DbPath,
-        '--ca-export', $exportPath
+        '--ca-export', $exportPath,
+        '--ca-export-exit-code', $exportExitCode
     )
     if ($Json.IsPresent) {
         $arguments += '--json'
@@ -95,7 +105,11 @@ try {
         Write-Output "For 'revoked_at_ca_valid_in_ra' entries, verify the RA store and ACME revocation records."
     }
     else {
-        Die "Reconciliation script exited with code $exitCode." $exitCode
+        # Exit 2 is INDETERMINATE, not merely "the script broke": the export did
+        # not account for every certificate the RA knows about, so a live
+        # unrevoked certificate could be sitting in the gap. It must never be
+        # read as a pass.
+        Die "Reconciliation could not be completed (exit $exitCode). This is NOT a pass -- revocation state is unproven. Review the report above." $exitCode
     }
 }
 finally {

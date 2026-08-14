@@ -201,6 +201,7 @@ async def reclaim_processing_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
     ca_verified_no_issuance: bool = False,
+    ca_request_resolved: str = "",
 ) -> JSONResponse:
     _require_admin_token(request, ctx)
     order = ctx.store.get_order(order_id)
@@ -275,6 +276,38 @@ async def reclaim_processing_order(
             f"causes double issuance."
         )
 
+    # An accepted-but-undecided CA request outranks every check below, because
+    # it is the one state where "no certificate was issued" can be *true right
+    # now* and false an hour later (2026-08-18 F4). The operator asserting
+    # non-issuance is answering a question about the past; an officer approving
+    # ReqID N afterwards makes a live certificate for an order that has since
+    # been reopened and re-enrolled. So: name the request, or the order stays
+    # shut. The ReqID must match exactly — a bare boolean would let an
+    # assertion made about one request discharge a different one.
+    pending_req_id = order.pending_ca_request_id
+    if pending_req_id and ca_request_resolved != pending_req_id:
+        _audit(ctx,
+            event_type="admin-order-reclaim-denied",
+            order_id=order_id,
+            account_id=order.account_id,
+            outcome="failed",
+            details={
+                "reason": "ca-request-pending",
+                "pending_ca_request_id": pending_req_id,
+                "asserted": ca_request_resolved,
+            },
+        )
+        raise malformed(
+            f"the CA accepted request ReqID={pending_req_id} for this order and "
+            "has not decided it. Reclaiming now lets the client re-enroll while "
+            "that request can still be approved into a live certificate — two "
+            "certificates for one order. Deny or cancel ReqID "
+            f"{pending_req_id} at the CA (certutil -deny -config <CA> "
+            f"{pending_req_id}), then retry with "
+            f"?ca_request_resolved={pending_req_id}. If it was instead ISSUED, "
+            "revoke it at the CA and record it before reclaiming."
+        )
+
     existing_cert = ctx.store.get_certificate_by_order(order_id)
     if existing_cert is not None:
         # Enrollment succeeded but the status flip was missed — close the
@@ -337,6 +370,12 @@ async def reclaim_processing_order(
         )
         return JSONResponse(content=_order_to_json(refreshed))
 
+    # The reclaim won its CAS, so the operator's assertion about this ReqID has
+    # been acted on: drop the marker (keyed on the ReqID, so a marker replaced
+    # in the meantime survives) and the order starts clean.
+    if pending_req_id:
+        ctx.store.clear_pending_ca_request(order_id, pending_req_id)
+
     _audit(ctx,
         event_type="admin-order-reclaimed",
         order_id=order_id,
@@ -346,6 +385,7 @@ async def reclaim_processing_order(
             "new_status": new_status,
             "had_certificate": had_certificate,
             "ca_verified_no_issuance": ca_verified_no_issuance,
+            "ca_request_resolved": pending_req_id or None,
         },
     )
     refreshed = _refresh_order_or_500(ctx, order_id, "after reclaim")
