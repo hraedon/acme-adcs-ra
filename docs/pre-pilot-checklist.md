@@ -138,6 +138,65 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Enrollment-lease live re-proof — PASSED (2026-08-14) on `1832163`, with one
+  claim explicitly NOT established and three observations opened.** Targeted at
+  the 2026-08-15 rescan fix rather than a full pass: §A issuance regression, the
+  removed GET routes, and a new lease phase. Deployed by the ordinary installer
+  and confirmed on the *installed* package, not the source tree — the version
+  string is `1.9.1` both before and after this change, so it proves nothing on
+  its own.
+
+  **§A issuance regression + removed GET routes, 19/19.** A real certificate
+  issued with EKU exactly `serverAuth`, SAN from the CSR, chain to the existing
+  root. `GET /acme/cert/{id}` and `GET /acme/authz/{id}` return **405, not 401**
+  — the routes are unregistered, not merely refusing, which is the stronger
+  evidence and the one the previous harness could not have distinguished.
+
+  **The lease, 9/9 + 8/8.** The migration applied to the real production-shaped
+  store (integrity `ok`, all 22 pre-existing orders still at generation 0, row
+  counts unchanged). A normal issuance mints generation 1 and completes. Against
+  a genuinely running enrollment, repeated reclaim attempts were refused
+  `enrollment-in-flight` and **none ever reopened the order**.
+
+  **The queue gap — the finding's own schedule — reproduced and refused.** With
+  the threadpool saturated (40 concurrent hung enrollments, confirmed by socket
+  count against the CA address) one further finalize was submitted. Its order
+  committed to `processing` while the audit log showed **no enrollment event for
+  it at all**, proving its task had never run. Reclaiming that order was refused
+  `enrollment-in-flight`, with `reclaim_minimum_processing_age_seconds=0` so the
+  age floor could not have been what answered. Before the fix this returns 200
+  and reopens the order.
+
+  **NOT established: the durable lease stopping a stale worker.** The attempt
+  bypassed the in-memory mark by reclaiming in SQL, but the audit trail shows
+  two `finalize-enrollment-transport-failed` rows for the contested order —
+  both tasks ran, so the stale-worker condition was never created. The lease
+  check remains unit-tested and mutation-proven only. Reproducing it live needs
+  a CA stand-in that accepts the connection and stalls, so enrollments expire on
+  a read timeout at staggered times instead of all at once.
+
+  **Three observations, none security-blocking:**
+  1. **A connect-level transport failure leaves the order wedged in
+     `processing` permanently** (no revert on `ca_issued=False`) and returns
+     503. This run produced 285 such failures and therefore 285 wedged orders.
+     Recovery is an admin reclaim that asks the operator to confirm at the CA
+     database that nothing was issued — when the RA already knows the CA was
+     never reached. A CA outage turns every in-flight order into an admin
+     ticket.
+  2. **Under ~42 concurrent hung enrollments the RA takes ~21 s to admit a new
+     request**, and admin reclaims serialise (the handler does its SQLite work
+     on the event loop).
+  3. **Measured end-to-end finalize against the real CA is ~0.4–0.5 s.** The
+     `reclaim_minimum_processing_age_seconds` default of 60 s is ~120× that.
+     The figure it was reasoned from (4 × 30 s per-call timeouts) is a
+     worst-case bound, not the operating point; the floor should be set from
+     measurement.
+
+  Lab left pristine: all 8 certificates this run caused revoked at the CA
+  (`21 -- Revoked`) and the CRL republished; store, dotenv and `web.config`
+  restored and **verified against a fingerprint taken at backup time** (integrity
+  `ok`, every table count identical); app pool back to `Started`.
+
 - **v1.9.1 live re-proof — PASSED (2026-08-14), one blocking defect found and
   fixed, three residuals opened.** Run against commit `bef2022`, which is
   `v1.9.0-rc2` plus the two fixes this run produced — and the reason the shipped
