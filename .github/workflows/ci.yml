@@ -142,18 +142,7 @@ jobs:
     # codepage parsing). The 2026-08-14 live re-proof found two defects in this
     # very code that CI could not see; running the suite where it ships is the
     # cheapest part of closing that gap.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            shell: pwsh
-            label: pwsh7-linux
-          - runner: windows-latest
-            shell: powershell
-            label: winps5.1
-    name: pester (${{ matrix.label }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -162,7 +151,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Pester
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         # Pinned (not -MinimumVersion): a floating linter/test-framework version
         # is the same non-determinism WI-039 removed for ruff/mypy. 5.7.1 is the
         # mature stable; the suite is verified green on 5.7.1 and 6.0.0. Bump
@@ -170,8 +159,39 @@ jobs:
         run: Install-Module -Name Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
 
       - name: Run Pester tests
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
+          $config = New-PesterConfiguration
+          $config.Run.Path = "tests/pester"
+          $config.Output.Verbosity = "Detailed"
+          $config.Run.Exit = $true
+          Invoke-Pester -Configuration $config
+
+  pester-windows-powershell:
+    # The same suite under **Windows PowerShell 5.1**, which is what these
+    # scripts actually ship on -- install-windows.ps1 says so in its own style
+    # header (no ternary, no ??, ANSI-codepage parsing). 5.1 differs from pwsh 7
+    # in ways this suite is exactly the wrong size to catch by inspection, and
+    # the 2026-08-14 live re-proof found two defects in this very PowerShell
+    # that CI could not see. Deliberately a separate job rather than a matrix:
+    # `shell:` does not take a matrix expression.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Pester
+        shell: powershell
+        run: Install-Module -Name Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Run Pester tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion
           Import-Module Pester -RequiredVersion 5.7.1 -Force
           $config = New-PesterConfiguration
           $config.Run.Path = "tests/pester"
