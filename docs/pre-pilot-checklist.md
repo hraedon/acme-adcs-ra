@@ -163,6 +163,66 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Daybreak round-5 findings validated and fixed (2026-08-15), final tip
+  `88e9c07`, live-proven on the lab RA host.** Five findings on the round-4
+  fixes (1 high, 4 medium), all closed; the live run itself found and fixed
+  **two calibration defects in the new chain-trust rule** (both classes CI
+  could not see: the raw generic-bit constants — `0x80000000` is
+  Generic*Read*, not GenericAll — and SID-vs-name comparison in the owner
+  check), plus a third (honouring `PropagationFlags.InheritOnly`, live-probed
+  both directions on the host) — each now pinned by a Pester case.
+
+  - **H — file-plant race into a freshly created root**: between `New-Item`
+    and the claim's protect step, the fresh root still *inherited* the
+    parent's Users-create rights; a dotenv planted there rode the whole claim
+    (the claim proof verifies shape, and an inherited-DACL dotenv has exactly
+    the descendant shape) and shipped via the no-clobber branch.
+    Fix: `Lock-FreshRoot` — protect the DACL in one atomic swap at creation,
+    prove the directory **empty** (anything present was raced through the only
+    remaining window), normalise the root owner without `/reset`, and skip
+    the reset on the fresh path entirely. **Live-proven on the absent path**
+    (both roots "protected at creation and verified empty", full install
+    exit 0); the raced-plant branch itself needs a genuinely won race and is
+    source-asserted + reviewed instead, like round-4's collision branch.
+  - **M — lexical path comparison missed aliases**: `Get-PathRelation` now
+    canonicalises (dot segments, slashes, case, UNC lexically everywhere;
+    junctions/symlinks/8.3 through kernel final-path resolution of the
+    deepest existing ancestor on Windows). **Live-proven**: dot-segment,
+    `C:\PROGRA~1` and a real junction alias each refused with the relation
+    named, pool untouched, nothing created.
+  - **M — PATH-resolved interpreter executed elevated unproven**: every
+    candidate (launcher resolution *and* the `sys.executable` self-resolution)
+    is chain-gated before first execution. **Live-proven both directions**:
+    a fake `python.exe` first on PATH in a Users-writable dir is rejected
+    with its chain reasons and **never executed** (marker-file proof), while
+    the legitimate ProgramFiles/profile candidates pass and the install
+    completes.
+  - **M — SitePath/web.config adopted unverified**: SitePath joins the
+    disjointness check against both managed roots; a pre-existing site tree
+    must prove itself (no reparse points, admin-only owners, no write-class
+    ACE for any broad trustee — the gMSA included) or the install refuses; a
+    fresh one is locked at birth. The web.config check became
+    `Assert-WebConfigLaunchTrusted` (throwing): unparseable XML, a
+    processPath inside the state tree, or outside the runtime tree, each
+    refuse. **Live-proven**: a Users-writable site tree with a planted
+    web.config is refused naming the ACEs (no IIS mutation, live sites
+    untouched); a hostile processPath is refused; and a mismatched-runtime
+    processPath on a *passing* tree also refuses — found while testing on
+    throwaway roots, exactly the fail-closed behaviour intended.
+  - **M — replayable authenticated requests grew the durable audit stores**:
+    coalescing now covers `account-request-denied`, `order-rate-limited`,
+    `finalize-csr-mismatch`, `finalize-policy-denied` (keyed additionally by
+    account/order so folded tallies stay attributable), and the challenge
+    route short-circuits an already-valid challenge (no state write, no audit
+    row) instead of re-auditing per POST. App-level pytest coverage; the
+    deployed build **live-proven** end-to-end with a 40-request denial storm:
+    40/40 rejected, **zero** durable rows (store counts unchanged at
+    22/5/21/87).
+
+  Local gates on `88e9c07`: 801 pytest / 259 Pester / ruff / mypy; CI green
+  on every tip in the chain (`b4cb6c6`, `fca6458`, `88e9c07`). The lab host
+  now runs `88e9c07`'s runtime; the CA host was never touched.
+
 - **Daybreak round-4 findings validated and fixed (2026-08-15) on `102a1f4`,
   live-proven on the lab RA host.** Four findings on the installer rework
   (2 medium, 2 low), all closed on the same branch with 14 new Pester cases

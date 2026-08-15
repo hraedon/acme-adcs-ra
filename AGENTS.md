@@ -148,6 +148,30 @@ a bare-`-ConfigureIIS` first install. Refusal runs leave the app pool stopped
 log in `docs/pre-pilot-checklist.md` and the gitignored
 `samples/lab-run-2026-08-15-installer-validation.md`.
 
+**Daybreak's FIFTH pass (of `f0597a5`) found five more (1 high, 4 medium);
+all five are fixed, the final tip is `88e9c07`, live-proven where
+deterministically possible** — the high was a *file*-plant race into a
+freshly created root (the round-4 collision fix closed the directory race,
+but between `New-Item` and the claim's protect step the fresh root still
+inherited Users-create rights, and a planted dotenv rode the whole claim —
+`Lock-FreshRoot` now protects at creation, proves the directory empty, and
+never runs `/reset` on the fresh path); lexical path comparison missed
+dot-segment/8.3/junction aliases (canonicalisation + kernel final-path
+resolution, all three refused live); PATH-resolved interpreters executed
+elevated unproven (ancestor-chain provenance gate — a fake PATH-first
+python is rejected and never executed, live-proven with a marker file);
+SitePath/web.config were adopted unverified (site-tree provenance +
+throwing launch-config validation, both halves refused live); and
+replayable authenticated requests grew the audit stores unbounded
+(coalescing extended to the replayable denial classes + an
+already-valid-challenge short-circuit; the deployed build held **zero**
+durable rows against a 40-request live denial storm). The live run found
+**two more calibration defects in the new chain rule itself** — the raw
+generic-bit constants (0x80000000 is GenericRead, not GenericAll) and
+SID-vs-name in the owner check — plus InheritOnly handling, each
+live-fixed and pinned by a Pester case. The lab host runs `88e9c07`,
+`/directory` 200, store unchanged.
+
 **Daybreak's FOURTH pass (of `27127af`) found four more; all four are fixed
 on `102a1f4` and live-proven where deterministically possible** — a TOCTOU on
 first-install state-root creation (`New-Item -Force` adopted a raced
