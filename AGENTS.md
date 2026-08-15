@@ -137,7 +137,7 @@ lets HttpPlatformHandler launch uvicorn** — that is a narrower grant than the
 old `M` and the most likely thing to be subtly wrong. `icacls /setowner` also
 now fails closed where `takeown` would have forced it, and the `*S-1-5-32-544`
 star form is unverified for that one verb. Pester 5.7.1 and Windows PowerShell
-5.1 are on `mvmcitest01`.
+5.1 are on the lab RA host (real hostname in the gitignored runbook).
 
 **Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
 security reviews.** There is **no 1.9.0 release**: that line shipped only as

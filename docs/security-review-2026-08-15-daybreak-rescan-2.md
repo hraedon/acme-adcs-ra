@@ -225,5 +225,6 @@ because the Windows CI job runs pytest and never touches the installer:
    race-oriented ACL checks, run end to end.
 
 `samples/lab-validation-runbook.md` plus `samples/lab-harness/` are the
-starting point; Pester 5.7.1 and Windows PowerShell 5.1 are on `mvmcitest01`.
+starting point; Pester 5.7.1 and Windows PowerShell 5.1 are on the lab RA host
+(real hostname in the gitignored runbook).
 **A live re-proof should precede any tag.**

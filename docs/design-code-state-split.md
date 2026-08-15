@@ -143,4 +143,5 @@ where defects escape. Before any tag:
 - the migration path in `operator-requirements.md` §4, walked end to end
 
 `samples/lab-validation-runbook.md` and `samples/lab-harness/` are the starting
-point; Pester 5.7.1 and Windows PowerShell 5.1 are on `mvmcitest01`.
+point; Pester 5.7.1 and Windows PowerShell 5.1 are on the lab RA host (real
+hostname in the gitignored runbook).
