@@ -16,8 +16,8 @@ from acme_adcs_ra.acme_errors import (
 from acme_adcs_ra.app_state import (
     _ACME_PATHS,
     ServerContext,
-    _audit,
     authenticate_account,
+    emit_audit_hook,
     get_context,
 )
 from acme_adcs_ra.jws import (
@@ -136,16 +136,23 @@ async def key_change(
     if existing is not None:
         raise bad_public_key("new account key is already registered to another account")
 
-    ctx.store.update_account_key(account_id, new_jwk)
-
-    _audit(ctx,
-        event_type="account-key-changed",
-        account_id=account_id,
-        outcome="success",
-        details={
-            "eab_kid": account.eab_kid,
-            "new_key_thumbprint": new_key_thumbprint,
+    # Key rotation and its audit row commit in ONE transaction (Daybreak
+    # 2026-08-15): the ``account-key-changed`` row is the only record naming
+    # the new key's thumbprint, and it used to be written after the rotation
+    # had already committed. The SIEM fan-out runs after the commit via the
+    # returned event, matching finalize and newAccount.
+    event = ctx.store.update_account_key_with_audit(
+        account_id,
+        new_jwk,
+        audit={
+            "event_type": "account-key-changed",
+            "outcome": "success",
+            "details": {
+                "eab_kid": account.eab_kid,
+                "new_key_thumbprint": new_key_thumbprint,
+            },
         },
     )
+    emit_audit_hook(ctx, event)
 
     return JSONResponse(content={})

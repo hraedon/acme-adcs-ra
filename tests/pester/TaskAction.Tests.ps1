@@ -204,3 +204,45 @@ Describe 'Build-SyncActionCommand injection resistance' {
         $cmd | Should -Match "x''; Stop-Service certsvc; ''"
     }
 }
+
+# --- Daybreak 2026-08-15: the registration command line is not a secret channel -
+#
+# -AdminToken/-ConfirmToken used to be [string] parameters, so the one-time
+# registration carried the FULL token values through shell history and the
+# invoking process's argument list -- the last place a secret still traveled
+# after F2 removed them from the task definitions. They are switches now: the
+# script cannot accept a secret value at all. These tests pin that property at
+# the AST level, which Linux CI can do.
+Describe 'Register-MaintenanceTasks credential surface (Daybreak 2026-08-15)' {
+    BeforeAll {
+        $script:text = Get-Content -Raw "$PSScriptRoot/../../scripts/Register-MaintenanceTasks.ps1"
+        $script:ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $script:text, [ref]$null, [ref]$null)
+        $script:params = @($script:ast.ParamBlock.Parameters)
+    }
+
+    It '-AdminToken is a switch -- it cannot accept a value' {
+        $p = $script:params | Where-Object { $_.Name.Extent.Text -eq '$AdminToken' }
+        @($p).Count | Should -Be 1
+        $p[0].StaticType.Name | Should -Be 'SwitchParameter'
+    }
+
+    It '-ConfirmToken is a switch -- it cannot accept a value' {
+        $p = $script:params | Where-Object { $_.Name.Extent.Text -eq '$ConfirmToken' }
+        @($p).Count | Should -Be 1
+        $p[0].StaticType.Name | Should -Be 'SwitchParameter'
+    }
+
+    It 'no value-shaped use of either token remains in the body' {
+        $script:text | Should -Not -Match 'IsNullOrWhiteSpace\(\$(AdminToken|ConfirmToken)\)'
+    }
+
+    It 'no example shows a value-shaped -AdminToken/-ConfirmToken' {
+        $script:text | Should -Not -Match '-(Admin|Confirm)Token "'
+    }
+
+    It 'the sync action is keyed off the switches, not off string presence' {
+        $script:text | Should -Match '-LoadAdminToken \(\[bool\]\$AdminToken\)'
+        $script:text | Should -Match '-LoadConfirmToken \(\[bool\]\$ConfirmToken\)'
+    }
+}

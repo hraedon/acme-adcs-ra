@@ -24,6 +24,7 @@ from acme_adcs_ra.app_state import (
     _order_url,
     _url,
     authenticate_account,
+    emit_audit_hook,
     get_context,
 )
 from acme_adcs_ra.jws import (
@@ -173,17 +174,28 @@ async def new_account(
         raise malformed("contact must be a list")
 
     try:
-        account = ctx.store.create_account(
+        # Account row and its provenance audit commit in ONE transaction
+        # (Daybreak 2026-08-15): an account that exists with no
+        # ``account-created`` row is unauditable, and the window between two
+        # separate commits was exactly that. The SIEM fan-out happens after
+        # the commit via the returned event, as finalize does for issuance.
+        account, event = ctx.store.create_account_with_audit(
             jwk=account_jwk,
             eab_kid=verified_kid,
             status="valid",
             contact=contact,
+            audit={
+                "event_type": "account-created",
+                "outcome": "success",
+                "details": {"eab_kid": verified_kid, "alg": eab_header.get("alg")},
+            },
         )
     except sqlite3.IntegrityError:
         # A concurrent newAccount for the same key won the UNIQUE index. That
         # is exactly the case the index exists to stop, and the right answer is
         # the RFC 8555 §7.3 one: return the account that already exists rather
         # than surfacing a 500 for what is a legitimate idempotent retry.
+        # (The audit row rolls back with the account: nothing was created.)
         winner = ctx.store.get_account_by_jwk(account_jwk)
         if winner is None:
             raise
@@ -192,13 +204,7 @@ async def new_account(
             content=_account_to_json(ctx, winner),
             headers={"Location": _account_url(ctx, winner.id)},
         )
-
-    _audit(ctx,
-        event_type="account-created",
-        account_id=account.id,
-        outcome="success",
-        details={"eab_kid": verified_kid, "alg": eab_header.get("alg")},
-    )
+    emit_audit_hook(ctx, event)
 
     body: dict[str, Any] = {
         **_account_to_json(ctx, account),

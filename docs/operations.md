@@ -297,27 +297,29 @@ nonce cleanup on `create_nonce` is a safety net only — wire the cron.
 that call these endpoints on a cadence (default 15 minutes):
 
 ```powershell
-# Register both tasks (run as the gMSA so the task can read acme-ra.env if
-# needed; the admin token is passed as a parameter — do NOT commit it):
+# Register both tasks (run as the gMSA so the task can read acme-ra.env).
+# -AdminToken is a FLAG: the task action loads ACME_RA_ADMIN_TOKEN from the
+# dotenv at run time -- the value is never accepted on a command line.
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
+    -AdminToken `
     -IntervalMinutes 15 `
     -TaskUser "WORK-DOMAIN\gMSA-acme-ra$"
 
 # Dry run (does not register anything):
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
+    -AdminToken `
     -WhatIf
 ```
 
 **Task-user choice.** Run the tasks as the gMSA (the same identity the RA app
-pool uses) so the task can read the env file if the token is sourced there,
-and so the task has no more privilege than the RA itself. Alternatively, run
-as `NT AUTHORITY\SYSTEM` if the gMSA is not desired for scheduled tasks;
-either way the admin token is passed in the task action's headers, not stored
-in a file the task reads.
+pool uses) so the task can read the env file, and so the task has no more
+privilege than the RA itself. Alternatively, run as `NT AUTHORITY\SYSTEM` if
+the gMSA is not desired for scheduled tasks; either way the task action reads
+its credentials from the dotenv at run time (2026-08-19 F2) — no token value
+is stored in the task definition or accepted by the registration script
+(Daybreak 2026-08-15).
 
 After registering, verify:
 
@@ -356,8 +358,8 @@ re-enroll — so the token is a high-value secret, treated like an EAB MAC key.
 1. Generate a new high-entropy token.
 2. Update `ACME_RA_ADMIN_TOKEN` in `acme-ra.env`.
 3. Restart the RA app pool.
-4. Re-register the scheduled tasks with the new token
-   (`Register-MaintenanceTasks.ps1 -AdminToken <new>`).
+4. Nothing else: the scheduled tasks read the token from the dotenv at run
+   time, so there is nothing to re-register.
 5. Confirm the old token is rejected (`GET /acme/admin/orders` with the old
    token → 401).
 
@@ -400,14 +402,17 @@ token) are not registered there, and omit `-AdminToken` entirely:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -RevocationSyncOnly -ConfirmToken "REPLACE-WITH-CONFIRM-TOKEN" `
+    -RevocationSyncOnly -ConfirmToken `
     -CaConfig 'CA01\WORK-DOMAIN-CA' -RequesterName "WORK-DOMAIN\gMSA-acme-ra$"
 ```
 
 The generated task action then carries zero admin-token bytes, so a compromise
-of the revocation host cannot reach order reclaim or nonce cleanup. Passing
-`-AdminToken` remains supported for a single-host deployment that has not split
-the credentials, and for the general tasks on the RA host.
+of the revocation host cannot reach order reclaim or nonce cleanup. The
+`-ConfirmToken` FLAG declares which key the action loads from the dotenv at
+run time; put `ACME_RA_REVOCATION_CONFIRM_TOKEN=<value>` in the host's
+`acme-ra.env` (`-DotEnvPath`, ACL'd like the RA's own). Adding `-AdminToken`
+(flag) is for a single-host deployment that has not split the credentials, and
+for the general tasks on the RA host.
 
 ### Optional: independent CRL evidence for confirmations
 
@@ -887,31 +892,36 @@ byte-level ACE the GUI produces (proven in Plan 004).
 #### Scheduling the agent
 
 Register `Sync-Revocations.ps1` as a Windows Scheduled Task on the utility
-host, running as `gMSA-acme-revoker$`:
+host, running as `gMSA-acme-revoker$`. Use the registration script, whose
+task action loads the confirm token from an ACL'd dotenv at run time — no
+credential ever lands in the task definition or on a command line:
 
 ```powershell
-$action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\acme-adcs-ra\scripts\Sync-Revocations.ps1 -RaBaseUrl 'https://ra.WORK-DOMAIN.local' -AdminToken '<admin-token>' -ConfirmToken '<confirm-token>' -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute"
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5)
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
-    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2)
-Register-ScheduledTask -TaskName "acme-adcs-ra-sync-revocations" `
-    -Action $action -Trigger $trigger -Settings $settings `
-    -User "WORK-DOMAIN\gMSA-acme-revoker$" -Force
+# 1. On the utility host, write the confirm token to a dotenv (this host needs
+#    ONLY this key -- do not copy the RA's whole env file):
+#    C:\ProgramData\acme-adcs-ra\acme-ra.env containing
+#        ACME_RA_REVOCATION_CONFIRM_TOKEN=<confirm-token>
+#    then ACL it: icacls <file> /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" "WORK-DOMAIN\gMSA-acme-revoker$:R"
+# 2. Register only the sync task, confirm-token only:
+powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
+    -BaseUrl "https://ra.WORK-DOMAIN.local" `
+    -RevocationSyncOnly -ConfirmToken `
+    -DotEnvPath "C:\ProgramData\acme-adcs-ra\acme-ra.env" `
+    -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -TaskUser "WORK-DOMAIN\gMSA-acme-revoker$" `
+    -IntervalMinutes 5 -Execute
 ```
 
-The admin token is embedded in the task action's arguments (not written to
-a file the task reads); rotate it by re-registering (see the admin-token
-runbook). Tune the interval to your latency requirement (default 5 minutes
-shown; the RA audit records `ca_crl_updated` lag so you can measure the
-actual cadence).
+Rotate the token by editing the dotenv — the action re-reads it on every run,
+so there is nothing to re-register. Tune the interval to your latency
+requirement (default 5 minutes shown; the RA audit records `ca_crl_updated`
+lag so you can measure the actual cadence).
 
-`-ConfirmToken` is the separate revocation-confirmation credential (see above);
-without it every confirm returns 401 and serials never leave the pending list.
-`Register-MaintenanceTasks.ps1` passes both tokens via the environment
-(`ACME_ADMIN_TOKEN`, `ACME_CONFIRM_TOKEN`) so neither lands on the script's
-process command line, and warns if `-ConfirmToken` is omitted.
+`-ConfirmToken` (as a flag) declares which credential the action loads from
+the dotenv; without it every confirm returns 401 and serials never leave the
+pending list, and the registration warns. The load happens into
+`ACME_CONFIRM_TOKEN` inside the task, so the value never appears on the
+script's process command line.
 
 **`-RaBaseUrl` must be https.** Since v1.9.1 both `Sync-Revocations.ps1` and
 `Register-MaintenanceTasks.ps1` validate it before attaching any token — https
@@ -1034,7 +1044,7 @@ first (report-only), then re-register without `-DryRun` to arm it:
 # Step 1: register in dry-run mode (report-only — no revocations applied):
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -AdminToken "<admin-token>" `
+    -AdminToken -ConfirmToken `
     -IntervalMinutes 5 `
     -TaskUser "WORK-DOMAIN\gMSA-acme-ra$" `
     -RegisterRevocationSync `
@@ -1045,7 +1055,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1
 # Step 2: after dry-run review, re-register without -DryRun to arm the task:
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -AdminToken "<admin-token>" `
+    -AdminToken -ConfirmToken `
     -IntervalMinutes 5 `
     -TaskUser "WORK-DOMAIN\gMSA-acme-ra$" `
     -RegisterRevocationSync `

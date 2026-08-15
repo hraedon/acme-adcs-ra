@@ -206,3 +206,170 @@ Describe 'Test-DestinationInterpreterTrusted' {
         Test-DestinationInterpreterTrusted -RootSecured $true -InterpreterAttributes $null | Should -BeFalse
     }
 }
+
+# --- Daybreak 2026-08-15: hostile-tree ACL lockdown ----------------------------
+#
+# /inheritance:r removes only INHERITED ACEs, so the F1 "claim" left an
+# attacker's explicit ACEs and ownership intact while treating the namespace
+# as trustworthy. The fix is takeown + /reset + /grant:r + a read-back proof;
+# Test-AclDumpLocked is the decision core of that proof, so it gets fixture
+# dumps shaped like real `icacls /save` output -- including the exact attacker
+# shapes the fix exists to catch.
+
+Describe 'Test-AclDumpLocked' {
+    BeforeAll {
+        $script:allowed = @(
+            'S-1-5-32-544', 'S-1-5-18', 'BUILTIN\Administrators',
+            'NT AUTHORITY\SYSTEM', 'BA', 'SY',
+            'S-1-5-21-1111222233-4444555566-7777888899'
+        )
+        $script:cleanTree = @'
+acme-adcs-ra
+D:PAI(A;OICI;FA;;;S-1-5-32-544)(A;OICI;FA;;;S-1-5-18)
+acme-adcs-ra\python
+D:AI(A;OICIID;FA;;;S-1-5-32-544)(A;OICIID;FA;;;S-1-5-18)
+acme-adcs-ra\python\python.exe
+D:AI(A;ID;FA;;;S-1-5-32-544)(A;ID;FA;;;S-1-5-18)
+acme-adcs-ra\venv
+D:AI(A;OICIID;FA;;;S-1-5-32-544)(A;OICIID;FA;;;S-1-5-18)
+'@
+    }
+
+    It 'accepts a locked tree (protected root, inheriting descendants)' {
+        $v = Test-AclDumpLocked -DumpText $script:cleanTree -AllowedTrustees $script:allowed
+        @($v).Count | Should -Be 0
+    }
+
+    It 'flags an explicit attacker ACE that survived the reset (the finding itself)' {
+        $dump = @'
+acme-adcs-ra
+D:PAI(A;OICI;FA;;;S-1-5-32-544)(A;OICI;FA;;;S-1-5-18)
+acme-adcs-ra\python
+D:PAI(A;OICI;FA;;;S-1-5-32-544)(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-1-0)
+'@
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed)
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'EXPLICIT ACE survived'
+        ($v -join ' ') | Should -Match "unexpected trustee 'S-1-1-0'"
+    }
+
+    It 'flags a protected child DACL that does not inherit the root' {
+        $dump = $script:cleanTree -replace 'acme-adcs-ra\\python\r?\nD:AI', "acme-adcs-ra\python`nD:PAI"
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed)
+        ($v -join ' ') | Should -Match 'PROTECTED and does not inherit'
+    }
+
+    It 'flags a DENY ace anywhere' {
+        $dump = $script:cleanTree -replace '\(A;ID;FA;;;S-1-5-18\)', '(D;ID;FA;;;S-1-5-18)'
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed)
+        ($v -join ' ') | Should -Match 'DENY ACE present'
+    }
+
+    It 'flags an unexpected trustee even on a properly inherited ace' {
+        $dump = $script:cleanTree -replace 'S-1-5-18\)$', 'S-1-5-32-545)'
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed)
+        ($v -join ' ') | Should -Match "unexpected trustee 'S-1-5-32-545'"
+    }
+
+    It 'flags an empty DACL (no ACEs at all) instead of reading it as clean' {
+        $dump = @'
+acme-adcs-ra
+D:PAI(A;OICI;FA;;;S-1-5-32-544)(A;OICI;FA;;;S-1-5-18)
+acme-adcs-ra\venv
+D:AI
+'@
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed)
+        ($v -join ' ') | Should -Match 'carries no ACEs'
+    }
+
+    It 'flags an unlocked root (first entry not protected)' {
+        $dump = @'
+acme-adcs-ra
+D:AI(A;OICI;FA;;;S-1-5-32-544)(A;OICI;FA;;;S-1-5-18)
+'@
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed)
+        ($v -join ' ') | Should -Match 'expected a PROTECTED DACL'
+    }
+
+    It 'flags an inherited ace on the root (its DACL must be exactly ours)' {
+        $dump = @'
+acme-adcs-ra
+D:PAI(A;OICIID;FA;;;S-1-5-32-544)(A;OICI;FA;;;S-1-5-18)
+'@
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed)
+        ($v -join ' ') | Should -Match 'INHERITED ACE on an object whose DACL should be exactly ours'
+    }
+
+    It 'skips exempted leaf names (verified separately in single-object mode)' {
+        $dump = @'
+acme-adcs-ra
+D:PAI(A;OICI;FA;;;S-1-5-32-544)(A;OICI;FA;;;S-1-5-18)
+acme-adcs-ra\acme-ra.env
+D:PAI(A;;FR;;;S-1-5-32-544)(A;;FR;;;S-1-5-18)(A;;FR;;;S-1-5-21-1111222233-4444555566-7777888899)
+'@
+        $v = Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed -ExemptLeafNames @('acme-ra.env')
+        @($v).Count | Should -Be 0
+        # ...and the same entry WITHOUT the exemption is (correctly) flagged,
+        # so the exemption cannot hide anything the verifier would otherwise catch.
+        $v2 = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed)
+        $v2.Count | Should -BeGreaterThan 0
+    }
+
+    It 'single-object mode: accepts the dotenv shape' {
+        $dump = @'
+acme-ra.env
+D:PAI(A;;FR;;;S-1-5-32-544)(A;;FR;;;S-1-5-18)(A;;FR;;;S-1-5-21-1111222233-4444555566-7777888899)
+'@
+        $v = Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed -AllEntriesMustBeProtected
+        @($v).Count | Should -Be 0
+    }
+
+    It 'single-object mode: refuses an unlocked object' {
+        $dump = @'
+acme-ra.env
+D:AI(A;;FR;;;S-1-5-32-544)(A;;FR;;;S-1-5-18)
+'@
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees $script:allowed -AllEntriesMustBeProtected)
+        ($v -join ' ') | Should -Match 'expected a PROTECTED DACL'
+    }
+
+    It 'fails closed on an unparsable/empty dump' {
+        $v = @(Test-AclDumpLocked -DumpText '' -AllowedTrustees $script:allowed)
+        $v.Count | Should -Be 1
+        $v[0] | Should -Match 'no entries parsed'
+    }
+}
+
+# The installer must actually USE the lockdown sequence: the raw one-line
+# icacls claim (the bypassable form) must be gone, and both ACL passes must
+# end in the read-back proof. Text-level, because these run on Linux where
+# icacls/takeown do not exist; the lab re-proof exercises the real calls.
+Describe 'install-windows.ps1 uses the hostile-tree lockdown' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    It 'no raw /inheritance:r claim remains on the install root' {
+        $script:installer | Should -Not -Match 'icacls\s+\$InstallDir\s+/inheritance:r'
+        $script:installer | Should -Not -Match 'icacls\s+\$envFile\s+/inheritance:r'
+    }
+
+    It 'ownership+reset runs on both ACL passes' {
+        @([regex]::Matches($script:installer, 'Reset-TreeToInherited -Path \$InstallDir')).Count | Should -Be 2
+    }
+
+    It 'both passes end in the read-back proof' {
+        @([regex]::Matches($script:installer, 'Assert-InstallTreeLocked -Root \$InstallDir')).Count | Should -Be 2
+    }
+
+    It 'the dotenv gets its own protected DACL' {
+        $script:installer | Should -Match 'Set-ObjectProtectedDacl -Path \$envFile'
+    }
+
+    It 'the install-root trust flag is set only after the proof' {
+        $iProof = $script:installer.IndexOf('Assert-InstallTreeLocked -Root $InstallDir')
+        $iFlag = $script:installer.IndexOf('$script:installRootSecured = $true')
+        $iProof | Should -BeGreaterThan -1
+        $iFlag | Should -BeGreaterThan $iProof
+    }
+}

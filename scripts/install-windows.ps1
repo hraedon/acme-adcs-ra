@@ -252,13 +252,27 @@ if ($null -ne $existing) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 }
 
-# Restrictive ACL first, gMSA added later. inheritance:r drops any inherited
-# grant a pre-created directory may have carried (the whole point: a tree the
-# attacker made is a tree whose ACL the attacker chose).
-icacls $InstallDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Failed to secure $InstallDir (icacls exit $LASTEXITCODE); refusing to continue." }
+# Restrictive ACL first, gMSA added later. Daybreak 2026-08-15 review:
+# /inheritance:r removes only INHERITED ACEs, so this one icacls line left two
+# attacker holds on a pre-created tree -- every EXPLICIT ACE they had set, and
+# OWNERSHIP (an owner can rewrite any DACL) -- while this script went on to
+# treat the namespace as trustworthy and execute its interpreter. Lockdown is
+# now three mechanical steps plus a proof (InstallVerifyLib):
+#   1. takeown -> the Administrators GROUP owns every object in the tree;
+#   2. icacls /reset -> every explicit ACE in the tree is discarded;
+#   3. /inheritance:r /grant:r -> the root carries EXACTLY our ACEs;
+#   4. Assert-InstallTreeLocked -> the tree is read back and PROVEN locked,
+#      or the install aborts.
+Reset-TreeToInherited -Path $InstallDir
+Set-ObjectProtectedDacl -Path $InstallDir -Grants @(
+    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F'
+)
+Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees @(
+    'S-1-5-32-544', 'S-1-5-18',
+    'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'BA', 'SY'
+)
 $script:installRootSecured = $true
-Write-Host "  [ok]   install root secured (Administrators/SYSTEM full; contents now trustworthy)"
+Write-Host "  [ok]   install root secured (ownership + ACL verified: Administrators/SYSTEM only)"
 
 if ($InstallPrereqs) { Install-Prerequisites }
 
@@ -578,16 +592,33 @@ ACME_RA_SAN_SCOPES={"REPLACE-WITH-UUID":{"dns_patterns":["*.work-domain.local"]}
 # --- ACLs: the worker runs AS THE gMSA, so grant the gMSA (not a virtual acct) -
 #
 # The root was already claimed with the Administrators/SYSTEM-only ACL at the
-# top of the run (2026-08-19 F1) -- that is what made everything under it
-# trustworthy. This pass re-asserts the same ACL and adds the gMSA's Modify,
-# which could not be granted earlier because the SID is resolved after the
-# prerequisite check. Deliberately the same icacls line plus one grant, so the
-# two cannot drift apart.
-Write-Host "Securing $InstallDir (Administrators/SYSTEM full; gMSA modify) ..."
-icacls $InstallDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "${GmsaAccount}:(OI)(CI)M" | Out-Null
-# The env file: gMSA read-only (it should never rewrite its own secrets).
-icacls $envFile /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" "${GmsaAccount}:R" | Out-Null
-if (Test-Path $sharedPyDir) { icacls $sharedPyDir /grant "${GmsaAccount}:(OI)(CI)RX" | Out-Null }
+# top of the run (2026-08-19 F1). This pass re-asserts ownership + ACL across
+# the tree (everything the install itself just created, plus anything that
+# survived from before) and adds the gMSA's Modify, which could not be granted
+# earlier because the SID is resolved after the prerequisite check. Same
+# reset+protect+prove sequence as the claim, so the two passes cannot drift.
+Write-Host "Securing $InstallDir (ownership reset; Administrators/SYSTEM full; gMSA modify) ..."
+Reset-TreeToInherited -Path $InstallDir
+Set-ObjectProtectedDacl -Path $InstallDir -Grants @(
+    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)M')
+)
+# The env file: same reset (it survives reinstalls and could carry a stale
+# attacker ACE from before this fix existed), then its own protected DACL --
+# gMSA read-only (the app must never rewrite its own secrets).
+Set-ObjectProtectedDacl -Path $envFile -Grants @(
+    '*S-1-5-32-544:F', '*S-1-5-18:F', ($GmsaAccount + ':R')
+)
+# NOTE: the old extra grant on the python\ subdirectory is deliberately gone:
+# the root's (OI)(CI)M propagates to every descendant, and an explicit ACE
+# down there would (correctly) trip the tree verification below.
+$trustees = @(
+    'S-1-5-32-544', 'S-1-5-18',
+    'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'BA', 'SY',
+    $gmsaSid, $GmsaAccount
+)
+Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees $trustees `
+    -ProtectedEntries @{ 'acme-ra.env' = $trustees }
+Write-Host "  [ok]   install tree verified locked (ownership + DACLs read back and proven)"
 
 # --- Grant the gMSA "Log on as a service" (best-effort) ----------------------
 # An IIS app pool running as a gMSA needs SeServiceLogonRight, or the pool fails

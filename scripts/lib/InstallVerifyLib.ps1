@@ -162,3 +162,261 @@ function Test-DestinationInterpreterTrusted {
     if ($a.HasFlag([System.IO.FileAttributes]::ReparsePoint)) { return $false }
     return $true
 }
+
+
+# --- hostile-tree ACL lockdown (Daybreak 2026-08-15 review) -------------------
+#
+# The 2026-08-19 F1 fix "claimed" the predictable install root with
+#     icacls $InstallDir /inheritance:r /grant:r <Admins/SYSTEM>
+# before executing anything under it. That leaves two attacker holds intact,
+# because /inheritance:r removes only INHERITED ACEs:
+#
+#   * every EXPLICIT ACE on a pre-created tree -- the attacker grants
+#     themselves (or Everyone) write, the installer "secures" the root, and the
+#     planted interpreter/venv stays writable and then runs elevated;
+#   * OWNERSHIP: an owner has implicit WRITE_DAC, so an attacker-owned object
+#     can have its DACL rewritten back at any time, whatever we set it to.
+#
+# The three mechanical steps below end with a proof (Assert-InstallTreeLocked),
+# because "we ran icacls" is not evidence -- reading the tree back and
+# comparing it against exactly the ACE set we intended is.
+
+# Take ownership of a whole tree for the Administrators group and discard every
+# explicit ACE in it. Runs elevated; THROWS on any failure (fail closed: a
+# partial reset leaves attacker ACEs behind, so partial is refused).
+#
+# takeown is the only primitive that works on a hostile tree: the attacker's
+# DACL can deny Administrators WRITE_DAC outright, but the elevated token holds
+# SeTakeOwnership/SeRestore, which takeown enables itself. /a assigns the
+# Administrators GROUP (not the invoking admin account) -- matching how the
+# rest of the install addresses the ACEs. /d answers takeown's "directory you
+# cannot list" prompt: the documented letter is Y (English locale); on a
+# localized Windows the accepted letter can differ, and the exit-code check
+# turns that into a loud abort rather than a silently partial reset.
+function Reset-TreeToInherited {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Reset-TreeToInherited: $Path does not exist; nothing to reset."
+    }
+    & takeown.exe /f $Path /r /a /d y | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Reset-TreeToInherited: takeown failed on $Path (exit $LASTEXITCODE). " +
+               "Ownership could not be established for the Administrators group; refusing to continue.")
+    }
+    # /reset replaces each object's DACL with the default INHERITED one, which
+    # discards every explicit ACE -- the attacker's included -- and clears DACL
+    # protection tree-wide. Descendants become pure inheritors, so the caller's
+    # protected root DACL propagates to all of them.
+    & icacls.exe $Path /reset /t /c /q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Reset-TreeToInherited: icacls /reset failed on $Path (exit $LASTEXITCODE). " +
+               "Explicit ACEs may have survived; refusing to continue.")
+    }
+}
+
+# Give ONE object a deterministic, protected DACL: drop every explicit ACE it
+# carries (/reset -- the same trap as the tree: /inheritance:r alone leaves
+# explicit ACEs untouched), then protect it with EXACTLY the grants given.
+# The caller must already own the object (Reset-TreeToInherited for anything
+# under the install root). THROWS on failure.
+function Set-ObjectProtectedDacl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Grants
+    )
+    $ErrorActionPreference = 'Stop'
+    & icacls.exe $Path /reset /q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Set-ObjectProtectedDacl: icacls /reset failed on $Path (exit $LASTEXITCODE)."
+    }
+    & icacls.exe $Path /inheritance:r /grant:r @Grants | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Set-ObjectProtectedDacl: icacls /inheritance:r /grant:r failed on " +
+               "$Path (exit $LASTEXITCODE) with grants: $($Grants -join ' ').")
+    }
+}
+
+# Pure decision function over an `icacls <root> /save <file> [/t]` dump: does
+# the dump describe a LOCKED tree? Returns an array of violation strings --
+# EMPTY means locked. No I/O, so tests/pester can drive it with fixture dumps
+# on Linux.
+#
+#   Tree mode (default): the FIRST entry is the root and must be PROTECTED with
+#   explicit ACEs for allowed trustees only; every other entry must NOT be
+#   protected (it inherits the root's ACL), must hold no explicit ACE, no deny
+#   ACE, no empty DACL, and no trustee outside the allowed set.
+#
+#   Single-object mode (-AllEntriesMustBeProtected): every entry must be
+#   protected with explicit allowed ACEs (used for the dotenv, which carries
+#   its own grant set).
+#
+#   -ExemptLeafNames: tree-mode entries whose leaf name matches one of these
+#   are skipped here because they are verified separately in single-object mode.
+#
+# The trustee check runs on BOTH inherited and explicit ACEs: after the reset
+# the only inheritable ACEs in existence are the root's, so an unexpected SID
+# anywhere -- inherited or not -- is a survived or re-introduced attacker grant.
+function Test-AclDumpLocked {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$DumpText,
+        [Parameter(Mandatory = $true)][string[]]$AllowedTrustees,
+        [switch]$AllEntriesMustBeProtected,
+        [string[]]$ExemptLeafNames = @()
+    )
+    $violations = @()
+
+    # --- parse: path line, then one or more consecutive SDDL lines ----------
+    $entries = New-Object System.Collections.Generic.List[object]
+    $currentPath = $null
+    $currentSddl = ''
+    foreach ($line in ($DumpText -split "`r?`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line.StartsWith('D:')) {
+            if ($null -ne $currentPath) { $currentSddl += $line.Trim() }
+            continue
+        }
+        if ($null -ne $currentPath -and $currentSddl -ne '') {
+            $entries.Add(@{ Path = $currentPath; Sddl = $currentSddl })
+        }
+        $currentPath = $line.Trim()
+        $currentSddl = ''
+    }
+    if ($null -ne $currentPath -and $currentSddl -ne '') {
+        $entries.Add(@{ Path = $currentPath; Sddl = $currentSddl })
+    }
+    if ($entries.Count -eq 0) {
+        return @('acl-dump: no entries parsed -- an unreadable dump fails closed')
+    }
+
+    $allowed = @($AllowedTrustees)
+    $exempt = @($ExemptLeafNames) | Where-Object { $_ }
+    $idx = 0
+    foreach ($e in $entries) {
+        $path = $e.Path
+        $sddl = $e.Sddl
+        $leaf = Split-Path -Leaf $path
+        $skip = $false
+        foreach ($x in $exempt) { if ($leaf -like $x) { $skip = $true } }
+        if (-not $skip) {
+            $mustBeProtected = $AllEntriesMustBeProtected -or ($idx -eq 0)
+
+            $firstParen = $sddl.IndexOf('(')
+            if ($firstParen -lt 0) {
+                # A DACL string with no ACE at all: either a deny-everyone
+                # empty DACL or an unparsable dump -- both are tampering
+                # signals, and both fail closed.
+                $violations += "$path : DACL carries no ACEs ($sddl)"
+            } else {
+                $flagPart = $sddl.Substring(2, $firstParen - 2)
+                $protected = $flagPart.Contains('P')
+                if ($mustBeProtected -and -not $protected) {
+                    $violations += "$path : expected a PROTECTED DACL (exactly our grants) but flags are '$flagPart'"
+                }
+                if (-not $mustBeProtected -and $protected) {
+                    $violations += "$path : DACL is PROTECTED and does not inherit the install root's ACL ('$flagPart')"
+                }
+
+                foreach ($m in [regex]::Matches($sddl, '\(([^)]*)\)')) {
+                    $fields = @($m.Groups[1].Value -split ';')
+                    if ($fields.Count -lt 6) {
+                        $violations += "$path : unparseable ACE '$($m.Value)'"
+                        continue
+                    }
+                    $aceType = $fields[0]
+                    $aceFlags = $fields[1]
+                    $trustee = $fields[5]
+                    if ($aceType -eq 'D') {
+                        $violations += "$path : DENY ACE present '$($m.Value)'"
+                    }
+                    $inherited = $aceFlags.Contains('ID')
+                    if ($mustBeProtected -and $inherited) {
+                        $violations += "$path : INHERITED ACE on an object whose DACL should be exactly ours '$($m.Value)'"
+                    }
+                    if (-not $mustBeProtected -and -not $inherited) {
+                        $violations += "$path : EXPLICIT ACE survived the tree reset '$($m.Value)'"
+                    }
+                    $known = $false
+                    foreach ($a in $allowed) { if ($trustee -eq $a) { $known = $true; break } }
+                    if (-not $known) {
+                        $violations += "$path : unexpected trustee '$trustee' in '$($m.Value)'"
+                    }
+                }
+            }
+        }
+        $idx++
+    }
+    return @($violations)
+}
+
+# Read the tree back and PROVE the lockdown, or throw. This is the step that
+# turns "we ran icacls" into evidence:
+#   * the root's owner must be Administrators or SYSTEM (any other owner can
+#     rewrite the DACL whenever they like, so the ACEs alone prove nothing);
+#   * the whole tree's DACLs must match Test-AclDumpLocked's locked shape for
+#     exactly the allowed trustee set;
+#   * each -ProtectedEntries item (leaf name -> allowed trustees) is verified
+#     separately as a single protected object (the dotenv and its distinct
+#     grant set).
+#
+# THROWS (with up to ten violations listed) when anything is off. Runs on
+# Windows only -- it shells out to icacls; the decision logic it exercises
+# lives in Test-AclDumpLocked, which is unit-tested on Linux.
+function Assert-InstallTreeLocked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string[]]$AllowedTrustees,
+        [hashtable]$ProtectedEntries = @{}
+    )
+    $ErrorActionPreference = 'Stop'
+    $violations = @()
+
+    $acl = Get-Acl -LiteralPath $Root
+    $owner = $acl.Owner
+    $ownerSid = $null
+    try {
+        $ownerSid = (New-Object System.Security.Principal.SecurityIdentifier($owner)).Value
+    } catch {
+        try {
+            $ownerSid = (New-Object System.Security.Principal.NTAccount($owner)).Translate(
+                [System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            $ownerSid = $null
+        }
+    }
+    if ($null -eq $ownerSid -or (@('S-1-5-32-544', 'S-1-5-18') -notcontains $ownerSid)) {
+        $violations += "$Root : owner is '$owner' (expected Administrators or SYSTEM) -- an owner can rewrite the DACL at any time"
+    }
+
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
+    try {
+        & icacls.exe $Root /save $tmp /t /c /q | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Assert-InstallTreeLocked: icacls /save failed on $Root (exit $LASTEXITCODE) -- the tree ACL could not be read back; refusing to trust it."
+        }
+        $dump = Get-Content -LiteralPath $tmp -Raw
+        $violations += Test-AclDumpLocked -DumpText $dump `
+            -AllowedTrustees $AllowedTrustees -ExemptLeafNames @($ProtectedEntries.Keys)
+
+        foreach ($leaf in @($ProtectedEntries.Keys)) {
+            $entryPath = Join-Path $Root $leaf
+            $tmpEntry = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
+            & icacls.exe $entryPath /save $tmpEntry /q | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "Assert-InstallTreeLocked: icacls /save failed on $entryPath (exit $LASTEXITCODE)."
+            }
+            $violations += Test-AclDumpLocked -DumpText (Get-Content -LiteralPath $tmpEntry -Raw) `
+                -AllowedTrustees @($ProtectedEntries[$leaf]) -AllEntriesMustBeProtected
+            Remove-Item -LiteralPath $tmpEntry -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+
+    $violations = @($violations) | Where-Object { $_ }
+    if (@($violations).Count -gt 0) {
+        $shown = @($violations) | Select-Object -First 10
+        throw ("Install-tree ACL verification FAILED (" + @($violations).Count + " violation(s)); " +
+               "the tree is NOT locked down:`n  " + ($shown -join "`n  "))
+    }
+}

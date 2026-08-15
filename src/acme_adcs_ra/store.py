@@ -11,7 +11,7 @@ import json
 import logging
 import sqlite3
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -861,35 +861,40 @@ class Store:
     # Accounts
     # ------------------------------------------------------------------
 
-    def create_account(
+    def _insert_account(
         self,
+        conn: sqlite3.Connection,
         *,
         jwk: dict[str, Any],
         eab_kid: str,
-        status: str = "valid",
-        contact: Sequence[str] | None = None,
+        status: str,
+        contact: Sequence[str] | None,
     ) -> AccountRecord:
+        """INSERT the account row on *conn* (the caller owns the transaction).
+
+        Shared by ``create_account`` and ``create_account_with_audit`` so the
+        row shape can never drift between the two.
+        """
         account_id = uuid.uuid4().hex
         created_at = _now_iso()
         contact_list = list(contact or [])
         thumbprint = jwk_thumbprint(jwk)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO accounts
-                    (id, status, jwk_json, eab_kid, contact, created_at, jwk_thumbprint)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    account_id,
-                    status,
-                    _dump_json(jwk),
-                    eab_kid,
-                    _dump_json(contact_list),
-                    created_at,
-                    thumbprint,
-                ),
-            )
+        conn.execute(
+            """
+            INSERT INTO accounts
+                (id, status, jwk_json, eab_kid, contact, created_at, jwk_thumbprint)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id,
+                status,
+                _dump_json(jwk),
+                eab_kid,
+                _dump_json(contact_list),
+                created_at,
+                thumbprint,
+            ),
+        )
         return AccountRecord(
             id=account_id,
             status=status,
@@ -898,6 +903,61 @@ class Store:
             created_at=created_at,
             contact=contact_list,
         )
+
+    def create_account(
+        self,
+        *,
+        jwk: dict[str, Any],
+        eab_kid: str,
+        status: str = "valid",
+        contact: Sequence[str] | None = None,
+    ) -> AccountRecord:
+        with self._connect() as conn:
+            return self._insert_account(
+                conn,
+                jwk=jwk,
+                eab_kid=eab_kid,
+                status=status,
+                contact=contact,
+            )
+
+    def create_account_with_audit(
+        self,
+        *,
+        jwk: dict[str, Any],
+        eab_kid: str,
+        status: str = "valid",
+        contact: Sequence[str] | None = None,
+        audit: Mapping[str, Any],
+    ) -> tuple[AccountRecord, dict[str, Any]]:
+        """``create_account`` plus its provenance audit row in ONE transaction.
+
+        Daybreak 2026-08-15 review: the route used to commit the account and
+        only then write the ``account-created`` row, so a crash or SQLite error
+        in the window left a live account with no provenance — an account the
+        operator could not tie to the EAB kid that minted it. Same shape as
+        ``record_issuance`` (v1.9): state change and audit row commit together
+        or not at all. ``account_id`` is always taken from the inserted row;
+        passing one in *audit* is rejected rather than silently overridden.
+
+        Returns ``(record, audit_event)``; the caller fans the event out to
+        SIEM via ``emit_audit_hook`` (the row is already durable).
+        """
+        kwargs = dict(audit)
+        if "account_id" in kwargs:
+            raise ValueError("audit must not carry account_id; it is set from the row")
+        with self._connect() as conn:
+            record = self._insert_account(
+                conn,
+                jwk=jwk,
+                eab_kid=eab_kid,
+                status=status,
+                contact=contact,
+            )
+            event = self._record_audit_in_conn(
+                conn, account_id=record.id, **kwargs
+            )
+        return record, event
 
     def get_account(self, account_id: str) -> AccountRecord | None:
         with self._connect() as conn:
@@ -950,10 +1010,45 @@ class Store:
         """
         thumbprint = jwk_thumbprint(new_jwk)
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE accounts SET jwk_json = ?, jwk_thumbprint = ? WHERE id = ?",
-                (_dump_json(new_jwk), thumbprint, account_id),
-            )
+            self._update_account_key_in_conn(conn, account_id, new_jwk, thumbprint)
+
+    def update_account_key_with_audit(
+        self,
+        account_id: str,
+        new_jwk: dict[str, Any],
+        *,
+        audit: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """``update_account_key`` plus its audit row in ONE transaction.
+
+        Daybreak 2026-08-15 review: the route committed the key rotation and
+        wrote the ``account-key-changed`` row afterwards, so a failure in the
+        window could leave an account whose key had silently rotated with no
+        audit trail of the rotation — the one row that names the new key's
+        thumbprint. Same fix shape as ``record_issuance`` and
+        ``create_account_with_audit``: commit together or not at all.
+
+        Returns the audit event for the caller's ``emit_audit_hook``.
+        """
+        kwargs = dict(audit)
+        if "account_id" in kwargs:
+            raise ValueError("audit must not carry account_id; it is set from the row")
+        thumbprint = jwk_thumbprint(new_jwk)
+        with self._connect() as conn:
+            self._update_account_key_in_conn(conn, account_id, new_jwk, thumbprint)
+            return self._record_audit_in_conn(conn, account_id=account_id, **kwargs)
+
+    def _update_account_key_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        new_jwk: dict[str, Any],
+        thumbprint: str,
+    ) -> None:
+        conn.execute(
+            "UPDATE accounts SET jwk_json = ?, jwk_thumbprint = ? WHERE id = ?",
+            (_dump_json(new_jwk), thumbprint, account_id),
+        )
 
     # ------------------------------------------------------------------
     # Nonces

@@ -72,6 +72,18 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**Status update (2026-08-15, post-validation):** Daybreak's review of `f495092`
+(the E2E-proven tip) found the installer's ACL claim was bypassable —
+`/inheritance:r` removes only *inherited* ACEs, so an attacker's explicit ACEs
+and ownership survived the "claim" — plus registration tokens on the command
+line and two commit-before-audit orderings. All four are fixed on
+`security-review-2026-08-15-daybreak` (takeown+/reset+read-back-proof for the
+tree; switch-only `-AdminToken`/`-ConfirmToken`; account/keyChange audit
+atomicity, fault-injection proven); WI-014 stays deferred. See
+`docs/security-review-2026-08-15-daybreak.md`. **The installer change owes a
+live install run before the next release** — CI executes neither takeown nor
+the read-back proof.
+
 **Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
 security reviews.** There is **no 1.9.0 release**: that line shipped only as
 `rc1`/`rc2`, and the re-proof that gates a tag found a red lint gate on the rc2
