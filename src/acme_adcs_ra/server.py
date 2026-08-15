@@ -24,6 +24,7 @@ from acme_adcs_ra.app_state import (
     _default_siem_emitter,
     logger,
 )
+from acme_adcs_ra.audit_coalesce import DenialCoalescer
 from acme_adcs_ra.routes.acme import router as acme_router
 from acme_adcs_ra.routes.admin import router as admin_router
 from acme_adcs_ra.siem import SiemEmitter
@@ -85,6 +86,10 @@ def create_app(context: ServerContext) -> FastAPI:
         context.audit_hook = _siem_emitter.export
     if context.nonce_bucket is None:
         context.nonce_bucket = _default_nonce_bucket(context.config)
+    if context.denial_coalescer is None:
+        context.denial_coalescer = DenialCoalescer(
+            context.config.audit_denial_coalesce_window_seconds
+        )
     context.crl_evidence_gate.set_limits(
         max_workers=context.config.revocation_confirm_crl_max_workers,
         max_pending=context.config.revocation_confirm_crl_max_pending,
@@ -99,6 +104,8 @@ def create_app(context: ServerContext) -> FastAPI:
         # Same reason: the CRL-evidence pool is the RA's own, so nothing else
         # reclaims its threads at shutdown.
         context.crl_evidence_gate.close()
+        if context.denial_coalescer is not None:
+            context.denial_coalescer.close()
 
     app = FastAPI(
         title="acme-adcs-ra",

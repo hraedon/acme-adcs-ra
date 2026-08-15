@@ -181,41 +181,109 @@ function Test-DestinationInterpreterTrusted {
 # because "we ran icacls" is not evidence -- reading the tree back and
 # comparing it against exactly the ACE set we intended is.
 
+# Did an icacls run succeed COMPLETELY? (Daybreak 2026-08-15 second rescan F2.)
+#
+# Two ways an icacls failure used to pass unnoticed:
+#
+#   * `/c` (continue on error) makes icacls skip objects it could not process.
+#     It still prints "Failed processing N files", but the exit code is not a
+#     dependable signal in that mode -- so a tree where half the objects kept
+#     their attacker ACEs could return 0.
+#   * A localized Windows prints a translated summary line, so text matching
+#     alone is not dependable either.
+#
+# So: `/c` is gone from every call (a single unprocessable object must abort the
+# install, not be skipped), the exit code is authoritative, and the summary text
+# is checked as a second, English-only belt-and-braces.
+function Test-IcaclsOutputClean {
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [AllowNull()][AllowEmptyString()]$Output = ""
+    )
+    if ($ExitCode -ne 0) { return $false }
+    $text = (@($Output) | ForEach-Object { if ($null -eq $_) { "" } else { $_.ToString() } }) -join "`n"
+    if ($text -match '(?im)Failed\s+processing\s+([1-9]\d*)\s') { return $false }
+    return $true
+}
+
+# The principals to try for `icacls /setowner`, in order.
+#
+# `*<SID>` is locale-independent and is what the rest of this script uses. The
+# translated NTAccount name is the fallback for the (unlikely, but untestable
+# from Linux) case where a Windows build's /setowner parser rejects the star
+# form -- on a localized Windows Translate() yields the localized name, which
+# icacls definitely accepts. Returns the star form alone when translation is
+# unavailable (non-Windows, i.e. the Pester run on Linux).
+function Get-AdministratorsOwnerCandidates {
+    $candidates = @('*S-1-5-32-544')
+    try {
+        $name = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate(
+            [System.Security.Principal.NTAccount]).Value
+        if ($name -and $candidates -notcontains $name) { $candidates += $name }
+    } catch {
+        # No SID translation here (Linux/Pester): the star form is all we have,
+        # and this function is not the thing under test in that environment.
+    }
+    return @($candidates)
+}
+
 # Take ownership of a whole tree for the Administrators group and discard every
 # explicit ACE in it. Runs elevated; THROWS on any failure (fail closed: a
 # partial reset leaves attacker ACEs behind, so partial is refused).
 #
-# takeown is the only primitive that works on a hostile tree: the attacker's
-# DACL can deny Administrators WRITE_DAC outright, but the elevated token holds
-# SeTakeOwnership/SeRestore, which takeown enables itself. /a assigns the
-# Administrators GROUP (not the invoking admin account) -- matching how the
-# rest of the install addresses the ACEs. /d answers takeown's "directory you
-# cannot list" prompt: the documented letter is Y (English locale); on a
-# localized Windows the accepted letter can differ, and the exit-code check
-# turns that into a loud abort rather than a silently partial reset.
+# 2026-08-15 SECOND rescan, F2: this used to run `takeown /f <root> /r`, and
+# takeown has NO no-follow option. Assert-NoReparsePoints ran first, but a
+# junction planted into the gap between that walk and takeown redirected an
+# ELEVATED recursive ownership rewrite outside the install tree -- real damage
+# to an external target that the post-walk could only detect, never undo.
+#
+# `icacls /setowner` does take /L, so ownership is now claimed without ever
+# following a link, and no privileged operation in the claim path follows one.
+#
+# The trade is deliberate and is the point: unlike takeown, icacls /setowner
+# does NOT force ownership (Microsoft's own documentation says so). It succeeds
+# wherever we already hold WRITE_OWNER -- a directory we just created, a tree a
+# previous install of ours locked down, a file the gMSA created inside it -- and
+# it FAILS on a tree a local attacker pre-created and locked against us. That
+# case now aborts the install with an instruction to remove the directory,
+# instead of forcibly adopting a hostile namespace. Refusing to install is the
+# correct outcome there; silently claiming it was how F2 and F3 existed.
 function Reset-TreeToInherited {
     param([Parameter(Mandatory = $true)][string]$Path)
     $ErrorActionPreference = 'Stop'
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Reset-TreeToInherited: $Path does not exist; nothing to reset."
     }
-    # /L (Daybreak 2026-08-15 rescan F2): operate on links THEMSELVES, never
-    # their targets. takeown below has no /L, so the CALLER must have run
-    # Assert-NoReparsePoints first -- and Assert-InstallTreeLocked re-walks
-    # afterwards to catch anything planted into the window between the two.
-    & takeown.exe /f $Path /r /a /d y | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw ("Reset-TreeToInherited: takeown failed on $Path (exit $LASTEXITCODE). " +
-               "Ownership could not be established for the Administrators group; refusing to continue.")
+    # /L everywhere: operate on links THEMSELVES, never their targets. The
+    # caller still runs Assert-NoReparsePoints first (a link in the tree means
+    # the namespace is not the closed one we are about to claim), and
+    # Assert-InstallTreeLocked re-walks afterwards -- but neither is load-bearing
+    # for containment any more, because nothing here can traverse a link.
+    $ownerFailures = @()
+    $owned = $false
+    foreach ($principal in (Get-AdministratorsOwnerCandidates)) {
+        $out = & icacls.exe $Path /setowner $principal /t /q /L 2>&1
+        if (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out) { $owned = $true; break }
+        $ownerFailures += ("{0} -> exit {1}: {2}" -f $principal, $LASTEXITCODE, (($out | Out-String).Trim()))
+    }
+    if (-not $owned) {
+        throw ("Reset-TreeToInherited: could not claim ownership of $Path for the Administrators " +
+               "group without following links.`n  " + ($ownerFailures -join "`n  ") + "`n" +
+               "This installer no longer force-claims a namespace it does not own (takeown cannot " +
+               "be told to skip junctions, so forcing it could rewrite ownership OUTSIDE the tree). " +
+               "If $Path was not created by a previous run of this installer, treat it as hostile: " +
+               "inspect it, move or delete it, and re-run.")
     }
     # /reset replaces each object's DACL with the default INHERITED one, which
     # discards every explicit ACE -- the attacker's included -- and clears DACL
     # protection tree-wide. Descendants become pure inheritors, so the caller's
-    # protected root DACL propagates to all of them.
-    & icacls.exe $Path /reset /t /c /q /L | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw ("Reset-TreeToInherited: icacls /reset failed on $Path (exit $LASTEXITCODE). " +
-               "Explicit ACEs may have survived; refusing to continue.")
+    # protected root DACL propagates to all of them. We own every object by now,
+    # so this cannot be denied.
+    $out = & icacls.exe $Path /reset /t /q /L 2>&1
+    if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
+        throw ("Reset-TreeToInherited: icacls /reset failed on $Path (exit $LASTEXITCODE): " +
+               (($out | Out-String).Trim()) +
+               "`nExplicit ACEs may have survived; refusing to continue.")
     }
 }
 
@@ -224,20 +292,26 @@ function Reset-TreeToInherited {
 # explicit ACEs untouched), then protect it with EXACTLY the grants given.
 # The caller must already own the object (Reset-TreeToInherited for anything
 # under the install root). THROWS on failure.
+#
+# /L on both calls (second rescan F2): these run against the install root, the
+# dotenv and the Python manifest, and a file symlink raced into any of those
+# paths would otherwise redirect an elevated ACL rewrite onto its target.
 function Set-ObjectProtectedDacl {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string[]]$Grants
     )
     $ErrorActionPreference = 'Stop'
-    & icacls.exe $Path /reset /q | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Set-ObjectProtectedDacl: icacls /reset failed on $Path (exit $LASTEXITCODE)."
+    $out = & icacls.exe $Path /reset /q /L 2>&1
+    if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
+        throw ("Set-ObjectProtectedDacl: icacls /reset failed on $Path (exit $LASTEXITCODE): " +
+               (($out | Out-String).Trim()))
     }
-    & icacls.exe $Path /inheritance:r /grant:r @Grants | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $out = & icacls.exe $Path /inheritance:r /grant:r @Grants /L 2>&1
+    if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
         throw ("Set-ObjectProtectedDacl: icacls /inheritance:r /grant:r failed on " +
-               "$Path (exit $LASTEXITCODE) with grants: $($Grants -join ' ').")
+               "$Path (exit $LASTEXITCODE) with grants: $($Grants -join ' ') : " +
+               (($out | Out-String).Trim()))
     }
 }
 
@@ -382,30 +456,23 @@ function Assert-InstallTreeLocked {
     # is about to claim it is.
     Assert-NoReparsePoints -Path $Root -Context 'Assert-InstallTreeLocked'
 
-    $acl = Get-Acl -LiteralPath $Root
-    $owner = $acl.Owner
-    $ownerSid = $null
-    try {
-        $ownerSid = (New-Object System.Security.Principal.SecurityIdentifier($owner)).Value
-    } catch {
-        try {
-            $ownerSid = (New-Object System.Security.Principal.NTAccount($owner)).Translate(
-                [System.Security.Principal.SecurityIdentifier]).Value
-        } catch {
-            $ownerSid = $null
-        }
-    }
-    if ($null -eq $ownerSid -or (@('S-1-5-32-544', 'S-1-5-18') -notcontains $ownerSid)) {
-        $violations += "$Root : owner is '$owner' (expected Administrators or SYSTEM) -- an owner can rewrite the DACL at any time"
-    }
+    # EVERY object's owner, not just the root's (second rescan F3). An owner
+    # holds implicit WRITE_DAC, so one attacker-owned descendant can rewrite its
+    # own DACL back at any time after this proof passes -- and the reset makes
+    # such a child look perfectly clean, because its inherited ACL is ours. This
+    # is also what catches a descendant created between the /setowner and
+    # /reset passes: it would still be owned by whoever made it.
+    $violations += Get-TreeOwnerViolations -Root $Root -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18')
 
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
     try {
         # /L: dump the links themselves rather than following them, so the
         # read-back cannot be redirected any more than the writes can.
-        & icacls.exe $Root /save $tmp /t /c /q /L | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Assert-InstallTreeLocked: icacls /save failed on $Root (exit $LASTEXITCODE) -- the tree ACL could not be read back; refusing to trust it."
+        $out = & icacls.exe $Root /save $tmp /t /q /L 2>&1
+        if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
+            throw ("Assert-InstallTreeLocked: icacls /save failed on $Root (exit $LASTEXITCODE): " +
+                   (($out | Out-String).Trim()) +
+                   "`nThe tree ACL could not be read back in full; refusing to trust it.")
         }
         $dump = Get-Content -LiteralPath $tmp -Raw
         $violations += Test-AclDumpLocked -DumpText $dump `
@@ -415,9 +482,10 @@ function Assert-InstallTreeLocked {
             $entryPath = Join-Path $Root $leaf
             if (-not (Test-Path -LiteralPath $entryPath)) { continue }
             $tmpEntry = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
-            & icacls.exe $entryPath /save $tmpEntry /q /L | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw "Assert-InstallTreeLocked: icacls /save failed on $entryPath (exit $LASTEXITCODE)."
+            $out = & icacls.exe $entryPath /save $tmpEntry /q /L 2>&1
+            if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
+                throw ("Assert-InstallTreeLocked: icacls /save failed on $entryPath (exit " +
+                       "$LASTEXITCODE): " + (($out | Out-String).Trim()))
             }
             $violations += Test-AclDumpLocked -DumpText (Get-Content -LiteralPath $tmpEntry -Raw) `
                 -AllowedTrustees @($ProtectedEntries[$leaf]) -AllEntriesMustBeProtected
@@ -517,6 +585,105 @@ function Assert-NoReparsePoints {
     }
 }
 
+# Every path under (and including) $Root, from the same non-following walk, and
+# THROWS on any reparse point rather than reporting it -- callers of this one
+# are about to inspect each path individually, and a link would send that
+# inspection somewhere else. Directories and files both, root first.
+function Get-TreePaths {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $rootFull = (Resolve-Path -LiteralPath $Path).Path
+    $all = New-Object System.Collections.Generic.List[string]
+    $all.Add($rootFull)
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($rootFull)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        $di = New-Object System.IO.DirectoryInfo($dir)
+        try {
+            $entries = @($di.EnumerateFileSystemInfos())
+        } catch {
+            throw ("Get-TreePaths: cannot enumerate $dir ($($_.Exception.Message)); " +
+                   "an uninspectable subtree cannot be proven locked.")
+        }
+        foreach ($e in $entries) {
+            if ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw ("Get-TreePaths: reparse point at $($e.FullName) -- refusing to inspect a " +
+                       "tree whose shape can redirect a per-object read.")
+            }
+            $all.Add($e.FullName)
+            if ($e.Attributes -band [System.IO.FileAttributes]::Directory) {
+                $stack.Push($e.FullName)
+            }
+        }
+    }
+    return @($all)
+}
+
+# Is this owner one of the allowed SIDs? Takes the owner as the string Get-Acl
+# returns, which is a SID string on some objects and a DOMAIN\name on others.
+# An owner that cannot be resolved to a SID is NOT allowed: "we could not tell"
+# fails closed, because an owner can rewrite the DACL whenever it likes.
+function Test-OwnerAllowed {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Owner,
+        [Parameter(Mandatory = $true)][string[]]$AllowedOwnerSids
+    )
+    if ([string]::IsNullOrWhiteSpace($Owner)) { return $false }
+    $candidate = $Owner.Trim()
+    $sid = $null
+    if ($candidate -match '^(?i)S-1-\d+(-\d+)+$') {
+        # Already a SID string. Matched textually rather than through
+        # System.Security.Principal.SecurityIdentifier, whose constructor throws
+        # PlatformNotSupportedException off Windows -- and this is the branch the
+        # Linux Pester run exercises.
+        $sid = $candidate
+    } else {
+        try {
+            $sid = (New-Object System.Security.Principal.NTAccount($candidate)).Translate(
+                [System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            $sid = $null
+        }
+    }
+    if ($null -eq $sid) { return $false }
+    foreach ($a in @($AllowedOwnerSids)) {
+        if ([string]::Equals($a, $sid, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+# Owner-check every object in the tree. Returns violation strings (EMPTY means
+# every owner is allowed). Windows-only in practice -- Get-Acl has no owner on
+# the Unix filesystem provider -- so the Linux Pester run exercises Get-TreePaths
+# and Test-OwnerAllowed separately instead.
+#
+# COST: one Get-Acl per object, and both ACL passes call it, so a venv with a
+# few thousand files adds tens of seconds to an install. That is the price of
+# the proof; the root-only check it replaces was cheap and did not detect the
+# case it existed for. If it ever becomes the dominant cost, measure before
+# narrowing the scope -- descendants are exactly where the finding lived.
+function Get-TreeOwnerViolations {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string[]]$AllowedOwnerSids
+    )
+    $violations = New-Object System.Collections.Generic.List[string]
+    foreach ($p in (Get-TreePaths -Path $Root)) {
+        $owner = $null
+        try {
+            $owner = (Get-Acl -LiteralPath $p).Owner
+        } catch {
+            $violations.Add("$p : owner could not be read ($($_.Exception.Message))")
+            continue
+        }
+        if (-not (Test-OwnerAllowed -Owner $owner -AllowedOwnerSids $AllowedOwnerSids)) {
+            $violations.Add("$p : owner is '$owner' (expected Administrators or SYSTEM) -- an owner can rewrite the DACL at any time")
+        }
+    }
+    return @($violations)
+}
+
 # SHA-256 every file under $Root, recursively, as an ordered map
 # "<relpath with / separators>" -> "<UPPERCASE sha256>". Sorted by path so the
 # manifest is reproducible. Cross-platform on purpose (Get-FileHash), so the
@@ -597,4 +764,204 @@ function Test-TreeManifestMatches {
         return @{ Ok = $false; Reason = 'tree does not match manifest'; Details = @($details | Select-Object -First 5) }
     }
     return @{ Ok = $true; Reason = 'verified'; Details = @() }
+}
+
+
+# --- Daybreak 2026-08-15 SECOND rescan, F1: anchor the manifest out of tree ----
+#
+# Test-TreeManifestMatches proves the interpreter tree is CONSISTENT with the
+# manifest sitting next to it. It cannot prove either is ours, and on a first
+# install both live in a namespace the attacker had write access to before we
+# ever ran: preplant python\python.exe AND a python.manifest.json listing its
+# hash, and the pair authenticates itself. The installer then ran it elevated.
+#
+# So the manifest needs a trust anchor OUTSIDE the install namespace. That is
+# HKLM\SOFTWARE\acme-adcs-ra: the digest of the manifest FILE, written by the
+# elevated install that built the runtime, read back by the next one. HKLM\
+# SOFTWARE is Administrators/SYSTEM-write by default -- the local user who can
+# pre-create ProgramData\acme-adcs-ra cannot pre-create this -- and the key's
+# owner is verified on read so a loosened parent ACL cannot substitute for it.
+#
+# No anchor means no trust: an unanchored runtime tree is deleted and rebuilt
+# from an authenticated source, never executed. That is also what an upgrade
+# from a pre-anchor install does, once, at the cost of re-copying Python.
+
+# --- Daybreak 2026-08-15 SECOND rescan, F3: kill the worker before claiming ---
+#
+# The app pool used to be stopped ~220 lines AFTER the install root was claimed
+# and the destination interpreter was verified and executed. Windows evaluates
+# access at handle-open time, so a compromised gMSA worker holding a write
+# handle opened under the old (Modify) ACL keeps that write access straight
+# through the /setowner + /reset pass -- and can therefore rewrite interpreter
+# bytes between the hash check and the elevated execution of those bytes.
+#
+# The fix is ordering plus proof: stop the pool and confirm the worker process
+# is GONE before anything under the install root is claimed, hashed or run.
+# `appcmd list wp` enumerates live worker processes, so it is the direct
+# evidence; "the pool says Stopped" is not, because the worker lingers while it
+# drains.
+
+# Does `appcmd list wp` still show a worker for this pool? Pure text decision so
+# the Linux Pester run can drive it. Fails CLOSED on unparseable input: a line
+# we cannot classify is treated as a live worker, not as an all-clear.
+function Test-AppPoolWorkersGone {
+    param(
+        [AllowNull()][AllowEmptyString()]$AppcmdWpOutput,
+        [Parameter(Mandatory = $true)][string]$AppPool
+    )
+    $text = (@($AppcmdWpOutput) | ForEach-Object { if ($null -eq $_) { "" } else { $_.ToString() } }) -join "`n"
+    foreach ($line in ($text -split "`r?`n")) {
+        $t = $line.Trim()
+        if ($t -eq '') { continue }
+        # appcmd prints: WP "1234" (applicationPool:SomePool)
+        $m = [regex]::Match($t, '^WP\s+"[^"]*"\s+\(applicationPool:(?<pool>.*)\)\s*$')
+        if (-not $m.Success) {
+            # An error message, a localized banner, anything we do not recognise.
+            return $false
+        }
+        if ($m.Groups['pool'].Value -eq $AppPool) { return $false }
+    }
+    return $true
+}
+
+# Stop $AppPool and WAIT for its worker to die. Returns $true when the pool was
+# running and is now gone, $false when there was no such pool. THROWS if a
+# worker is still alive after $TimeoutSeconds -- continuing would mean claiming
+# and hashing a tree that a live gMSA process still holds handles into.
+function Stop-AppPoolAndWait {
+    param(
+        [Parameter(Mandatory = $true)][string]$AppcmdExe,
+        [Parameter(Mandatory = $true)][string]$AppPool,
+        [int]$TimeoutSeconds = 60
+    )
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-Path -LiteralPath $AppcmdExe)) { return $false }
+    $exists = & $AppcmdExe list apppool "$AppPool" 2>$null
+    if (-not $exists) { return $false }
+    & $AppcmdExe stop apppool /apppool.name:"$AppPool" 2>$null | Out-Null
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $wp = & $AppcmdExe list wp 2>$null
+        if (Test-AppPoolWorkersGone -AppcmdWpOutput $wp -AppPool $AppPool) { return $true }
+        if ((Get-Date) -ge $deadline) {
+            throw ("Stop-AppPoolAndWait: app pool `"$AppPool`" still has a live worker process after " +
+                   "$TimeoutSeconds s. Its identity (the gMSA) holds write handles into the install " +
+                   "tree that survive the ACL reset, so the runtime cannot be claimed or verified " +
+                   "safely. Stop the pool (or the w3wp process) by hand and re-run.")
+        }
+        Start-Sleep -Seconds 2
+    }
+}
+
+
+$script:ManifestAnchorKey = 'HKLM:\SOFTWARE\acme-adcs-ra'
+
+# Registry value name for an install root. Normalized (full-ish, trailing
+# separators dropped, upper-cased) so C:\ProgramData\acme-adcs-ra and
+# c:\programdata\acme-adcs-ra\ are one anchor rather than two.
+function Get-ManifestAnchorValueName {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$InstallDir)
+    $d = $InstallDir.Trim().TrimEnd('\', '/')
+    return ('PythonManifestSha256:' + $d.ToUpperInvariant())
+}
+
+# SHA-256 of one file as uppercase hex, or "" when it is not there.
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+}
+
+# The whole trust decision for a destination-local runtime, as one pure-ish
+# function so the Pester suite can drive every branch on Linux: the manifest
+# file must match the out-of-tree anchor digest, AND the tree must match the
+# manifest. Either half missing is a refusal.
+function Test-TreeManifestAuthentic {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$ManifestPath,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$AnchorDigest
+    )
+    if ([string]::IsNullOrWhiteSpace($AnchorDigest)) {
+        return @{ Ok = $false; Reason = 'no out-of-tree anchor for this install root'; Details = @() }
+    }
+    $actual = Get-FileSha256 -Path $ManifestPath
+    if ([string]::IsNullOrWhiteSpace($actual)) {
+        return @{ Ok = $false; Reason = 'manifest missing'; Details = @() }
+    }
+    if (-not (Test-Sha256Match -Actual $actual -Expected $AnchorDigest)) {
+        return @{
+            Ok = $false
+            Reason = 'manifest does not match its out-of-tree anchor (planted or rewritten manifest)'
+            Details = @("anchor $AnchorDigest", "manifest $actual")
+        }
+    }
+    return (Test-TreeManifestMatches -Root $Root -ManifestPath $ManifestPath)
+}
+
+# Read the anchor digest for $InstallDir from HKLM, or "" when there is none.
+# THROWS if the anchor key exists but is not owned by Administrators/SYSTEM:
+# an anchor an attacker could rewrite is worse than no anchor, because it looks
+# like proof. Returns "" (not an error) on a non-Windows host, where the whole
+# destination-runtime path does not apply.
+function Get-TreeManifestAnchor {
+    param([Parameter(Mandatory = $true)][string]$InstallDir)
+    if (-not (Test-Path -LiteralPath $script:ManifestAnchorKey)) { return "" }
+    $owner = (Get-Acl -Path $script:ManifestAnchorKey).Owner
+    if (-not (Test-OwnerAllowed -Owner $owner -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18'))) {
+        throw ("Get-TreeManifestAnchor: $($script:ManifestAnchorKey) is owned by '$owner', not " +
+               "Administrators/SYSTEM. That key is the trust anchor for the interpreter this " +
+               "installer executes as Administrator; refusing to read it. Delete the key (as an " +
+               "administrator) and re-run to rebuild the runtime from an authenticated source.")
+    }
+    $name = Get-ManifestAnchorValueName -InstallDir $InstallDir
+    $item = Get-ItemProperty -Path $script:ManifestAnchorKey -Name $name -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return "" }
+    $value = [string]$item.$name
+    if ([string]::IsNullOrWhiteSpace($value)) { return "" }
+    return $value.Trim().ToUpperInvariant()
+}
+
+# Record the manifest's own digest as the out-of-tree anchor for $InstallDir,
+# creating the key with a protected Administrators/SYSTEM-write ACL if needed.
+# THROWS on failure -- an install that cannot anchor its runtime would silently
+# rebuild that runtime on every subsequent run, which is a fail-safe outcome but
+# not one to reach by accident.
+function Set-TreeManifestAnchor {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir,
+        [Parameter(Mandatory = $true)][string]$ManifestPath
+    )
+    $ErrorActionPreference = 'Stop'
+    $digest = Get-FileSha256 -Path $ManifestPath
+    if ([string]::IsNullOrWhiteSpace($digest)) {
+        throw "Set-TreeManifestAnchor: $ManifestPath does not exist; nothing to anchor."
+    }
+    if (-not (Test-Path -LiteralPath $script:ManifestAnchorKey)) {
+        New-Item -Path $script:ManifestAnchorKey -Force | Out-Null
+        # Protected, explicit ACL rather than whatever HKLM\SOFTWARE happens to
+        # inherit: Administrators and SYSTEM write, everyone else read.
+        $key = Get-Item -Path $script:ManifestAnchorKey
+        $sec = $key.GetAccessControl()
+        $sec.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($sec.Access)) { $sec.RemoveAccessRuleSpecific($rule) | Out-Null }
+        foreach ($grant in @(
+            @('S-1-5-32-544', 'FullControl'),
+            @('S-1-5-18',     'FullControl'),
+            @('S-1-5-32-545', 'ReadKey')
+        )) {
+            $sec.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier($grant[0])),
+                [System.Security.AccessControl.RegistryRights]$grant[1],
+                'ContainerInherit, ObjectInherit',
+                'None',
+                'Allow')))
+        }
+        $sec.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+        $key.SetAccessControl($sec)
+    }
+    $name = Get-ManifestAnchorValueName -InstallDir $InstallDir
+    New-ItemProperty -Path $script:ManifestAnchorKey -Name $name -Value $digest `
+        -PropertyType String -Force | Out-Null
+    return $digest
 }

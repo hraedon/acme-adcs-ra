@@ -20,6 +20,7 @@ from typing import Any, NamedTuple
 
 from cryptography import x509
 
+from acme_adcs_ra.audit_bounds import bound_details, bound_value
 from acme_adcs_ra.jws import canonicalize_jwk, jwk_thumbprint
 
 # ---------------------------------------------------------------------------
@@ -2485,15 +2486,21 @@ class Store:
         quarantine) use this so both rows land in a single transaction.
         """
         timestamp = _now_iso()
+        # Bound the attacker-controlled parts before anything durable is
+        # written (second daybreak rescan F4). ``details`` carries the client's
+        # EAB kid on the pre-authentication denial paths, and a peer that
+        # passes the network allowlist chooses its length. The bound preserves
+        # a readable prefix plus a digest of the whole value, so nothing an
+        # investigator needs survives only in the discarded tail.
         event: dict[str, Any] = {
             "event_type": event_type,
             "account_id": account_id,
             "order_id": order_id,
             "sans": list(sans or []),
             "template": template,
-            "requester": requester,
+            "requester": bound_value(requester),
             "outcome": outcome,
-            "details": details or {},
+            "details": bound_details(details),
             "timestamp": timestamp,
         }
         cursor = conn.execute(
@@ -2509,7 +2516,7 @@ class Store:
                 order_id,
                 _dump_json(event["sans"]),
                 template,
-                requester,
+                event["requester"],
                 outcome,
                 _dump_json(event["details"]),
                 timestamp,
@@ -2517,6 +2524,25 @@ class Store:
         )
         event["id"] = cursor.lastrowid
         return event
+
+    def update_audit_details(self, audit_id: int, details: dict[str, Any]) -> bool:
+        """Replace one audit row's details blob. Returns False if it is gone.
+
+        The single mutation this table allows, and it exists for exactly one
+        caller: ``DenialCoalescer`` bumping the tally on an open window's row
+        (second daybreak rescan F4). Folding repeats into a committed row is
+        what makes the count survive a crash — a counter held in memory until
+        the window closes would not — and it is why the fix for unbounded
+        denial growth deletes nothing.
+
+        Every other column is immutable; there is no method that changes one.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE audit_log SET details = ? WHERE id = ?",
+                (_dump_json(bound_details(details)), audit_id),
+            )
+            return cursor.rowcount > 0
 
     def list_audit_events(
         self,

@@ -90,11 +90,34 @@ child junctions redirected the recursive `takeown`/`icacls /t` outside the
 tree (now: a never-following reparse-point walk refuses any link, `/L` on
 every icacls traversal; takeown's remaining TOCTOU window is detected
 post-hoc, not prevented — documented). See
-`docs/security-review-2026-08-15-daybreak-rescan.md`. **The installer change
-owes a live install run before the next release — including a fresh install
-into a pre-planted tree (planted `python\python.exe`, planted venv `.pth`,
-child junction) proving refusal/rebuild/abort.** CI executes none of takeown,
-the read-back proof, or the manifest dance.
+`docs/security-review-2026-08-15-daybreak-rescan.md`.
+
+**Daybreak's THIRD pass (of `63529a6`) found four more; all four are fixed on
+the same branch** — see `docs/security-review-2026-08-15-daybreak-rescan-2.md`.
+Briefly: the manifest could not authenticate anything on a first install
+because a local user pre-creates both it and the interpreter it vouches for
+(now: the manifest's own digest is anchored in `HKLM\SOFTWARE\acme-adcs-ra`,
+and an unanchored runtime tree is deleted, never executed); `takeown` has no
+`/L`, so a raced junction still redirected elevated recursive ownership out of
+tree (now: `takeown` is gone entirely, ownership is claimed with
+`icacls /setowner … /L`, and `/c` is gone from every call so a partial run
+aborts); the app pool was stopped ~220 lines *after* the claim, so retained
+gMSA write handles outlived the ACL reset (now: stopped and proven dead via
+`appcmd list wp` before anything is claimed, hashed or run) and only the root's
+owner was verified (now: every descendant's). And **WI-014 is fixed rather than
+deferred a fourth time** — not with a pruner, which the earlier deferrals were
+right to refuse, but by folding repeated pre-auth denials into the row already
+on disk, so growth tracks time instead of request rate and nothing is deleted.
+
+**The installer still owes a live install run before the next release —
+including a fresh install into a pre-planted tree (planted `python\python.exe`
+with a matching planted manifest, planted venv `.pth`, child junction) proving
+refusal/rebuild/abort.** CI executes none of the ownership claim, the read-back
+proof, the registry anchor, or the manifest dance. Two behaviours are newly
+unobserved: `icacls /setowner` now *fails closed* on a tree it cannot claim
+(deliberate — the installer no longer force-adopts a hostile namespace), and
+the `*S-1-5-32-544` star form is unverified for that one verb. Pester 5.7.1 and
+Windows PowerShell 5.1 are on `mvmcitest01`.
 
 **Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
 security reviews.** There is **no 1.9.0 release**: that line shipped only as

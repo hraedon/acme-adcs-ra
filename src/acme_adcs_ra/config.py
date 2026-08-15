@@ -185,6 +185,20 @@ class RAConfig(BaseSettings):
     # refuse startup unless audit events leave the box (syslog or HEC).
     audit_offbox_required: bool = False
 
+    # Coalescing window for pre-authentication denial audit rows, in seconds
+    # (second daybreak rescan F4 / the standing WI-014). A peer that passes the
+    # network allowlist needs no account and no valid EAB secret to make the RA
+    # write one durable SQLite row plus one JSONL line per rejected newAccount,
+    # which is unbounded growth on an issuance host's disk.
+    #
+    # Inside a window, repeats of the same denial reason update the row that is
+    # already on disk — bumping an exact counter — instead of adding new ones,
+    # so durable growth becomes a function of time rather than of the
+    # attacker's request rate. Nothing is deleted and no attempt goes
+    # uncounted; see audit_coalesce for why that distinction is the whole
+    # point. Set to 0 to write one row per denial, as before this existed.
+    audit_denial_coalesce_window_seconds: int = Field(default=60, ge=0)
+
     # --- SIEM / audit emission -----------------------------------------------
     # Auditing every issuance is mandatory (hard rule). There is no toggle.
     # The default sink is JSON-lines next to the database; syslog and Splunk

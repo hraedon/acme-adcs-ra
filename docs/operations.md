@@ -223,6 +223,17 @@ measured a legitimate need.
 **Caveat:** the bucket is per worker *process*. Under IIS/HttpPlatformHandler
 the RA runs as a single uvicorn process, so one bucket sees all traffic; if you
 ever scale to multiple workers the effective ceiling multiplies by worker count.
+
+The nonce bucket bounds the *rate* of the cheapest step. It does not bound what
+a slower, sustained stream of rejected `newAccount` requests writes to disk;
+that is a separate control:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ACME_RA_AUDIT_DENIAL_COALESCE_WINDOW_SECONDS` | `60` | Window in which repeats of the same pre-auth denial reason update one durable audit row instead of adding rows. `0` writes one row per denial. |
+
+See **Retention and archival → audit_log table** below for what the coalesced
+row contains and why nothing is deleted.
 The network allowlist below remains the authoritative outer bound.
 
 ### Network allowlist (`<ipSecurity>`)
@@ -617,7 +628,22 @@ someone attempting to use credentials they should not have.
 ### audit_log table
 
 The `audit_log` table is the authoritative local audit (the SIEM JSONL is a
-secondary emission). It grows unbounded by default. Retention guidance:
+secondary emission).
+
+**Attacker-driven growth is bounded; ordinary growth is not.** Since v1.9.2,
+repeated *pre-authentication denials* — the one audit path an unauthenticated
+peer can drive, by failing EAB validation on `newAccount` over and over — no
+longer write a row each. Within
+`ACME_RA_AUDIT_DENIAL_COALESCE_WINDOW_SECONDS` (default 60), repeats of the
+same denial reason update the row that is already on disk, bumping an exact
+`denial_count` and recording how many distinct `kid` values were offered. Set
+the window to 0 to go back to one row per denial.
+
+Nothing is pruned, and no attempt goes uncounted: the counter is written to a
+committed row on every increment, so even a crash mid-window keeps the tally.
+What this bounds is *rows per unit time* (at most one per reason per window),
+not the total, so the retention guidance below still applies to normal
+operation:
 
 - **Keep hot** for the incident-review window (e.g. 90 days) for fast query.
 - **Archive cold** after the hot window: export rows older than N days to a
@@ -631,7 +657,14 @@ secondary emission). It grows unbounded by default. Retention guidance:
 
 A retention script is operator-owned (not shipped) — the schema is stable
 (`SELECT * FROM audit_log WHERE timestamp < ?`), so a simple cron/export
-suffices.
+suffices. The RA itself never deletes an audit row; pruning evidence is
+exactly the operation an attacker wants, so it stays a deliberate operator
+action rather than a background job.
+
+Attacker-supplied fields inside `details` (notably the offered EAB `kid`) are
+truncated to 256 characters with a SHA-256 of the full value appended, and the
+whole `details` blob is capped at ~4 KB. Two rows for the same oversized value
+still compare equal, so a row can still be matched against a captured request.
 
 ### certificates table
 
@@ -654,6 +687,11 @@ needed for revocation lookups (serial → cert) and audit. Retention guidance:
 - Rotate / compress old JSONL on a schedule (operator-owned) so it does not
   grow unbounded. The SIEM ingest should be the authoritative copy; the
   local JSONL is the fail-open buffer.
+- Coalesced denials reach this sink once per window, not once per request:
+  the SIEM sees the window's opening event, and the *next* window's event
+  carries the closed one's final tally in `previous_window`. For an exact
+  live count of an in-progress flood, read `denial_count` on the `audit_log`
+  row — SQLite is authoritative there, and is updated on every attempt.
 
 ## Revocation runbook
 

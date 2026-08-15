@@ -14,6 +14,7 @@ from typing import Any, cast
 from fastapi import Request
 
 from acme_adcs_ra.acme_errors import unauthorized
+from acme_adcs_ra.audit_coalesce import DenialCoalescer
 from acme_adcs_ra.config import RAConfig
 from acme_adcs_ra.crl_evidence import CrlEvidenceGate
 from acme_adcs_ra.enrollment import EnrollmentLeg
@@ -148,6 +149,9 @@ class ServerContext:
     # Token bucket for the unauthenticated nonce endpoint. When None,
     # create_app builds one from config (or leaves it None if disabled).
     nonce_bucket: TokenBucket | None = None
+    # Bounds durable growth from repeated pre-authentication denials. When
+    # None, create_app builds one from config.
+    denial_coalescer: DenialCoalescer | None = None
 
 
 def emit_audit_hook(ctx: ServerContext, event: dict[str, Any]) -> None:
@@ -171,8 +175,19 @@ def emit_audit_hook(ctx: ServerContext, event: dict[str, Any]) -> None:
 
 
 def _audit(ctx: ServerContext, **kwargs: Any) -> None:
-    """Persist an audit row and notify the optional SIEM hook."""
-    event = ctx.store.record_audit(**kwargs)
+    """Persist an audit row and notify the optional SIEM hook.
+
+    Repeated pre-authentication denials are folded into the window's existing
+    row rather than adding one each (second daybreak rescan F4); the coalescer
+    returns None in that case, and there is nothing new to fan out. Every other
+    event type passes straight through, one row apiece, as before.
+    """
+    if ctx.denial_coalescer is not None:
+        event = ctx.denial_coalescer.record(ctx.store, **kwargs)
+        if event is None:
+            return
+    else:
+        event = ctx.store.record_audit(**kwargs)
     emit_audit_hook(ctx, event)
 
 

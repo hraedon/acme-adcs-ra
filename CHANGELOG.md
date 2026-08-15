@@ -6,6 +6,72 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — Daybreak 2026-08-15 rescan, iteration 3 (four findings; all fixed)
+
+An independent re-review of `63529a6`. One high, two medium, one low (WI-014,
+on its fourth consecutive review). Three of the four are in the Windows
+installer. See `docs/security-review-2026-08-15-daybreak-rescan-2.md`.
+
+- **A preplanted manifest authenticated a preplanted interpreter (high,
+  CWE-345/CWE-426).** The previous iteration gated execution of
+  `$InstallDir\python\python.exe` on a whole-tree SHA-256 match against
+  `python.manifest.json` — a *sibling*, in the same namespace. On a first
+  install into a predictable `C:\ProgramData\acme-adcs-ra`, a local
+  low-privilege user writes both: the pair is self-consistent, verification
+  passes, and the planted binary is the preferred launcher, executed as
+  Administrator. Hash equality proves consistency, not provenance. The
+  manifest's own digest is now anchored **out of tree** in
+  `HKLM\SOFTWARE\acme-adcs-ra` (written by the elevated install that built the
+  runtime, its key owner-checked on read); an unanchored runtime tree is
+  deleted and rebuilt from an authenticated source, never executed. An upgrade
+  from a pre-anchor install rebuilds once.
+- **A raced junction still redirected privileged ownership changes (medium,
+  CWE-59/CWE-367).** `icacls` had `/L` everywhere it recursed, but ownership
+  went through `takeown /r`, which has **no no-follow option** — a junction
+  inserted after the reparse pre-walk redirected an elevated recursive
+  ownership rewrite outside the install tree, damage the post-walk could detect
+  but never undo. `takeown` is gone: ownership is claimed with
+  `icacls /setowner *S-1-5-32-544 /t /q /L`, before the DACL reset so the reset
+  cannot be denied. `/L` is now on every icacls call including the
+  single-object ones; `/c` is gone from all of them (it skips objects it cannot
+  process); and every result goes through `Test-IcaclsOutputClean`, which
+  checks the exit code *and* the "Failed processing N files" summary.
+  **Behaviour change:** `icacls /setowner` does not force ownership, so the
+  installer now *refuses* a tree a local attacker pre-created and locked
+  against it, rather than force-adopting a hostile namespace.
+- **The live-tree claim left retained handles and attacker-owned descendants
+  (medium, CWE-367/CWE-732).** The app pool was stopped ~220 lines after the
+  install root was claimed and after the destination interpreter had been
+  verified and run — and Windows checks access at handle-open time, so a
+  compromised gMSA worker's write handle survived the ACL reset and could
+  rewrite interpreter bytes between the hash and the execution. The pool is now
+  stopped and **proven dead** (`appcmd list wp` polled to empty, abort on
+  timeout) before anything under the install root is claimed, hashed or run.
+  Separately, the read-back proof checked only the root's owner; it now checks
+  every descendant's, which also catches a child created between the ownership
+  and DACL passes.
+- **Unbounded durable audit growth from unauthenticated denials — WI-014,
+  fixed (low, CWE-400).** Three waves deferred this because the usual
+  remediation is a pruner, and deleting audit evidence is the operation an
+  attacker most wants. That reasoning stands: nothing is pruned, and a test
+  asserts no `DELETE FROM audit_log` exists in the store. Instead, within
+  `ACME_RA_AUDIT_DENIAL_COALESCE_WINDOW_SECONDS` (default 60; `0` restores
+  one row per denial), repeats of the same `account-creation-denied` reason
+  **update the row already on disk** — exact `denial_count`, `last_seen`, and
+  a bounded set of digests of the distinct `kid`s offered. The count is written
+  on every increment, so a crash mid-window keeps it. Coalescing keys on
+  `(event_type, reason)` and deliberately not on `kid` or requester, which
+  would let a peer defeat the bound by varying one character. Only the
+  unauthenticated denial path is coalesced; issuance, revocation and admin
+  events keep one row each. Separately, attacker-controlled detail values are
+  truncated at 256 chars with a SHA-256 of the whole value appended, and the
+  `details` blob is capped at ~4 KB — bounded at the durable sink, not at each
+  call site.
+
+Suite: 795 pytest + 1 skip (was 773 + 1), 218 Pester (was 184), ruff and mypy
+clean. The installer still owes a live Windows run before any tag; the two
+newly-unobserved behaviours are named in the review doc.
+
 ### Security — 2026-08-19 review (six findings; five fixed, one deferred)
 
 An independent source review of `c8ad4c2`. One high, one medium, four low. The

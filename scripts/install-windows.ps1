@@ -226,6 +226,28 @@ function Install-Prerequisites {
     Write-Host ""
 }
 
+# --- Stop the worker BEFORE the tree is claimed (2026-08-15 rescan-2 F3) -----
+#
+# This used to sit ~220 lines below, after the install root had been claimed and
+# after the destination interpreter had been verified and EXECUTED. Windows
+# checks access when a handle is opened, not when it is used: a compromised
+# gMSA worker with a write handle opened under the steady-state Modify ACL
+# keeps that write access straight through the ownership/ACL reset, and can
+# rewrite interpreter bytes between the hash check and the elevated run of
+# those bytes. Stopping the pool -- and proving the worker process is gone --
+# has to come first, or none of the verification below binds anything.
+$script:poolWasStopped = $false
+$appcmdExe = "$env:windir\system32\inetsrv\appcmd.exe"
+if (Test-Path $appcmdExe) {
+    Write-Host "Stopping app pool `"$AppPool`" (and waiting for its worker) before touching $InstallDir ..."
+    $script:poolWasStopped = Stop-AppPoolAndWait -AppcmdExe $appcmdExe -AppPool $AppPool
+    if ($script:poolWasStopped) {
+        Write-Host "  [ok]   app pool stopped and no worker process remains"
+    } else {
+        Write-Host "  [ok]   no such app pool yet (first install)"
+    }
+}
+
 # --- Claim the install root BEFORE anything under it is inspected (F1) -------
 #
 # 2026-08-19 F1 (high, CWE-426). This block used to run ~250 lines later, and
@@ -348,14 +370,26 @@ $launchers = @()
 # python.manifest.json, which is written at build time and DACL-protected
 # against the gMSA. Anything else is deleted and rebuilt from an
 # authenticated source below -- never executed.
+#
+# And the manifest itself is only believed when it matches the digest recorded
+# OUT OF TREE, in HKLM (2026-08-15 rescan-2 F1): a manifest that lives in the
+# same namespace as the bytes it vouches for proves consistency, not provenance.
+# Preplant both and they authenticate each other. HKLM\SOFTWARE is not writable
+# by the local user who can pre-create ProgramData\acme-adcs-ra, so it is the
+# anchor; no anchor means the runtime is rebuilt, never executed.
 $sharedCandidate = Join-Path $InstallDir "python\python.exe"
 $pyManifest = Join-Path $InstallDir "python.manifest.json"
+$pyAnchor = Get-TreeManifestAnchor -InstallDir $InstallDir
+if (-not $pyAnchor) {
+    Write-Host "  [note] no out-of-tree runtime anchor for $InstallDir yet -- any existing python\ tree will be rebuilt, not trusted."
+}
 $sharedItem = Get-Item -LiteralPath $sharedCandidate -Force -ErrorAction SilentlyContinue
 if ($null -ne $sharedItem) {
     $sharedAuthentic = $false
     if (Test-DestinationInterpreterTrusted -RootSecured $script:installRootSecured `
                                            -InterpreterAttributes $sharedItem.Attributes) {
-        $m = Test-TreeManifestMatches -Root (Split-Path $sharedCandidate) -ManifestPath $pyManifest
+        $m = Test-TreeManifestAuthentic -Root (Split-Path $sharedCandidate) `
+                                        -ManifestPath $pyManifest -AnchorDigest $pyAnchor
         $sharedAuthentic = [bool]$m.Ok
         if (-not $sharedAuthentic) {
             Write-Host ("  [!!] shared Python fails manifest verification ($($m.Reason): " +
@@ -370,6 +404,11 @@ if ($null -ne $sharedItem) {
     } else {
         Assert-NoReparsePoints -Path (Split-Path $sharedCandidate) -Context 'unverified shared-python removal'
         Remove-Item -LiteralPath (Split-Path $sharedCandidate) -Recurse -Force
+        # The manifest goes with the tree it described. Leaving it would not be
+        # a trust problem (an unanchored manifest is never believed), but it
+        # would leave a document on disk vouching for bytes that no longer
+        # exist, which is exactly the sort of thing an operator misreads.
+        Remove-Item -LiteralPath $pyManifest -Force -ErrorAction SilentlyContinue
         Write-Host "  [ok]   unverified python\ tree removed (rebuilt below only if needed, from an authenticated source)"
     }
 }
@@ -448,7 +487,7 @@ if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
     # launcher gate above, or never existed.
     $reuseShared = $false
     if (Test-Path $sharedPyExe) {
-        $m = Test-TreeManifestMatches -Root $sharedPyDir -ManifestPath $pyManifest
+        $m = Test-TreeManifestAuthentic -Root $sharedPyDir -ManifestPath $pyManifest -AnchorDigest $pyAnchor
         if ($m.Ok) {
             $reuseShared = $true
             Write-Host "Using existing shared Python at $sharedPyDir (manifest verified: $($m.Reason))"
@@ -482,7 +521,11 @@ if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
         Set-ObjectProtectedDacl -Path $pyManifest -Grants @(
             '*S-1-5-32-544:F', '*S-1-5-18:F'
         )
-        Write-Host "  Shared Python ready at $sharedPyExe (manifest: $n files, ACL'd to Administrators/SYSTEM)"
+        # ... and anchor the manifest OUTSIDE the namespace it describes
+        # (rescan-2 F1). Without this the next run cannot tell our manifest from
+        # one an attacker wrote alongside a planted interpreter.
+        $pyAnchor = Set-TreeManifestAnchor -InstallDir $InstallDir -ManifestPath $pyManifest
+        Write-Host "  Shared Python ready at $sharedPyExe (manifest: $n files, ACL'd to Administrators/SYSTEM, anchored in HKLM)"
     }
     $python = @{ Exe = $sharedPyExe; Args = @() }
 }
@@ -490,19 +533,10 @@ if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
 Write-Host "Creating directories under $InstallDir ..."
 foreach ($d in @($InstallDir, $logs)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
 
-# Stop the app pool (if any) BEFORE touching the venv so the worker releases
-# locked files (python.exe, loaded .pyd). appcmd is always present with IIS.
-$script:poolWasStopped = $false
-$appcmdExe = "$env:windir\system32\inetsrv\appcmd.exe"
-if (Test-Path $appcmdExe) {
-    $poolExists = & $appcmdExe list apppool "$AppPool" 2>$null
-    if ($poolExists) {
-        Write-Host "Stopping app pool `"$AppPool`" to release files before install ..."
-        & $appcmdExe stop apppool /apppool.name:"$AppPool" 2>$null | Out-Null
-        Start-Sleep -Seconds 3
-        $script:poolWasStopped = $true
-    }
-}
+# NOTE: the app pool was stopped -- and its worker proven gone -- at the top of
+# this run, before the install root was claimed (rescan-2 F3). It is not
+# stopped again here: a second stop would be a no-op, and the guarantee that
+# matters is that no gMSA handle predates the claim.
 
 # Clear hidden/system attrs on venv launchers (Python 3.14 marks them) so venv
 # creation does not fail with "Unable to copy ... venvlauncher.exe".
@@ -843,7 +877,14 @@ if ($ConfigureIIS) {
             Write-Host "  [warn] No -TlsCertThumbprint. HTTPS binding exists but no certificate is assigned."
         }
 
-        icacls $SitePath /grant "${GmsaAccount}:(OI)(CI)R" | Out-Null
+        # /L: the site path is as predictable as the install root, and this
+        # grant runs elevated -- it must not be redirectable by a link either
+        # (2026-08-15 rescan-2 F2).
+        $siteAclOut = & icacls.exe $SitePath /grant "${GmsaAccount}:(OI)(CI)R" /L 2>&1
+        if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $siteAclOut)) {
+            throw ("Failed to grant the gMSA read access to $SitePath (exit $LASTEXITCODE): " +
+                   (($siteAclOut | Out-String).Trim()))
+        }
 
         Write-Host "  Starting app pool `"$AppPool`" ..."
         & $appcmdExe start apppool /apppool.name:"$AppPool" 2>$null | Out-Null
