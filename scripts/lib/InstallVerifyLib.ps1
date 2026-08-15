@@ -296,6 +296,41 @@ function Set-ObjectProtectedDacl {
     }
 }
 
+# Read an `icacls <root> /save <file>` dump back as text.
+#
+# icacls /save writes UTF-16 LE **without a BOM** (observed on Windows 10.0.26100:
+# 61 00 63 00 ... -- each ASCII byte followed by 00). `Get-Content -Raw` with no
+# BOM decodes as ANSI on Windows PowerShell 5.1 and as UTF-8 on pwsh 7, and
+# either way every other character becomes a NUL: no line starts with 'D:', the
+# parser reads zero entries, and the proof fails closed on a healthy tree. That
+# is exactly what the first live run of the two-tree installer did -- the Pester
+# suite feeds SDDL strings straight to Test-AclDumpLocked and never exercised
+# this read, so no environment had ever decoded a real /save file.
+#
+# The decode is decided from the BYTES, not from a parameter: a BOM is honoured,
+# a BOM-less even-length file whose odd bytes are consistently 0x00 is UTF-16LE
+# (an ASCII-dominated SDDL dump is decisive), and anything else is decoded with
+# the platform default. Byte-sniffing rather than assuming: if some future
+# icacls writes ANSI, the dump still decodes, and if it is ever ambiguous the
+# parser below fails closed rather than passing a mangled tree.
+function Get-IcaclsDumpText {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+        return [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+    }
+    $oddZeros = 0; $evenZeros = 0
+    $probe = [Math]::Min($bytes.Length, 4096)
+    for ($i = 0; $i -lt $probe; $i += 2) {
+        if ($bytes[$i] -eq 0) { $evenZeros++ }
+        if (($i + 1) -lt $probe -and $bytes[$i + 1] -eq 0) { $oddZeros++ }
+    }
+    if ($oddZeros -gt 0 -and $evenZeros -eq 0) {
+        return [System.Text.Encoding]::Unicode.GetString($bytes)
+    }
+    return [System.Text.Encoding]::Default.GetString($bytes)
+}
+
 # Pure decision function over an `icacls <root> /save <file> [/t]` dump: does
 # the dump describe a LOCKED tree? Returns an array of violation strings --
 # EMPTY means locked. No I/O, so tests/pester can drive it with fixture dumps
@@ -331,7 +366,10 @@ function Test-AclDumpLocked {
     $currentSddl = ''
     foreach ($line in ($DumpText -split "`r?`n")) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        if ($line.StartsWith('D:')) {
+        # ORDINAL: a culture-sensitive StartsWith ignores NUL characters, so a
+        # mangled (wrong-encoding) dump could partially parse on some platforms
+        # and fail closed on others. Wrong-encoding must fail closed everywhere.
+        if ($line.StartsWith('D:', [System.StringComparison]::Ordinal)) {
             if ($null -ne $currentPath) { $currentSddl += $line.Trim() }
             continue
         }
@@ -491,7 +529,7 @@ function Get-InstallTreeViolations {
                      (($out | Out-String).Trim()) +
                      " -- the tree ACL could not be read back in full, so it cannot be trusted")
         }
-        $dump = Get-Content -LiteralPath $tmp -Raw
+        $dump = Get-IcaclsDumpText -Path $tmp
         $violations += Test-AclDumpLocked -DumpText $dump `
             -AllowedTrustees $AllowedTrustees -ExemptLeafNames @($ProtectedEntries.Keys)
 
@@ -524,7 +562,7 @@ function Get-InstallTreeViolations {
                 $violations += "$entryPath : icacls /save failed (exit $LASTEXITCODE): $(($out | Out-String).Trim())"
                 continue
             }
-            $violations += Test-AclDumpLocked -DumpText (Get-Content -LiteralPath $tmpEntry -Raw) `
+            $violations += Test-AclDumpLocked -DumpText (Get-IcaclsDumpText -Path $tmpEntry) `
                 -AllowedTrustees @($ProtectedEntries[$leaf]) -AllEntriesMustBeProtected
             Remove-Item -LiteralPath $tmpEntry -Force -ErrorAction SilentlyContinue
         }

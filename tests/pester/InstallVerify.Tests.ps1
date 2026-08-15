@@ -316,6 +316,69 @@ D:AI(A;;FR;;;S-1-5-32-544)(A;;FR;;;S-1-5-18)
         $v[0] | Should -Match 'no entries parsed'
     }
 }
+
+# --- Live-run finding, 2026-08-15: icacls /save is UTF-16LE without a BOM ------
+#
+# The first live execution of the two-tree installer proved a healthy tree
+# FAILED its own ACL verification: `Get-Content -Raw` decoded the BOM-less
+# UTF-16LE /save file as ANSI (5.1) / UTF-8 (pwsh 7), every second character
+# became NUL, no line started with 'D:', and Test-AclDumpLocked failed closed
+# with 'no entries parsed'. No earlier test had decoded a real /save file --
+# the fixtures were hand-typed SDDL strings -- so this was invisible from
+# Linux and from CI alike. These tests build the dump as BYTES, the way icacls
+# writes it.
+Describe 'Get-IcaclsDumpText (live-run finding: icacls /save is BOM-less UTF-16LE)' {
+    BeforeAll {
+        $script:dumpText = @'
+acme-adcs-ra
+D:PAI(A;OICI;FA;;;S-1-5-32-544)(A;OICI;FA;;;S-1-5-18)
+acme-adcs-ra\venv
+D:AI(A;OICIID;FA;;;S-1-5-32-544)(A;OICIID;FA;;;S-1-5-18)
+'@
+        $script:dir = New-Item -ItemType Directory -Force -Path (Join-Path ([IO.Path]::GetTempPath()) ("ra-dumptext-" + [guid]::NewGuid().ToString('N')))
+        # icacls /save, byte for byte: UTF-16LE, no BOM, CRLF line endings.
+        $script:noBom = New-Object System.Text.UnicodeEncoding($false, $false)
+        $script:fNoBom = Join-Path $script:dir 'dump-nobom.txt'
+        [IO.File]::WriteAllText($script:fNoBom, $script:dumpText, $script:noBom)
+        # Same dump with a BOM, in case a future icacls writes one.
+        $script:fBom = Join-Path $script:dir 'dump-bom.txt'
+        [IO.File]::WriteAllText($script:fBom, $script:dumpText, [System.Text.Encoding]::Unicode)
+        # A plain single-byte dump, in case a future icacls ever writes ANSI.
+        $script:fAnsi = Join-Path $script:dir 'dump-ansi.txt'
+        [IO.File]::WriteAllText($script:fAnsi, $script:dumpText, [System.Text.Encoding]::ASCII)
+    }
+    AfterAll { Remove-Item -LiteralPath $script:dir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'decodes a BOM-less UTF-16LE dump so the parser finds the entries (what icacls /save actually writes)' {
+        $text = Get-IcaclsDumpText -Path $script:fNoBom
+        @($text -split "`r?`n" | Where-Object { $_.StartsWith('D:') }).Count | Should -Be 2
+        $v = @(Test-AclDumpLocked -DumpText $text -AllowedTrustees @('S-1-5-32-544', 'S-1-5-18'))
+        @($v).Count | Should -Be 0
+    }
+
+    It 'decodes a BOM-prefixed UTF-16LE dump identically' {
+        $text = Get-IcaclsDumpText -Path $script:fBom
+        @($text -split "`r?`n" | Where-Object { $_.StartsWith('D:') }).Count | Should -Be 2
+    }
+
+    It 'still decodes a single-byte dump' {
+        $text = Get-IcaclsDumpText -Path $script:fAnsi
+        @($text -split "`r?`n" | Where-Object { $_.StartsWith('D:') }).Count | Should -Be 2
+    }
+
+    It 'the old reader fails this same file, so this test cannot pass against the old code' {
+        # Mutation guard: this is what Windows PowerShell 5.1's Get-Content -Raw
+        # did -- decode the bytes with the platform default (ANSI) because there
+        # is no BOM. (This very pwsh SNIFS BOM-less UTF-16, which is why the
+        # defect passed every local Pester run and only bit on 5.1, live.) The
+        # comparison must be ORDINAL: culture-sensitive StartsWith ignores NUL
+        # characters, so it falsely "matches" the mangled lines on pwsh and the
+        # guard would pass on both old and fixed code.
+        $bytes = [IO.File]::ReadAllBytes($script:fNoBom)
+        $old = [System.Text.Encoding]::Default.GetString($bytes)
+        @($old -split "`r?`n" | Where-Object { $_.StartsWith('D:', [System.StringComparison]::Ordinal) }).Count | Should -Be 0
+    }
+}
 # --- Daybreak 2026-08-15 SECOND rescan -----------------------------------------
 #
 # Four findings; three of them Windows-installer ones:
