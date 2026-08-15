@@ -163,6 +163,71 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Installer rework validation — the two-tree layout EXECUTED for the first
+  time (2026-08-15) on `54b90db`, the tip after two live-found defects were
+  fixed and re-proven on the host.** Everything the code/state split's "what is
+  still unproven" list demanded, on the exact commit, from CI-green preflight
+  through teardown. See `samples/lab-run-2026-08-15-installer-validation.md`
+  (gitignored) for the full transcript map.
+
+  **Proven live, all on `54b90db`'s own bytes:** clean install from absent
+  roots (exit 0, both trees claimed, built, and read-back-proven); reinstall
+  over the result (both roots recognised as ours, runtime retired → rebuilt →
+  retired copy deleted, dotenv preserved no-clobber); **refusal of the real
+  old-layout tree** (the §4 BREAKING behaviour, actionable message naming the
+  violations and the rescue list); **refusal of a genuine non-admin pre-plant**
+  (a throwaway local user pre-created a ProgramData state root with a hostile
+  `acme-ra.env` — refused, tree untouched, refusal precedes any dotenv read;
+  and its attempt to pre-create under `%ProgramFiles%` is access-denied, so
+  the code root cannot be pre-planted at all); **rollback** (deliberately
+  corrupted pinned hash → build fails after retirement → previous runtime
+  restored byte-identically, zero `.retired-*` leftovers, and after the
+  by-hand pool restart the old runtime still serves `/directory` 200);
+  **the gMSA `RX` grant launches uvicorn** — HttpPlatformHandler starts the
+  ProgramFiles venv as the domain gMSA and `/directory` answers 200 with the
+  app running as the gMSA identity; **the §4 migration walked end to end**
+  (backup → rescue → read-the-dotenv → rename → fresh install → restore db/env
+  byte-identical → re-run installer → web.config processPath → verify: §5
+  shape, owners Administrators, spnego imports, db integrity + counts
+  unchanged).
+
+  **Two escaped defects found and fixed on the branch (both the WI-050
+  class — PowerShell semantics invisible to Linux CI):**
+  1. `icacls /save` writes UTF-16LE **without BOM**; `Get-Content -Raw`
+     decoded it as ANSI on Windows PowerShell 5.1 (this pwsh *sniffs* BOM-less
+     UTF-16, which is why local Pester was green) — the ACL proof failed
+     closed on a healthy tree and blocked every install. Fixed in `b816352`
+     (`Get-IcaclsDumpText`, byte-sniffed decode, ordinal `StartsWith`).
+  2. The state-root claim's `icacls /reset /t` strips the dotenv's protected
+     DACL, and it was only re-applied ~150 lines later — a build failure in
+     between (the rollback path) left `acme-ra.env` inheriting gMSA **Modify**
+     (EAB allowlist + SAN scopes worker-writable), and the *next* pre-flight
+     then correctly refused the tree, bricking the install. Fixed in
+     `54b90db` (re-protect immediately after the claim; the rollback catch now
+     re-protects and re-proves the state tree too). Both fixes re-proven live
+     on the host: the failed-build rerun prints "state tree re-protected and
+     re-proven" and the dotenv survives the failure protected.
+
+  **Also closed:** the `*S-1-5-32-544` star form **works** for
+  `icacls /setowner` on this host (previously "unverified for that verb").
+
+  **Not proven:** the no-rollback proof-failure path (a runtime that builds
+     but fails its proof — the honest "app pool left stopped deliberately"
+     message); a `-ConfigureIIS` first install from bare IIS (the lab host
+     already had the site); the user-scoped-Python copy path was exercised,
+     the machine-wide reference path was not (the host's 3.13 lost the
+     launcher preference to the profile 3.14).
+
+  **Host end-state (deliberate, not restored):** the lab RA now runs the
+  two-tree layout on `54b90db`'s runtime with the same store (counts
+  22/5/21/87, unchanged), same dotenv, same siem trail; the old tree is
+  preserved at `C:\ProgramData\acme-adcs-ra.preSplit` as the migration
+  rollback artifact; `web.config` processPath points at the ProgramFiles
+  venv. The CA host was never touched (no issuance, no revocation, no
+  ca-provision this run). Refusal runs leave the app pool stopped
+  (fail-closed; restart by hand) — observed behaviour worth knowing
+  operationally, not a defect.
+
 - **Full E2E lab validation — PASSED (2026-08-15) on `2d6ac20`, the tip after the
   two fixes the `b028b96` pass produced plus the three CI/test/PowerShell commits
   behind them.** Preflight green on the exact commit (CI, ruff, mypy, pytest

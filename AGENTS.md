@@ -127,17 +127,26 @@ reuse branch. `docs/operator-requirements.md` is the operator contract.
 **BREAKING for deployments: an old single-directory install is refused.**
 Migration is manual and deliberate — `docs/operator-requirements.md` §4.
 
-**None of the installer rework has ever been executed.** CI runs pytest on
-Windows and never touches the installer, and this project's record is four
-escaped PowerShell defects across two rounds. Before any tag: a clean install,
-a reinstall over it, a refusal run (pre-create both roots as a non-admin), a
-rollback run (fail the build deliberately), the migration path walked end to
-end, and above all **whether the gMSA's `RX` grant on the runtime tree actually
-lets HttpPlatformHandler launch uvicorn** — that is a narrower grant than the
-old `M` and the most likely thing to be subtly wrong. `icacls /setowner` also
-now fails closed where `takeown` would have forced it, and the `*S-1-5-32-544`
-star form is unverified for that one verb. Pester 5.7.1 and Windows PowerShell
-5.1 are on the lab RA host (real hostname in the gitignored runbook).
+**The installer rework is now EXECUTED and lab-validated (2026-08-15, on
+`54b90db`)** — every item the design doc's "still unproven" list demanded:
+clean install, reinstall over it, refusal runs (the real old-layout tree AND
+a genuine non-admin pre-plant), a rollback run, the §4 migration end to end,
+and the load-bearing **gMSA `RX` launch** (HttpPlatformHandler starts the
+ProgramFiles venv as the gMSA; `/directory` 200). The run found **two escaped
+PowerShell defects, both fixed on the branch and re-proven live**: the ACL
+proof could not read `icacls /save` output (UTF-16LE without BOM vs
+`Get-Content`'s ANSI decode on 5.1 — and pwsh *sniffs* BOM-less UTF-16, which
+is why local Pester never saw it), and a failed build left `acme-ra.env`
+inheriting gMSA Modify — the claim's `/reset` strips the dotenv's protected
+DACL and the re-protect was 150 lines downstream of the abort point — bricking
+the next install's pre-flight. Both fixes carry byte-realistic / source-order
+regression tests. Also closed: the `*S-1-5-32-544` star form **works** for
+`icacls /setowner`. Still not proven: the no-rollback proof-failure path and
+a bare-`-ConfigureIIS` first install. Refusal runs leave the app pool stopped
+(fail-closed) — restart by hand. The lab RA host now runs the two-tree layout
+(old tree preserved as the migration rollback artifact); see the validation
+log in `docs/pre-pilot-checklist.md` and the gitignored
+`samples/lab-run-2026-08-15-installer-validation.md`.
 
 **Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
 security reviews.** There is **no 1.9.0 release**: that line shipped only as
