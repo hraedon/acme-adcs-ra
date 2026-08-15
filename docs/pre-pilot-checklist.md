@@ -163,6 +163,77 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Full E2E lab validation — PASSED (2026-08-15) on `2d6ac20`, the tip after the
+  two fixes the `b028b96` pass produced plus the three CI/test/PowerShell commits
+  behind them.** Preflight green on the exact commit (CI, ruff, mypy, pytest
+  768/1, Pester 148). Deployed by the ordinary installer (exit 0) and asserted on
+  the *installed* package; the hash-pinned closure installed clean into a
+  throwaway venv on Windows/3.14. **No new product defect found.** The
+  sync-path PowerShell fix (`2d6ac20`) is exercised live: the agent ran to
+  completion six times on this deployment.
+
+  **What passed.** §A 14/14, §A1 front controls 13/13, §G 5/5 (removed GET
+  routes answer 405), both transport-orphan branches 6/6, the revocation round
+  trip three times (R 5/5 + Rverify 3/3 each: through the registered task as the
+  gMSA, then the agent-authority pair, then under CRL evidence). Agent authority:
+  admin-token-only exits 2 with the confirm 401'd; confirm-token-only completes
+  with no admin token present at all. CRL evidence fails closed
+  (`crl-evidence-required-but-absent`) until an administrator republishes, then
+  records `crl-verified`. Least privilege live: the gMSA is denied CRL
+  publication (`0x80070005`), denied an out-of-template revocation
+  (`CERTSRV_E_RESTRICTEDOFFICER`), and its token carries no domain groups (E-1).
+  Reason 8 refused inside the gMSA context by `Revoke-Cert.ps1` (exit 3, exact
+  error text). The lease: §L 9/9 (migration on the real store, pre-existing
+  orders still generation 0, in-flight reclaims refused by the registry) and
+  §Lqueue 8/8 (saturation 40 sockets, target provably queued — committed to
+  `processing` with **no** enrollment audit row — reclaim denied
+  `enrollment-in-flight`, nothing reopened, re-finalize takes a fresh lease).
+
+  **The WI-053 deployment shape, proven live for the first time.** The sync task
+  registered with `-RevocationSyncOnly -ConfirmToken` only: the task action
+  loads **only** `ACME_RA_REVOCATION_CONFIRM_TOKEN` from the ACL'd dotenv at run
+  time (F2), contains no admin-key load and no literal token, runs as the gMSA
+  with LogonType Password — and that task drained every revocation this run
+  queued. The revocation host needs no admin authority, in the deployed
+  artifact, not just in the script.
+
+  **STILL NOT established: the durable lease stopping a stale worker.** Third
+  run, same verdict — raced, neither confirmed nor refuted. The contested
+  order's two `finalize-enrollment-transport-failed` rows are sequential: the
+  gen-1 worker ran and returned (transport failure) before the SQL-reclaim +
+  re-finalize could invalidate it, so no worker ever survived a generation bump
+  and no `finalize-enrollment-abandoned` row exists anywhere. `total_abandoned=0`
+  with Ld4/Ld5 holding (no order anywhere has two certificates; the contested
+  order has none — the CA never issued for it). Ld1 remains the documented
+  non-defect: 86 orders wedge in `processing` for operator reconciliation.
+
+  **The CRL cadence finding stands unchanged** (CRL3 FAIL by design of the
+  check): 7d 12h20m window vs the 604800s default ceiling — the WI-052 operator
+  item, configuration not code.
+
+  **Two harness defects found (not product).** (1) Lqueue's saturation counter
+  reads `ca-ip.txt`, which held the *real* CA address, but the §9-approved
+  blackhole is **config-mode** (`ACME_RA_ADCS_HOST=192.0.2.1`), so it counted
+  the wrong destination and failed at `ca_sockets=2` while the substantive
+  checks passed — the counter must be pointed at the blackhole address in that
+  mode (re-run then measured 40/40 clean). (2) `bh-off.ps1` only clears the
+  *firewall* blackhole; the config blackhole needs the explicit
+  `setenv ACME_RA_ADCS_HOST` restore, which teardown.ps1 does. Also: `cw-admin`
+  over SSH **cannot DCOM to the CA** (key-auth logon has no network credential —
+  `RPC_S_SERVER_UNAVAILABLE` on `-ping` while the same call succeeds on the CA
+  console and as the gMSA task), so teardown revocations must run through the
+  gMSA runner. The §2 ssh-quoting trap claimed three more victims this run
+  (icacls `$:`, a method call, a pipe under cmd.exe).
+
+  **Teardown verified, not assumed.** All five certificates this run caused the
+  CA to issue revoked — including the untracked ReqID-only orphan (ReqID 201,
+  serial `6c…c9`) — and the CRL republished; CA back to 224 bytes / 4 ACEs /
+  `OfficerRights: ABSENT`; `denyUrlSequences` empty; RA store restored from the
+  pre-run backup and **fingerprint-identical** (integrity `ok`, every row count
+  equal); tasks unregistered; dotenv verified free of throwaway credentials;
+  web.config back to its pristine 10-variable set; harness temp removed on both
+  hosts. Artifacts table in `samples/lab-run-2026-08-15-notes.md`.
+
 - **Full E2E lab validation — PASSED (2026-08-14) on `b028b96` + two fixes it
   produced, with one claim still NOT established.** The first full pass over the
   whole 2026-08-15 → 2026-08-18-wave-3 security series; every one of those
