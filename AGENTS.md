@@ -109,15 +109,35 @@ deferred a fourth time** — not with a pruner, which the earlier deferrals were
 right to refuse, but by folding repeated pre-auth denials into the row already
 on disk, so growth tracks time instead of request rate and nothing is deleted.
 
-**The installer still owes a live install run before the next release —
-including a fresh install into a pre-planted tree (planted `python\python.exe`
-with a matching planted manifest, planted venv `.pth`, child junction) proving
-refusal/rebuild/abort.** CI executes none of the ownership claim, the read-back
-proof, the registry anchor, or the manifest dance. Two behaviours are newly
-unobserved: `icacls /setowner` now *fails closed* on a tree it cannot claim
-(deliberate — the installer no longer force-adopts a hostile namespace), and
-the `*S-1-5-32-544` star form is unverified for that one verb. Pester 5.7.1 and
-Windows PowerShell 5.1 are on `mvmcitest01`.
+**Then the adoption model itself was retired** — see
+`docs/design-code-state-split.md`. Five of the eight installer findings across
+those four rounds were defects in the previous round's fix, and every mechanism
+involved existed to make it safe to *adopt* a directory a local user might have
+created first. So: executable content moved to `%ProgramFiles%\acme-adcs-ra`
+(new `-RuntimeDir`; `%ProgramData%` grants Users create-folder rights with
+CREATOR OWNER inheritance, `%ProgramFiles%` does not), state stayed in
+`%ProgramData%` with the gMSA on modify and **read+execute only** on code, and
+a pre-existing root is now proven ours or refused with an actionable message.
+That also closed an unreported path: `acme-ra.env` is preserved no-clobber, so
+a planted dotenv in a pre-created state dir used to be preserved and ACL'd —
+and it carries the EAB allowlist and SAN scopes. Deleted with the model: the
+tree manifest, the HKLM anchor, `Test-DestinationInterpreterTrusted`, the whole
+reuse branch. `docs/operator-requirements.md` is the operator contract.
+
+**BREAKING for deployments: an old single-directory install is refused.**
+Migration is manual and deliberate — `docs/operator-requirements.md` §4.
+
+**None of the installer rework has ever been executed.** CI runs pytest on
+Windows and never touches the installer, and this project's record is four
+escaped PowerShell defects across two rounds. Before any tag: a clean install,
+a reinstall over it, a refusal run (pre-create both roots as a non-admin), a
+rollback run (fail the build deliberately), the migration path walked end to
+end, and above all **whether the gMSA's `RX` grant on the runtime tree actually
+lets HttpPlatformHandler launch uvicorn** — that is a narrower grant than the
+old `M` and the most likely thing to be subtly wrong. `icacls /setowner` also
+now fails closed where `takeown` would have forced it, and the `*S-1-5-32-544`
+star form is unverified for that one verb. Pester 5.7.1 and Windows PowerShell
+5.1 are on `mvmcitest01`.
 
 **Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
 security reviews.** There is **no 1.9.0 release**: that line shipped only as

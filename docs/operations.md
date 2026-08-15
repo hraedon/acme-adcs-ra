@@ -630,7 +630,8 @@ someone attempting to use credentials they should not have.
 The `audit_log` table is the authoritative local audit (the SIEM JSONL is a
 secondary emission).
 
-**Attacker-driven growth is bounded; ordinary growth is not.** Since v1.9.2,
+**Attacker-driven growth is bounded; ordinary growth is not.** Since the
+2026-08-15 audit work,
 repeated *pre-authentication denials* — the one audit path an unauthenticated
 peer can drive, by failing EAB validation on `newAccount` over and over — no
 longer write a row each. Within

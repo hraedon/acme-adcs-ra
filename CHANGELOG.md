@@ -6,6 +6,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — the Windows install is split into code and state (BREAKING for deployments)
+
+Not a review finding: a response to the *shape* of four rounds of them. Five of
+the eight installer findings across those rounds were defects in the previous
+round's fix, and every mechanism involved — an ACL claim, an ownership claim, a
+link walk, a content manifest, an out-of-tree anchor for that manifest — existed
+to make it safe to **adopt** a directory a local user might have created first.
+The premise was the problem. See `docs/design-code-state-split.md`.
+
+- **Executable content moved to `%ProgramFiles%\acme-adcs-ra`** (new
+  `-RuntimeDir`), under a `current\` subdirectory rebuilt from scratch on every
+  install. `%ProgramData%` grants `Users` create-folder rights with
+  `CREATOR OWNER` inheritance — which is exactly why a non-administrator could
+  pre-create `C:\ProgramData\acme-adcs-ra` and own it. `%ProgramFiles%` grants
+  read and execute only, so the executable half cannot be pre-planted at all.
+- **The gMSA gets read+execute on code and modify on state**, where it used to
+  get modify over one tree holding both. A compromised app pool can no longer
+  rewrite the interpreter it is about to be relaunched with.
+- **Neither root is ever adopted.** `Get-RootProvenance` answers absent / ours /
+  foreign, and a foreign root stops the install with a message naming what
+  disqualified it, which files to rescue, and in what order. "Ours" is decided
+  by the same function that proves the lockdown at the end of an install, so
+  the two definitions cannot drift.
+- **This closed an unreported path.** `acme-ra.env` is preserved no-clobber
+  across reinstalls, so a pre-created state directory with a planted dotenv was
+  *preserved and ACL'd* rather than rejected — and that file carries
+  `ACME_RA_EAB_ALLOWLIST` and `ACME_RA_SAN_SCOPES`, which decide who may enrol
+  and for which names.
+- **The runtime is retired by atomic rename, rebuilt at the final path, and
+  rolled back if the build throws.** In place rather than staged-then-renamed
+  because a venv is not relocatable: `pyvenv.cfg` records an absolute `home`
+  and `Scripts\*.exe` embed the interpreter path.
+- **Deleted:** the tree manifest and its verifier, the
+  `HKLM\SOFTWARE\acme-adcs-ra` anchor, `Test-DestinationInterpreterTrusted`,
+  and the whole destination-reuse branch. They answered "may I reuse the bytes
+  already there?", which no longer arises.
+- **`web.config` `processPath` now points at
+  `C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe`.** The
+  database, logs and dotenv paths are unchanged.
+
+**Upgrading is a deliberate, manual step.** An install from the old
+single-directory layout will be refused, because it does not match the new
+shape — it granted the gMSA modify over executable content, which is the state
+the split exists to end. The migration runbook is
+`docs/operator-requirements.md` §4.
+
+### Added — `docs/operator-requirements.md`
+
+The contract for everything the installer deliberately does not decide: what
+the operator must provide, every condition the installer refuses on with the
+exact remedy for each, the invariants that must stay true afterwards, the
+migration runbook, and a post-install verification script.
+
 ### Security — Daybreak 2026-08-15 rescan, iteration 3 (four findings; all fixed)
 
 An independent re-review of `63529a6`. One high, two medium, one low (WI-014,

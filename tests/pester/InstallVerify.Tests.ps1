@@ -184,29 +184,6 @@ Describe 'Test-InstallRootAttributesAcceptable' {
     }
 }
 
-Describe 'Test-DestinationInterpreterTrusted' {
-    It 'refuses the destination interpreter while the root is unclaimed' {
-        # This is the finding itself: before the ACL is applied, a planted
-        # python.exe must never be a candidate no matter how ordinary it looks.
-        Test-DestinationInterpreterTrusted -RootSecured $false `
-            -InterpreterAttributes ([System.IO.FileAttributes]::Normal) | Should -BeFalse
-    }
-
-    It 'accepts it once the root has been claimed and re-ACLd' {
-        Test-DestinationInterpreterTrusted -RootSecured $true `
-            -InterpreterAttributes ([System.IO.FileAttributes]::Normal) | Should -BeTrue
-    }
-
-    It 'still refuses a reparse-point interpreter inside a secured root' {
-        $link = [System.IO.FileAttributes]::Normal -bor [System.IO.FileAttributes]::ReparsePoint
-        Test-DestinationInterpreterTrusted -RootSecured $true -InterpreterAttributes $link | Should -BeFalse
-    }
-
-    It 'refuses when the interpreter cannot be stat-ed' {
-        Test-DestinationInterpreterTrusted -RootSecured $true -InterpreterAttributes $null | Should -BeFalse
-    }
-}
-
 # --- Daybreak 2026-08-15: hostile-tree ACL lockdown ----------------------------
 #
 # /inheritance:r removes only INHERITED ACEs, so the F1 "claim" left an
@@ -339,235 +316,6 @@ D:AI(A;;FR;;;S-1-5-32-544)(A;;FR;;;S-1-5-18)
         $v[0] | Should -Match 'no entries parsed'
     }
 }
-
-# The installer must actually USE the lockdown sequence: the raw one-line
-# icacls claim (the bypassable form) must be gone, and both ACL passes must
-# end in the read-back proof. Text-level, because these run on Linux where
-# icacls/takeown do not exist; the lab re-proof exercises the real calls.
-Describe 'install-windows.ps1 uses the hostile-tree lockdown' {
-    BeforeAll {
-        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
-    }
-
-    It 'no raw /inheritance:r claim remains on the install root' {
-        $script:installer | Should -Not -Match 'icacls\s+\$InstallDir\s+/inheritance:r'
-        $script:installer | Should -Not -Match 'icacls\s+\$envFile\s+/inheritance:r'
-    }
-
-    It 'ownership+reset runs on both ACL passes' {
-        @([regex]::Matches($script:installer, 'Reset-TreeToInherited -Path \$InstallDir')).Count | Should -Be 2
-    }
-
-    It 'both passes end in the read-back proof' {
-        @([regex]::Matches($script:installer, 'Assert-InstallTreeLocked -Root \$InstallDir')).Count | Should -Be 2
-    }
-
-    It 'the dotenv gets its own protected DACL' {
-        $script:installer | Should -Match 'Set-ObjectProtectedDacl -Path \$envFile'
-    }
-
-    It 'the install-root trust flag is set only after the proof' {
-        $iProof = $script:installer.IndexOf('Assert-InstallTreeLocked -Root $InstallDir')
-        $iFlag = $script:installer.IndexOf('$script:installRootSecured = $true')
-        $iProof | Should -BeGreaterThan -1
-        $iFlag | Should -BeGreaterThan $iProof
-    }
-}
-
-# --- Daybreak 2026-08-15 rescan F1: destination bytes must authenticate ---------
-#
-# "We ACL'd the tree" bounds future writes; it says nothing about the bytes
-# already in it. The shared interpreter is therefore only executable when its
-# whole tree matches a manifest the gMSA cannot rewrite. These round-trip the
-# manifest machinery on Linux (Get-FileHash is cross-platform) against the
-# exact attacker shapes: tampered file, planted file, deleted file, corrupt or
-# missing manifest.
-
-Describe 'Tree manifest (shared-Python authentication)' {
-    BeforeAll {
-        $script:root = Join-Path ([System.IO.Path]::GetTempPath()) ("mfst-test-" + [guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Force -Path $script:root | Out-Null
-        $script:manifest = Join-Path $script:root "manifest.json"
-        # The manifest lives OUTSIDE the tree it vouches for in production
-        # (python.manifest.json is a sibling of python\), mirror that here.
-        $script:tree = Join-Path $script:root "python"
-        New-Item -ItemType Directory -Force -Path (Join-Path $script:tree "Scripts") | Out-Null
-        Set-Content -Path (Join-Path $script:tree "python.exe") -Value "PE-exe-bytes"
-        Set-Content -Path (Join-Path $script:tree "python313.dll") -Value "PE-dll-bytes"
-        Set-Content -Path (Join-Path $script:tree "Scripts\pip.exe") -Value "PE-pip-bytes"
-    }
-    AfterAll {
-        Remove-Item -LiteralPath $script:root -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    It 'Save-TreeManifest covers every file, recursively' {
-        $script:n = Save-TreeManifest -Root $script:tree -ManifestPath $script:manifest
-        $script:n | Should -Be 3
-    }
-
-    It 'an untouched tree verifies' {
-        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
-        $r.Ok | Should -BeTrue
-    }
-
-    It 'a tampered python.exe fails verification (the planted-interpreter case)' {
-        Set-Content -Path (Join-Path $script:tree "python.exe") -Value "evil-replacement"
-        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
-        $r.Ok | Should -BeFalse
-        ($r.Details -join ' ') | Should -Match 'hash mismatch: python\.exe'
-        # restore
-        Set-Content -Path (Join-Path $script:tree "python.exe") -Value "PE-exe-bytes"
-    }
-
-    It 'a planted extra file fails verification (set equality, not subset)' {
-        Set-Content -Path (Join-Path $script:tree "sitecustomize.py") -Value "import os; os.system('...')"
-        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
-        $r.Ok | Should -BeFalse
-        ($r.Details -join ' ') | Should -Match 'unmanifested file in tree: sitecustomize\.py'
-        Remove-Item -LiteralPath (Join-Path $script:tree "sitecustomize.py") -Force
-    }
-
-    It 'a deleted manifested file fails verification' {
-        Remove-Item -LiteralPath (Join-Path $script:tree "Scripts\pip.exe") -Force
-        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
-        $r.Ok | Should -BeFalse
-        ($r.Details -join ' ') | Should -Match 'manifest entry missing from tree: Scripts/pip\.exe'
-        Set-Content -Path (Join-Path $script:tree "Scripts\pip.exe") -Value "PE-pip-bytes"
-    }
-
-    It 'a corrupt manifest fails closed, not open' {
-        Set-Content -LiteralPath $script:manifest -Value '{not json'
-        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
-        $r.Ok | Should -BeFalse
-        $r.Reason | Should -Match 'unreadable'
-    }
-
-    It 'a missing manifest fails closed (pre-fix trees carry no manifest)' {
-        Remove-Item -LiteralPath $script:manifest -Force
-        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
-        $r.Ok | Should -BeFalse
-        $r.Reason | Should -Match 'missing'
-    }
-}
-
-# --- Daybreak 2026-08-15 rescan F1/F2: the installer must USE the new controls --
-#
-# Text/AST level (Linux CI cannot run takeown/icacls; the live install run is
-# separately owed and recorded). The properties pinned here are the ones the
-# findings were about: no unverified destination-local interpreter may enter
-# the launcher list; the venv cannot survive a run; every recursive privileged
-# operation is preceded by the reparse walk; icacls never follows a link.
-
-Describe 'install-windows.ps1 authenticates destination bytes (rescan)' {
-    BeforeAll {
-        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
-        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
-    }
-
-    It 'the shared-python launcher candidate is gated on ANCHORED manifest verification' {
-        # Test-TreeManifestAuthentic, not Test-TreeManifestMatches: the second
-        # rescan's F1 is that a manifest inside the namespace it describes
-        # authenticates nothing on its own.
-        $script:installer | Should -Match 'Test-TreeManifestAuthentic -Root \(Split-Path \$sharedCandidate\)'
-        $script:installer | Should -Not -Match 'Test-TreeManifestMatches -Root \(Split-Path \$sharedCandidate\)'
-        # The gate must come BEFORE the candidate is added to $launchers.
-        $iGate = $script:installer.IndexOf('Test-TreeManifestAuthentic -Root (Split-Path $sharedCandidate)')
-        $iAdd  = $script:installer.IndexOf('$launchers += @{ Exe = $sharedCandidate')
-        $iGate | Should -BeGreaterThan -1
-        $iAdd  | Should -BeGreaterThan $iGate
-    }
-
-    It 'no manifest check anywhere in the installer skips the out-of-tree anchor' {
-        @([regex]::Matches($script:installer, 'Test-TreeManifestMatches')).Count | Should -Be 0
-        @([regex]::Matches($script:installer, 'Test-TreeManifestAuthentic')).Count | Should -Be 2
-        @([regex]::Matches($script:installer, '-AnchorDigest \$pyAnchor')).Count | Should -Be 2
-    }
-
-    It 'the anchor is read before any destination interpreter is trusted' {
-        $iRead = $script:installer.IndexOf('$pyAnchor = Get-TreeManifestAnchor -InstallDir $InstallDir')
-        $iUse  = $script:installer.IndexOf('Test-TreeManifestAuthentic -Root (Split-Path $sharedCandidate)')
-        $iRead | Should -BeGreaterThan -1
-        $iUse  | Should -BeGreaterThan $iRead
-    }
-
-    It 'an unverified shared-python tree is removed, not skipped' {
-        $script:installer | Should -Match 'unverified shared-python removal'
-    }
-
-    It 'the venv is deleted before recreation every run' {
-        $iDel = $script:installer.IndexOf('Remove-Item -LiteralPath $venv -Recurse -Force')
-        $iNew = $script:installer.IndexOf('-m", "venv", $venv')
-        $iDel | Should -BeGreaterThan -1
-        $iNew | Should -BeGreaterThan $iDel
-    }
-
-    It 'the manifest is written, DACL-protected AND anchored at build time' {
-        $iSave = $script:installer.IndexOf('Save-TreeManifest -Root $sharedPyDir')
-        $iProt = $script:installer.IndexOf('Set-ObjectProtectedDacl -Path $pyManifest')
-        $iAnch = $script:installer.IndexOf('Set-TreeManifestAnchor -InstallDir $InstallDir')
-        $iSave | Should -BeGreaterThan -1
-        $iProt | Should -BeGreaterThan $iSave
-        $iAnch | Should -BeGreaterThan $iSave
-    }
-
-    It 'every recursive reset and the verify are reparse-walked' {
-        @([regex]::Matches($script:installer, 'Assert-NoReparsePoints -Path')).Count | Should -BeGreaterOrEqual 4
-    }
-
-    It 'no privileged filesystem operation follows a link any more' {
-        # takeown has no /L. It was the last link-following privileged step in
-        # the claim path (second rescan F2) and must not come back.
-        $script:lib      | Should -Not -Match 'takeown\.exe'
-        $script:installer| Should -Not -Match 'takeown\.exe'
-        # Every icacls invocation in the library carries /L.
-        $calls = @([regex]::Matches($script:lib, '&\s+icacls\.exe[^\r\n]*'))
-        $calls.Count | Should -BeGreaterOrEqual 5
-        foreach ($c in $calls) { $c.Value | Should -Match '\s/L\b' }
-    }
-
-    It 'no icacls call uses /c, which skips objects it cannot process' {
-        foreach ($c in @([regex]::Matches($script:lib, '&\s+icacls\.exe[^\r\n]*'))) {
-            $c.Value | Should -Not -Match '\s/c\b'
-        }
-    }
-
-    It 'every icacls result is checked with Test-IcaclsOutputClean, not just $LASTEXITCODE' {
-        $calls = @([regex]::Matches($script:lib, '&\s+icacls\.exe')).Count
-        $checks = @([regex]::Matches($script:lib, 'Test-IcaclsOutputClean -ExitCode \$LASTEXITCODE')).Count
-        $checks | Should -Be $calls
-    }
-
-    It 'ownership is claimed before the DACL reset, so the reset cannot be denied' {
-        $iOwn = $script:lib.IndexOf('/setowner $principal /t /q /L')
-        $iRes = $script:lib.IndexOf('$Path /reset /t /q /L')
-        $iOwn | Should -BeGreaterThan -1
-        $iRes | Should -BeGreaterThan $iOwn
-    }
-
-    It 'the app pool is stopped and proven dead BEFORE the install root is claimed' {
-        $iStop  = $script:installer.IndexOf('Stop-AppPoolAndWait -AppcmdExe $appcmdExe')
-        $iClaim = $script:installer.IndexOf('Reset-TreeToInherited -Path $InstallDir')
-        $iHash  = $script:installer.IndexOf('Test-TreeManifestAuthentic -Root (Split-Path $sharedCandidate)')
-        $iStop  | Should -BeGreaterThan -1
-        $iClaim | Should -BeGreaterThan $iStop
-        $iHash  | Should -BeGreaterThan $iStop
-        # ... and the old fire-and-forget stop (no worker proof) is gone.
-        $script:installer | Should -Not -Match 'stop apppool /apppool\.name:"\$AppPool" 2>\$null \| Out-Null\s*\r?\n\s*Start-Sleep'
-    }
-
-    It 'the tree proof checks EVERY owner, not only the root' {
-        $script:lib | Should -Match 'Get-TreeOwnerViolations -Root \$Root'
-        # The old root-only Get-Acl owner check is gone from Assert-InstallTreeLocked.
-        $script:lib | Should -Not -Match '\$acl = Get-Acl -LiteralPath \$Root'
-    }
-
-    It 'the walk never descends into a reparse point (manual stack, not -Recurse)' {
-        $script:lib | Should -Match 'function Find-ReparsePoints'
-        $script:lib | Should -Not -Match 'Get-ChildItem.*-Recurse.*reparse'
-    }
-}
-
-
 # --- Daybreak 2026-08-15 SECOND rescan -----------------------------------------
 #
 # Four findings; three of them Windows-installer ones:
@@ -709,94 +457,346 @@ Describe 'Get-TreePaths (F3: per-object inspection must not be redirectable)' {
     }
 }
 
-Describe 'Get-ManifestAnchorValueName (F1)' {
-    It 'normalizes case and trailing separators to ONE anchor per install root' {
-        $a = Get-ManifestAnchorValueName -InstallDir 'C:\ProgramData\acme-adcs-ra'
-        Get-ManifestAnchorValueName -InstallDir 'c:\programdata\acme-adcs-ra\'   | Should -Be $a
-        Get-ManifestAnchorValueName -InstallDir '  C:\ProgramData\acme-adcs-ra ' | Should -Be $a
+
+# --- 2026-08-15 rescan-3: retire the adoption model ----------------------------
+#
+# Four rounds of findings all shared one premise: that a directory a local user
+# might have created first could be made safe to ADOPT. Each round's mechanism
+# -- ACL claim, ownership claim, link walk, content manifest, out-of-tree anchor
+# -- became the next round's finding.
+#
+# The premise is gone. Executable content moved to %ProgramFiles%, which
+# non-administrators cannot create in; state stayed in %ProgramData% where the
+# gMSA needs write and nothing is executed; and a pre-existing root is either
+# provably ours or refused. The tests below pin the properties that only exist
+# as STRUCTURE, so a future edit cannot quietly reintroduce the model.
+
+Describe 'Get-ForeignRootRefusal (the operator must be able to act on a refusal)' {
+    BeforeAll {
+        $script:refusal = Get-ForeignRootRefusal -Path 'C:\ProgramData\acme-adcs-ra' `
+            -Purpose 'state (database, logs, secrets)' `
+            -Reasons @('C:\ProgramData\acme-adcs-ra : owner is BUILTIN\Users') `
+            -Preserve @('C:\ProgramData\acme-adcs-ra\acme_ra.db')
     }
 
-    It 'keeps distinct install roots distinct' {
-        (Get-ManifestAnchorValueName -InstallDir 'C:\ProgramData\acme-adcs-ra') |
-            Should -Not -Be (Get-ManifestAnchorValueName -InstallDir 'D:\ra')
+    It 'names the path, the purpose and why it did not qualify' {
+        $script:refusal | Should -Match 'C:\\ProgramData\\acme-adcs-ra'
+        $script:refusal | Should -Match 'state \(database, logs, secrets\)'
+        $script:refusal | Should -Match 'owner is BUILTIN\\Users'
+    }
+
+    It 'tells the operator what to DO, not just that it failed' {
+        # A refusal nobody can act on gets worked around, which is worse than
+        # not refusing.
+        $script:refusal | Should -Match 'What to do'
+        $script:refusal | Should -Match 'Remove or rename'
+        $script:refusal | Should -Match 'Re-run this installer'
+    }
+
+    It 'lists the files worth keeping BEFORE telling them to delete the directory' {
+        $iKeep = $script:refusal.IndexOf('acme_ra.db')
+        $iDel  = $script:refusal.IndexOf('Remove or rename')
+        $iKeep | Should -BeGreaterThan -1
+        $iDel  | Should -BeGreaterThan $iKeep
+    }
+
+    It 'warns that preserved files from a foreign tree are themselves suspect' {
+        # The planted acme-ra.env case: it carries ACME_RA_EAB_ALLOWLIST and
+        # ACME_RA_SAN_SCOPES, so restoring it unexamined hands over issuance.
+        $script:refusal | Should -Match 'Inspect them before reusing them'
+    }
+
+    It 'caps the reason list rather than printing hundreds of violations' {
+        $many = Get-ForeignRootRefusal -Path 'C:\x' -Purpose 'runtime (code)' `
+            -Reasons (1..50 | ForEach-Object { "violation $_" })
+        $many | Should -Match 'and 45 more'
     }
 }
 
-Describe 'Test-TreeManifestAuthentic (F1: the self-authenticating manifest)' {
+Describe 'install-windows.ps1 separates code from state' {
     BeforeAll {
-        $script:aRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("anch-test-" + [guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Force -Path $script:aRoot | Out-Null
-        $script:aTree = Join-Path $script:aRoot "python"
-        New-Item -ItemType Directory -Force -Path $script:aTree | Out-Null
-        Set-Content -Path (Join-Path $script:aTree "python.exe") -Value "genuine-PE-bytes"
-        $script:aManifest = Join-Path $script:aRoot "python.manifest.json"
-        Save-TreeManifest -Root $script:aTree -ManifestPath $script:aManifest | Out-Null
-        $script:aDigest = Get-FileSha256 -Path $script:aManifest
-    }
-    AfterAll {
-        Remove-Item -LiteralPath $script:aRoot -Recurse -Force -ErrorAction SilentlyContinue
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $script:webconfig = Get-Content -Raw "$PSScriptRoot/../../deploy/iis/web.config"
     }
 
-    It 'accepts a tree whose manifest matches the out-of-tree anchor' {
-        $r = Test-TreeManifestAuthentic -Root $script:aTree -ManifestPath $script:aManifest `
-                                        -AnchorDigest $script:aDigest
-        $r.Ok | Should -BeTrue
+    It 'defaults the runtime to %ProgramFiles% and the state to %ProgramData%' {
+        $script:installer | Should -Match '\$RuntimeDir = "\$env:ProgramFiles\\acme-adcs-ra"'
+        $script:installer | Should -Match '\$InstallDir = "C:\\ProgramData\\acme-adcs-ra"'
     }
 
-    It 'refuses when there is no anchor at all -- the first-install case' {
-        foreach ($empty in @('', '   ', $null)) {
-            $r = Test-TreeManifestAuthentic -Root $script:aTree -ManifestPath $script:aManifest `
-                                            -AnchorDigest $empty
-            $r.Ok | Should -BeFalse
-            $r.Reason | Should -Match 'no out-of-tree anchor'
+    It 'puts the venv in the RUNTIME tree, never the state tree' {
+        $script:installer | Should -Match '\$runtimeCurrent = Join-Path \$RuntimeDir "current"'
+        $script:installer | Should -Match '\$venv\s+= Join-Path \$runtimeCurrent "venv"'
+        $script:installer | Should -Not -Match '\$venv\s+= Join-Path \$InstallDir'
+    }
+
+    It 'grants the gMSA execute on code and modify on state -- never write on code' {
+        $script:installer | Should -Match "\`$runtimeGrants = @\(\s*\r?\n\s*'\*S-1-5-32-544:\(OI\)\(CI\)F', '\*S-1-5-18:\(OI\)\(CI\)F', \(\`$GmsaAccount \+ ':\(OI\)\(CI\)RX'\)"
+        $script:installer | Should -Match "\`$stateGrants = @\(\s*\r?\n\s*'\*S-1-5-32-544:\(OI\)\(CI\)F', '\*S-1-5-18:\(OI\)\(CI\)F', \(\`$GmsaAccount \+ ':\(OI\)\(CI\)M'\)"
+        # The runtime tree must never carry a Modify or Full grant for the gMSA.
+        $script:installer | Should -Not -Match "runtimeGrants[^)]*GmsaAccount \+ ':\(OI\)\(CI\)M'"
+        $script:installer | Should -Not -Match "runtimeGrants[^)]*GmsaAccount \+ ':\(OI\)\(CI\)F'"
+    }
+
+    It 'points web.config processPath at the runtime tree' {
+        $script:webconfig | Should -Match 'processPath="C:\\Program Files\\acme-adcs-ra\\current\\venv\\Scripts\\python.exe"'
+        $script:webconfig | Should -Not -Match 'processPath="C:\\ProgramData'
+    }
+
+    It 'keeps the database, logs and dotenv in the state tree' {
+        $script:webconfig | Should -Match 'ACME_RA_DB_PATH" value="C:\\ProgramData\\acme-adcs-ra\\acme_ra\.db"'
+        $script:webconfig | Should -Match 'ACME_RA_DOTENV" value="C:\\ProgramData\\acme-adcs-ra\\acme-ra\.env"'
+    }
+
+    It 'rewrites BOTH roots in web.config when either is overridden' {
+        $script:installer | Should -Match '\$wcContent\.Replace\(\$defaultRuntime, \$RuntimeDir\)'
+        $script:installer | Should -Match '\$wcContent\.Replace\(\$defaultState, \$InstallDir\)'
+    }
+}
+
+Describe 'install-windows.ps1 never adopts a namespace' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+    }
+
+    It 'runs the provenance pre-flight on BOTH roots before claiming either' {
+        @([regex]::Matches($script:installer, 'Initialize-SecuredRoot -Path')).Count | Should -Be 2
+        $script:installer | Should -Match 'Initialize-SecuredRoot -Path \$RuntimeDir'
+        $script:installer | Should -Match 'Initialize-SecuredRoot -Path \$InstallDir'
+        # ... and the claim inside it is gated on the verdict.
+        $iProv  = $script:installer.IndexOf('$prov = Get-RootProvenance -Path $Path')
+        $iClaim = $script:installer.IndexOf('Reset-TreeToInherited -Path $Path')
+        $iProv  | Should -BeGreaterThan -1
+        $iClaim | Should -BeGreaterThan $iProv
+    }
+
+    It 'refuses a foreign root instead of force-claiming it' {
+        $script:installer | Should -Match "'foreign' \{"
+        $script:installer | Should -Match 'throw \(Get-ForeignRootRefusal'
+    }
+
+    It 'resolves the gMSA SID BEFORE the pre-flight, which needs it' {
+        # The pre-flight has to know what a finished install looks like, and a
+        # finished install carries a gMSA ACE on both roots.
+        $iSid = $script:installer.IndexOf('$gmsaSid = (New-Object System.Security.Principal.NTAccount($GmsaAccount))')
+        $iRoot = $script:installer.IndexOf('Initialize-SecuredRoot -Path $RuntimeDir')
+        $iSid  | Should -BeGreaterThan -1
+        $iRoot | Should -BeGreaterThan $iSid
+    }
+
+    It 'no longer executes, verifies or reuses a destination interpreter' {
+        # The whole manifest/anchor apparatus is gone, along with the question
+        # it answered. Its return would mean the adoption model came back.
+        foreach ($gone in @('Test-TreeManifestMatches', 'Test-TreeManifestAuthentic',
+                            'Get-TreeManifestAnchor', 'Set-TreeManifestAnchor',
+                            'Save-TreeManifest', 'Test-DestinationInterpreterTrusted',
+                            'python.manifest.json')) {
+            $script:installer | Should -Not -Match ([regex]::Escape($gone))
+            $script:lib       | Should -Not -Match ([regex]::Escape($gone))
+        }
+        $script:installer | Should -Not -Match '\$InstallDir "python\\\\python\.exe"'
+    }
+
+    It 'builds the runtime fresh rather than cleaning up a reused one' {
+        $iReset = $script:installer.IndexOf('$reset = Reset-RuntimeDirectory -RuntimeDir $RuntimeDir')
+        $iVenv  = $script:installer.IndexOf('-m", "venv", $venv')
+        $iReset | Should -BeGreaterThan -1
+        $iVenv  | Should -BeGreaterThan $iReset
+        # The old delete-the-venv-first dance is gone; there is nothing to delete.
+        $script:installer | Should -Not -Match 'Remove-Item -LiteralPath \$venv -Recurse -Force'
+    }
+
+    It 'rolls the previous runtime back when the build throws' {
+        $script:installer | Should -Match 'Restore-RetiredRuntime -RuntimeDir \$RuntimeDir -Retired \$retiredRuntime'
+        $iCatch   = $script:installer.IndexOf('} catch {')
+        $iRestore = $script:installer.IndexOf('Restore-RetiredRuntime -RuntimeDir $RuntimeDir')
+        $iCatch   | Should -BeGreaterThan -1
+        $iRestore | Should -BeGreaterThan $iCatch
+    }
+
+    It 'removes the retired runtime BEFORE proving the new one, and says so' {
+        # The retired tree sits inside $RuntimeDir, so leaving it there would
+        # put a whole second (old) venv inside the recursive ownership reset
+        # and the read-back proof -- doubling their cost and letting a tree we
+        # are about to delete fail the proof of the tree we just built.
+        $iRemove = $script:installer.IndexOf('Remove-Item -LiteralPath $retiredRuntime')
+        $iProve  = $script:installer.IndexOf('Assert-InstallTreeLocked -Root $RuntimeDir')
+        $iRemove | Should -BeGreaterThan -1
+        $iProve  | Should -BeGreaterThan $iRemove
+        # ... and the rollback target is cleared so the catch cannot claim to
+        # have restored something that is gone.
+        $script:installer | Should -Match '\$retiredRuntime = \$null'
+    }
+
+    It 'tells the operator plainly when a failure is past the rollback point' {
+        # A proof failure after the retired tree is gone leaves the host with a
+        # built-but-unverified runtime and the pool deliberately stopped. That
+        # is the right direction, and it has to be legible.
+        $script:installer | Should -Match 'no previous runtime to fall back to'
+        $script:installer | Should -Match 'app pool has been left'
+        # The restore branch must report its actual result, not assume success.
+        $script:installer | Should -Match 'if \(Restore-RetiredRuntime -RuntimeDir \$RuntimeDir -Retired \$retiredRuntime\)'
+    }
+
+    It 'still stops and proves the app pool dead before any of it' {
+        $iStop  = $script:installer.IndexOf('Stop-AppPoolAndWait -AppcmdExe $appcmdExe')
+        $iRoot  = $script:installer.IndexOf('Initialize-SecuredRoot -Path $RuntimeDir')
+        $iStop  | Should -BeGreaterThan -1
+        $iRoot  | Should -BeGreaterThan $iStop
+    }
+
+    It 'still refuses every link-following privileged operation' {
+        $script:lib       | Should -Not -Match 'takeown\.exe'
+        $script:installer | Should -Not -Match 'takeown\.exe'
+        $calls = @([regex]::Matches($script:lib, '&\s+icacls\.exe[^\r\n]*'))
+        $calls.Count | Should -BeGreaterOrEqual 5
+        foreach ($c in $calls) {
+            $c.Value | Should -Match '\s/L\b'
+            $c.Value | Should -Not -Match '\s/c\b'
         }
     }
 
-    It 'THE FINDING: a preplanted interpreter with its OWN matching manifest is refused' {
-        # Exactly the attack: the attacker writes both files, so they agree with
-        # each other perfectly. Test-TreeManifestMatches (the old gate) passes.
-        Set-Content -Path (Join-Path $script:aTree "python.exe") -Value "attacker-PE-bytes"
-        Save-TreeManifest -Root $script:aTree -ManifestPath $script:aManifest | Out-Null
-        (Test-TreeManifestMatches -Root $script:aTree -ManifestPath $script:aManifest).Ok |
-            Should -BeTrue -Because 'the pair is self-consistent; that was the whole problem'
-
-        $r = Test-TreeManifestAuthentic -Root $script:aTree -ManifestPath $script:aManifest `
-                                        -AnchorDigest $script:aDigest
-        $r.Ok | Should -BeFalse
-        $r.Reason | Should -Match 'does not match its out-of-tree anchor'
-
-        # restore the genuine pair for the tests below
-        Set-Content -Path (Join-Path $script:aTree "python.exe") -Value "genuine-PE-bytes"
-        Save-TreeManifest -Root $script:aTree -ManifestPath $script:aManifest | Out-Null
-        (Get-FileSha256 -Path $script:aManifest) | Should -Be $script:aDigest
-    }
-
-    It 'still catches tampered BYTES under an anchored manifest (the gMSA case)' {
-        Set-Content -Path (Join-Path $script:aTree "python.exe") -Value "rewritten-by-the-app-pool"
-        $r = Test-TreeManifestAuthentic -Root $script:aTree -ManifestPath $script:aManifest `
-                                        -AnchorDigest $script:aDigest
-        $r.Ok | Should -BeFalse
-        ($r.Details -join ' ') | Should -Match 'hash mismatch'
-        Set-Content -Path (Join-Path $script:aTree "python.exe") -Value "genuine-PE-bytes"
-    }
-
-    It 'refuses a missing manifest even when an anchor exists' {
-        $gone = Join-Path $script:aRoot "not-here.json"
-        $r = Test-TreeManifestAuthentic -Root $script:aTree -ManifestPath $gone -AnchorDigest $script:aDigest
-        $r.Ok | Should -BeFalse
-        $r.Reason | Should -Match 'manifest missing'
-    }
-
-    It 'refuses a malformed anchor rather than comparing loosely' {
-        $r = Test-TreeManifestAuthentic -Root $script:aTree -ManifestPath $script:aManifest `
-                                        -AnchorDigest $script:aDigest.Substring(0, 32)
-        $r.Ok | Should -BeFalse
+    It 'proves both trees with the same function the pre-flight uses' {
+        # One definition of "ours", so the end of one install and the start of
+        # the next cannot disagree.
+        $script:lib | Should -Match 'function Get-InstallTreeViolations'
+        $script:lib | Should -Match 'Get-InstallTreeViolations -Root \$Root -AllowedTrustees \$AllowedTrustees'
+        $script:lib | Should -Match 'Get-InstallTreeViolations -Root \$Path -AllowedTrustees \$AllowedTrustees'
     }
 }
 
-Describe 'Get-FileSha256' {
-    It 'returns empty string (not an error) for a file that is not there' {
-        Get-FileSha256 -Path (Join-Path ([System.IO.Path]::GetTempPath()) 'definitely-absent-xyz') |
-            Should -Be ''
+Describe 'Get-TreeOwnerViolations root/descendant split' {
+    It 'holds the root to a stricter owner set than its descendants' {
+        # The state tree legitimately contains gMSA-owned files (log lines, the
+        # SQLite journal). Its ROOT never is: a directory a non-administrator
+        # created is owned by them, and that is the pre-flight's best signal.
+        $lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $lib | Should -Match '\[string\[\]\]\$RootOwnerSids = @\(\)'
+        $lib | Should -Match '\$expected = if \(\$isRoot\) \{ \$rootSids \} else \{ @\(\$AllowedOwnerSids\) \}'
+    }
+
+    It 'passes the gMSA as a permitted state-tree owner, but never for the runtime' {
+        $installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+        $installer | Should -Match "\`$stateOwnerSids = @\('S-1-5-32-544', 'S-1-5-18', \`$gmsaSid\)"
+        # The runtime claim passes no -AllowedOwnerSids override, so it keeps
+        # the Administrators/SYSTEM default.
+        $installer | Should -Match 'Initialize-SecuredRoot -Path \$RuntimeDir -Purpose ''runtime \(code\)'' `\r?\n\s*-Grants \$runtimeGrants -AllowedTrustees \$raTrustees\r?\n'
+    }
+}
+
+Describe 'Runtime staging is rename-based and rollback-safe' {
+    It 'retires with a directory rename, not a copy' {
+        $lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $lib | Should -Match '\[System\.IO\.Directory\]::Move\(\$current, \$retired\)'
+        $lib | Should -Match '\[System\.IO\.Directory\]::Move\(\$Retired, \$current\)'
+        # Exactly those two, and nothing else moving a runtime: Move-Item can
+        # silently degrade to copy-then-delete across volumes, which is neither
+        # atomic nor cheap for a tree this size.
+        @([regex]::Matches($lib, '\[System\.IO\.Directory\]::Move')).Count | Should -Be 2
+    }
+
+    It 'builds at the FINAL path because a venv is not relocatable' {
+        # pyvenv.cfg records an absolute home and Scripts\*.exe embed the
+        # interpreter path; a built-then-renamed venv cannot find its stdlib.
+        $lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $lib | Should -Match 'venv is NOT relocatable'
+        $lib | Should -Match "\`$current = Join-Path \`$RuntimeDir 'current'"
+    }
+
+    It 'prunes leftovers from an interrupted run without failing the install' {
+        $lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $lib | Should -Match 'function Remove-StaleRuntimeDirectories'
+        $lib | Should -Match "\.staging-\*"
+        $lib | Should -Match "\.retired-\*"
+    }
+}
+
+Describe 'Reset-RuntimeDirectory / Restore-RetiredRuntime round trip' {
+    BeforeAll {
+        $script:rt = Join-Path ([System.IO.Path]::GetTempPath()) ("rt-test-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $script:rt | Out-Null
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:rt -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates current\ on a first install, with nothing retired' {
+        # Set-ObjectProtectedDacl is Windows-only, so this exercises the
+        # rename/create logic alone -- which is the part with the ordering bug
+        # potential.
+        $r = Reset-RuntimeDirectory -RuntimeDir $script:rt
+        $r.Retired | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $r.Current | Should -BeTrue
+        (Get-ChildItem -LiteralPath $r.Current -Force).Count | Should -Be 0
+    }
+
+    It 'retires a populated runtime and hands back an EMPTY one' {
+        Set-Content -Path (Join-Path $script:rt "current/old-marker.txt") -Value "previous build"
+        $r = Reset-RuntimeDirectory -RuntimeDir $script:rt
+        $r.Retired | Should -Not -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $r.Retired "old-marker.txt") | Should -BeTrue
+        (Get-ChildItem -LiteralPath $r.Current -Force).Count | Should -Be 0
+        $script:lastRetired = $r.Retired
+    }
+
+    It 'puts the retired runtime back, discarding the half-built one' {
+        Set-Content -Path (Join-Path $script:rt "current/half-built.txt") -Value "failed build"
+        Restore-RetiredRuntime -RuntimeDir $script:rt -Retired $script:lastRetired | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:rt "current/old-marker.txt") | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:rt "current/half-built.txt") | Should -BeFalse
+    }
+
+    It 'is a no-op when there is nothing to restore' {
+        Restore-RetiredRuntime -RuntimeDir $script:rt -Retired "" | Should -BeFalse
+        Restore-RetiredRuntime -RuntimeDir $script:rt -Retired (Join-Path $script:rt ".retired-nope") |
+            Should -BeFalse
+    }
+
+    It 'removes the stale staging and retired directories it finds' {
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:rt ".staging-abc") | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:rt ".retired-def") | Out-Null
+        Remove-StaleRuntimeDirectories -RuntimeDir $script:rt | Should -Be 2
+        Test-Path -LiteralPath (Join-Path $script:rt "current") | Should -BeTrue
+    }
+}
+
+Describe 'Root and dotenv ownership are held strictly (rescan-3 audit)' {
+    BeforeAll {
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    It 'never derives the strict owner set from the loose one' {
+        # Found while auditing the rework. The state tree permits gMSA-owned
+        # DESCENDANTS (log files, the SQLite journal). If the root and the
+        # protected entries inherited that permission, a compromised worker
+        # could delete acme-ra.env -- it holds Modify on the parent, which
+        # includes delete-child -- write its own, and have the NEXT install
+        # accept the tree as "ours" and preserve the planted file. That file
+        # carries ACME_RA_EAB_ALLOWLIST and ACME_RA_SAN_SCOPES.
+        $script:lib | Should -Match "\[string\[\]\]\`$RootOwnerSids = @\('S-1-5-32-544', 'S-1-5-18'\)"
+        $script:lib | Should -Match '-AllowedOwnerSids \$AllowedOwnerSids -RootOwnerSids \$RootOwnerSids'
+    }
+
+    It 'owner-checks every protected entry, not just its DACL' {
+        $script:lib | Should -Match '\$entryOwner = \(Get-Acl -LiteralPath \$entryPath\)\.Owner'
+        $script:lib | Should -Match 'Test-OwnerAllowed -Owner \$entryOwner -AllowedOwnerSids \$RootOwnerSids'
+    }
+
+    It 'the installer registers the dotenv as a protected entry on both passes' {
+        @([regex]::Matches($script:installer, "ProtectedEntries @\{ 'acme-ra\.env'")).Count |
+            Should -Be 2
+    }
+
+    It 'Test-OwnerAllowed would reject a gMSA-owned object under the strict set' {
+        # The strict set by SID, exercised directly: a domain account SID is not
+        # Administrators or SYSTEM, however legitimate it is elsewhere.
+        Test-OwnerAllowed -Owner 'S-1-5-21-99-88-77-1104' `
+            -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18') | Should -BeFalse
+        Test-OwnerAllowed -Owner 'S-1-5-21-99-88-77-1104' `
+            -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-21-99-88-77-1104') |
+            Should -BeTrue
     }
 }

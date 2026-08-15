@@ -12,9 +12,24 @@ PowerShell 5.1 (the Windows default): no ?? , no ternary, no && / || .
 
 .DESCRIPTION
     Adapted from cert-watch/scripts/install-windows.ps1 (same FastAPI/uvicorn
-    deployment model on the same VM). Creates the data directory, a virtualenv,
-    and installs acme-adcs-ra into it. When -ConfigureIIS is passed, also
+    deployment model on the same VM). When -ConfigureIIS is passed, also
     creates/updates the IIS site, app pool, web.config, and TLS binding.
+
+    THE INSTALL IS SPLIT IN TWO, and the split is a security boundary:
+
+      CODE  -RuntimeDir, default %ProgramFiles%\acme-adcs-ra
+            The interpreter and virtualenv, under `current`, rebuilt from
+            scratch on every run. The gMSA gets read + execute, never write.
+      STATE -InstallDir, default C:\ProgramData\acme-adcs-ra
+            Audit DB, logs, secret env file. The gMSA gets modify. Nothing
+            here is ever executed.
+
+    Neither root is ever ADOPTED. If a root already exists, it must match what
+    a completed install of this RA leaves behind -- same ownership, same DACL
+    shape, no reparse points -- or the install refuses and tells you what to
+    do. Earlier versions force-claimed a pre-existing directory, and on a path
+    a local user can create first, that was a privilege-escalation route.
+    See docs/operator-requirements.md.
 
     THE CENTRAL DIFFERENCE FROM cert-watch: the IIS application pool identity is
     set to the gMSA you pass via -GmsaAccount. The uvicorn worker therefore runs
@@ -33,8 +48,24 @@ PowerShell 5.1 (the Windows default): no ?? , no ternary, no && / || .
     trailing $). Required.
 
 .PARAMETER InstallDir
-    Base dir for data (audit DB), venv, env file, logs, shared Python.
+    STATE directory: audit DB, logs, and the secret env file. Nothing here is
+    ever executed, and the gMSA has Modify on it because the worker must write
+    the database and the log.
     Default: C:\ProgramData\acme-adcs-ra
+
+.PARAMETER RuntimeDir
+    CODE directory: the interpreter and the virtualenv, under a `current`
+    subdirectory that is rebuilt from scratch on every run. The gMSA gets read
+    and EXECUTE here, never write.
+
+    This lives under %ProgramFiles% on purpose, and the split is a security
+    boundary rather than tidiness. The default ACL on %ProgramData% grants
+    Users "create folders / append data" with CREATOR OWNER inheritance, so any
+    local user can pre-create C:\ProgramData\acme-adcs-ra and own it — which is
+    how four review rounds' worth of findings began. %ProgramFiles% grants
+    Users read and execute only, so the executable half of the install cannot
+    be pre-planted at all.
+    Default: %ProgramFiles%\acme-adcs-ra
 
 .PARAMETER AppPool / SitePath / HostName / SharePort443 / TlsCertThumbprint
     As in cert-watch's installer. -SharePort443 -HostName lets the RA co-reside
@@ -53,6 +84,7 @@ PowerShell 5.1 (the Windows default): no ?? , no ternary, no && / || .
 param(
     [Parameter(Mandatory = $true)][string]$GmsaAccount,
     [string]$InstallDir = "C:\ProgramData\acme-adcs-ra",
+    [string]$RuntimeDir = "$env:ProgramFiles\acme-adcs-ra",
     [string]$AppPool = "acme-adcs-ra",
     [switch]$ConfigureIIS,
     [string]$SitePath = "C:\inetpub\acme-adcs-ra",
@@ -96,7 +128,12 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
-$venv     = Join-Path $InstallDir "venv"
+# CODE (RuntimeDir): rebuilt every run, gMSA read+execute, never written by the
+# app. STATE (InstallDir): survives every run, gMSA modify, never executed.
+# Keeping those two sets in one directory with one ACL is what made a
+# compromised app pool able to rewrite the interpreter it runs as.
+$runtimeCurrent = Join-Path $RuntimeDir "current"
+$venv     = Join-Path $runtimeCurrent "venv"
 $logs     = Join-Path $InstallDir "logs"
 $envFile  = Join-Path $InstallDir "acme-ra.env"
 
@@ -248,57 +285,109 @@ if (Test-Path $appcmdExe) {
     }
 }
 
-# --- Claim the install root BEFORE anything under it is inspected (F1) -------
-#
-# 2026-08-19 F1 (high, CWE-426). This block used to run ~250 lines later, and
-# the Python discovery below preferred and EXECUTED
-# `$InstallDir\python\python.exe` before it. ProgramData\acme-adcs-ra is a
-# predictable path; a local user who pre-creates it plants an interpreter that
-# the elevated installer then runs as Administrator on an issuance host.
-#
-# So: create the directory (or validate an existing one), apply the restrictive
-# ACL, and only then let any later step read, trust or execute what is inside.
-# The gMSA's Modify grant is still applied later, once its SID is resolved --
-# this pass establishes Administrators/SYSTEM ownership of the namespace, which
-# is what makes the contents trustworthy.
-$script:installRootSecured = $false
-Write-Host "Claiming install root $InstallDir (before inspecting its contents) ..."
-$existing = Get-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue
-if ($null -ne $existing) {
-    if (-not (Test-InstallRootAttributesAcceptable $existing.Attributes)) {
-        throw ("Refusing to install into $InstallDir : it is a reparse point or not a directory " +
-               "(attributes: $($existing.Attributes)). A junction here would redirect every " +
-               "subsequent write, ACL and probe. Remove or relocate it and re-run.")
-    }
-} else {
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+# --- Resolve the gMSA SID FIRST ----------------------------------------------
+# Needed before either root is claimed, because both roots carry a gMSA ACE and
+# the pre-flight below has to know what a completed install looks like in order
+# to recognise one. This is a pure directory lookup; it touches nothing on disk.
+if ($GmsaAccount -notmatch '\$$') {
+    Write-Host "[warn] -GmsaAccount `"$GmsaAccount`" has no trailing `$ -- gMSA SAM names end in `$. Continuing, but verify."
+}
+try {
+    $gmsaSid = (New-Object System.Security.Principal.NTAccount($GmsaAccount)).Translate(
+        [System.Security.Principal.SecurityIdentifier]).Value
+    Write-Host "Resolved gMSA $GmsaAccount -> $gmsaSid"
+} catch {
+    throw "Could not resolve gMSA account `"$GmsaAccount`". Use DOMAIN\gMSA-name$ form and confirm it exists."
 }
 
-# Restrictive ACL first, gMSA added later. Daybreak 2026-08-15 review:
-# /inheritance:r removes only INHERITED ACEs, so this one icacls line left two
-# attacker holds on a pre-created tree -- every EXPLICIT ACE they had set, and
-# OWNERSHIP (an owner can rewrite any DACL) -- while this script went on to
-# treat the namespace as trustworthy and execute its interpreter. Lockdown is
-# now three mechanical steps plus a proof (InstallVerifyLib):
-#   1. reparse-point walk -> a child junction anywhere would redirect the
-#      recursive steps below OUTSIDE the tree; abort before touching anything;
-#   2. takeown -> the Administrators GROUP owns every object in the tree;
-#   3. icacls /reset /L -> every explicit ACE in the tree is discarded, and
-#      links themselves (if any appeared) are reset, never followed;
-#   4. /inheritance:r /grant:r -> the root carries EXACTLY our ACEs;
-#   5. Assert-InstallTreeLocked -> the tree is read back (links re-walked,
-#      /L everywhere) and PROVEN locked, or the install aborts.
-Assert-NoReparsePoints -Path $InstallDir -Context 'install-root claim'
-Reset-TreeToInherited -Path $InstallDir
-Set-ObjectProtectedDacl -Path $InstallDir -Grants @(
-    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F'
+# The trustees permitted anywhere in either tree. Identity only -- the rights
+# differ sharply between the two roots (execute vs write) and are set by the
+# grant strings below.
+$raTrustees = @(
+    'S-1-5-32-544', 'S-1-5-18',
+    'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'BA', 'SY',
+    $gmsaSid, $GmsaAccount
 )
-Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees @(
+$adminOnlyTrustees = @(
     'S-1-5-32-544', 'S-1-5-18',
     'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'BA', 'SY'
 )
-$script:installRootSecured = $true
-Write-Host "  [ok]   install root secured (ownership + ACL verified: Administrators/SYSTEM only)"
+# CODE: read + execute for the worker, full for administrators. No write ACE
+# for the gMSA anywhere in this tree -- a compromised app pool must not be able
+# to rewrite the interpreter it is about to be relaunched with.
+$runtimeGrants = @(
+    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)RX')
+)
+# STATE: modify for the worker (it writes the database and the log), full for
+# administrators. Nothing here is ever executed.
+$stateGrants = @(
+    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)M')
+)
+# The gMSA legitimately OWNS files it creates in the state tree (log lines, the
+# SQLite journal). It can own nothing in the runtime tree, having no write
+# access there at all.
+$stateOwnerSids = @('S-1-5-32-544', 'S-1-5-18', $gmsaSid)
+
+# --- Claim both roots: provably ours, or refused -----------------------------
+#
+# 2026-08-15 rescan-3. Every previous round tried to make it safe to ADOPT a
+# directory a local user might have created first, and every round's mechanism
+# became the next round's finding. There is no force-claim path any more: a
+# pre-existing root either matches what a completed install of this RA leaves
+# behind -- same ownership, same DACL shape, no reparse points, verified by the
+# same function that proves the lockdown at the end of this script -- or the
+# install stops and tells the operator exactly what to do.
+#
+# Refusing is the safe direction and it is also the honest one: this installer
+# cannot tell a hostile pre-planted tree from a half-finished one, so it treats
+# both as "not mine" rather than guessing.
+function Initialize-SecuredRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Purpose,
+        [Parameter(Mandatory = $true)][string[]]$Grants,
+        [Parameter(Mandatory = $true)][string[]]$AllowedTrustees,
+        [string[]]$AllowedOwnerSids = @('S-1-5-32-544', 'S-1-5-18'),
+        [hashtable]$ProtectedEntries = @{},
+        [string[]]$Preserve = @()
+    )
+    $ErrorActionPreference = 'Stop'
+    Write-Host "Claiming $Purpose root $Path ..."
+    $prov = Get-RootProvenance -Path $Path -AllowedTrustees $AllowedTrustees `
+        -AllowedOwnerSids $AllowedOwnerSids -ProtectedEntries $ProtectedEntries
+    switch ($prov.State) {
+        'foreign' {
+            throw (Get-ForeignRootRefusal -Path $Path -Purpose $Purpose `
+                       -Reasons $prov.Reasons -Preserve $Preserve)
+        }
+        'absent' {
+            New-Item -ItemType Directory -Force -Path $Path | Out-Null
+            Write-Host "  [ok]   created $Path"
+        }
+        default {
+            Write-Host "  [ok]   $Path recognised as a previous install of this RA"
+        }
+    }
+    # Normalise ownership and discard every explicit ACE, then apply exactly our
+    # grants, then read the whole tree back and prove it. The proof is not
+    # ceremony: "we ran icacls" is not evidence, and this is the same evidence
+    # the NEXT run's pre-flight will demand.
+    Assert-NoReparsePoints -Path $Path -Context "$Purpose claim"
+    Reset-TreeToInherited -Path $Path
+    Set-ObjectProtectedDacl -Path $Path -Grants $Grants
+    Assert-InstallTreeLocked -Root $Path -AllowedTrustees $AllowedTrustees `
+        -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18')
+    Write-Host "  [ok]   $Purpose root secured (ownership + DACLs read back and proven)"
+}
+
+Initialize-SecuredRoot -Path $RuntimeDir -Purpose 'runtime (code)' `
+    -Grants $runtimeGrants -AllowedTrustees $raTrustees
+
+Initialize-SecuredRoot -Path $InstallDir -Purpose 'state (database, logs, secrets)' `
+    -Grants $stateGrants -AllowedTrustees $raTrustees `
+    -AllowedOwnerSids $stateOwnerSids `
+    -ProtectedEntries @{ 'acme-ra.env' = $raTrustees } `
+    -Preserve @("$InstallDir\acme_ra.db", "$InstallDir\acme-ra.env", "$InstallDir\logs")
 
 if ($InstallPrereqs) { Install-Prerequisites }
 
@@ -315,17 +404,7 @@ $haveRsat = [bool](Get-Command Test-ADServiceAccount -ErrorAction SilentlyContin
 Write-Host "  RSAT AD PowerShell ........... $(if ($haveRsat) { 'present' } else { 'absent (gMSA test will be skipped)' })"
 Write-Host ""
 
-# --- Validate the gMSA: resolve its SID and (best-effort) confirm it installed -
-if ($GmsaAccount -notmatch '\$$') {
-    Write-Host "[warn] -GmsaAccount `"$GmsaAccount`" has no trailing `$ -- gMSA SAM names end in `$. Continuing, but verify."
-}
-try {
-    $gmsaSid = (New-Object System.Security.Principal.NTAccount($GmsaAccount)).Translate(
-        [System.Security.Principal.SecurityIdentifier]).Value
-    Write-Host "Resolved gMSA $GmsaAccount -> $gmsaSid"
-} catch {
-    throw "Could not resolve gMSA account `"$GmsaAccount`". Use DOMAIN\gMSA-name$ form and confirm it exists."
-}
+# --- Confirm the gMSA is installed here (best-effort; the SID resolved above) -
 # Strip the domain for Test-ADServiceAccount (it wants the SAM without DOMAIN\).
 $gmsaSam = ($GmsaAccount -replace ".*\\", "") -replace '\$$', ""
 if (Get-Command Test-ADServiceAccount -ErrorAction SilentlyContinue) {
@@ -356,62 +435,14 @@ function Invoke-PyProbe {
     @{ ExitCode = $exit; Output = if ($out) { $out.Trim() } else { "" } }
 }
 
+# Candidate interpreters, in preference order. Note what is NOT here any more:
+# `$InstallDir\python\python.exe`. Four review rounds were spent trying to make
+# it safe to execute an interpreter found sitting in the destination -- an ACL
+# claim, an ownership claim, a link walk, a content manifest, an out-of-tree
+# anchor for that manifest -- and each mechanism was the next round's finding.
+# The runtime is now built fresh, under %ProgramFiles%, on every run, so there
+# is never a destination interpreter to decide about. That is the whole fix.
 $launchers = @()
-# The destination-local interpreter is only a candidate once the install root
-# has been claimed and re-ACL'd above (2026-08-19 F1). Without that, this is an
-# attacker-plantable path being executed elevated; with it, the namespace is
-# Administrators/SYSTEM-only. BUT "we ACL'd it" is not "these bytes are ours"
-# (Daybreak 2026-08-15 rescan F1): the lockdown bounds future WRITES, it does
-# not authenticate existing BYTES -- a planted python\python.exe survived the
-# claim, was the PREFERRED candidate, and was then executed as Administrator.
-# And the gMSA holds Modify over the tree, so even genuinely-ours bytes can be
-# rewritten between runs by a compromised app pool. A destination-local
-# interpreter is therefore only a candidate when its WHOLE tree hashes match
-# python.manifest.json, which is written at build time and DACL-protected
-# against the gMSA. Anything else is deleted and rebuilt from an
-# authenticated source below -- never executed.
-#
-# And the manifest itself is only believed when it matches the digest recorded
-# OUT OF TREE, in HKLM (2026-08-15 rescan-2 F1): a manifest that lives in the
-# same namespace as the bytes it vouches for proves consistency, not provenance.
-# Preplant both and they authenticate each other. HKLM\SOFTWARE is not writable
-# by the local user who can pre-create ProgramData\acme-adcs-ra, so it is the
-# anchor; no anchor means the runtime is rebuilt, never executed.
-$sharedCandidate = Join-Path $InstallDir "python\python.exe"
-$pyManifest = Join-Path $InstallDir "python.manifest.json"
-$pyAnchor = Get-TreeManifestAnchor -InstallDir $InstallDir
-if (-not $pyAnchor) {
-    Write-Host "  [note] no out-of-tree runtime anchor for $InstallDir yet -- any existing python\ tree will be rebuilt, not trusted."
-}
-$sharedItem = Get-Item -LiteralPath $sharedCandidate -Force -ErrorAction SilentlyContinue
-if ($null -ne $sharedItem) {
-    $sharedAuthentic = $false
-    if (Test-DestinationInterpreterTrusted -RootSecured $script:installRootSecured `
-                                           -InterpreterAttributes $sharedItem.Attributes) {
-        $m = Test-TreeManifestAuthentic -Root (Split-Path $sharedCandidate) `
-                                        -ManifestPath $pyManifest -AnchorDigest $pyAnchor
-        $sharedAuthentic = [bool]$m.Ok
-        if (-not $sharedAuthentic) {
-            Write-Host ("  [!!] shared Python fails manifest verification ($($m.Reason): " +
-                        "$($m.Details -join '; ')) -- planted or tampered bytes; deleting the " +
-                        "tree, refusing to execute it.")
-        }
-    } else {
-        Write-Host "  [skip] $sharedCandidate -- destination interpreter not trusted (root secured: $($script:installRootSecured))"
-    }
-    if ($sharedAuthentic) {
-        $launchers += @{ Exe = $sharedCandidate; Args = @() }
-    } else {
-        Assert-NoReparsePoints -Path (Split-Path $sharedCandidate) -Context 'unverified shared-python removal'
-        Remove-Item -LiteralPath (Split-Path $sharedCandidate) -Recurse -Force
-        # The manifest goes with the tree it described. Leaving it would not be
-        # a trust problem (an unanchored manifest is never believed), but it
-        # would leave a document on disk vouching for bytes that no longer
-        # exist, which is exactly the sort of thing an operator misreads.
-        Remove-Item -LiteralPath $pyManifest -Force -ErrorAction SilentlyContinue
-        Write-Host "  [ok]   unverified python\ tree removed (rebuilt below only if needed, from an authenticated source)"
-    }
-}
 $imRoot = Join-Path $env:LOCALAPPDATA "Python"
 foreach ($pc in (Get-ChildItem $imRoot -Filter "pythoncore-*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
     $p = Join-Path $pc.FullName "python.exe"
@@ -476,100 +507,80 @@ foreach ($l in $launchers) {
 }
 if (-not $python) { throw "Python 3.12+ not found. Install it (winget install Python.Python.3.14) and re-run." }
 
-# --- Ensure Python is in a shared (non-user-profile) location ----------------
-# The IIS app pool identity (the gMSA) cannot read a user profile, so a
-# user-scoped interpreter must be copied to a shared dir under InstallDir.
-$sharedPyDir = Join-Path $InstallDir "python"
-$sharedPyExe = Join-Path $sharedPyDir "python.exe"
-if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
-    # The shared tree is only reusable when its bytes authenticate against the
-    # protected manifest (rescan F1). Anything else was already deleted at the
-    # launcher gate above, or never existed.
-    $reuseShared = $false
-    if (Test-Path $sharedPyExe) {
-        $m = Test-TreeManifestAuthentic -Root $sharedPyDir -ManifestPath $pyManifest -AnchorDigest $pyAnchor
-        if ($m.Ok) {
-            $reuseShared = $true
-            Write-Host "Using existing shared Python at $sharedPyDir (manifest verified: $($m.Reason))"
-        } else {
-            Write-Host "  [!!] shared Python at $sharedPyDir fails manifest verification ($($m.Reason)); rebuilding"
-            Assert-NoReparsePoints -Path $sharedPyDir -Context 'shared-python rebuild'
-            Remove-Item -LiteralPath $sharedPyDir -Recurse -Force
-        }
-    }
-    if (-not $reuseShared) {
-        Write-Host "Python is user-scoped ($($python.Exe)); copying to shared location ..."
-        $r = Invoke-PyProbe -Exe "py" -Arguments @("install", "--target=$sharedPyDir", "$major.$minor")
+# --- Build the runtime FRESH, in place, under %ProgramFiles% -----------------
+#
+# "In place" rather than "stage elsewhere then rename" for one concrete reason:
+# a venv is not relocatable. pyvenv.cfg records an absolute `home`, and every
+# console-script .exe under Scripts\ embeds the absolute path of the interpreter
+# that built it. A built-then-renamed venv is a runtime whose python.exe cannot
+# find its own stdlib.
+#
+# So: retire the live runtime with an atomic rename, build into a brand-new
+# `current`, and roll the retired one back if anything throws. Nothing observes
+# the gap -- the app pool was stopped and proven dead before any of this.
+Remove-StaleRuntimeDirectories -RuntimeDir $RuntimeDir | Out-Null
+Write-Host "Building the runtime at $runtimeCurrent (retiring any previous one) ..."
+$reset = Reset-RuntimeDirectory -RuntimeDir $RuntimeDir
+$retiredRuntime = $reset.Retired
+if ($retiredRuntime) { Write-Host "  previous runtime retired to $retiredRuntime (removed once this build succeeds)" }
+
+try {
+    # A user-profile interpreter is unusable by the app pool -- the gMSA cannot
+    # read another account's profile -- so it is copied into the runtime tree.
+    # A machine-wide interpreter is left where it is and simply referenced: it
+    # already lives somewhere non-administrators cannot write, and copying it
+    # would add bytes to verify for no gain.
+    $runtimePy = Join-Path $runtimeCurrent "python"
+    if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
+        Write-Host "  Python is user-scoped ($($python.Exe)); copying it into the runtime ..."
+        $r = Invoke-PyProbe -Exe "py" -Arguments @("install", "--target=$runtimePy", "$major.$minor")
         if ($r.ExitCode -ne 0) {
             $pySrc = Split-Path $python.Exe
-            if (Test-Path $pySrc) { Copy-Item -Path $pySrc -Destination $sharedPyDir -Recurse -Force }
+            if (Test-Path $pySrc) { Copy-Item -Path $pySrc -Destination $runtimePy -Recurse -Force }
         }
-        if (-not (Test-Path $sharedPyExe)) {
-            $nested = Get-ChildItem -Path $sharedPyDir -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($nested) { $sharedPyDir = Split-Path $nested.FullName; $sharedPyExe = $nested.FullName }
+        $runtimePyExe = Join-Path $runtimePy "python.exe"
+        if (-not (Test-Path $runtimePyExe)) {
+            $nested = Get-ChildItem -Path $runtimePy -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($nested) { $runtimePyExe = $nested.FullName }
         }
-        if (-not (Test-Path $sharedPyExe)) { throw "Failed to create shared Python at $sharedPyDir. Copy $($python.Exe) manually." }
+        if (-not (Test-Path $runtimePyExe)) {
+            throw "Failed to copy Python into $runtimePy. Install a machine-wide Python 3.12+ and re-run."
+        }
         foreach ($vl in @("Lib\venv\scripts\nt\venvlauncher.exe", "Lib\venv\scripts\nt\venvwlauncher.exe")) {
-            $vlPath = Join-Path $sharedPyDir $vl
+            $vlPath = Join-Path (Split-Path $runtimePyExe) $vl
             if (Test-Path $vlPath) { attrib -H -S $vlPath 2>$null | Out-Null }
         }
-        # Vouch for what was just built: manifest the whole tree, then protect
-        # the manifest against everyone but Administrators/SYSTEM -- the gMSA
-        # holds Modify over the tree and must not be able to rewrite the bytes
-        # AND the document that vouches for them.
-        $n = Save-TreeManifest -Root $sharedPyDir -ManifestPath $pyManifest
-        Set-ObjectProtectedDacl -Path $pyManifest -Grants @(
-            '*S-1-5-32-544:F', '*S-1-5-18:F'
-        )
-        # ... and anchor the manifest OUTSIDE the namespace it describes
-        # (rescan-2 F1). Without this the next run cannot tell our manifest from
-        # one an attacker wrote alongside a planted interpreter.
-        $pyAnchor = Set-TreeManifestAnchor -InstallDir $InstallDir -ManifestPath $pyManifest
-        Write-Host "  Shared Python ready at $sharedPyExe (manifest: $n files, ACL'd to Administrators/SYSTEM, anchored in HKLM)"
+        $python = @{ Exe = $runtimePyExe; Args = @() }
+        Write-Host "  [ok]   runtime interpreter at $runtimePyExe"
+    } else {
+        Write-Host "  Using the machine-wide interpreter $($python.Exe) (not copied; not user-writable)"
     }
-    $python = @{ Exe = $sharedPyExe; Args = @() }
-}
 
-Write-Host "Creating directories under $InstallDir ..."
-foreach ($d in @($InstallDir, $logs)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    # Clear hidden/system attrs on venv launchers (Python 3.14 marks them) so
+    # venv creation does not fail with "Unable to copy ... venvlauncher.exe".
+    $pyPrefix = Split-Path $python.Exe
+    foreach ($vl in @("Lib\venv\scripts\nt\venvlauncher.exe", "Lib\venv\scripts\nt\venvwlauncher.exe")) {
+        $vlPath = Join-Path $pyPrefix $vl
+        if (Test-Path $vlPath) { attrib -H -S $vlPath 2>$null | Out-Null }
+    }
 
-# NOTE: the app pool was stopped -- and its worker proven gone -- at the top of
-# this run, before the install root was claimed (rescan-2 F3). It is not
-# stopped again here: a second stop would be a no-op, and the guarantee that
-# matters is that no gMSA handle predates the claim.
-
-# Clear hidden/system attrs on venv launchers (Python 3.14 marks them) so venv
-# creation does not fail with "Unable to copy ... venvlauncher.exe".
-$pyPrefix = Split-Path $python.Exe
-foreach ($vl in @("Lib\venv\scripts\nt\venvlauncher.exe", "Lib\venv\scripts\nt\venvwlauncher.exe")) {
-    $vlPath = Join-Path $pyPrefix $vl
-    if (Test-Path $vlPath) { attrib -H -S $vlPath 2>$null | Out-Null }
-}
-
-# The venv is DELETED and rebuilt from scratch on every run (rescan F1):
-# `python -m venv` over an existing directory, without --clear, refreshes its
-# own files but leaves everything else -- so a planted .pth or
-# sitecustomize.py in an existing venv survived every previous "rebuild" and
-# executed on each elevated pip invocation. Executed bytes must be minted by
-# THIS run. (Cost is nil: the pinned closure is reinstalled every run anyway.)
-if (Test-Path $venv) {
-    Assert-NoReparsePoints -Path $venv -Context 'venv rebuild'
-    Remove-Item -LiteralPath $venv -Recurse -Force
-    Write-Host "Removed previous venv (rebuilt fresh every run; planted startup files cannot survive)"
-}
-Write-Host "Creating virtualenv at $venv ..."
-$venvOut = & $python.Exe @($python.Args + @("-m", "venv", $venv)) 2>&1
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
-    if ($venvOut) { Write-Host ($venvOut | Out-String) }
-    throw "Failed to create virtualenv at $venv using $($python.Exe)."
-}
-$venvPy = Join-Path $venv "Scripts\python.exe"
-$venvProbe = & $venvPy -c "import sys; print(sys.executable)" 2>&1
-if ($LASTEXITCODE -ne 0) {
-    if ($venvOut) { Write-Host ($venvOut | Out-String) }
-    throw "venv created but python.exe is not functional (exit $LASTEXITCODE): $venvProbe"
-}
-Write-Host "  venv verified: $venvProbe"
+    # No delete-before-create dance any more: `current` was created empty
+    # moments ago, so a planted .pth or sitecustomize.py has nowhere to have
+    # survived from. Executed bytes are minted by THIS run, by construction
+    # rather than by cleanup.
+    Write-Host "  Creating virtualenv at $venv ..."
+    $venvOut = & $python.Exe @($python.Args + @("-m", "venv", $venv)) 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
+        if ($venvOut) { Write-Host ($venvOut | Out-String) }
+        throw "Failed to create virtualenv at $venv using $($python.Exe)."
+    }
+    $venvPy = Join-Path $venv "Scripts\python.exe"
+    $venvProbe = & $venvPy -c "import sys; print(sys.executable)" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        if ($venvOut) { Write-Host ($venvOut | Out-String) }
+        throw "venv created but python.exe is not functional (exit $LASTEXITCODE): $venvProbe"
+    }
+    Write-Host "  venv verified: $venvProbe"
 
 Write-Host "Installing acme-adcs-ra ..."
 
@@ -653,6 +664,68 @@ if (Test-Path $lockFile) {
 $installedVer = ((& $venvPy -m pip show acme-adcs-ra 2>$null | Select-String "^Version:") -replace "^Version:\s*", "").Trim()
 Write-Host "  Installed acme-adcs-ra version: $installedVer"
 
+    # The retired runtime goes NOW, before the proof, not after it.
+    #
+    # It sits inside $RuntimeDir, so leaving it in place would put an entire
+    # second (old) venv inside the recursive ownership reset and the read-back
+    # proof below -- doubling their cost, and letting anything odd in a tree we
+    # are about to delete fail the proof of the tree we just built.
+    #
+    # The trade: past this line a rollback is no longer possible. That is the
+    # right way round. A build failure is recoverable and rolls back; a PROOF
+    # failure means the newly built tree's ownership or DACLs are not what this
+    # installer set, which is a "something else on this host is interfering"
+    # condition -- and the correct response to that is to stop with the pool
+    # still down, not to quietly serve the old runtime.
+    if ($retiredRuntime -and (Test-Path -LiteralPath $retiredRuntime)) {
+        Assert-NoReparsePoints -Path $retiredRuntime -Context 'retired runtime removal'
+        Remove-Item -LiteralPath $retiredRuntime -Recurse -Force
+        $retiredRuntime = $null
+    }
+
+    # Normalise ownership across everything pip just created (files an
+    # administrator creates are owned by that ACCOUNT, not the Administrators
+    # group), re-assert the exact runtime DACL, and prove the whole tree. Only
+    # now is the runtime allowed to be considered live.
+    Write-Host "Securing and proving the runtime at $RuntimeDir ..."
+    Assert-NoReparsePoints -Path $RuntimeDir -Context 'runtime proof'
+    Reset-TreeToInherited -Path $RuntimeDir
+    Set-ObjectProtectedDacl -Path $RuntimeDir -Grants $runtimeGrants
+    Assert-InstallTreeLocked -Root $RuntimeDir -AllowedTrustees $raTrustees `
+        -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18')
+    Write-Host "  [ok]   runtime verified (Administrators/SYSTEM own every object; gMSA read+execute only)"
+} catch {
+    # A failed build must not leave the host with no runtime. Put the retired
+    # one back and re-throw, so the operator gets the real error and a machine
+    # that still serves what it served before.
+    if ($retiredRuntime) {
+        Write-Host "  [!!] runtime build failed; restoring the previous runtime from $retiredRuntime"
+        try {
+            if (Restore-RetiredRuntime -RuntimeDir $RuntimeDir -Retired $retiredRuntime) {
+                Write-Host "  [ok]   previous runtime restored"
+            } else {
+                Write-Host ("  [!!] nothing to restore -- $retiredRuntime is gone. This host has NO " +
+                            "runtime at $runtimeCurrent until a successful re-run.")
+            }
+        } catch {
+            Write-Host ("  [!!] restore ALSO failed: $($_.Exception.Message). The previous runtime is " +
+                        "still at $retiredRuntime -- rename it to $runtimeCurrent by hand.")
+        }
+    } else {
+        # Past the point of no rollback: the build got far enough that the old
+        # runtime was already discarded. Say so plainly rather than letting the
+        # operator assume the previous install is still serving.
+        Write-Host ("  [!!] the runtime at $runtimeCurrent was built but did NOT pass verification, " +
+                    "and there is no previous runtime to fall back to. The app pool has been left " +
+                    "stopped deliberately. Fix the reported problem and re-run.")
+    }
+    throw
+}
+
+# --- State directory contents (never executed) -------------------------------
+Write-Host "Creating state directories under $InstallDir ..."
+foreach ($d in @($InstallDir, $logs)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+
 # --- Lay down the locked, no-clobber secret env file -------------------------
 # Holds the EAB credential(s) + optional SIEM HEC token. NEVER taken on the
 # command line (would hit shell history). The operator fills the EAB entries.
@@ -682,50 +755,34 @@ ACME_RA_SAN_SCOPES={"REPLACE-WITH-UUID":{"dns_patterns":["*.work-domain.local"]}
     [System.IO.File]::WriteAllText($envFile, $envTemplate, (New-Object System.Text.UTF8Encoding $false))
 }
 
-# --- ACLs: the worker runs AS THE gMSA, so grant the gMSA (not a virtual acct) -
+# --- Re-assert and prove the STATE tree --------------------------------------
 #
-# The root was already claimed with the Administrators/SYSTEM-only ACL at the
-# top of the run (2026-08-19 F1). This pass re-asserts ownership + ACL across
-# the tree (everything the install itself just created, plus anything that
-# survived from before) and adds the gMSA's Modify, which could not be granted
-# earlier because the SID is resolved after the prerequisite check. Same
-# reset+protect+prove sequence as the claim, so the two passes cannot drift.
-Write-Host "Securing $InstallDir (ownership reset; Administrators/SYSTEM full; gMSA modify) ..."
+# The state root was claimed at the top of the run; this pass covers what the
+# install itself created since (the logs directory, the dotenv) and normalises
+# their ownership, because a file an administrator creates is owned by that
+# ACCOUNT rather than the Administrators group. Same reset+protect+prove
+# sequence as the claim, using the same grant strings, so the two cannot drift
+# -- and the proof it leaves behind is exactly what the NEXT run's pre-flight
+# will demand before it agrees this directory is ours.
+#
+# Note what this tree does NOT contain any more: the interpreter, the venv, and
+# the manifest that used to vouch for them. Code lives under %ProgramFiles%
+# with no gMSA write ACE at all, so the app pool can no longer rewrite what it
+# is about to be relaunched with.
+Write-Host "Securing and proving the state tree at $InstallDir ..."
 Assert-NoReparsePoints -Path $InstallDir -Context 'post-install ACL pass'
 Reset-TreeToInherited -Path $InstallDir
-Set-ObjectProtectedDacl -Path $InstallDir -Grants @(
-    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)M')
-)
-# The env file: same reset (it survives reinstalls and could carry a stale
-# attacker ACE from before this fix existed), then its own protected DACL --
-# gMSA read-only (the app must never rewrite its own secrets).
+Set-ObjectProtectedDacl -Path $InstallDir -Grants $stateGrants
+# The dotenv carries its own DACL: gMSA READ-ONLY. The worker must never be
+# able to rewrite its own EAB credentials or SAN scope -- those decide what it
+# is allowed to issue.
 Set-ObjectProtectedDacl -Path $envFile -Grants @(
     '*S-1-5-32-544:F', '*S-1-5-18:F', ($GmsaAccount + ':R')
 )
-# The python manifest must be re-protected too: the /reset above just stripped
-# its protected DACL back to tree inheritance (which carries the gMSA's
-# Modify). It vouches for the interpreter the NEXT elevated install will run,
-# so the gMSA must never be able to rewrite it.
-if (Test-Path $pyManifest) {
-    Set-ObjectProtectedDacl -Path $pyManifest -Grants @(
-        '*S-1-5-32-544:F', '*S-1-5-18:F'
-    )
-}
-# NOTE: the old extra grant on the python\ subdirectory is deliberately gone:
-# the root's (OI)(CI)M propagates to every descendant, and an explicit ACE
-# down there would (correctly) trip the tree verification below.
-$trustees = @(
-    'S-1-5-32-544', 'S-1-5-18',
-    'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'BA', 'SY',
-    $gmsaSid, $GmsaAccount
-)
-$manifestTrustees = @(
-    'S-1-5-32-544', 'S-1-5-18',
-    'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'BA', 'SY'
-)
-Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees $trustees `
-    -ProtectedEntries @{ 'acme-ra.env' = $trustees; 'python.manifest.json' = $manifestTrustees }
-Write-Host "  [ok]   install tree verified locked (ownership + DACLs read back and proven)"
+Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees $raTrustees `
+    -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18') `
+    -ProtectedEntries @{ 'acme-ra.env' = $raTrustees }
+Write-Host "  [ok]   state tree verified locked (ownership + DACLs read back and proven)"
 
 # --- Grant the gMSA "Log on as a service" (best-effort) ----------------------
 # An IIS app pool running as a gMSA needs SeServiceLogonRight, or the pool fails
@@ -784,9 +841,17 @@ if ($ConfigureIIS) {
             Write-Host "  Keeping existing web.config (preserving operator settings)."
         } else {
             Copy-Item $webConfigSrc $webConfigDst -Force
-            $defaultDir = "C:\ProgramData\acme-adcs-ra"
+            # Two substitutions now, not one: processPath points into the
+            # RUNTIME tree (%ProgramFiles%) and ACME_RA_DOTENV into the STATE
+            # tree (%ProgramData%). The runtime one must be rewritten first --
+            # the default runtime path contains the default state path nowhere,
+            # but doing them in a fixed order keeps the result deterministic if
+            # an operator ever nests one inside the other.
+            $defaultRuntime = "C:\Program Files\acme-adcs-ra"
+            $defaultState   = "C:\ProgramData\acme-adcs-ra"
             $wcContent = Get-Content $webConfigDst -Raw
-            if ($InstallDir -ne $defaultDir) { $wcContent = $wcContent.Replace($defaultDir, $InstallDir) }
+            if ($RuntimeDir -ne $defaultRuntime) { $wcContent = $wcContent.Replace($defaultRuntime, $RuntimeDir) }
+            if ($InstallDir -ne $defaultState)   { $wcContent = $wcContent.Replace($defaultState, $InstallDir) }
             try { $null = [xml]$wcContent } catch { throw "web.config rewrite produced invalid XML" }
             [System.IO.File]::WriteAllText($webConfigDst, $wcContent, (New-Object System.Text.UTF8Encoding $false))
             Write-Host "  Wrote template web.config -- EDIT ACME_RA_BASE_URL + ACME_RA_ADCS_* before first use."
@@ -904,8 +969,19 @@ if ($script:poolWasStopped -and -not $script:iisActuallyConfigured) {
 }
 
 Write-Host ""
-Write-Host "Done. acme-adcs-ra installed to $venv"
-Write-Host "Data dir: $InstallDir   Audit DB: $InstallDir\acme_ra.db   Env file: $envFile"
+Write-Host "Done. acme-adcs-ra is installed in two separate trees, on purpose:"
+Write-Host ""
+Write-Host "  CODE   $runtimeCurrent"
+Write-Host "         Administrators/SYSTEM full; $GmsaAccount read + EXECUTE only."
+Write-Host "         Rebuilt from scratch on every install. Never written by the app."
+Write-Host "  STATE  $InstallDir"
+Write-Host "         Administrators/SYSTEM full; $GmsaAccount modify."
+Write-Host "         Audit DB: $InstallDir\acme_ra.db   Env file: $envFile"
+Write-Host "         Nothing here is ever executed."
+Write-Host ""
+Write-Host "         Do not move code into the state tree or grant the gMSA write access"
+Write-Host "         to the code tree. That separation is the control; see"
+Write-Host "         docs/operator-requirements.md."
 if ($script:iisActuallyConfigured) {
     Write-Host "IIS site: $SitePath   App pool: $AppPool (as $GmsaAccount)"
     $dispHost = if ($HostName) { $HostName } else { $env:COMPUTERNAME }

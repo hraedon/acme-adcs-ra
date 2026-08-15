@@ -201,6 +201,30 @@ authenticates to `/certsrv/`. `scripts/install-windows.ps1` does the whole host
 side; the CA side (Web Enrollment + the issuance template) is set up once per CA
 via [`docs/certsrv-setup.md`](docs/certsrv-setup.md).
 
+> **Read [`docs/operator-requirements.md`](docs/operator-requirements.md)
+> first.** It is the contract for everything the installer deliberately does
+> not decide for you, and it lists every condition the installer *refuses* on
+> together with the exact remedy. The installer fails closed in several places
+> by design; knowing which ones in advance saves a confusing first run.
+
+**The install is split across two directories, and the split is a security
+boundary:**
+
+| | Code (`-RuntimeDir`) | State (`-InstallDir`) |
+|---|---|---|
+| Default | `%ProgramFiles%\acme-adcs-ra` | `C:\ProgramData\acme-adcs-ra` |
+| Holds | interpreter + venv, under `current\` | audit DB, logs, `acme-ra.env` |
+| The gMSA gets | **read + execute** | **modify** (dotenv: read) |
+| Lifecycle | rebuilt from scratch every install | survives every install |
+
+`%ProgramData%` grants `Users` create-folder rights by default, so a local user
+can pre-create a predictable path there and own it; `%ProgramFiles%` does not.
+Keeping executable content out of the tree the worker can write to is what
+stops a compromised app pool from rewriting the interpreter it runs as.
+Neither root is ever *adopted*: a pre-existing directory must match what a
+completed install leaves behind, or the installer refuses and tells you what
+to do.
+
 ### Prerequisites
 
 | Prerequisite | How to satisfy it |
@@ -286,7 +310,7 @@ single-site catch-all binding. Full IIS detail is in
 # ACME directory should return JSON:
 Invoke-WebRequest https://acme-ra.work-domain.local/directory -UseBasicParsing
 # The Negotiate stack imports (run as the venv python):
-& C:\ProgramData\acme-adcs-ra\venv\Scripts\python.exe -c "import spnego; import acme_adcs_ra.negotiate_auth"
+& "C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" -c "import spnego; import acme_adcs_ra.negotiate_auth"
 ```
 
 **Before going live, work through [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).**
