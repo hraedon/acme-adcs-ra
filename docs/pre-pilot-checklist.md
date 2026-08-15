@@ -218,8 +218,9 @@ engineered to. Until then it has not — regardless of a green local test run.
   checks passed — the counter must be pointed at the blackhole address in that
   mode (re-run then measured 40/40 clean). (2) `bh-off.ps1` only clears the
   *firewall* blackhole; the config blackhole needs the explicit
-  `setenv ACME_RA_ADCS_HOST` restore, which teardown.ps1 does. Also: `cw-admin`
-  over SSH **cannot DCOM to the CA** (key-auth logon has no network credential —
+  `setenv ACME_RA_ADCS_HOST` restore, which teardown.ps1 does. Also: the lab's
+  key-auth SSH admin logon **cannot DCOM to the CA** (it carries no network
+  credential —
   `RPC_S_SERVER_UNAVAILABLE` on `-ping` while the same call succeeds on the CA
   console and as the gMSA task), so teardown revocations must run through the
   gMSA runner. The §2 ssh-quoting trap claimed three more victims this run
