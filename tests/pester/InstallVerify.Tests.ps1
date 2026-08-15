@@ -1123,52 +1123,67 @@ Describe 'Test-AceEndangersBytes (round 5: the interpreter chain rule)' {
         $RX = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute
         $FC = [int][System.Security.AccessControl.FileSystemRights]::FullControl
         $OI = [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $IO = [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
+    }
+
+    It 'the live C:\ pattern: Users (CI)(IO) CreateFiles must NOT flag (it does not apply to this object)' {
+        # Live-probed: C:\ carries exactly this ACE. It grants nothing on C:\
+        # itself; where it lands (a freshly created first-level directory shows
+        # an APPLICABLE Users CreateFiles), the chain walk flags the child.
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $WD -AceType 'Allow' -InheritanceFlags ([int][System.Security.AccessControl.InheritanceFlags]::ContainerInherit) -PropagationFlags $IO -IsDirectory $true |
+            Should -BeFalse
+    }
+
+    It 'the live ProgramData pattern: applicable (non-IO) Users Write MUST flag' {
+        # rights=278 (0x116, the 'Write' composite), inh=ContainerInherit, prop=None
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 278 -AceType 'Allow' -InheritanceFlags ([int][System.Security.AccessControl.InheritanceFlags]::ContainerInherit) -PropagationFlags 0 -IsDirectory $true |
+            Should -BeTrue
     }
 
     It 'raw generic bits: GenericRead and GenericExecute must NOT flag; GenericWrite and GenericAll MUST' {
         # Found live: the first version of the mask carried 0x80000000 as
         # "GenericAll" -- it is GenericRead -- and rejected every %ProgramFiles%
         # Users GR,GE ACE as write-class, blocking the whole install.
-        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0xA0000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0xA0000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeFalse     # GenericRead|GenericExecute (the Program Files pattern)
-        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0x40000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0x40000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeTrue      # GenericWrite
-        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0x10000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0x10000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeTrue      # GenericAll
     }
 
     It 'flags Users CreateFiles on a directory (the ProgramData pattern)' {
-        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $WD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $WD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeTrue
     }
 
     It 'does NOT flag Users RX (Program Files pattern) or the C:\ create-subdir-only ACE' {
-        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $RX -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $RX -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeFalse
         # C:\ grants Users AppendData (create subdirectory) non-object-inherit:
         # that cannot replace bytes.
-        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $AD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $AD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeFalse
     }
 
     It 'flags object-inherit AppendData (byte-append lands on files)' {
-        Test-AceEndangersBytes -Identity 'S-1-5-32-545' -Rights $AD -AceType 'Allow' -InheritanceFlags $OI -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'S-1-5-32-545' -Rights $AD -AceType 'Allow' -InheritanceFlags $OI -IsDirectory $true -PropagationFlags 0 |
             Should -BeTrue
     }
 
     It 'flags Everyone Modify/FullControl and deny-style supersets, ignores deny ACEs and admin trustees' {
-        Test-AceEndangersBytes -Identity 'Everyone' -Rights $FC -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'Everyone' -Rights $FC -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeTrue
-        Test-AceEndangersBytes -Identity 'Everyone' -Rights $FC -AceType 'Deny' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'Everyone' -Rights $FC -AceType 'Deny' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeFalse
-        Test-AceEndangersBytes -Identity 'BUILTIN\Administrators' -Rights $FC -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'BUILTIN\Administrators' -Rights $FC -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeFalse
-        Test-AceEndangersBytes -Identity 'NT AUTHORITY\Authenticated Users' -Rights $WD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+        Test-AceEndangersBytes -Identity 'NT AUTHORITY\Authenticated Users' -Rights $WD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
             Should -BeTrue
     }
 
     It 'on a FILE, byte-append (AppendData) is dangerous regardless of inheritance' {
-        Test-AceEndangersBytes -Identity 'Everyone' -Rights $AD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $false |
+        Test-AceEndangersBytes -Identity 'Everyone' -Rights $AD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $false -PropagationFlags 0 |
             Should -BeTrue
     }
 }

@@ -1232,9 +1232,20 @@ function Test-AceEndangersBytes {
         [Parameter(Mandatory = $true)][int]$Rights,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$AceType,
         [Parameter(Mandatory = $true)][int]$InheritanceFlags,
+        [Parameter(Mandatory = $true)][int]$PropagationFlags,
         [Parameter(Mandatory = $true)][bool]$IsDirectory
     )
     if ($AceType -ne 'Allow') { return $false }
+    # INHERIT_ONLY ACEs do not apply to THIS object (live-probed 2026-08-15:
+    # C:\ carries Users (CI)(IO) CreateFiles -- it does not let anyone write
+    # INTO C:\'s existing protected children, and where it does land -- a
+    # freshly created first-level directory shows an APPLICABLE Users
+    # CreateFiles -- the chain walk sees the landed copy on that child and
+    # flags it there. Honouring IO here is what keeps C:\ itself clean
+    # without whitewashing the directories the write actually reaches.
+    if (($PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+        return $false
+    }
     $broad = $false
     foreach ($sid in $script:BroadTrusteeSids) {
         if ($Identity -eq $sid) { $broad = $true; break }
@@ -1319,10 +1330,12 @@ function Test-ObjectDaclTrusted {
             -Rights ([int]$rule.FileSystemRights) `
             -AceType ([string]$rule.AccessControlType) `
             -InheritanceFlags ([int]$rule.InheritanceFlags) `
+            -PropagationFlags ([int]$rule.PropagationFlags) `
             -IsDirectory $isDir
         if (-not $flag -and @($AlsoFlagTrustees).Count -gt 0) {
+            $ioFlagged = ($rule.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0
             foreach ($t in $AlsoFlagTrustees) {
-                if ($identity -and ($identity -ieq $t) -and
+                if ($identity -and ($identity -ieq $t) -and (-not $ioFlagged) -and
                     $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
                     $writeBits = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
                                  [int][System.Security.AccessControl.FileSystemRights]::Modify -bor
