@@ -65,6 +65,7 @@ def _check_rate_limit(ctx: ServerContext, account_id: str) -> None:
                     account_id=account_id,
                     outcome="denied",
                     details={
+                        "reason": "per-account-limit",
                         "limit": limit,
                         "window_seconds": window,
                         "count": count,
@@ -87,6 +88,7 @@ def _check_rate_limit(ctx: ServerContext, account_id: str) -> None:
                 account_id=account_id,
                 outcome="denied",
                 details={
+                    "reason": "global-limit",
                     "limit": global_limit,
                     "window_seconds": window,
                     "count": global_count,
@@ -168,6 +170,7 @@ async def new_order(
         )
     except OrderRateLimitExceeded as exc:
         details = {
+            "reason": f"{exc.scope}-limit",
             "limit": exc.limit,
             "window_seconds": exc.window_seconds,
             "count": exc.count,

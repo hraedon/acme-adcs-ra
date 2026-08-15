@@ -277,11 +277,23 @@ class TestDenialCoalescing:
     def test_authenticated_and_issuance_events_are_never_coalesced(
         self, tmp_path: Path
     ) -> None:
-        """Only the unauthenticated denial path is bounded.
+        """Accountable, one-time events keep one row each.
+
+        The set was extended in round 5 with the *replayable* authenticated
+        denial classes (see test_security_review_2026_08_15_daybreak_round5);
+        issuance, revocation and admin actions must never join it. The exact
+        membership is pinned so a future addition is a deliberate, reviewed
+        change rather than drift.
 
         Mutation: coalesce every event type.
         """
-        assert COALESCED_EVENT_TYPES == {"account-creation-denied"}
+        assert COALESCED_EVENT_TYPES == {
+            "account-creation-denied",
+            "account-request-denied",
+            "order-rate-limited",
+            "finalize-csr-mismatch",
+            "finalize-policy-denied",
+        }
         store = _store(tmp_path)
         coalescer = DenialCoalescer(60, clock=_Clock())
 

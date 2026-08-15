@@ -32,7 +32,11 @@ already committed, even a hard crash cannot lose it.
 The coalescing key deliberately excludes the ``kid`` and the requester. Both
 are attacker-chosen; keying on them would let a peer defeat the bound by
 varying one character per request. The distinct kids seen in a window are
-recorded as digests instead, bounded in number and counted in full.
+recorded as digests instead, bounded in number and counted in full. For the
+replayable *authenticated* classes added in Daybreak round 5, the key carries
+the account and order ids (not attacker-chosen per request): one account's
+replay storm folds, different accounts stay separable, and the row's own
+``account_id``/``order_id`` columns keep the folded tally attributable.
 """
 
 from __future__ import annotations
@@ -46,11 +50,37 @@ from typing import Any
 
 from acme_adcs_ra.store import Store, _now_iso
 
-# Only unauthenticated, pre-authentication denials are coalesced. Everything
-# else — issuance, revocation, admin action, anything an authenticated account
-# did — keeps one row per event, unconditionally. An attacker cannot reach
-# these without a valid EAB credential, so their volume is accountable.
-COALESCED_EVENT_TYPES = frozenset({"account-creation-denied"})
+# Which denials are coalesced, and why exactly these.
+#
+# Unauthenticated, pre-authentication denials (``account-creation-denied``):
+# an allowlisted peer needs no account and no valid EAB secret to make the RA
+# write a durable audit row, so their volume is pure attacker choice.
+#
+# Replayable authenticated denials (Daybreak round 5): a *valid* credential
+# replayed at line rate could grow the durable stores without bound even
+# though every request is individually accountable -- accountability does not
+# bound disk. These classes are replayable because each one can be re-sent
+# indefinitely against unchanged server state, costing the attacker nothing:
+#
+# * ``account-request-denied`` -- a deactivated or EAB-evicted account key
+#   still authenticates the JWS; the denial is the point.
+# * ``order-rate-limited`` -- requests rejected *because* they exceed a cap
+#   are unbounded by definition: the limiter does not throttle the audit row.
+# * ``finalize-csr-mismatch`` / ``finalize-policy-denied`` -- cheap pre-enrollment
+#   validation failures on an order that stays ``ready``, so the identical
+#   failing finalize can be replayed forever.
+#
+# Everything else -- issuance, revocation, admin action, one-time state
+# transitions -- keeps one row per event, unconditionally.
+COALESCED_EVENT_TYPES = frozenset(
+    {
+        "account-creation-denied",
+        "account-request-denied",
+        "order-rate-limited",
+        "finalize-csr-mismatch",
+        "finalize-policy-denied",
+    }
+)
 
 # Distinct offered kids sampled per window. The full number seen is counted
 # regardless; this bounds only how many are named.
@@ -104,7 +134,7 @@ class DenialCoalescer:
         self._max_kid_samples = max_kid_samples
         self._clock = clock
         self._lock = threading.Lock()
-        self._windows: dict[tuple[str, str], _Window] = {}
+        self._windows: dict[tuple[str, str, str, str], _Window] = {}
 
     @property
     def enabled(self) -> bool:
@@ -126,7 +156,21 @@ class DenialCoalescer:
         details = dict(kwargs.get("details") or {})
         reason = str(details.get("reason", ""))
         kid = details.get("kid")
-        key = (event_type, reason)
+        # The coalescing key. For pre-auth denials it is (type, reason) as
+        # before -- there is no account to key on, and keying on the
+        # attacker-chosen kid would let one character of variance defeat the
+        # bound. For the replayable authenticated classes (round 5) the key
+        # additionally carries account_id and order_id: different accounts'
+        # denials stay in separate rows (each remains individually
+        # accountable), while one account replaying one request folds into a
+        # single window. Both key shapes tuple naturally; absent ids read as
+        # "" and keep the pre-auth behaviour byte-identical.
+        key = (
+            event_type,
+            reason,
+            str(kwargs.get("account_id") or ""),
+            str(kwargs.get("order_id") or ""),
+        )
         now = self._clock()
 
         with self._lock:

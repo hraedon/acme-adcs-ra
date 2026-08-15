@@ -1028,9 +1028,11 @@ Describe 'install-windows.ps1: Daybreak round 4 fixes' {
         $rtCall | Should -Not -Match 'ForbiddenTopLevelEntries'
     }
 
-    It 'M2: warns loudly when a preserved web.config launches a state-tree interpreter' {
-        $script:installer | Should -Match 'Test-PathInsideTree -Path \$procPath -Tree \$InstallDir'
-        $script:installer | Should -Match 'worker-writable interpreter'
+    It 'M2: refuses (not warns) when a preserved web.config launches a state-tree interpreter' {
+        # Round 5 hardened this from a warning with a swallowed parse failure
+        # into a fail-closed validation shared with -ConfigureIIS.
+        $script:installer | Should -Match 'Assert-WebConfigLaunchTrusted -WebConfigPath \$siteWcPath'
+        $script:installer | Should -Not -Match '\[!!\] .*INSIDE the state tree'
     }
 
     It 'L1: disables CWD executable lookup before any cmd /c, and resolves bare probe names' {
@@ -1050,5 +1052,220 @@ Describe 'install-windows.ps1: Daybreak round 4 fixes' {
             $script:installer.IndexOf($marker) | Should -BeGreaterThan $ov
         }
         $script:installer | Should -Match "rootRelation -ne 'disjoint'"
+    }
+}
+
+# --- Daybreak round 5 (2026-08-15): five findings on the round-4 fixes -------
+#
+#   H   file-plant race into a freshly created root (closed by Lock-FreshRoot:
+#       protect-at-creation + empty-proof, no /reset on the fresh path)
+#   M   lexical path comparison missed aliases (dot segments, slashes, 8.3,
+#       junctions) -- canonicalisation added
+#   M   PATH-resolved interpreter executed elevated unproven -- chain gate
+#   M   SitePath/web.config adopted unverified -- provenance + throwing
+#       launch-config validation
+#   M   replayable authenticated requests grew the audit stores unboundedly
+#       (app-side; pytest covers it)
+
+Describe 'Get-CanonicalPathString / Get-PathRelation (round 5: aliases)' {
+    It 'dot-segment aliases collapse to the same canonical string' {
+        Get-PathRelation -A 'C:\Program Files\acme-adcs-ra\current\..\..\acme-adcs-ra' -B 'C:\Program Files\acme-adcs-ra' |
+            Should -Be 'equal'
+    }
+
+    It 'forward slashes and case noise normalise' {
+        Get-PathRelation -A 'c:/program files/acme-adcs-ra' -B 'C:\Program Files\ACME-ADCS-RA\' |
+            Should -Be 'equal'
+    }
+
+    It 'a dot-segment alias of a NESTED root is detected, not "disjoint"' {
+        # The exact bypass class: -InstallDir written with .. so the lexical
+        # prefix test used to answer disjoint while Windows resolves nesting.
+        Get-PathRelation -A 'C:\ProgramData\acme-ra\state' -B 'C:\ProgramData\acme-ra\code\..\state' |
+            Should -Be 'equal'
+        Get-PathRelation -A 'C:\ProgramData\acme-ra\code' -B 'C:\ProgramData\acme-ra\code\sub\..\..\state' |
+            Should -Be 'disjoint'
+    }
+
+    It 'UNC and drive roots survive normalisation' {
+        Get-CanonicalPathString -Path 'C:\' | Should -Be 'C:'
+        Get-CanonicalPathString -Path '\\\\server\\share\\dir/' | Should -Be '\\server\share\dir'
+    }
+
+    It 'genuinely disjoint roots stay disjoint (no false positives)' {
+        Get-PathRelation -A 'C:\Program Files\acme-adcs-ra' -B 'C:\ProgramData\acme-adcs-ra' |
+            Should -Be 'disjoint'
+    }
+
+    It 'junction aliases resolve through the kernel (Windows only)' -Skip:($env:OS -ne 'Windows_NT') {
+        $base = Join-Path ([IO.Path]::GetTempPath()) ("ra-junction-" + [guid]::NewGuid().ToString('N'))
+        $real = Join-Path $base 'real'
+        $link = Join-Path $base 'link'
+        New-Item -ItemType Directory -Force -Path $real | Out-Null
+        $null = & cmd.exe /c "mklink /J `"$link`" `"$real`" 2>&1"
+        if (-not (Test-Path $link)) { Set-ItResult -Skipped -Because 'junction creation unavailable'; return }
+        try {
+            Get-PathRelation -A "$link\venv" -B "$real\venv" | Should -Be 'equal'
+            Get-PathRelation -A "$link\state" -B "$real" | Should -Be 'a-inside-b'
+        } finally {
+            & cmd.exe /c "rmdir `"$link`" 2>&1" | Out-Null
+            Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'Test-AceEndangersBytes (round 5: the interpreter chain rule)' {
+    BeforeAll {
+        # FileSystemRights / InheritanceFlags enum values are plain ints on
+        # every platform, so the matrix runs on Linux too.
+        $WD = [int][System.Security.AccessControl.FileSystemRights]::WriteData
+        $AD = [int][System.Security.AccessControl.FileSystemRights]::AppendData
+        $RX = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+        $FC = [int][System.Security.AccessControl.FileSystemRights]::FullControl
+        $OI = [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    }
+
+    It 'flags Users CreateFiles on a directory (the ProgramData pattern)' {
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $WD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeTrue
+    }
+
+    It 'does NOT flag Users RX (Program Files pattern) or the C:\ create-subdir-only ACE' {
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $RX -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeFalse
+        # C:\ grants Users AppendData (create subdirectory) non-object-inherit:
+        # that cannot replace bytes.
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $AD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeFalse
+    }
+
+    It 'flags object-inherit AppendData (byte-append lands on files)' {
+        Test-AceEndangersBytes -Identity 'S-1-5-32-545' -Rights $AD -AceType 'Allow' -InheritanceFlags $OI -IsDirectory $true |
+            Should -BeTrue
+    }
+
+    It 'flags Everyone Modify/FullControl and deny-style supersets, ignores deny ACEs and admin trustees' {
+        Test-AceEndangersBytes -Identity 'Everyone' -Rights $FC -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeTrue
+        Test-AceEndangersBytes -Identity 'Everyone' -Rights $FC -AceType 'Deny' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeFalse
+        Test-AceEndangersBytes -Identity 'BUILTIN\Administrators' -Rights $FC -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeFalse
+        Test-AceEndangersBytes -Identity 'NT AUTHORITY\Authenticated Users' -Rights $WD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeTrue
+    }
+
+    It 'on a FILE, byte-append (AppendData) is dangerous regardless of inheritance' {
+        Test-AceEndangersBytes -Identity 'Everyone' -Rights $AD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $false |
+            Should -BeTrue
+    }
+}
+
+Describe 'Assert-WebConfigLaunchTrusted (round 5: launch config fails closed)' {
+    BeforeAll {
+        $script:dir = New-Item -ItemType Directory -Force -Path (Join-Path ([IO.Path]::GetTempPath()) ("ra-wcval-" + [guid]::NewGuid().ToString('N')))
+        $script:good = @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration><system.webServer>
+  <httpPlatform processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" arguments="-m acme_adcs_ra" />
+</system.webServer></configuration>
+'@
+        $script:inState = $script:good.Replace(
+            'C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe',
+            'C:\ProgramData\acme-adcs-ra\venv\Scripts\python.exe')
+        $script:elsewhere = $script:good.Replace(
+            'C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe',
+            'C:\Tools\ra-launcher.exe')
+        $script:broken = '<configuration><system.webServer><httpPlatform processPath="C:\x'
+        Set-Content (Join-Path $script:dir 'good.xml') $script:good
+        Set-Content (Join-Path $script:dir 'state.xml') $script:inState
+        Set-Content (Join-Path $script:dir 'else.xml') $script:elsewhere
+        Set-Content (Join-Path $script:dir 'broken.xml') $script:broken
+    }
+    AfterAll { Remove-Item -LiteralPath $script:dir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'accepts a processPath inside the runtime tree' {
+        { Assert-WebConfigLaunchTrusted -WebConfigPath (Join-Path $script:dir 'good.xml') `
+            -InstallDir 'C:\ProgramData\acme-adcs-ra' -RuntimeDir 'C:\Program Files\acme-adcs-ra' `
+            -ExpectedProcessPath 'C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe' } |
+            Should -Not -Throw
+    }
+
+    It 'REFUSES a processPath inside the state tree (gMSA-writable interpreter)' {
+        { Assert-WebConfigLaunchTrusted -WebConfigPath (Join-Path $script:dir 'state.xml') `
+            -InstallDir 'C:\ProgramData\acme-adcs-ra' -RuntimeDir 'C:\Program Files\acme-adcs-ra' `
+            -ExpectedProcessPath 'x' } | Should -Throw '*INSIDE the state tree*'
+    }
+
+    It 'REFUSES a processPath outside the runtime tree entirely' {
+        { Assert-WebConfigLaunchTrusted -WebConfigPath (Join-Path $script:dir 'else.xml') `
+            -InstallDir 'C:\ProgramData\acme-adcs-ra' -RuntimeDir 'C:\Program Files\acme-adcs-ra' `
+            -ExpectedProcessPath 'x' } | Should -Throw '*OUTSIDE the runtime tree*'
+    }
+
+    It 'REFUSES unparseable XML (the old code swallowed this)' {
+        { Assert-WebConfigLaunchTrusted -WebConfigPath (Join-Path $script:dir 'broken.xml') `
+            -InstallDir 'C:\ProgramData\acme-adcs-ra' -RuntimeDir 'C:\Program Files\acme-adcs-ra' `
+            -ExpectedProcessPath 'x' } | Should -Throw '*not parseable XML*'
+    }
+}
+
+Describe 'install-windows.ps1: round-5 fixes' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    It 'H: a fresh root is locked at creation (Lock-FreshRoot) and SKIPS the reset that would reopen the window' {
+        $absent = $script:installer.IndexOf("'absent' {")
+        $branch = $script:installer.Substring($absent, [Math]::Min(2600, $script:installer.Length - $absent))
+        $branch | Should -Match 'Lock-FreshRoot -Path \$Path'
+        $freshSkip = $script:installer.IndexOf('if (-not $fresh)')
+        $reset = $script:installer.IndexOf('Reset-TreeToInherited -Path $Path')
+        $freshSkip | Should -BeGreaterThan 0
+        $reset | Should -BeGreaterThan $freshSkip
+    }
+
+    It 'H: Lock-FreshRoot protects FIRST, then proves emptiness, then setowner (source order)' {
+        $lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $fn = $lib.IndexOf('function Lock-FreshRoot')
+        $body = $lib.Substring($fn, [Math]::Min(2600, $lib.Length - $fn))
+        $protect = $body.IndexOf('Set-ObjectProtectedDacl')
+        $empty = $body.IndexOf('Get-ChildItem -LiteralPath $Path -Force')
+        $refusal = $body.IndexOf('Get-ForeignRootRefusal')
+        $owner = $body.IndexOf('/setowner')
+        foreach ($x in @($protect, $empty, $refusal, $owner)) { $x | Should -BeGreaterThan 0 }
+        $protect | Should -BeLessThan $empty
+        $empty | Should -BeLessThan $refusal
+        $refusal | Should -BeLessThan $owner
+    }
+
+    It 'M: interpreter candidates are chain-gated BEFORE the first probe executes them' {
+        $gate = $script:installer.IndexOf('Test-PathChainTrusted -Path $chainProbePath')
+        $probe = $script:installer.IndexOf('Invoke-PyProbe -Exe $l.Exe -Arguments ($l.Args + @("--version"))')
+        $gate | Should -BeGreaterThan 0
+        $probe | Should -BeGreaterThan $gate
+        # ...and the self-resolved interpreter gets its own gate before adoption
+        $selfGate = $script:installer.IndexOf('Test-PathChainTrusted -Path $resolved')
+        $selfGate | Should -BeGreaterThan 0
+    }
+
+    It 'M: SitePath is disjointness-checked against BOTH managed roots' {
+        @([regex]::Matches($script:installer, 'Get-PathRelation -A \$SitePath')).Count | Should -Be 2
+    }
+
+    It 'M: -ConfigureIIS proves a pre-existing site tree (reparse + per-object DACL) or refuses' {
+        $script:installer | Should -Match 'Find-ReparsePoints -Path \$SitePath'
+        $script:installer | Should -Match 'Test-ObjectDaclTrusted -Path \$obj\.FullName -AlsoFlagTrustees'
+        $script:installer | Should -Match 'is not administrator-only'
+    }
+
+    It 'M: a fresh SitePath is locked at creation like the managed roots' {
+        $script:installer | Should -Match 'Lock-FreshRoot -Path \$SitePath'
+    }
+
+    It 'M: the post-install web.config check is a THROW on every run, not a warning' {
+        $script:installer | Should -Match 'Assert-WebConfigLaunchTrusted -WebConfigPath \$siteWcPath'
+        # the old warning-only text is gone
+        $script:installer | Should -Not -Match '\[!!\] .*INSIDE the state tree'
     }
 }

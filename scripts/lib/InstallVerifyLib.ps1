@@ -331,19 +331,24 @@ function Get-IcaclsDumpText {
     return [System.Text.Encoding]::Default.GetString($bytes)
 }
 
-# Relation of two Windows path strings, normalised for case and trailing
-# separators: 'equal', 'a-inside-b', 'b-inside-a' or 'disjoint'. Pure string
-# logic (no filesystem, no GetFullPath) so the Linux Pester run can drive it
-# with Windows-shaped paths. Used to refuse overlapping -RuntimeDir/-InstallDir:
-# the ACL boundary between the two trees IS the code/state control, and nested
-# roots would let one tree's grants apply to the other's subtree.
+# Relation of two Windows path strings: 'equal', 'a-inside-b', 'b-inside-a'
+# or 'disjoint'. Both inputs are CANONICALISED first (round 5): lexical
+# normalisation catches dot segments, forward slashes and case everywhere
+# (Linux Pester included), and on Windows the deepest existing ancestor is
+# resolved through the kernel so junctions, symlinks and 8.3 short names
+# cannot alias one physical tree as two "disjoint" strings -- which would let
+# the state root's Modify grant land on runtime bytes. Used to refuse
+# overlapping -RuntimeDir/-InstallDir: the ACL boundary between the two trees
+# IS the code/state control.
 function Get-PathRelation {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$A,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$B
     )
-    $na = (@($A -split '\\') | Where-Object { $_ }) -join '\'
-    $nb = (@($B -split '\\') | Where-Object { $_ }) -join '\'
+    $na = Get-CanonicalPathString -Path $A
+    $nb = Get-CanonicalPathString -Path $B
+    $na = (@($na -split '\\') | Where-Object { $_ }) -join '\'
+    $nb = (@($nb -split '\\') | Where-Object { $_ }) -join '\'
     if ($na -eq $nb) { return 'equal' }
     if ($na.StartsWith($nb + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return 'a-inside-b' }
     if ($nb.StartsWith($na + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return 'b-inside-a' }
@@ -1100,3 +1105,331 @@ function Stop-AppPoolAndWait {
     }
 }
 
+
+# --- Daybreak round 5 (2026-08-15): five findings on the round-4 fixes -------
+#
+#   H   a file raced into a FRESHLY CREATED root while it still inherited the
+#       parent's Users-create DACL rode the whole claim (the claim proof has no
+#       -ProtectedEntries, so a plain inherited-DACL dotenv passes the tree
+#       walk) and was then preserved by the no-clobber branch -- the round-4
+#       collision fix closed the DIRECTORY race, not the FILE race.
+#   M   Get-PathRelation compared raw strings: dot segments, forward slashes,
+#       8.3 short names and junction aliases read as "disjoint" while Windows
+#       resolves them to the same tree, collapsing the RX/Modify boundary.
+#   M   PATH-resolved interpreter candidates executed elevated with no
+#       provenance check on the file or its ancestor chain.
+#   M   SitePath/web.config (the gMSA launch configuration) adopted whatever
+#       was already on disk; the state-tree processPath check was warning-only
+#       and unparseable XML bypassed even the warning.
+
+# Kernel-resolved final path (junctions, symlinks, 8.3 names, case) for an
+# EXISTING file or directory. Windows-only; returns $null when the handle or
+# the query fails. Compiled once per session.
+if (-not ('ACMERA.FinalPath' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using Microsoft.Win32.SafeHandles;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace ACMERA {
+    public static class FinalPath {
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        private static extern uint GetFinalPathNameByHandleW(SafeFileHandle hFile, StringBuilder sb, uint cap, uint flags);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+        public static string Resolve(string path) {
+            using (SafeFileHandle h = CreateFileW(path, 0x80000000, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (h.IsInvalid) { return null; }
+                StringBuilder sb = new StringBuilder(1024);
+                uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+                if (n == 0 || n >= (uint)sb.Capacity) { return null; }
+                return sb.ToString();
+            }
+        }
+    }
+}
+"@
+}
+
+# Canonical string form of a path, existing or not:
+#   * drive-absolute and UNC inputs are normalised lexically (forward slashes,
+#     dot segments, duplicate separators) so the same rules apply on any test
+#     platform -- GetFullPath would treat a Windows path as RELATIVE on Linux;
+#   * genuinely relative inputs are made absolute against the CWD (GetFullPath);
+#   * on Windows, the deepest EXISTING ancestor is additionally resolved
+#     through the kernel, so junctions, symlinks and 8.3 short names in the
+#     middle of the path cannot alias one tree as two. The non-existent tail
+#     cannot host a pre-made alias: if it existed, it would be the resolved
+#     ancestor, and a reparse point planted there is a provenance refusal in
+#     its own right before anything executes.
+function Get-CanonicalPathString {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+    if (-not $Path) { return '' }
+    if ($Path -match '^[A-Za-z]:[\\/]' -or $Path -match '^[A-Za-z]:$' -or $Path.StartsWith('\\')) {
+        $parts = New-Object System.Collections.Generic.List[string]
+        foreach ($seg in ($Path -split '[\\/]')) {
+            if ($seg -eq '' -or $seg -eq '.') { continue }
+            if ($seg -eq '..') {
+                if ($parts.Count -gt 1) { $parts.RemoveAt($parts.Count - 1) }
+                continue
+            }
+            $parts.Add($seg)
+        }
+        if ($parts.Count -eq 0) { return '' }
+        $full = ($parts -join '\')
+        if ($Path.StartsWith('\\') -and -not $full.StartsWith('\\')) { $full = '\\' + $full }
+    } else {
+        try { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $Path }
+    }
+    if ($env:OS -eq 'Windows_NT') {
+        $segs = @($full -split '\\') | Where-Object { $_ }
+        for ($i = $segs.Count; $i -ge 1; $i--) {
+            $prefix = ($segs[0..($i - 1)] -join '\')
+            if ($i -eq 1 -and $segs[0] -match '^[A-Za-z]:$') { break }
+            if (Test-Path -LiteralPath $prefix) {
+                $resolved = [ACMERA.FinalPath]::Resolve($prefix)
+                if ($resolved) {
+                    $resolved = ($resolved -replace '^\\\\\?\\', '').TrimEnd('\')
+                    $tail = if ($i -lt $segs.Count) { '\' + ($segs[$i..($segs.Count - 1)] -join '\') } else { '' }
+                    return ($resolved + $tail)
+                }
+                break
+            }
+        }
+    }
+    return $full
+}
+
+# Trustees whose WRITE-class access to executable content means "not
+# administrator-only". CREATOR OWNER is deliberately absent: a CREATOR OWNER
+# ACE only ever benefits whoever created the object (SYSTEM or TrustedInstaller
+# for a real install), and it appears on %ProgramFiles% and %SystemDrive%
+# roots, whose Users ACEs are read/execute or (IO)-flagged; flagging it would
+# condemn every legitimate location. The gMSA and the running administrator
+# are added by callers where appropriate.
+$script:BroadTrusteeSids = @(
+    'S-1-1-0',            # Everyone
+    'S-1-5-32-545',       # BUILTIN\Users
+    'S-1-5-11',           # NT AUTHORITY\Authenticated Users
+    'S-1-5-4',            # NT AUTHORITY\Interactive
+    'S-1-5-3'             # NT AUTHORITY\Batch
+)
+
+# Pure decision over one ACE's raw fields (identity, rights, type, inheritance
+# flags): does it endanger the BYTES of an object in the tree (create/replace/
+# rewrite/re-ACL)? Taking primitives rather than a FileSystemAccessRule keeps
+# it drivable from the Linux Pester run, which cannot construct ACL objects.
+#
+#   * WriteData on a directory is CreateFiles: an attacker can plant content.
+#   * AppendData on a directory is only CreateDirectories UNLESS the ACE is
+#     object-inherit, in which case it lands on files as byte-append.
+#   * Delete / DeleteSubdirectoriesAndFiles allow replace-by-recreate.
+#   * WriteDacl/WriteOwner/ChangePermissions/TakeOwnership allow re-ACL to
+#     full control; FullControl/Modify/GenericWrite/GenericAll supersets.
+function Test-AceEndangersBytes {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Identity,
+        [Parameter(Mandatory = $true)][int]$Rights,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$AceType,
+        [Parameter(Mandatory = $true)][int]$InheritanceFlags,
+        [Parameter(Mandatory = $true)][bool]$IsDirectory
+    )
+    if ($AceType -ne 'Allow') { return $false }
+    $broad = $false
+    foreach ($sid in $script:BroadTrusteeSids) {
+        if ($Identity -eq $sid) { $broad = $true; break }
+    }
+    if ($Identity -match '^(Everyone|BUILTIN\\Users|NT AUTHORITY\\Authenticated Users|NT AUTHORITY\\Interactive|NT AUTHORITY\\Batch)$') { $broad = $true }
+    if (-not $broad) { return $false }
+
+    # The mask carries only bits that are dangerous ON THEIR OWN. FullControl
+    # (0x1F01FF) and Modify (0x301BF) are deliberately NOT in it wholesale:
+    # both contain AppendData, which is only CreateDirectories on a directory
+    # unless it reaches files -- a real FullControl/Modify ACE always also
+    # carries WriteData/Delete/DeleteChild, so it flags through those bits
+    # without dragging AppendData (or the read bits) along.
+    $mask = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
+             [int][System.Security.AccessControl.FileSystemRights]::Delete -bor
+             [int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+             [int][System.Security.AccessControl.FileSystemRights]::WriteDacl -bor
+             [int][System.Security.AccessControl.FileSystemRights]::WriteOwner -bor
+             [int][System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+             [int][System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+             0x40000000 -bor 0x80000000      # GenericWrite, GenericAll raw bits
+    $inheritObject = ($InheritanceFlags -band [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0
+    if ($inheritObject) {
+        $mask = $mask -bor [int][System.Security.AccessControl.FileSystemRights]::AppendData
+    }
+    if (-not $IsDirectory) {
+        # On a file, AppendData is byte-append: always dangerous.
+        $mask = $mask -bor [int][System.Security.AccessControl.FileSystemRights]::AppendData
+    }
+    return (($Rights -band $mask) -ne 0)
+}
+
+# Owners that may hold executable content or its containers. The running
+# administrator's own account owns their profile tree (AppData\Local), which
+# no other local user can write, so it is allowed for that chain.
+function Get-AllowedExecutableOwners {
+    $allowed = @('S-1-5-32-544', 'S-1-5-18', 'NT SERVICE\TrustedInstaller',
+                 'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')
+    try {
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        if ($me) { $allowed += $me }
+    } catch { }
+    return $allowed
+}
+
+# One object's owner + DACL as violations against the "administrator-only
+# bytes" rule. Empty list = trusted. -AlsoFlagTrustees extends the broad set
+# for callers with an additional principal to hold to the same standard (the
+# site tree check passes the gMSA: a worker that can write web.config can
+# rewrite its own launch configuration).
+function Test-ObjectDaclTrusted {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$AlsoFlagTrustees = @()
+    )
+    $violations = @()
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path } catch { return @("$Path : ACL unreadable ($($_.Exception.Message))") }
+    $isDir = (Test-Path -LiteralPath $Path -PathType Container)
+    if (-not (Test-OwnerAllowed -Owner $acl.Owner -AllowedOwnerSids @(Get-AllowedExecutableOwners))) {
+        $violations += "$Path : owner is '$($acl.Owner)' (expected Administrators, SYSTEM or TrustedInstaller)"
+    }
+    foreach ($rule in $acl.Access) {
+        $identity = ''
+        try { $identity = $rule.IdentityReference.Value } catch { }
+        $flag = Test-AceEndangersBytes -Identity $identity `
+            -Rights ([int]$rule.FileSystemRights) `
+            -AceType ([string]$rule.AccessControlType) `
+            -InheritanceFlags ([int]$rule.InheritanceFlags) `
+            -IsDirectory $isDir
+        if (-not $flag -and @($AlsoFlagTrustees).Count -gt 0) {
+            foreach ($t in $AlsoFlagTrustees) {
+                if ($identity -and ($identity -ieq $t) -and
+                    $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
+                    $writeBits = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
+                                 [int][System.Security.AccessControl.FileSystemRights]::Modify -bor
+                                 [int][System.Security.AccessControl.FileSystemRights]::FullControl
+                    if (([int]$rule.FileSystemRights -band $writeBits) -ne 0) { $flag = $true }
+                }
+            }
+        }
+        if ($flag) {
+            $violations += ("$Path : '$identity' holds write-class access " +
+                            "('$($rule.FileSystemRights)') -- a non-administrator can replace or rewrite bytes here")
+        }
+    }
+    return $violations
+}
+
+# The FULL provenance gate for a file we are about to execute elevated: the
+# file itself plus every existing ancestor directory up to the drive root must
+# be administrator-only. Observed-baseline semantics (live host, 2026-08-15):
+# C:\ passes (its Users write ACEs are (IO)-only or CreateDirectories-only);
+# C:\Program Files passes (Users RX); C:\ProgramData FAILS (non-IO
+# Users CreateFiles on subdirectories); a user profile passes (owner+admins).
+function Test-PathChainTrusted {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $violations = @()
+    $p = $Path
+    $guard = 0
+    while ($p -and $guard -lt 32) {
+        $guard++
+        if (Test-Path -LiteralPath $p) {
+            $violations += Test-ObjectDaclTrusted -Path $p
+        }
+        $parent = Split-Path -Parent $p
+        if ($parent -eq $p) { break }
+        $p = $parent
+    }
+    return @($violations | Where-Object { $_ })
+}
+
+# Fail-closed validation of the web.config the gMSA pool will launch from.
+# web.config IS launch configuration: httpPlatform/@processPath names the
+# executable IIS starts as the gMSA. Round 5: this used to be a warning whose
+# XML parse failure was silently swallowed -- a pre-planted or half-migrated
+# web.config kept launching an interpreter inside the gMSA-writable state
+# tree. Now: unparseable/unreadable = refuse (we cannot prove it safe), a
+# processPath inside the STATE tree = refuse, and a processPath outside the
+# RUNTIME tree = refuse (the runtime tree is the only executed tree; that is
+# the whole code/state control).
+function Assert-WebConfigLaunchTrusted {
+    param(
+        [Parameter(Mandatory = $true)][string]$WebConfigPath,
+        [Parameter(Mandatory = $true)][string]$InstallDir,
+        [Parameter(Mandatory = $true)][string]$RuntimeDir,
+        [Parameter(Mandatory = $true)][string]$ExpectedProcessPath
+    )
+    $ErrorActionPreference = 'Stop'
+    $raw = ''
+    try { $raw = Get-Content -LiteralPath $WebConfigPath -Raw } catch {
+        throw ("$WebConfigPath could not be read ($($_.Exception.Message)). It is the gMSA launch " +
+               "configuration; an unreadable launch configuration is refused, not adopted.")
+    }
+    $xml = $null
+    try { $xml = [xml]$raw } catch {
+        throw ("$WebConfigPath is not parseable XML ($($_.Exception.Message)). It is the gMSA " +
+               "launch configuration; an unparseable launch configuration is refused, not adopted.")
+    }
+    $procPath = $xml.configuration.'system.webServer'.httpPlatform.processPath
+    if (-not $procPath) {
+        throw ("$WebConfigPath has no httpPlatform/@processPath. The gMSA launch configuration " +
+               "must name an executable, and it must be the runtime venv:")
+    }
+    $procPath = [string]$procPath
+    if (Test-PathInsideTree -Path $procPath -Tree $InstallDir) {
+        throw ("$WebConfigPath launches `"$procPath`", which is INSIDE the state tree $InstallDir. " +
+               "The gMSA holds Modify on that tree: a worker-writable interpreter is exactly what " +
+               "the code/state split removes. Set processPath to `"$ExpectedProcessPath`" " +
+               "(docs/operator-requirements.md section 4, step 8).")
+    }
+    if (-not (Test-PathInsideTree -Path $procPath -Tree $RuntimeDir)) {
+        throw ("$WebConfigPath launches `"$procPath`", which is OUTSIDE the runtime tree $RuntimeDir. " +
+               "The runtime tree is the only tree whose bytes the gMSA never writes and the only " +
+               "tree permitted to hold executed content. Set processPath to " +
+               "`"$ExpectedProcessPath`" (docs/operator-requirements.md section 1).")
+    }
+}
+
+# Lock a root this run JUST created (New-Item already succeeded, no -Force):
+# protect the DACL immediately, prove the directory is empty, normalise the
+# root's owner -- all WITHOUT Reset-TreeToInherited, whose /reset would strip
+# the DACL again and reopen the window this exists to close.
+#
+# The race this closes (round 5, high): between New-Item and the old claim's
+# protect step sat a reparse walk and a recursive setowner/reset, during which
+# the fresh directory still INHERITED the parent's Users-create rights. A file
+# planted there rode the claim (the claim proof verifies shape, and a plain
+# inherited-DACL dotenv has exactly the shape the tree walk expects of a
+# descendant), survived setowner as Administrators-owned, and was then
+# preserved by the no-clobber branch -- shipping an attacker-chosen EAB
+# allowlist and SAN scope. Here the only writable interval is New-Item to the
+# single atomic DACL swap, and the emptiness check catches anything that
+# slipped through it: after the swap Users hold no create right, so nothing
+# new can appear.
+function Lock-FreshRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Grants,
+        [Parameter(Mandatory = $true)][string]$Purpose,
+        [string[]]$Preserve = @()
+    )
+    $ErrorActionPreference = 'Stop'
+    Set-ObjectProtectedDacl -Path $Path -Grants $Grants
+    $entries = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    if ($entries.Count -gt 0) {
+        $reasons = @("$Path was created empty moments ago and now contains content that was raced " +
+                     "into it while it still inherited create rights from its parent:") +
+                   ($entries | ForEach-Object { "raced entry: $($_.Name)" }) +
+                   @("This is the file-planting race from Daybreak round 5. Treat the content as " +
+                     "hostile: inspect it, delete it, and re-run.")
+        throw (Get-ForeignRootRefusal -Path $Path -Purpose $Purpose -Reasons $reasons -Preserve $Preserve)
+    }
+    foreach ($principal in (Get-AdministratorsOwnerCandidates)) {
+        $out = & icacls.exe $Path /setowner $principal /q /L 2>&1
+        if (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out) { break }
+    }
+}

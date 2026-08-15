@@ -100,6 +100,15 @@ async def post_challenge(
     if payload != {}:
         raise malformed("challenge payload must be an empty object {}")
 
+    # Replay short-circuit (Daybreak round 5): a challenge already ``valid``
+    # is a finished, idempotent operation. Re-running the block below on every
+    # replay rewrote identical state and emitted a fresh audit row per POST --
+    # durable audit growth at the attacker's request rate for an operation
+    # that happened once. Return the current object; the original validation
+    # keeps its row.
+    if challenge.status == "valid":
+        return JSONResponse(content=_challenge_to_json(challenge))
+
     # ------------------------------------------------------------------
     # Enterprise trust decision point.
     #

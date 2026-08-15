@@ -164,6 +164,26 @@ if ($rootRelation -ne 'disjoint') {
            "proofs stay green. Use two separate roots (see docs/operator-requirements.md section 1).")
 }
 
+# Round 5: the SITE tree is the third tree that decides what runs -- web.config
+# is the gMSA launch configuration -- so it is held to the same disjointness
+# rule even though it holds no interpreter bytes itself. A SitePath inside the
+# state tree would put the launch configuration on gMSA-writable ground; a
+# SitePath inside the runtime tree would let a site-content write land on
+# executable bytes.
+$rel = Get-PathRelation -A $SitePath -B $RuntimeDir
+if ($rel -ne 'disjoint') {
+    throw ("-SitePath `"$SitePath`" and -RuntimeDir `"$RuntimeDir`" are not disjoint trees " +
+           "(relation: $rel). web.config under -SitePath is the gMSA launch configuration; " +
+           "it must not live inside either managed tree (see docs/operator-requirements.md section 1).")
+}
+$rel = Get-PathRelation -A $SitePath -B $InstallDir
+if ($rel -ne 'disjoint') {
+    throw ("-SitePath `"$SitePath`" and -InstallDir `"$InstallDir`" are not disjoint trees " +
+           "(relation: $rel). web.config under -SitePath is the gMSA launch configuration; " +
+           "the gMSA holds Modify on the state tree, so the launch configuration must not " +
+           "live there (see docs/operator-requirements.md section 1).")
+}
+
 # --- Prerequisites -----------------------------------------------------------
 # IIS features the installer relies on:
 #   Web-Server          the IIS role itself
@@ -384,29 +404,34 @@ function Initialize-SecuredRoot {
     $prov = Get-RootProvenance -Path $Path -AllowedTrustees $AllowedTrustees `
         -AllowedOwnerSids $AllowedOwnerSids -ProtectedEntries $ProtectedEntries `
         -ForbiddenTopLevelEntries $ForbiddenTopLevelEntries
+    $fresh = $false
     switch ($prov.State) {
         'foreign' {
             throw (Get-ForeignRootRefusal -Path $Path -Purpose $Purpose `
                        -Reasons $prov.Reasons -Preserve $Preserve)
         }
         'absent' {
-            # TOCTOU (Daybreak round 4): between the provenance check above and
-            # this creation, a local attacker can pre-create the predictable
-            # path -- and -Force accepted their directory as if we had made it.
-            # Everything downstream then worked FOR them: setowner /t
-            # normalised their files to Administrators-owned, the reset and
-            # proof passed, the re-protect protected their planted dotenv, and
-            # "preserving operator EAB settings" shipped an attacker-chosen EAB
-            # allowlist and SAN scope. The adoption finding, reopened by race.
-            #
+            # TOCTOU (round 4): between the provenance check above and this
+            # creation, a local attacker can pre-create the predictable path.
             # Create WITHOUT -Force -- on an existing path that THROWS -- and on
             # the collision, re-run the verdict on what actually appeared. A
             # non-administrator cannot set owner to Administrators, so their
             # tree can only re-verify as 'foreign' and hit the refusal above;
             # 'ours' is unreachable for them and the retry cannot loop.
+            #
+            # TOCTOU (round 5, high -- the FILE race the round-4 fix did not
+            # cover): a file planted into the fresh directory while it still
+            # INHERITED the parent's Users-create rights rode the entire claim
+            # (the claim proof verifies shape, and a plain inherited-DACL
+            # dotenv has exactly the shape the tree walk expects of a
+            # descendant), survived setowner as Administrators-owned, and was
+            # preserved by the no-clobber branch -- shipping attacker-chosen
+            # EAB/SAN policy. Lock-FreshRoot closes it: protect the DACL in
+            # one atomic swap the instant the directory exists, then PROVE the
+            # directory empty -- anything present was raced in during the only
+            # window that remained, and the install refuses.
             try {
                 New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
-                Write-Host "  [ok]   created $Path"
             } catch {
                 if (-not (Test-Path -LiteralPath $Path)) { throw }
                 Write-Host "  [!!]  $Path appeared between the absence check and creation -- re-verifying it"
@@ -418,19 +443,28 @@ function Initialize-SecuredRoot {
                                -Reasons $prov.Reasons -Preserve $Preserve)
                 }
                 Write-Host "  [ok]   $Path recognised as a previous install of this RA"
+                break
             }
+            Lock-FreshRoot -Path $Path -Grants $Grants -Purpose $Purpose -Preserve $Preserve
+            $fresh = $true
+            Write-Host "  [ok]   created $Path (protected at creation and verified empty)"
         }
         default {
             Write-Host "  [ok]   $Path recognised as a previous install of this RA"
         }
     }
-    # Normalise ownership and discard every explicit ACE, then apply exactly our
-    # grants, then read the whole tree back and prove it. The proof is not
-    # ceremony: "we ran icacls" is not evidence, and this is the same evidence
-    # the NEXT run's pre-flight will demand.
-    Assert-NoReparsePoints -Path $Path -Context "$Purpose claim"
-    Reset-TreeToInherited -Path $Path
-    Set-ObjectProtectedDacl -Path $Path -Grants $Grants
+    # An existing tree: normalise ownership and discard every explicit ACE,
+    # then apply exactly our grants, then read the whole tree back and prove
+    # it. The proof is not ceremony: "we ran icacls" is not evidence, and this
+    # is the same evidence the NEXT run's pre-flight will demand. A FRESH tree
+    # skips the reset deliberately: /reset would strip the DACL Lock-FreshRoot
+    # just applied and reopen the window it exists to close (and there is
+    # nothing in an empty tree to normalise).
+    if (-not $fresh) {
+        Assert-NoReparsePoints -Path $Path -Context "$Purpose claim"
+        Reset-TreeToInherited -Path $Path
+        Set-ObjectProtectedDacl -Path $Path -Grants $Grants
+    }
     Assert-InstallTreeLocked -Root $Path -AllowedTrustees $AllowedTrustees `
         -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18') `
         -ForbiddenTopLevelEntries $ForbiddenTopLevelEntries
@@ -569,6 +603,21 @@ foreach ($l in $launchers) {
         Write-Host "  [skip] $label -- Windows Store alias ($($cmd.Source)), unusable non-interactively"
         continue
     }
+    # Round 5: prove the candidate AND its whole ancestor chain are
+    # administrator-only BEFORE the first probe executes it elevated. The
+    # version probe below IS execution; "it was on PATH" is not provenance
+    # (C:\ProgramData, a loosened C:\Python3xx, or a writable PATH entry are
+    # all places a low-privilege user can plant an interpreter that elevated
+    # code would then run). The check's baseline semantics were surveyed on
+    # the lab host: %ProgramFiles% chains pass, %ProgramData% fails (non-IO
+    # Users CreateFiles), the running admin's profile passes (owner+admins).
+    $chainProbePath = if ($cmd.Source) { $cmd.Source } else { $l.Exe }
+    $chainViol = Test-PathChainTrusted -Path $chainProbePath
+    if (@($chainViol).Count -gt 0) {
+        Write-Host "  [skip] $label -- candidate or its ancestor chain is not administrator-only:"
+        foreach ($v in @($chainViol | Select-Object -First 4)) { Write-Host "         $v" }
+        continue
+    }
     $r = Invoke-PyProbe -Exe $l.Exe -Arguments ($l.Args + @("--version"))
     if ($r.ExitCode -ne 0) { Write-Host "  [fail] $label -- exit $($r.ExitCode)"; continue }
     $ver = ($r.Output -split "`n" | Where-Object { $_ -match "^Python\s+\d" } | Select-Object -First 1).Trim()
@@ -583,6 +632,18 @@ foreach ($l in $launchers) {
                     if ($candidate -and (Test-Path $candidate -ErrorAction SilentlyContinue)) { $resolved = $candidate }
                 }
             } catch { }
+            if ($resolved) {
+                # The self-resolved interpreter can live elsewhere than the
+                # launcher that produced it (py.exe in C:\Windows, python.exe
+                # wherever it was installed) -- gate it on its own chain too,
+                # before the runtime build adopts it.
+                $resolvedViol = Test-PathChainTrusted -Path $resolved
+                if (@($resolvedViol).Count -gt 0) {
+                    Write-Host "  [skip] $label -- resolved interpreter $resolved is not administrator-only:"
+                    foreach ($v in @($resolvedViol | Select-Object -First 4)) { Write-Host "         $v" }
+                    continue
+                }
+            }
             $major = $mj; $minor = $mn
             if ($resolved) {
                 Write-Host "  [ok]   $label -- $ver (resolved: $resolved)"
@@ -900,29 +961,19 @@ Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees $raTrustees `
     -ForbiddenTopLevelEntries $stateForbiddenEntries
 Write-Host "  [ok]   state tree verified locked (ownership + DACLs read back and proven)"
 
-# --- A preserved web.config must not keep launching a STATE-TREE interpreter ---
+# --- The web.config the pool launches from is launch configuration ----------
 #
-# Daybreak round 4, second half of the legacy-layout finding: on a half-done
-# section-4 migration (old venv directories removed, web.config untouched) the
-# install succeeds and stays green while the pool keeps launching whatever
-# processPath names -- and a processPath under %ProgramData% points the worker
-# at an interpreter it can MODIFY. The path is usually gone by then (503,
-# fail-closed), but refuse to be silent about it: name the exact line to fix.
+# Daybreak round 5: this check used to be a warning with a swallowed parse
+# failure, which meant a pre-planted or half-migrated web.config kept
+# launching an interpreter inside the gMSA-writable state tree while the
+# install stayed green. It is a refusal now, on every run: web.config names
+# the executable IIS starts as the gMSA, so an unprovable launch
+# configuration fails the install, on the exact commit being shipped.
 $siteWcPath = Join-Path $SitePath 'web.config'
 if (Test-Path -LiteralPath $siteWcPath) {
-    try {
-        [xml]$siteWcXml = (Get-Content -LiteralPath $siteWcPath -Raw)
-        $procPath = $siteWcXml.configuration.'system.webServer'.httpPlatform.processPath
-        if ($procPath -and (Test-PathInsideTree -Path $procPath -Tree $InstallDir)) {
-            Write-Host ""
-            Write-Host ("[!!] $siteWcPath launches `"$procPath`", which is INSIDE the state tree $InstallDir.")
-            Write-Host "     The gMSA holds Modify on that tree: a worker-writable interpreter is exactly what"
-            Write-Host "     the code/state split removes. The app pool will keep using it until you change"
-            Write-Host "     processPath to:"
-            Write-Host "       $venv\Scripts\python.exe"
-            Write-Host "     (docs/operator-requirements.md section 4, step 8.)"
-        }
-    } catch { }
+    Assert-WebConfigLaunchTrusted -WebConfigPath $siteWcPath -InstallDir $InstallDir `
+        -RuntimeDir $RuntimeDir -ExpectedProcessPath "$venv\Scripts\python.exe"
+    Write-Host "  [ok]   $siteWcPath launch configuration verified (processPath inside the runtime tree)"
 }
 
 # --- Grant the gMSA "Log on as a service" (best-effort) ----------------------
@@ -971,7 +1022,42 @@ if ($ConfigureIIS) {
     } else {
         Import-Module WebAdministration
 
-        if (-not (Test-Path $SitePath)) { New-Item -ItemType Directory -Force -Path $SitePath | Out-Null }
+        # Round 5: SitePath is the third security-relevant tree -- web.config
+        # inside it is the gMSA launch configuration. A pre-existing site tree
+        # must PROVE itself (no reparse points, every object administrator-
+        # owned, no write-class ACE for a broad trustee anywhere in it) or the
+        # install refuses; a fresh one is created locked-at-birth exactly like
+        # the managed roots. The earlier code adopted whatever was on disk.
+        $siteGrants = @(
+            '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)RX')
+        )
+        $siteFresh = $false
+        if (Test-Path -LiteralPath $SitePath) {
+            Write-Host "  Proving the pre-existing site tree $SitePath ..."
+            $reparse = @(Find-ReparsePoints -Path $SitePath)
+            if ($reparse.Count -gt 0) {
+                throw ("$SitePath contains reparse points ($($reparse -join ', ')). A link inside the " +
+                       "launch-configuration tree can redirect what IIS reads as the gMSA launch " +
+                       "configuration. Remove or rename the site directory and re-run.")
+            }
+            $siteViol = @()
+            foreach ($obj in @(Get-Item -LiteralPath $SitePath -Force; Get-ChildItem -LiteralPath $SitePath -Recurse -Force)) {
+                $siteViol += Test-ObjectDaclTrusted -Path $obj.FullName -AlsoFlagTrustees @($GmsaAccount, $gmsaSid)
+            }
+            if (@($siteViol).Count -gt 0) {
+                throw ("The pre-existing site tree $SitePath is not administrator-only:`n  " +
+                       (($siteViol | Select-Object -First 8) -join "`n  ") +
+                       "`nweb.config under it is the gMSA launch configuration: a tree a local user " +
+                       "can write is a tree that decides what runs as the gMSA. Inspect the site " +
+                       "directory, remove or rename it, and re-run so this installer creates it locked.")
+            }
+            Write-Host "  [ok]   site tree proven: administrator-only, no reparse points"
+        } else {
+            New-Item -ItemType Directory -Path $SitePath -ErrorAction Stop | Out-Null
+            Lock-FreshRoot -Path $SitePath -Grants $siteGrants -Purpose 'site (web.config, launch configuration)' -Preserve @()
+            $siteFresh = $true
+            Write-Host "  [ok]   created $SitePath (protected at creation and verified empty)"
+        }
 
         $webConfigSrc = Join-Path $repoRoot "deploy\iis\web.config"
         $webConfigDst = Join-Path $SitePath "web.config"
@@ -997,6 +1083,16 @@ if ($ConfigureIIS) {
             [System.IO.File]::WriteAllText($webConfigDst, $wcContent, (New-Object System.Text.UTF8Encoding $false))
             Write-Host "  Wrote template web.config -- EDIT ACME_RA_BASE_URL + ACME_RA_ADCS_* before first use."
         }
+
+        # Round 5: validate the launch configuration BEFORE IIS is reconfigured
+        # and before the pool starts -- preserved operator settings included.
+        # Unparseable or missing processPath, or a processPath outside the
+        # runtime tree (worst case inside the gMSA-writable state tree), is a
+        # refusal, not a warning: this file decides which executable IIS
+        # starts as the gMSA.
+        Assert-WebConfigLaunchTrusted -WebConfigPath $webConfigDst -InstallDir $InstallDir `
+            -RuntimeDir $RuntimeDir -ExpectedProcessPath "$venv\Scripts\python.exe"
+        Write-Host "  [ok]   launch configuration verified (processPath inside the runtime tree)"
 
         Write-Host "  Unlocking system.webServer/handlers ..."
         & $appcmdExe unlock config -section:system.webServer/handlers
@@ -1085,11 +1181,15 @@ if ($ConfigureIIS) {
 
         # /L: the site path is as predictable as the install root, and this
         # grant runs elevated -- it must not be redirectable by a link either
-        # (2026-08-15 rescan-2 F2).
-        $siteAclOut = & icacls.exe $SitePath /grant "${GmsaAccount}:(OI)(CI)R" /L 2>&1
-        if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $siteAclOut)) {
-            throw ("Failed to grant the gMSA read access to $SitePath (exit $LASTEXITCODE): " +
-                   (($siteAclOut | Out-String).Trim()))
+        # (2026-08-15 rescan-2 F2). A site tree created THIS run already
+        # carries the grant (Lock-FreshRoot), and a duplicate /grant would add
+        # a second gMSA ACE to the protected DACL.
+        if (-not $siteFresh) {
+            $siteAclOut = & icacls.exe $SitePath /grant "${GmsaAccount}:(OI)(CI)R" /L 2>&1
+            if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $siteAclOut)) {
+                throw ("Failed to grant the gMSA read access to $SitePath (exit $LASTEXITCODE): " +
+                       (($siteAclOut | Out-String).Trim()))
+            }
         }
 
         Write-Host "  Starting app pool `"$AppPool`" ..."
