@@ -903,3 +903,152 @@ Describe 'Root and dotenv ownership are held strictly (rescan-3 audit)' {
             Should -BeTrue
     }
 }
+
+# --- Daybreak round 4 (2026-08-15): four findings on the two-tree installer ---
+#
+#   M1  TOCTOU on first-install state-root creation: New-Item -Force adopted a
+#       directory raced into the gap after the absence check; setowner /t then
+#       normalised the attacker's files and the planted dotenv shipped.
+#   M2  A clean legacy single-tree layout passes the generic trustee/owner/DACL
+#       provenance check (same SIDs, plain inheritance) while the preserved
+#       web.config keeps launching the old gMSA-writable ProgramData venv.
+#   L1  Bare py/python names through cmd /c resolve from the CWD first.
+#   L2  Overlapping -RuntimeDir/-InstallDir silently collapse the RX/Modify
+#       boundary; both grant sets have the same proof shape, so everything
+#       reads back green.
+
+Describe 'Get-PathRelation / Test-PathInsideTree (L2: the boundary must be two trees)' {
+    It 'identifies equal roots across case and trailing-slash noise' {
+        Get-PathRelation -A 'C:\Program Files\acme-adcs-ra' -B 'c:\program files\ACME-ADCS-RA\' |
+            Should -Be 'equal'
+    }
+
+    It 'identifies state nested inside the runtime tree' {
+        Get-PathRelation -A 'C:\ra\state' -B 'C:\ra' | Should -Be 'a-inside-b'
+        Get-PathRelation -A 'C:\ra' -B 'C:\ra\state' | Should -Be 'b-inside-a'
+    }
+
+    It 'treats a drive root as containing its children, not as equal' {
+        Get-PathRelation -A 'C:\x' -B 'C:' | Should -Be 'a-inside-b'
+        Get-PathRelation -A 'C:' -B 'C:\x' | Should -Be 'b-inside-a'
+    }
+
+    It 'identifies the two default roots as disjoint' {
+        Get-PathRelation -A 'C:\Program Files\acme-adcs-ra' -B 'C:\ProgramData\acme-adcs-ra' |
+            Should -Be 'disjoint'
+    }
+
+    It 'Test-PathInsideTree: a ProgramData processPath is inside the state tree' {
+        Test-PathInsideTree -Path 'C:\ProgramData\acme-adcs-ra\venv\Scripts\python.exe' `
+            -Tree 'C:\ProgramData\acme-adcs-ra' | Should -BeTrue
+        Test-PathInsideTree -Path 'C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe' `
+            -Tree 'C:\ProgramData\acme-adcs-ra' | Should -BeFalse
+    }
+
+    It 'Test-PathInsideTree: a sibling with a shared prefix is NOT inside' {
+        Test-PathInsideTree -Path 'C:\ProgramData\acme-adcs-ra-legacy\x' `
+            -Tree 'C:\ProgramData\acme-adcs-ra' | Should -BeFalse
+    }
+}
+
+Describe 'Get-InstallTreeViolations: executable content at the state root (M2)' {
+    BeforeAll {
+        $script:root = New-Item -ItemType Directory -Force -Path (Join-Path ([IO.Path]::GetTempPath()) ("ra-forbidden-" + [guid]::NewGuid().ToString('N')))
+        # A plausible clean legacy tree: venv + python + scripts + the data files.
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:root 'venv\Scripts') | Out-Null
+        Set-Content (Join-Path $script:root 'venv\Scripts\python.exe') 'fake interpreter'
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:root 'python') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:root 'scripts') | Out-Null
+        Set-Content (Join-Path $script:root 'acme_ra.db') 'db'
+        Set-Content (Join-Path $script:root 'acme-ra.env') 'env'
+        $script:allowed = @('S-1-5-32-544', 'S-1-5-18', 'BA', 'SY')
+    }
+    AfterAll { Remove-Item -LiteralPath $script:root -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'refuses a legacy venv at the state root, naming it as executable content' {
+        $v = @(Get-InstallTreeViolations -Root $script:root.FullName -AllowedTrustees $script:allowed `
+            -ForbiddenTopLevelEntries @('venv', 'python', 'scripts'))
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'venv : executable content at the state tree root'
+        ($v -join ' ') | Should -Match 'operator-requirements\.md section 4'
+    }
+
+    It 'the refusal is decided BEFORE the icacls walk, so it is the only violation' {
+        # On Linux icacls.exe does not exist, so any test that reaches the ACL
+        # stage picks up an icacls failure violation. Exactly one violation
+        # here proves the forbidden check short-circuits the walk.
+        $v = @(Get-InstallTreeViolations -Root $script:root.FullName -AllowedTrustees $script:allowed `
+            -ForbiddenTopLevelEntries @('venv', 'python', 'scripts'))
+        $v.Count | Should -Be 1
+    }
+
+    It 'does not fire on a tree without the forbidden names, with or without the parameter' {
+        # On Linux the ACL stage cannot run (no icacls.exe), so a tree that
+        # passes the forbidden check surfaces an icacls error instead of
+        # violations. Either way the forbidden-content message must NOT appear.
+        $clean = New-Item -ItemType Directory -Force -Path (Join-Path $script:root.FullName 'sub-clean')
+        Set-Content (Join-Path $clean 'acme_ra.db') 'db'
+        foreach ($withList in @($true, $false)) {
+            $out = ''
+            try {
+                $args_ = @{ Root = $clean.FullName; AllowedTrustees = $script:allowed }
+                if ($withList) { $args_['ForbiddenTopLevelEntries'] = @('venv', 'python', 'scripts') }
+                $out = (Get-InstallTreeViolations @args_) -join ' '
+            } catch { $out = "$_" }
+            $out | Should -Not -Match 'executable content at the state tree root'
+        }
+    }
+}
+
+Describe 'install-windows.ps1: Daybreak round 4 fixes' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    It 'M1: creates an absent root WITHOUT -Force and re-verifies on collision' {
+        $absent = $script:installer.IndexOf("'absent' {")
+        $absent | Should -BeGreaterThan 0
+        $branch = $script:installer.Substring($absent, [Math]::Min(2200, $script:installer.Length - $absent))
+        # Creation that THROWS on an existing path -- no -Force anywhere in it.
+        $branch | Should -Match 'New-Item -ItemType Directory -Path \$Path -ErrorAction Stop'
+        $branch | Should -Not -Match 'New-Item -ItemType Directory -Force'
+        # ...and the collision path re-runs the provenance verdict rather than
+        # adopting whatever appeared.
+        $branch | Should -Match 'Get-RootProvenance -Path \$Path'
+        $branch | Should -Match "prov\.State -ne 'ours'"
+    }
+
+    It 'M2: the state claim, the final proof and the rollback proof all forbid legacy executable names' {
+        @([regex]::Matches($script:installer, 'ForbiddenTopLevelEntries \$stateForbiddenEntries')).Count |
+            Should -Be 3   # the state claim, the rollback re-proof, the final proof
+        $script:installer | Should -Match '\$stateForbiddenEntries = @\(''venv'', ''python'', ''scripts''\)'
+        # The runtime claim must NOT pass the list: its venv is legitimate.
+        $rt = $script:installer.IndexOf('Initialize-SecuredRoot -Path $RuntimeDir')
+        $rtCall = $script:installer.Substring($rt, 120)
+        $rtCall | Should -Not -Match 'ForbiddenTopLevelEntries'
+    }
+
+    It 'M2: warns loudly when a preserved web.config launches a state-tree interpreter' {
+        $script:installer | Should -Match 'Test-PathInsideTree -Path \$procPath -Tree \$InstallDir'
+        $script:installer | Should -Match 'worker-writable interpreter'
+    }
+
+    It 'L1: disables CWD executable lookup before any cmd /c, and resolves bare probe names' {
+        $envSet = $script:installer.IndexOf("NoDefaultCurrentDirectoryInExePath = '1'")
+        $probe = $script:installer.IndexOf('function Invoke-PyProbe')
+        $envSet | Should -BeGreaterThan 0
+        $probe | Should -BeGreaterThan $envSet
+        $script:installer | Should -Match 'Get-Command \$Exe -ErrorAction SilentlyContinue'
+    }
+
+    It 'L2: refuses overlapping runtime/state roots before touching the host' {
+        $ov = $script:installer.IndexOf('Get-PathRelation -A $RuntimeDir -B $InstallDir')
+        $ov | Should -BeGreaterThan 0
+        # The refusal must precede every host mutation: the pool stop, both
+        # claims, and the runtime build.
+        foreach ($marker in @('Stop-AppPoolAndWait', 'Initialize-SecuredRoot -Path $RuntimeDir', 'Reset-RuntimeDirectory')) {
+            $script:installer.IndexOf($marker) | Should -BeGreaterThan $ov
+        }
+        $script:installer | Should -Match "rootRelation -ne 'disjoint'"
+    }
+}

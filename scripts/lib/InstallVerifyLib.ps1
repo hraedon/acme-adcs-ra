@@ -331,6 +331,37 @@ function Get-IcaclsDumpText {
     return [System.Text.Encoding]::Default.GetString($bytes)
 }
 
+# Relation of two Windows path strings, normalised for case and trailing
+# separators: 'equal', 'a-inside-b', 'b-inside-a' or 'disjoint'. Pure string
+# logic (no filesystem, no GetFullPath) so the Linux Pester run can drive it
+# with Windows-shaped paths. Used to refuse overlapping -RuntimeDir/-InstallDir:
+# the ACL boundary between the two trees IS the code/state control, and nested
+# roots would let one tree's grants apply to the other's subtree.
+function Get-PathRelation {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$A,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$B
+    )
+    $na = (@($A -split '\\') | Where-Object { $_ }) -join '\'
+    $nb = (@($B -split '\\') | Where-Object { $_ }) -join '\'
+    if ($na -eq $nb) { return 'equal' }
+    if ($na.StartsWith($nb + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return 'a-inside-b' }
+    if ($nb.StartsWith($na + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return 'b-inside-a' }
+    return 'disjoint'
+}
+
+# Is $Path equal to or underneath $Tree? (Used for the preserved-web.config
+# check: a processPath inside the state tree is a worker-writable interpreter.)
+function Test-PathInsideTree {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Tree
+    )
+    if (-not $Path -or -not $Tree) { return $false }
+    $rel = Get-PathRelation -A $Path -B $Tree
+    return ($rel -eq 'equal' -or $rel -eq 'a-inside-b')
+}
+
 # Pure decision function over an `icacls <root> /save <file> [/t]` dump: does
 # the dump describe a LOCKED tree? Returns an array of violation strings --
 # EMPTY means locked. No I/O, so tests/pester can drive it with fixture dumps
@@ -493,7 +524,16 @@ function Get-InstallTreeViolations {
         # non-administrator created is owned by them, and that is the single
         # most reliable signal that a tree is not ours.
         [string[]]$RootOwnerSids = @('S-1-5-32-544', 'S-1-5-18'),
-        [hashtable]$ProtectedEntries = @{}
+        [hashtable]$ProtectedEntries = @{},
+        # Top-level entry names that must NOT exist under this root (state tree
+        # only). The pre-split layout kept venv\, python\ and scripts\ in what
+        # is now the state tree, and its trustee/owner/DACL shape otherwise
+        # MATCHES ours -- same SIDs, plain inheritance -- so a clean legacy
+        # tree passed the generic checks below as 'ours' (Daybreak round 4).
+        # But the gMSA holds Modify on this tree, so an adopted interpreter
+        # there is a worker-writable interpreter: exactly what the split exists
+        # to end.
+        [string[]]$ForbiddenTopLevelEntries = @()
     )
     $violations = @()
 
@@ -506,6 +546,20 @@ function Get-InstallTreeViolations {
         Assert-NoReparsePoints -Path $Root -Context 'tree proof'
     } catch {
         return @($_.Exception.Message)
+    }
+
+    # Known executable content at the root: refuse EARLY, before the owner walk
+    # and the icacls dump -- the tree is not adoptable regardless of how clean
+    # its ACLs are, and this stays decidable on Linux (no icacls needed), which
+    # is how the Pester suite exercises it.
+    foreach ($name in @($ForbiddenTopLevelEntries)) {
+        if ($name -and (Test-Path -LiteralPath (Join-Path $Root $name))) {
+            return @(("{0}\{1} : executable content at the state tree root -- the pre-split " -f $Root, $name) +
+                     "single-tree layout put the interpreter, the venv and the operator scripts here, " +
+                     "and the gMSA holds Modify on this tree, so nothing under it may be executed. " +
+                     "A preserved web.config would keep launching a worker-writable interpreter. " +
+                     "Migrate per docs/operator-requirements.md section 4; this tree is not adoptable.")
+        }
     }
 
     # EVERY object's owner, not just the root's (rescan-2 F3). An owner holds
@@ -579,12 +633,13 @@ function Assert-InstallTreeLocked {
         [Parameter(Mandatory = $true)][string[]]$AllowedTrustees,
         [string[]]$AllowedOwnerSids = @('S-1-5-32-544', 'S-1-5-18'),
         [string[]]$RootOwnerSids = @('S-1-5-32-544', 'S-1-5-18'),
-        [hashtable]$ProtectedEntries = @{}
+        [hashtable]$ProtectedEntries = @{},
+        [string[]]$ForbiddenTopLevelEntries = @()
     )
     $ErrorActionPreference = 'Stop'
     $violations = @(Get-InstallTreeViolations -Root $Root -AllowedTrustees $AllowedTrustees `
         -AllowedOwnerSids $AllowedOwnerSids -RootOwnerSids $RootOwnerSids `
-        -ProtectedEntries $ProtectedEntries)
+        -ProtectedEntries $ProtectedEntries -ForbiddenTopLevelEntries $ForbiddenTopLevelEntries)
     if (@($violations).Count -gt 0) {
         $shown = @($violations) | Select-Object -First 10
         throw ("Install-tree ACL verification FAILED (" + @($violations).Count + " violation(s)); " +
@@ -838,7 +893,8 @@ function Get-RootProvenance {
         # that recreated the state root -- or the dotenv inside it -- passed the
         # pre-flight as "ours" on the next install.
         [string[]]$RootOwnerSids = @('S-1-5-32-544', 'S-1-5-18'),
-        [hashtable]$ProtectedEntries = @{}
+        [hashtable]$ProtectedEntries = @{},
+        [string[]]$ForbiddenTopLevelEntries = @()
     )
     if (-not (Test-Path -LiteralPath $Path)) {
         return @{ State = 'absent'; Reasons = @() }
@@ -853,7 +909,7 @@ function Get-RootProvenance {
     }
     $violations = @(Get-InstallTreeViolations -Root $Path -AllowedTrustees $AllowedTrustees `
         -AllowedOwnerSids $AllowedOwnerSids -RootOwnerSids $RootOwnerSids `
-        -ProtectedEntries $ProtectedEntries)
+        -ProtectedEntries $ProtectedEntries -ForbiddenTopLevelEntries $ForbiddenTopLevelEntries)
     if (@($violations).Count -gt 0) {
         return @{ State = 'foreign'; Reasons = @($violations) }
     }

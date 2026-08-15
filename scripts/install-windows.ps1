@@ -121,6 +121,15 @@ $ErrorActionPreference = "Stop"
 # without a signed file or a live download.
 . "$PSScriptRoot/lib/InstallVerifyLib.ps1"
 
+# Bare executable names handed to `cmd /c` resolve from the CURRENT DIRECTORY
+# before PATH (Daybreak round 4). An elevated shell whose CWD is user-writable
+# (a extracted source tree under %TEMP%, a share, a Downloads folder) would
+# execute a planted python.exe/py.exe AS ADMINISTRATOR during the interpreter
+# probe below. Defining this variable removes the CWD from the child-process
+# search path for this process and everything it launches. PowerShell itself
+# never searches the CWD for commands, so only the cmd /c call sites needed it.
+$env:NoDefaultCurrentDirectoryInExePath = '1'
+
 # --- Must be elevated (we write under ProgramData, set ACLs, configure IIS) ---
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -136,6 +145,24 @@ $runtimeCurrent = Join-Path $RuntimeDir "current"
 $venv     = Join-Path $runtimeCurrent "venv"
 $logs     = Join-Path $InstallDir "logs"
 $envFile  = Join-Path $InstallDir "acme-ra.env"
+
+# --- The two roots must be DISJOINT (Daybreak round 4) ------------------------
+#
+# The RX/Modify boundary between the trees IS the control. If the state root is
+# inside the runtime tree, the state claim's recursive reset re-applies Modify
+# over a code subtree; if they are the same directory, the two grant sets
+# collapse onto one tree and the gMSA ends up with Modify over the interpreter
+# it runs -- with every read-back proof green, because the proof checks SHAPE
+# (trustees, protection, inheritance) and both grant sets have the same shape.
+# Refuse before anything on the host is touched.
+$rootRelation = Get-PathRelation -A $RuntimeDir -B $InstallDir
+if ($rootRelation -ne 'disjoint') {
+    throw ("-RuntimeDir `"$RuntimeDir`" and -InstallDir `"$InstallDir`" are not disjoint trees " +
+           "(relation: $rootRelation). The ACL boundary between them is the entire control -- " +
+           "gMSA read+execute on code, modify on state, never both on one tree -- and nested or " +
+           "equal roots make one grant set apply to the other's subtree while the read-back " +
+           "proofs stay green. Use two separate roots (see docs/operator-requirements.md section 1).")
+}
 
 # --- Prerequisites -----------------------------------------------------------
 # IIS features the installer relies on:
@@ -349,20 +376,49 @@ function Initialize-SecuredRoot {
         [Parameter(Mandatory = $true)][string[]]$AllowedTrustees,
         [string[]]$AllowedOwnerSids = @('S-1-5-32-544', 'S-1-5-18'),
         [hashtable]$ProtectedEntries = @{},
+        [string[]]$ForbiddenTopLevelEntries = @(),
         [string[]]$Preserve = @()
     )
     $ErrorActionPreference = 'Stop'
     Write-Host "Claiming $Purpose root $Path ..."
     $prov = Get-RootProvenance -Path $Path -AllowedTrustees $AllowedTrustees `
-        -AllowedOwnerSids $AllowedOwnerSids -ProtectedEntries $ProtectedEntries
+        -AllowedOwnerSids $AllowedOwnerSids -ProtectedEntries $ProtectedEntries `
+        -ForbiddenTopLevelEntries $ForbiddenTopLevelEntries
     switch ($prov.State) {
         'foreign' {
             throw (Get-ForeignRootRefusal -Path $Path -Purpose $Purpose `
                        -Reasons $prov.Reasons -Preserve $Preserve)
         }
         'absent' {
-            New-Item -ItemType Directory -Force -Path $Path | Out-Null
-            Write-Host "  [ok]   created $Path"
+            # TOCTOU (Daybreak round 4): between the provenance check above and
+            # this creation, a local attacker can pre-create the predictable
+            # path -- and -Force accepted their directory as if we had made it.
+            # Everything downstream then worked FOR them: setowner /t
+            # normalised their files to Administrators-owned, the reset and
+            # proof passed, the re-protect protected their planted dotenv, and
+            # "preserving operator EAB settings" shipped an attacker-chosen EAB
+            # allowlist and SAN scope. The adoption finding, reopened by race.
+            #
+            # Create WITHOUT -Force -- on an existing path that THROWS -- and on
+            # the collision, re-run the verdict on what actually appeared. A
+            # non-administrator cannot set owner to Administrators, so their
+            # tree can only re-verify as 'foreign' and hit the refusal above;
+            # 'ours' is unreachable for them and the retry cannot loop.
+            try {
+                New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
+                Write-Host "  [ok]   created $Path"
+            } catch {
+                if (-not (Test-Path -LiteralPath $Path)) { throw }
+                Write-Host "  [!!]  $Path appeared between the absence check and creation -- re-verifying it"
+                $prov = Get-RootProvenance -Path $Path -AllowedTrustees $AllowedTrustees `
+                    -AllowedOwnerSids $AllowedOwnerSids -ProtectedEntries $ProtectedEntries `
+                    -ForbiddenTopLevelEntries $ForbiddenTopLevelEntries
+                if ($prov.State -ne 'ours') {
+                    throw (Get-ForeignRootRefusal -Path $Path -Purpose $Purpose `
+                               -Reasons $prov.Reasons -Preserve $Preserve)
+                }
+                Write-Host "  [ok]   $Path recognised as a previous install of this RA"
+            }
         }
         default {
             Write-Host "  [ok]   $Path recognised as a previous install of this RA"
@@ -376,9 +432,19 @@ function Initialize-SecuredRoot {
     Reset-TreeToInherited -Path $Path
     Set-ObjectProtectedDacl -Path $Path -Grants $Grants
     Assert-InstallTreeLocked -Root $Path -AllowedTrustees $AllowedTrustees `
-        -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18')
+        -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18') `
+        -ForbiddenTopLevelEntries $ForbiddenTopLevelEntries
     Write-Host "  [ok]   $Purpose root secured (ownership + DACLs read back and proven)"
 }
+
+# Entry names that must never sit at the STATE root. 'venv' and 'python' are
+# the pre-split layout's interpreter trees; 'scripts' was the operator-scripts
+# copy. A legacy tree otherwise matches our trustee/owner/DACL shape, so these
+# names are what distinguishes "old single-tree install" from "ours" (Daybreak
+# round 4, medium -- a clean legacy tree passed the generic check as 'ours'
+# while the preserved web.config kept launching the gMSA-writable ProgramData
+# venv).
+$stateForbiddenEntries = @('venv', 'python', 'scripts')
 
 Initialize-SecuredRoot -Path $RuntimeDir -Purpose 'runtime (code)' `
     -Grants $runtimeGrants -AllowedTrustees $raTrustees
@@ -387,6 +453,7 @@ Initialize-SecuredRoot -Path $InstallDir -Purpose 'state (database, logs, secret
     -Grants $stateGrants -AllowedTrustees $raTrustees `
     -AllowedOwnerSids $stateOwnerSids `
     -ProtectedEntries @{ 'acme-ra.env' = $raTrustees } `
+    -ForbiddenTopLevelEntries $stateForbiddenEntries `
     -Preserve @("$InstallDir\acme_ra.db", "$InstallDir\acme-ra.env", "$InstallDir\logs")
 
 # The /reset inside the claim just stripped EVERY descendant's explicit DACL --
@@ -442,6 +509,16 @@ if (Get-Command Test-ADServiceAccount -ErrorAction SilentlyContinue) {
 # stubs, arg mangling). Probe via cmd /c, then resolve the real python.exe.
 function Invoke-PyProbe {
     param([string]$Exe, [string[]]$Arguments)
+    # Resolve a BARE name to the absolute path PowerShell discovered on PATH
+    # (PowerShell never searches the CWD; cmd.exe does). The
+    # NoDefaultCurrentDirectoryInExePath setting above closes the CWD lookup,
+    # and this closes passing a bare name through to cmd at all -- belt and
+    # braces, because the probe output decides which interpreter the elevated
+    # install runs for the rest of the script (Daybreak round 4).
+    if ($Exe -notmatch '[\\/]') {
+        $resolved = Get-Command $Exe -ErrorAction SilentlyContinue
+        if ($resolved -and $resolved.Source) { $Exe = $resolved.Source }
+    }
     $argStr = ($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
     $tmp = Join-Path $env:TEMP "ra-py-probe.txt"
     & cmd /c "`"$Exe`" $argStr > `"$tmp`" 2>&1"
@@ -748,7 +825,8 @@ Write-Host "  Installed acme-adcs-ra version: $installedVer"
             )
             Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees $raTrustees `
                 -AllowedOwnerSids $stateOwnerSids `
-                -ProtectedEntries @{ 'acme-ra.env' = $raTrustees }
+                -ProtectedEntries @{ 'acme-ra.env' = $raTrustees } `
+                -ForbiddenTopLevelEntries $stateForbiddenEntries
             Write-Host "  [ok]   state tree re-protected and re-proven (dotenv gMSA read-only)"
         }
     } catch {
@@ -818,8 +896,34 @@ Set-ObjectProtectedDacl -Path $envFile -Grants @(
 )
 Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees $raTrustees `
     -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18') `
-    -ProtectedEntries @{ 'acme-ra.env' = $raTrustees }
+    -ProtectedEntries @{ 'acme-ra.env' = $raTrustees } `
+    -ForbiddenTopLevelEntries $stateForbiddenEntries
 Write-Host "  [ok]   state tree verified locked (ownership + DACLs read back and proven)"
+
+# --- A preserved web.config must not keep launching a STATE-TREE interpreter ---
+#
+# Daybreak round 4, second half of the legacy-layout finding: on a half-done
+# section-4 migration (old venv directories removed, web.config untouched) the
+# install succeeds and stays green while the pool keeps launching whatever
+# processPath names -- and a processPath under %ProgramData% points the worker
+# at an interpreter it can MODIFY. The path is usually gone by then (503,
+# fail-closed), but refuse to be silent about it: name the exact line to fix.
+$siteWcPath = Join-Path $SitePath 'web.config'
+if (Test-Path -LiteralPath $siteWcPath) {
+    try {
+        [xml]$siteWcXml = (Get-Content -LiteralPath $siteWcPath -Raw)
+        $procPath = $siteWcXml.configuration.'system.webServer'.httpPlatform.processPath
+        if ($procPath -and (Test-PathInsideTree -Path $procPath -Tree $InstallDir)) {
+            Write-Host ""
+            Write-Host ("[!!] $siteWcPath launches `"$procPath`", which is INSIDE the state tree $InstallDir.")
+            Write-Host "     The gMSA holds Modify on that tree: a worker-writable interpreter is exactly what"
+            Write-Host "     the code/state split removes. The app pool will keep using it until you change"
+            Write-Host "     processPath to:"
+            Write-Host "       $venv\Scripts\python.exe"
+            Write-Host "     (docs/operator-requirements.md section 4, step 8.)"
+        }
+    } catch { }
+}
 
 # --- Grant the gMSA "Log on as a service" (best-effort) ----------------------
 # An IIS app pool running as a gMSA needs SeServiceLogonRight, or the pool fails
