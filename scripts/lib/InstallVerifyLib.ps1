@@ -1248,6 +1248,11 @@ function Test-AceEndangersBytes {
     # unless it reaches files -- a real FullControl/Modify ACE always also
     # carries WriteData/Delete/DeleteChild, so it flags through those bits
     # without dragging AppendData (or the read bits) along.
+    # Raw generic bits (observed from Get-Acl on the live host): GenericRead
+    # 0x80000000, GenericWrite 0x40000000, GenericExecute 0x20000000,
+    # GenericAll 0x10000000. Only the write/all two belong here -- the first
+    # live run shipped 0x80000000 as "GenericAll" and flagged every %ProgramFiles%
+    # Users GR,GE ACE as write-class.
     $mask = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
              [int][System.Security.AccessControl.FileSystemRights]::Delete -bor
              [int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
@@ -1255,7 +1260,7 @@ function Test-AceEndangersBytes {
              [int][System.Security.AccessControl.FileSystemRights]::WriteOwner -bor
              [int][System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
              [int][System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
-             0x40000000 -bor 0x80000000      # GenericWrite, GenericAll raw bits
+             0x40000000 -bor 0x10000000      # GenericWrite, GenericAll raw bits
     $inheritObject = ($InheritanceFlags -band [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0
     if ($inheritObject) {
         $mask = $mask -bor [int][System.Security.AccessControl.FileSystemRights]::AppendData
@@ -1267,17 +1272,27 @@ function Test-AceEndangersBytes {
     return (($Rights -band $mask) -ne 0)
 }
 
-# Owners that may hold executable content or its containers. The running
-# administrator's own account owns their profile tree (AppData\Local), which
-# no other local user can write, so it is allowed for that chain.
+# Owners that may hold executable content or its containers, as SIDs
+# (Test-OwnerAllowed compares SID-to-SID). The running administrator's own
+# account owns their profile tree (AppData\Local), which no other local user
+# can write, so it is allowed for that chain; TrustedInstaller owns the
+# %ProgramFiles% roots a real machine-wide install lives under.
 function Get-AllowedExecutableOwners {
-    $allowed = @('S-1-5-32-544', 'S-1-5-18', 'NT SERVICE\TrustedInstaller',
-                 'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')
+    $names = @('S-1-5-32-544', 'S-1-5-18', 'NT SERVICE\TrustedInstaller',
+               'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')
     try {
         $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-        if ($me) { $allowed += $me }
+        if ($me) { $names += $me }
     } catch { }
-    return $allowed
+    $sids = @()
+    foreach ($n in $names) {
+        if ($n -match '^S-1-\d+(-\d+)+$') { $sids += $n; continue }
+        try {
+            $sids += (New-Object System.Security.Principal.NTAccount($n)).Translate(
+                [System.Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+    }
+    return $sids
 }
 
 # One object's owner + DACL as violations against the "administrator-only

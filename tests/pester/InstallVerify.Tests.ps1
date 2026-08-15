@@ -1125,6 +1125,18 @@ Describe 'Test-AceEndangersBytes (round 5: the interpreter chain rule)' {
         $OI = [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit
     }
 
+    It 'raw generic bits: GenericRead and GenericExecute must NOT flag; GenericWrite and GenericAll MUST' {
+        # Found live: the first version of the mask carried 0x80000000 as
+        # "GenericAll" -- it is GenericRead -- and rejected every %ProgramFiles%
+        # Users GR,GE ACE as write-class, blocking the whole install.
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0xA0000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeFalse     # GenericRead|GenericExecute (the Program Files pattern)
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0x40000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeTrue      # GenericWrite
+        Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights 0x10000000 -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
+            Should -BeTrue      # GenericAll
+    }
+
     It 'flags Users CreateFiles on a directory (the ProgramData pattern)' {
         Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $WD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true |
             Should -BeTrue
