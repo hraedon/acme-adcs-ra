@@ -80,9 +80,21 @@ line and two commit-before-audit orderings. All four are fixed on
 `security-review-2026-08-15-daybreak` (takeown+/reset+read-back-proof for the
 tree; switch-only `-AdminToken`/`-ConfirmToken`; account/keyChange audit
 atomicity, fault-injection proven); WI-014 stays deferred. See
-`docs/security-review-2026-08-15-daybreak.md`. **The installer change owes a
-live install run before the next release** — CI executes neither takeown nor
-the read-back proof.
+`docs/security-review-2026-08-15-daybreak.md`. **Daybreak's rescan of that fix
+found two more (both fixed, same branch):** the ACL lockdown bounded *writes*
+but not *bytes* — a planted `python\python.exe` was still preferred and
+executed, and a planted venv `.pth` survived `python -m venv` (now: the shared
+interpreter runs only on strict whole-tree manifest verification against a
+gMSA-unwritable manifest, and the venv is deleted and rebuilt every run); and
+child junctions redirected the recursive `takeown`/`icacls /t` outside the
+tree (now: a never-following reparse-point walk refuses any link, `/L` on
+every icacls traversal; takeown's remaining TOCTOU window is detected
+post-hoc, not prevented — documented). See
+`docs/security-review-2026-08-15-daybreak-rescan.md`. **The installer change
+owes a live install run before the next release — including a fresh install
+into a pre-planted tree (planted `python\python.exe`, planted venv `.pth`,
+child junction) proving refusal/rebuild/abort.** CI executes none of takeown,
+the read-back proof, or the manifest dance.
 
 **Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
 security reviews.** There is **no 1.9.0 release**: that line shipped only as

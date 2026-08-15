@@ -199,6 +199,10 @@ function Reset-TreeToInherited {
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Reset-TreeToInherited: $Path does not exist; nothing to reset."
     }
+    # /L (Daybreak 2026-08-15 rescan F2): operate on links THEMSELVES, never
+    # their targets. takeown below has no /L, so the CALLER must have run
+    # Assert-NoReparsePoints first -- and Assert-InstallTreeLocked re-walks
+    # afterwards to catch anything planted into the window between the two.
     & takeown.exe /f $Path /r /a /d y | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw ("Reset-TreeToInherited: takeown failed on $Path (exit $LASTEXITCODE). " +
@@ -208,7 +212,7 @@ function Reset-TreeToInherited {
     # discards every explicit ACE -- the attacker's included -- and clears DACL
     # protection tree-wide. Descendants become pure inheritors, so the caller's
     # protected root DACL propagates to all of them.
-    & icacls.exe $Path /reset /t /c /q | Out-Null
+    & icacls.exe $Path /reset /t /c /q /L | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw ("Reset-TreeToInherited: icacls /reset failed on $Path (exit $LASTEXITCODE). " +
                "Explicit ACEs may have survived; refusing to continue.")
@@ -371,6 +375,13 @@ function Assert-InstallTreeLocked {
     $ErrorActionPreference = 'Stop'
     $violations = @()
 
+    # Reparse points anywhere in the tree are an abort in their own right
+    # (rescan F2): every recursive read or write below would either traverse
+    # the link outside the tree (/L-less operations) or skip it (/L), and
+    # either way the tree is not the closed namespace the rest of this proof
+    # is about to claim it is.
+    Assert-NoReparsePoints -Path $Root -Context 'Assert-InstallTreeLocked'
+
     $acl = Get-Acl -LiteralPath $Root
     $owner = $acl.Owner
     $ownerSid = $null
@@ -390,7 +401,9 @@ function Assert-InstallTreeLocked {
 
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
     try {
-        & icacls.exe $Root /save $tmp /t /c /q | Out-Null
+        # /L: dump the links themselves rather than following them, so the
+        # read-back cannot be redirected any more than the writes can.
+        & icacls.exe $Root /save $tmp /t /c /q /L | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "Assert-InstallTreeLocked: icacls /save failed on $Root (exit $LASTEXITCODE) -- the tree ACL could not be read back; refusing to trust it."
         }
@@ -400,8 +413,9 @@ function Assert-InstallTreeLocked {
 
         foreach ($leaf in @($ProtectedEntries.Keys)) {
             $entryPath = Join-Path $Root $leaf
+            if (-not (Test-Path -LiteralPath $entryPath)) { continue }
             $tmpEntry = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
-            & icacls.exe $entryPath /save $tmpEntry /q | Out-Null
+            & icacls.exe $entryPath /save $tmpEntry /q /L | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 throw "Assert-InstallTreeLocked: icacls /save failed on $entryPath (exit $LASTEXITCODE)."
             }
@@ -419,4 +433,168 @@ function Assert-InstallTreeLocked {
         throw ("Install-tree ACL verification FAILED (" + @($violations).Count + " violation(s)); " +
                "the tree is NOT locked down:`n  " + ($shown -join "`n  "))
     }
+}
+
+
+# --- Daybreak 2026-08-15 rescan: link traversal + content authentication -------
+#
+# Two gaps in the first round of fixes:
+#
+#   F2 (medium): only the ROOT was checked for reparse status. takeown /r and
+#   icacls /t traverse child junctions/symlinks (icacls needs /L to operate on
+#   the link itself; takeown has no /L), so a child junction planted in a
+#   pre-created tree redirected the elevated ownership/ACL rewrite OUTSIDE the
+#   install directory.
+#
+#   F1 (high): the ACL lockdown bounds future WRITES, it does not authenticate
+#   existing BYTES. A planted python\python.exe survived the claim, was the
+#   PREFERRED launcher candidate, and was executed as Administrator; a planted
+#   .pth/sitecustomize in an existing venv likewise survived `python -m venv`
+#   (which, without --clear, keeps unknown files) and ran on every elevated
+#   pip invocation. And the gMSA holds Modify over the tree, so even a
+#   genuinely-ours interpreter can be rewritten between runs by a compromised
+#   app pool and then "trusted" by the next install.
+#
+# Fixes: refuse any reparse point anywhere in the tree (walked without
+# following links), give icacls /L so it never traverses one either, DELETE +
+# rebuild the venv every run, and only ever execute a destination-local
+# interpreter whose whole tree hashes match a manifest that is write-protected
+# against the gMSA.
+
+# Manual, non-following walk: returns the paths of every reparse point under
+# (and including) $Path. Level-by-level .NET enumeration -- EnumerateFileSystem
+# Entries never descends into anything itself, and we only push subdirectories
+# that are NOT reparse points, so a junction is reported and never traversed.
+# Get-ChildItem -Recurse cannot be used here: it follows junctions on Windows
+# PowerShell 5.1, which is the exact behaviour this exists to avoid.
+function Find-ReparsePoints {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $found = New-Object System.Collections.Generic.List[string]
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push((Resolve-Path -LiteralPath $Path).Path)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        $di = New-Object System.IO.DirectoryInfo($dir)
+        # A subdirectory we cannot enumerate (deny ACE) is itself a refusal:
+        # an uninspectable tree is not a tree we may operate on recursively.
+        try {
+            $entries = @($di.EnumerateFileSystemInfos())
+        } catch {
+            throw ("Find-ReparsePoints: cannot enumerate $dir ($($_.Exception.Message)); " +
+                   "refusing to operate recursively on a tree that cannot be fully inspected.")
+        }
+        foreach ($e in $entries) {
+            if ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                $found.Add($e.FullName)
+                continue
+            }
+            if ($e.Attributes -band [System.IO.FileAttributes]::Directory) {
+                $stack.Push($e.FullName)
+            }
+        }
+    }
+    return @($found)
+}
+
+# Fail-closed wrapper: THROWS if any reparse point exists under $Path. Called
+# before every recursive privileged operation on the tree (takeown, icacls /t,
+# Remove-Item -Recurse) and again by Assert-InstallTreeLocked afterwards -- the
+# pre-walk kills the static planted-link case outright; the post-walk catches a
+# link planted into the TOCTOU window mid-sequence (takeown has no /L, so that
+# residual window is documented in the review doc and detected, not prevented).
+function Assert-NoReparsePoints {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Context = ""
+    )
+    $links = @(Find-ReparsePoints -Path $Path)
+    if (@($links).Count -gt 0) {
+        $shown = @($links) | Select-Object -First 5
+        throw ("Assert-NoReparsePoints ($Context): " + @($links).Count + " reparse point(s) under " +
+               "$Path -- a junction/symlink redirects privileged recursive operations outside " +
+               "the install tree. Remove it and re-run. First offenders:`n  " + ($shown -join "`n  "))
+    }
+}
+
+# SHA-256 every file under $Root, recursively, as an ordered map
+# "<relpath with / separators>" -> "<UPPERCASE sha256>". Sorted by path so the
+# manifest is reproducible. Cross-platform on purpose (Get-FileHash), so the
+# Pester suite can exercise create/verify round trips on Linux.
+function Get-TreeFileHashes {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $rootFull = (Resolve-Path -LiteralPath $Root).Path
+    $map = [ordered]@{}
+    $paths = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($rootFull)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        $di = New-Object System.IO.DirectoryInfo($dir)
+        foreach ($e in $di.EnumerateFileSystemInfos()) {
+            if ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            if ($e.Attributes -band [System.IO.FileAttributes]::Directory) {
+                $stack.Push($e.FullName)
+            } else {
+                $paths.Add($e.FullName)
+            }
+        }
+    }
+    foreach ($f in ($paths | Sort-Object)) {
+        $rel = $f.Substring($rootFull.Length).TrimStart('\', '/') -replace '\\', '/'
+        $map[$rel] = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash
+    }
+    return $map
+}
+
+# Write the manifest JSON for $Root to $ManifestPath (UTF-8, no BOM). The
+# CALLER protects the manifest's DACL immediately afterwards -- against the
+# gMSA, which holds Modify over the tree and could otherwise rewrite both the
+# interpreter and the manifest that vouches for it.
+function Save-TreeManifest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$ManifestPath
+    )
+    $map = Get-TreeFileHashes -Root $Root
+    $json = $map | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText($ManifestPath, $json, (New-Object System.Text.UTF8Encoding $false))
+    return $map.Count
+}
+
+# Strict set-equality verification of $Root against $ManifestPath: every file
+# currently in the tree must be manifested with a matching hash, and every
+# manifested file must still exist. A planted file, a tampered file, a deleted
+# file, a corrupt/missing manifest -- all fail. Returns
+# @{ Ok; Reason; Details } so callers can log the first few offenders.
+function Test-TreeManifestMatches {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$ManifestPath
+    )
+    if (-not (Test-Path -LiteralPath $ManifestPath)) {
+        return @{ Ok = $false; Reason = 'manifest missing'; Details = @() }
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    } catch {
+        return @{ Ok = $false; Reason = 'manifest unreadable/corrupt'; Details = @() }
+    }
+    $current = Get-TreeFileHashes -Root $Root
+    $mflat = @{}
+    if ($manifest) {
+        foreach ($p in $manifest.PSObject.Properties) { $mflat[$p.Name] = [string]$p.Value }
+    }
+    $details = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $mflat.Keys) {
+        if (-not $current.Contains($k)) { $details.Add("manifest entry missing from tree: $k") }
+        elseif ($current[$k] -ne $mflat[$k]) { $details.Add("hash mismatch: $k") }
+    }
+    foreach ($k in $current.Keys) {
+        if (-not $mflat.Contains($k)) { $details.Add("unmanifested file in tree: $k") }
+    }
+    if ($details.Count -gt 0) {
+        return @{ Ok = $false; Reason = 'tree does not match manifest'; Details = @($details | Select-Object -First 5) }
+    }
+    return @{ Ok = $true; Reason = 'verified'; Details = @() }
 }

@@ -258,11 +258,15 @@ if ($null -ne $existing) {
 # OWNERSHIP (an owner can rewrite any DACL) -- while this script went on to
 # treat the namespace as trustworthy and execute its interpreter. Lockdown is
 # now three mechanical steps plus a proof (InstallVerifyLib):
-#   1. takeown -> the Administrators GROUP owns every object in the tree;
-#   2. icacls /reset -> every explicit ACE in the tree is discarded;
-#   3. /inheritance:r /grant:r -> the root carries EXACTLY our ACEs;
-#   4. Assert-InstallTreeLocked -> the tree is read back and PROVEN locked,
-#      or the install aborts.
+#   1. reparse-point walk -> a child junction anywhere would redirect the
+#      recursive steps below OUTSIDE the tree; abort before touching anything;
+#   2. takeown -> the Administrators GROUP owns every object in the tree;
+#   3. icacls /reset /L -> every explicit ACE in the tree is discarded, and
+#      links themselves (if any appeared) are reset, never followed;
+#   4. /inheritance:r /grant:r -> the root carries EXACTLY our ACEs;
+#   5. Assert-InstallTreeLocked -> the tree is read back (links re-walked,
+#      /L everywhere) and PROVEN locked, or the install aborts.
+Assert-NoReparsePoints -Path $InstallDir -Context 'install-root claim'
 Reset-TreeToInherited -Path $InstallDir
 Set-ObjectProtectedDacl -Path $InstallDir -Grants @(
     '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F'
@@ -334,16 +338,39 @@ $launchers = @()
 # The destination-local interpreter is only a candidate once the install root
 # has been claimed and re-ACL'd above (2026-08-19 F1). Without that, this is an
 # attacker-plantable path being executed elevated; with it, the namespace is
-# Administrators/SYSTEM-only and its contents are ours. The interpreter itself
-# is still refused if it is a reparse point.
+# Administrators/SYSTEM-only. BUT "we ACL'd it" is not "these bytes are ours"
+# (Daybreak 2026-08-15 rescan F1): the lockdown bounds future WRITES, it does
+# not authenticate existing BYTES -- a planted python\python.exe survived the
+# claim, was the PREFERRED candidate, and was then executed as Administrator.
+# And the gMSA holds Modify over the tree, so even genuinely-ours bytes can be
+# rewritten between runs by a compromised app pool. A destination-local
+# interpreter is therefore only a candidate when its WHOLE tree hashes match
+# python.manifest.json, which is written at build time and DACL-protected
+# against the gMSA. Anything else is deleted and rebuilt from an
+# authenticated source below -- never executed.
 $sharedCandidate = Join-Path $InstallDir "python\python.exe"
+$pyManifest = Join-Path $InstallDir "python.manifest.json"
 $sharedItem = Get-Item -LiteralPath $sharedCandidate -Force -ErrorAction SilentlyContinue
 if ($null -ne $sharedItem) {
+    $sharedAuthentic = $false
     if (Test-DestinationInterpreterTrusted -RootSecured $script:installRootSecured `
                                            -InterpreterAttributes $sharedItem.Attributes) {
-        $launchers += @{ Exe = $sharedCandidate; Args = @() }
+        $m = Test-TreeManifestMatches -Root (Split-Path $sharedCandidate) -ManifestPath $pyManifest
+        $sharedAuthentic = [bool]$m.Ok
+        if (-not $sharedAuthentic) {
+            Write-Host ("  [!!] shared Python fails manifest verification ($($m.Reason): " +
+                        "$($m.Details -join '; ')) -- planted or tampered bytes; deleting the " +
+                        "tree, refusing to execute it.")
+        }
     } else {
         Write-Host "  [skip] $sharedCandidate -- destination interpreter not trusted (root secured: $($script:installRootSecured))"
+    }
+    if ($sharedAuthentic) {
+        $launchers += @{ Exe = $sharedCandidate; Args = @() }
+    } else {
+        Assert-NoReparsePoints -Path (Split-Path $sharedCandidate) -Context 'unverified shared-python removal'
+        Remove-Item -LiteralPath (Split-Path $sharedCandidate) -Recurse -Force
+        Write-Host "  [ok]   unverified python\ tree removed (rebuilt below only if needed, from an authenticated source)"
     }
 }
 $imRoot = Join-Path $env:LOCALAPPDATA "Python"
@@ -416,9 +443,22 @@ if (-not $python) { throw "Python 3.12+ not found. Install it (winget install Py
 $sharedPyDir = Join-Path $InstallDir "python"
 $sharedPyExe = Join-Path $sharedPyDir "python.exe"
 if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
+    # The shared tree is only reusable when its bytes authenticate against the
+    # protected manifest (rescan F1). Anything else was already deleted at the
+    # launcher gate above, or never existed.
+    $reuseShared = $false
     if (Test-Path $sharedPyExe) {
-        Write-Host "Using existing shared Python at $sharedPyDir"
-    } else {
+        $m = Test-TreeManifestMatches -Root $sharedPyDir -ManifestPath $pyManifest
+        if ($m.Ok) {
+            $reuseShared = $true
+            Write-Host "Using existing shared Python at $sharedPyDir (manifest verified: $($m.Reason))"
+        } else {
+            Write-Host "  [!!] shared Python at $sharedPyDir fails manifest verification ($($m.Reason)); rebuilding"
+            Assert-NoReparsePoints -Path $sharedPyDir -Context 'shared-python rebuild'
+            Remove-Item -LiteralPath $sharedPyDir -Recurse -Force
+        }
+    }
+    if (-not $reuseShared) {
         Write-Host "Python is user-scoped ($($python.Exe)); copying to shared location ..."
         $r = Invoke-PyProbe -Exe "py" -Arguments @("install", "--target=$sharedPyDir", "$major.$minor")
         if ($r.ExitCode -ne 0) {
@@ -434,7 +474,15 @@ if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
             $vlPath = Join-Path $sharedPyDir $vl
             if (Test-Path $vlPath) { attrib -H -S $vlPath 2>$null | Out-Null }
         }
-        Write-Host "  Shared Python ready at $sharedPyExe"
+        # Vouch for what was just built: manifest the whole tree, then protect
+        # the manifest against everyone but Administrators/SYSTEM -- the gMSA
+        # holds Modify over the tree and must not be able to rewrite the bytes
+        # AND the document that vouches for them.
+        $n = Save-TreeManifest -Root $sharedPyDir -ManifestPath $pyManifest
+        Set-ObjectProtectedDacl -Path $pyManifest -Grants @(
+            '*S-1-5-32-544:F', '*S-1-5-18:F'
+        )
+        Write-Host "  Shared Python ready at $sharedPyExe (manifest: $n files, ACL'd to Administrators/SYSTEM)"
     }
     $python = @{ Exe = $sharedPyExe; Args = @() }
 }
@@ -464,6 +512,17 @@ foreach ($vl in @("Lib\venv\scripts\nt\venvlauncher.exe", "Lib\venv\scripts\nt\v
     if (Test-Path $vlPath) { attrib -H -S $vlPath 2>$null | Out-Null }
 }
 
+# The venv is DELETED and rebuilt from scratch on every run (rescan F1):
+# `python -m venv` over an existing directory, without --clear, refreshes its
+# own files but leaves everything else -- so a planted .pth or
+# sitecustomize.py in an existing venv survived every previous "rebuild" and
+# executed on each elevated pip invocation. Executed bytes must be minted by
+# THIS run. (Cost is nil: the pinned closure is reinstalled every run anyway.)
+if (Test-Path $venv) {
+    Assert-NoReparsePoints -Path $venv -Context 'venv rebuild'
+    Remove-Item -LiteralPath $venv -Recurse -Force
+    Write-Host "Removed previous venv (rebuilt fresh every run; planted startup files cannot survive)"
+}
 Write-Host "Creating virtualenv at $venv ..."
 $venvOut = & $python.Exe @($python.Args + @("-m", "venv", $venv)) 2>&1
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
@@ -598,6 +657,7 @@ ACME_RA_SAN_SCOPES={"REPLACE-WITH-UUID":{"dns_patterns":["*.work-domain.local"]}
 # earlier because the SID is resolved after the prerequisite check. Same
 # reset+protect+prove sequence as the claim, so the two passes cannot drift.
 Write-Host "Securing $InstallDir (ownership reset; Administrators/SYSTEM full; gMSA modify) ..."
+Assert-NoReparsePoints -Path $InstallDir -Context 'post-install ACL pass'
 Reset-TreeToInherited -Path $InstallDir
 Set-ObjectProtectedDacl -Path $InstallDir -Grants @(
     '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)M')
@@ -608,6 +668,15 @@ Set-ObjectProtectedDacl -Path $InstallDir -Grants @(
 Set-ObjectProtectedDacl -Path $envFile -Grants @(
     '*S-1-5-32-544:F', '*S-1-5-18:F', ($GmsaAccount + ':R')
 )
+# The python manifest must be re-protected too: the /reset above just stripped
+# its protected DACL back to tree inheritance (which carries the gMSA's
+# Modify). It vouches for the interpreter the NEXT elevated install will run,
+# so the gMSA must never be able to rewrite it.
+if (Test-Path $pyManifest) {
+    Set-ObjectProtectedDacl -Path $pyManifest -Grants @(
+        '*S-1-5-32-544:F', '*S-1-5-18:F'
+    )
+}
 # NOTE: the old extra grant on the python\ subdirectory is deliberately gone:
 # the root's (OI)(CI)M propagates to every descendant, and an explicit ACE
 # down there would (correctly) trip the tree verification below.
@@ -616,8 +685,12 @@ $trustees = @(
     'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'BA', 'SY',
     $gmsaSid, $GmsaAccount
 )
+$manifestTrustees = @(
+    'S-1-5-32-544', 'S-1-5-18',
+    'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'BA', 'SY'
+)
 Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees $trustees `
-    -ProtectedEntries @{ 'acme-ra.env' = $trustees }
+    -ProtectedEntries @{ 'acme-ra.env' = $trustees; 'python.manifest.json' = $manifestTrustees }
 Write-Host "  [ok]   install tree verified locked (ownership + DACLs read back and proven)"
 
 # --- Grant the gMSA "Log on as a service" (best-effort) ----------------------

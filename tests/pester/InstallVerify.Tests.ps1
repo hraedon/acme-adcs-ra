@@ -373,3 +373,135 @@ Describe 'install-windows.ps1 uses the hostile-tree lockdown' {
         $iFlag | Should -BeGreaterThan $iProof
     }
 }
+
+# --- Daybreak 2026-08-15 rescan F1: destination bytes must authenticate ---------
+#
+# "We ACL'd the tree" bounds future writes; it says nothing about the bytes
+# already in it. The shared interpreter is therefore only executable when its
+# whole tree matches a manifest the gMSA cannot rewrite. These round-trip the
+# manifest machinery on Linux (Get-FileHash is cross-platform) against the
+# exact attacker shapes: tampered file, planted file, deleted file, corrupt or
+# missing manifest.
+
+Describe 'Tree manifest (shared-Python authentication)' {
+    BeforeAll {
+        $script:root = Join-Path ([System.IO.Path]::GetTempPath()) ("mfst-test-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $script:root | Out-Null
+        $script:manifest = Join-Path $script:root "manifest.json"
+        # The manifest lives OUTSIDE the tree it vouches for in production
+        # (python.manifest.json is a sibling of python\), mirror that here.
+        $script:tree = Join-Path $script:root "python"
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:tree "Scripts") | Out-Null
+        Set-Content -Path (Join-Path $script:tree "python.exe") -Value "PE-exe-bytes"
+        Set-Content -Path (Join-Path $script:tree "python313.dll") -Value "PE-dll-bytes"
+        Set-Content -Path (Join-Path $script:tree "Scripts\pip.exe") -Value "PE-pip-bytes"
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'Save-TreeManifest covers every file, recursively' {
+        $script:n = Save-TreeManifest -Root $script:tree -ManifestPath $script:manifest
+        $script:n | Should -Be 3
+    }
+
+    It 'an untouched tree verifies' {
+        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
+        $r.Ok | Should -BeTrue
+    }
+
+    It 'a tampered python.exe fails verification (the planted-interpreter case)' {
+        Set-Content -Path (Join-Path $script:tree "python.exe") -Value "evil-replacement"
+        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
+        $r.Ok | Should -BeFalse
+        ($r.Details -join ' ') | Should -Match 'hash mismatch: python\.exe'
+        # restore
+        Set-Content -Path (Join-Path $script:tree "python.exe") -Value "PE-exe-bytes"
+    }
+
+    It 'a planted extra file fails verification (set equality, not subset)' {
+        Set-Content -Path (Join-Path $script:tree "sitecustomize.py") -Value "import os; os.system('...')"
+        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
+        $r.Ok | Should -BeFalse
+        ($r.Details -join ' ') | Should -Match 'unmanifested file in tree: sitecustomize\.py'
+        Remove-Item -LiteralPath (Join-Path $script:tree "sitecustomize.py") -Force
+    }
+
+    It 'a deleted manifested file fails verification' {
+        Remove-Item -LiteralPath (Join-Path $script:tree "Scripts\pip.exe") -Force
+        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
+        $r.Ok | Should -BeFalse
+        ($r.Details -join ' ') | Should -Match 'manifest entry missing from tree: Scripts/pip\.exe'
+        Set-Content -Path (Join-Path $script:tree "Scripts\pip.exe") -Value "PE-pip-bytes"
+    }
+
+    It 'a corrupt manifest fails closed, not open' {
+        Set-Content -LiteralPath $script:manifest -Value '{not json'
+        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
+        $r.Ok | Should -BeFalse
+        $r.Reason | Should -Match 'unreadable'
+    }
+
+    It 'a missing manifest fails closed (pre-fix trees carry no manifest)' {
+        Remove-Item -LiteralPath $script:manifest -Force
+        $r = Test-TreeManifestMatches -Root $script:tree -ManifestPath $script:manifest
+        $r.Ok | Should -BeFalse
+        $r.Reason | Should -Match 'missing'
+    }
+}
+
+# --- Daybreak 2026-08-15 rescan F1/F2: the installer must USE the new controls --
+#
+# Text/AST level (Linux CI cannot run takeown/icacls; the live install run is
+# separately owed and recorded). The properties pinned here are the ones the
+# findings were about: no unverified destination-local interpreter may enter
+# the launcher list; the venv cannot survive a run; every recursive privileged
+# operation is preceded by the reparse walk; icacls never follows a link.
+
+Describe 'install-windows.ps1 authenticates destination bytes (rescan)' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+    }
+
+    It 'the shared-python launcher candidate is gated on manifest verification' {
+        $script:installer | Should -Match 'Test-TreeManifestMatches -Root \(Split-Path \$sharedCandidate\)'
+        # The gate must come BEFORE the candidate is added to $launchers.
+        $iGate = $script:installer.IndexOf('Test-TreeManifestMatches -Root (Split-Path $sharedCandidate)')
+        $iAdd  = $script:installer.IndexOf('$launchers += @{ Exe = $sharedCandidate')
+        $iGate | Should -BeGreaterThan -1
+        $iAdd  | Should -BeGreaterThan $iGate
+    }
+
+    It 'an unverified shared-python tree is removed, not skipped' {
+        $script:installer | Should -Match 'unverified shared-python removal'
+    }
+
+    It 'the venv is deleted before recreation every run' {
+        $iDel = $script:installer.IndexOf('Remove-Item -LiteralPath $venv -Recurse -Force')
+        $iNew = $script:installer.IndexOf('-m", "venv", $venv')
+        $iDel | Should -BeGreaterThan -1
+        $iNew | Should -BeGreaterThan $iDel
+    }
+
+    It 'the manifest is written and DACL-protected at build time' {
+        $iSave = $script:installer.IndexOf('Save-TreeManifest -Root $sharedPyDir')
+        $iProt = $script:installer.IndexOf('Set-ObjectProtectedDacl -Path $pyManifest')
+        $iSave | Should -BeGreaterThan -1
+        $iProt | Should -BeGreaterThan $iSave
+    }
+
+    It 'every recursive reset and the verify are reparse-walked' {
+        @([regex]::Matches($script:installer, 'Assert-NoReparsePoints -Path')).Count | Should -BeGreaterOrEqual 4
+    }
+
+    It 'icacls /reset and /save carry /L (never follow a link)' {
+        @([regex]::Matches($script:lib, '/reset /t /c /q /L')).Count | Should -Be 1
+        @([regex]::Matches($script:lib, '/save \$tmp /t /c /q /L')).Count | Should -Be 1
+    }
+
+    It 'the walk never descends into a reparse point (manual stack, not -Recurse)' {
+        $script:lib | Should -Match 'function Find-ReparsePoints'
+        $script:lib | Should -Not -Match 'Get-ChildItem.*-Recurse.*reparse'
+    }
+}
