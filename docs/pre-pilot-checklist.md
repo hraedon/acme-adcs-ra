@@ -163,6 +163,49 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Daybreak round-4 findings validated and fixed (2026-08-15) on `102a1f4`,
+  live-proven on the lab RA host.** Four findings on the installer rework
+  (2 medium, 2 low), all closed on the same branch with 14 new Pester cases
+  (235 total, plus 795 pytest / ruff / mypy green):
+
+  - **M1 TOCTOU on first-install state-root creation** — between the
+    provenance check and `New-Item -Force`, a local attacker could pre-create
+    the predictable ProgramData path; the claim then worked *for* them
+    (`setowner /t` normalised their files' owners, the proof passed, the
+    re-protect protected their planted dotenv, and no-clobber preserved it —
+    the adoption finding reopened by race). Fix: creation without `-Force`
+    (throws on an existing path) plus a provenance re-verdict on collision; a
+    non-admin cannot manufacture an "ours"-shaped tree (owner Administrators
+    is unreachable for them), so the retry can only land in the foreign
+    refusal. **Not live-proven** — the branch is reachable only by a genuinely
+    won race; it is source-asserted and reviewed instead.
+  - **M2 legacy single-tree layout passing the generic provenance check** —
+    a clean pre-split tree has the same trustee/owner/DACL shape as ours, so
+    it verified as "ours" while the preserved web.config kept launching the
+    old gMSA-writable ProgramData venv. Fix, both halves **live-proven**:
+    the state tree now refuses `venv`/`python`/`scripts` at its root
+    (decided before the icacls walk) — proven against the **real preserved
+    `.preSplit` tree**: refusal names the venv as executable content, tree
+    untouched; and a post-install check warns loudly when the site's
+    web.config `processPath` points inside the state tree — proven with a
+    simulated half-done migration (warning printed, then a clean install over
+    the healthy tree still exits 0 and `/directory` answers 200, so the new
+    rule does not trip on our own layout).
+  - **L1 CWD executable hijack on bare `py`/`python` probes through
+    `cmd /c`** — an elevated shell in a user-writable directory would execute
+    a planted interpreter during the probe. Fix:
+    `NoDefaultCurrentDirectoryInExePath` process-wide (set before any
+    `cmd /c`) plus absolute-path resolution in `Invoke-PyProbe`. Source-
+    asserted; deliberately not "proven" live by executing planted bytes as
+    admin.
+  - **L2 overlapping `-RuntimeDir`/`-InstallDir` silently collapsing the
+    RX/Modify boundary** — both grant sets have the same proof shape, so
+    nested or equal roots stayed green while the gMSA gained Modify over
+    executable content. Fix: `Get-PathRelation` refusal before any host
+    mutation. **Live-proven**: equal roots and nested roots both refused
+    (relation named), app pool never touched (still Started), nothing
+    created.
+
 - **Installer rework validation — the two-tree layout EXECUTED for the first
   time (2026-08-15) on `54b90db`, the tip after two live-found defects were
   fixed and re-proven on the host.** Everything the code/state split's "what is

@@ -148,6 +148,25 @@ a bare-`-ConfigureIIS` first install. Refusal runs leave the app pool stopped
 log in `docs/pre-pilot-checklist.md` and the gitignored
 `samples/lab-run-2026-08-15-installer-validation.md`.
 
+**Daybreak's FOURTH pass (of `27127af`) found four more; all four are fixed
+on `102a1f4` and live-proven where deterministically possible** — a TOCTOU on
+first-install state-root creation (`New-Item -Force` adopted a raced
+pre-creation and the whole proof chain then normalised and *preserved* the
+planted dotenv — now created without `-Force`, provenance re-verified on
+collision); a clean legacy single-tree layout passing the generic
+trustee/owner/DACL provenance while the preserved web.config kept launching
+the old gMSA-writable venv (now: `venv`/`python`/`scripts` at the state root
+are a pre-icacls refusal, proven against the real `.preSplit` tree; and a
+post-install loud warning when web.config's `processPath` points inside the
+state tree); a CWD-executable hijack on the bare `py`/`python` probes through
+`cmd /c` (now: `NoDefaultCurrentDirectoryInExePath` + absolute-path
+resolution); and overlapping `-RuntimeDir`/`-InstallDir` silently collapsing
+the RX/Modify boundary — both grant sets have the same proof *shape*, so
+nested roots stayed green (now: refused before any host mutation). The
+collision branch of the TOCTOU fix is the one thing not live-proven (it is
+reachable only by a genuinely won race). The lab host now runs `102a1f4`'s
+runtime, `/directory` 200, store unchanged.
+
 **Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
 security reviews.** There is **no 1.9.0 release**: that line shipped only as
 `rc1`/`rc2`, and the re-proof that gates a tag found a red lint gate on the rc2
