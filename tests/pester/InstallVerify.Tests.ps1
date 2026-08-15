@@ -618,6 +618,43 @@ Describe 'install-windows.ps1 separates code from state' {
     }
 }
 
+# --- Live-run finding #2, 2026-08-15: the rollback forgot the state tree ------
+#
+# Every install's state-root claim runs `icacls /reset /t`, which strips the
+# dotenv's own protected DACL; it was only re-applied ~150 lines later, AFTER
+# the runtime build. A build that failed in between (the documented rollback
+# path) rolled the RUNTIME back meticulously and left acme-ra.env -- the EAB
+# allowlist and SAN scopes -- inheriting gMSA MODIFY. Found live: the next
+# install's pre-flight then refused the whole tree, bricking the install.
+#
+# Source-order assertions on the installer (the same pattern as the Describe
+# above); the ACL semantics themselves are Test-AclDumpLocked's, already
+# unit-tested.
+Describe 'install-windows.ps1: a failed build must not leave the dotenv unprotected' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    It 're-protects the dotenv IMMEDIATELY after the state-root claim, before the runtime build' {
+        $claim = $script:installer.IndexOf("Initialize-SecuredRoot -Path `$InstallDir")
+        $reprotect = $script:installer.IndexOf('re-protected', $claim)
+        $build = $script:installer.IndexOf('Reset-RuntimeDirectory -RuntimeDir $RuntimeDir')
+        $claim | Should -BeGreaterThan 0
+        $build | Should -BeGreaterThan 0
+        $reprotect | Should -BeGreaterThan $claim
+        $reprotect | Should -BeLessThan $build
+    }
+
+    It 'the rollback handler restores the dotenv DACL and re-proves the state tree' {
+        $catch = $script:installer.IndexOf('} catch {', $script:installer.IndexOf('try {', $script:installer.IndexOf('Reset-RuntimeDirectory')))
+        $catch | Should -BeGreaterThan 0
+        $body = $script:installer.Substring($catch, [Math]::Min(3000, $script:installer.Length - $catch))
+        $body | Should -Match 'Set-ObjectProtectedDacl -Path \$envFile'
+        $body | Should -Match 'Assert-InstallTreeLocked -Root \$InstallDir'
+    }
+}
+
+
 Describe 'install-windows.ps1 never adopts a namespace' {
     BeforeAll {
         $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
@@ -848,9 +885,12 @@ Describe 'Root and dotenv ownership are held strictly (rescan-3 audit)' {
         $script:lib | Should -Match 'Test-OwnerAllowed -Owner \$entryOwner -AllowedOwnerSids \$RootOwnerSids'
     }
 
-    It 'the installer registers the dotenv as a protected entry on both passes' {
+    It 'the installer registers the dotenv as a protected entry on every pass' {
+        # Three passes now: the state-root claim, the final post-install proof,
+        # and the rollback handler's re-proof (a failed build must leave the
+        # dotenv protected too -- live finding #2, 2026-08-15).
         @([regex]::Matches($script:installer, "ProtectedEntries @\{ 'acme-ra\.env'")).Count |
-            Should -Be 2
+            Should -Be 3
     }
 
     It 'Test-OwnerAllowed would reject a gMSA-owned object under the strict set' {

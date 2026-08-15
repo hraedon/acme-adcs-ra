@@ -389,6 +389,22 @@ Initialize-SecuredRoot -Path $InstallDir -Purpose 'state (database, logs, secret
     -ProtectedEntries @{ 'acme-ra.env' = $raTrustees } `
     -Preserve @("$InstallDir\acme_ra.db", "$InstallDir\acme-ra.env", "$InstallDir\logs")
 
+# The /reset inside the claim just stripped EVERY descendant's explicit DACL --
+# including the dotenv's protected one. It is normally re-applied after the
+# runtime build (~150 lines below), but any abort in between (a failed build --
+# the documented rollback path -- or a failed runtime proof) would leave
+# acme-ra.env inheriting gMSA MODIFY from the state root, and that file decides
+# who may enrol and for which names. Found live: a deliberately failed build
+# left exactly that state, and the NEXT install's pre-flight correctly refused
+# the whole tree, bricking the install until manual ACL surgery. Re-protect it
+# IMMEDIATELY, so the only unprotected window is the icacls call itself.
+if (Test-Path -LiteralPath $envFile) {
+    Set-ObjectProtectedDacl -Path $envFile -Grants @(
+        '*S-1-5-32-544:F', '*S-1-5-18:F', ($GmsaAccount + ':R')
+    )
+    Write-Host "  [ok]   re-protected $envFile after the claim reset (gMSA read-only)"
+}
+
 if ($InstallPrereqs) { Install-Prerequisites }
 
 # Read-only prerequisite report (always) -- a quick green/red of what the app pool
@@ -718,6 +734,27 @@ Write-Host "  Installed acme-adcs-ra version: $installedVer"
         Write-Host ("  [!!] the runtime at $runtimeCurrent was built but did NOT pass verification, " +
                     "and there is no previous runtime to fall back to. The app pool has been left " +
                     "stopped deliberately. Fix the reported problem and re-run.")
+    }
+    # The runtime is only half the story. The state claim's /reset stripped the
+    # dotenv's protected DACL at the top of this run and the re-protect below
+    # was never reached -- without this, a failed build leaves acme-ra.env
+    # (EAB allowlist + SAN scopes) inheriting gMSA MODIFY, and the next
+    # install's pre-flight refuses the whole tree. Restore the protected DACL
+    # and re-prove the state tree so the rollback is complete for BOTH trees.
+    try {
+        if (Test-Path -LiteralPath $envFile) {
+            Set-ObjectProtectedDacl -Path $envFile -Grants @(
+                '*S-1-5-32-544:F', '*S-1-5-18:F', ($GmsaAccount + ':R')
+            )
+            Assert-InstallTreeLocked -Root $InstallDir -AllowedTrustees $raTrustees `
+                -AllowedOwnerSids $stateOwnerSids `
+                -ProtectedEntries @{ 'acme-ra.env' = $raTrustees }
+            Write-Host "  [ok]   state tree re-protected and re-proven (dotenv gMSA read-only)"
+        }
+    } catch {
+        Write-Host ("  [!!] state tree could NOT be re-proven after the rollback: " +
+                    "$($_.Exception.Message). Fix the state tree by hand before re-running -- " +
+                    "the next install's pre-flight will refuse it otherwise.")
     }
     throw
 }
