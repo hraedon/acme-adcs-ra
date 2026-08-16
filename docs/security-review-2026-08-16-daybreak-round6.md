@@ -134,11 +134,43 @@ Run on Windows PowerShell 5.1 and the deployed host shape, on the exact commit:
    nested root spellings are refused before the state grant.
 4. PATH-first marker `py`, `python`, and `winget` programs are never executed.
 5. A writable checkout is refused before the helper loads; a trusted checkout
-   builds from the protected snapshot and survives mutation attempts against
-   the original after snapshot creation.
+    builds from the protected snapshot and survives mutation attempts against
+    the original after snapshot creation.
 6. Local and downloaded MSI source paths are replaced during verification; no
-   replacement bytes reach `msiexec`.
+    replacement bytes reach `msiexec`.
 7. Repeat the complete clean install, reinstall, rollback, migration, and gMSA
    HttpPlatformHandler launch proof. Partial/delta proof is insufficient.
 
 Until those pass, the design is source-reviewed and test-clean, not pilot-ready.
+
+## Native proof outcome (2026-08-16, tip `8964eba`)
+
+Executed on the lab RA host under Windows PowerShell 5.1; see the validation
+log entry in `pre-pilot-checklist.md` for the full tally. Items 1–5 and 7
+passed (item 1 **after** the run found and fixed one more defect, below).
+Item 6 is Pester-proven and source-ordered but was not live-executed: the
+lab host already has HttpPlatformHandler installed and the DLL-presence
+fallback short-circuits the MSI path; forcing the case would have required
+hiding a production DLL. That single native case remains owed.
+
+### Finding 8 (high, live-found) - the mid-install re-assert re-opened the root
+
+The round-6 atomic creation covers a root's birth only. The post-build state
+re-assert (and the claim's existing-tree branch, and the runtime re-assert)
+then ran `icacls /reset` on the ROOT, which replaces the protected DACL with
+the inherited one until `/inheritance:r` restores it a moment later.
+`%ProgramData%` grants `Users (CI)(WD,AD,WEA,WA)`, so during that interval a
+standard user can create content in the state root. A looping standard-user
+process achieved exactly that (3 successes in 43,701 attempts; the post-claim
+proof caught the plants and aborted the install, so nothing was adopted, but
+the write itself is the thing the round-6 design says must be impossible). A
+deterministic `/reset` probe confirmed the window: writable-by-standard-user
+flips True between `/reset` and `/inheritance:r`.
+
+Fixed on `8964eba`: roots are never `/reset` mid-install.
+`Reset-TreeChildrenToInherited` resets descendant subtrees only;
+`Set-ObjectProtectedDacl -SkipReset` re-asserts the exact protected shape
+with no unprotected interval. The dotenv keeps its explicit-ACE-stripping
+`/reset` (a preserved *file* may carry attacker ACEs; a root proven ours
+cannot). Mutation-verified Pester coverage added; the live race re-run after
+the fix measured 0 successes in 43,920 attempts with the install green.

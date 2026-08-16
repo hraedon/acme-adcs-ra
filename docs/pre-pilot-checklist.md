@@ -163,6 +163,66 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Round-6 native Windows re-proof executed (2026-08-16), final tip
+  `8964eba`, on the lab RA host under Windows PowerShell 5.1.** The run
+  covered the full live re-proof (§A, §A.1, CRL/G, both transport-orphan
+  branches, revocation round-trip through the registered task as the gMSA,
+  least-privilege denials, agent authority split, CRL evidence) **and** the
+  native items the round-6 review demanded — and it found one more defect,
+  fixed and re-proven live in the same session:
+
+  - **Live-found (and fixed on `8964eba`): the mid-install state re-assert
+    ran `icacls /reset` on the protected state root**, re-inheriting
+    `%ProgramData%`'s `Users (CI)(WD,AD,WEA,WA)` until `/inheritance:r`
+    restored — a create-capable window the atomic `CreateDirectoryW` birth
+    DACL does not cover. A looping standard-user process planted 3 entries
+    into the installer-created state root through it (3 successes in 43,701
+    attempts); the post-claim proof caught the plants and aborted (fail-closed
+    held; nothing was adopted), and a deterministic `/reset`-window probe
+    confirmed the cause. Fix: roots are never `/reset` mid-install —
+    `Reset-TreeChildrenToInherited` resets descendants only and
+    `Set-ObjectProtectedDacl -SkipReset` re-asserts the protected shape with
+    no unprotected interval (claim, runtime re-assert, state re-assert).
+    Re-proven live: the same race loop then achieved **0 successes in 43,920
+    attempts** with the install exiting 0.
+  - retained-handle/race item: see above — 0 plants post-fix; the loop's
+    pre-creation of a ProgramData root was separately proven to hit the
+    collision refusal (user-owned tree, never adopted);
+  - named user (`M`/`W`) and named group (`F`) write ACEs on the source tree
+    are refused by the bootstrap before the helper loads (no scratch created);
+    a `C:\Temp`-staged checkout (Users create rights) is likewise refused;
+  - post-snapshot mutation of the checkout cannot reach the build: a syntax
+    bomb written into `src/` after the snapshot appeared left the install
+    green and the built runtime importable;
+  - path spellings refused before any host mutation (pool untouched):
+    trailing dot, trailing space, ADS component, reserved device name, UNC,
+    forward slashes, dot segments, nested roots, equal roots;
+  - PATH-first `py`/`python`/`winget` marker executables were never executed
+    (`-InstallPrereqs`); trusted discovery accepted only the chain-proven
+    interpreter;
+  - MSI: the no-digest and staged-copy refusals are Pester-proven and
+    source-ordered, but **not live-executed this round** — the handler is
+    installed on the lab host and its DLL fallback short-circuits the MSI
+    path; forcing it would have meant hiding a production DLL. Recorded as
+    the one native case still owed;
+  - clean install (also under the live race), reinstall ("recognised as a
+    previous install"), rollback (corrupted pinned hash → previous runtime
+    restored byte-identically, dotenv re-protected, no leftovers), and the
+    §4 migration refusal against the real `.preSplit` tree all passed;
+  - the EAB quota (finding 7) was proven live at its default: a second
+    distinct-key account is denied `badExternalAccountBinding`, 46 replayed
+    denials coalesced into 2 durable rows with exact tallies, and a
+    deactivated account's slot was not recycled;
+  - the standing WI-052 was re-observed unchanged (CRL3: the lab CA's 7d12h
+    window vs the 7d default ceiling) — operator-owned, not a regression.
+
+  Teardown returned both hosts to their pre-run state (store fingerprint
+  byte-identical: 21/87/22/5/22/42/22/1; CA `Security` 224 bytes,
+  `OfficerRights` absent; `SeBatchLogonRight` restored exactly and verified
+  by re-export; every issued cert revoked and the CRL republished; zero
+  scratch/retired/task leftovers). The lab host now runs `8964eba`,
+  `/directory` 200.
+
 - **Daybreak round-6 review remediated in source (2026-08-16); native Windows
   re-proof is still required before pilot.** Seven findings at `d1d7c17` (four
   high, three medium) were independently reproduced and addressed as one
