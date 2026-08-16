@@ -388,6 +388,7 @@ def _build(tmp_path: Path, **overrides: Any) -> tuple[TestClient, ServerContext]
         siem_jsonl_path=tmp_path / "test_ra.siem.jsonl",
         eab_allowlist=[EABEntry(kid=KID, mac_key=MAC_B64)],
         san_scopes={KID: {"dns_patterns": ["*.WORK-DOMAIN.local"]}},
+        max_accounts_per_eab_kid=3,
         adcs_template="ACME-ServerAuth",
         admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
         # The nonce limiter would otherwise throttle the flood before the audit

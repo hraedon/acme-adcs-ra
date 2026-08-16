@@ -149,7 +149,7 @@ class ServerContext:
     # Token bucket for the unauthenticated nonce endpoint. When None,
     # create_app builds one from config (or leaves it None if disabled).
     nonce_bucket: TokenBucket | None = None
-    # Bounds durable growth from repeated pre-authentication denials. When
+    # Bounds durable growth from repeated account-creation denials. When
     # None, create_app builds one from config.
     denial_coalescer: DenialCoalescer | None = None
 
@@ -177,8 +177,8 @@ def emit_audit_hook(ctx: ServerContext, event: dict[str, Any]) -> None:
 def _audit(ctx: ServerContext, **kwargs: Any) -> None:
     """Persist an audit row and notify the optional SIEM hook.
 
-    Repeated pre-authentication denials are folded into the window's existing
-    row rather than adding one each (second daybreak rescan F4); the coalescer
+    Repeated account-creation denials are folded into the window's existing row
+    rather than adding one each (second daybreak rescan F4); the coalescer
     returns None in that case, and there is nothing new to fan out. Every other
     event type passes straight through, one row apiece, as before.
     """

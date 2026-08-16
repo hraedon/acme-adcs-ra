@@ -270,6 +270,16 @@ class OrderRateLimitExceeded(Exception):
         self.eab_kid = eab_kid
 
 
+class EabAccountLimitExceeded(Exception):
+    """Raised when a lifetime EAB-kid account quota is exhausted."""
+
+    def __init__(self, *, kid: str, limit: int, count: int) -> None:
+        super().__init__("EAB account limit exceeded")
+        self.kid = kid
+        self.limit = limit
+        self.count = count
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -930,6 +940,7 @@ class Store:
         status: str = "valid",
         contact: Sequence[str] | None = None,
         audit: Mapping[str, Any],
+        max_accounts_per_eab_kid: int = 1,
     ) -> tuple[AccountRecord, dict[str, Any]]:
         """``create_account`` plus its provenance audit row in ONE transaction.
 
@@ -943,11 +954,34 @@ class Store:
 
         Returns ``(record, audit_event)``; the caller fans the event out to
         SIEM via ``emit_audit_hook`` (the row is already durable).
+
+        ``max_accounts_per_eab_kid`` is a lifetime quota: every account row
+        for the kid counts, regardless of status. The quota check, account
+        insert, and audit insert share the same ``BEGIN IMMEDIATE`` transaction;
+        an exhausted quota raises :class:`EabAccountLimitExceeded` without
+        creating either row.
         """
+        if max_accounts_per_eab_kid < 1:
+            raise ValueError("max_accounts_per_eab_kid must be at least 1")
         kwargs = dict(audit)
         if "account_id" in kwargs:
             raise ValueError("audit must not carry account_id; it is set from the row")
         with self._connect() as conn:
+            # The count and insert must be serialized with other account
+            # creations. A route-level count is only advisory: two concurrent
+            # requests could both observe the same count and both insert.
+            conn.execute("BEGIN IMMEDIATE")
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE eab_kid = ?", (eab_kid,)
+                ).fetchone()[0]
+            )
+            if count >= max_accounts_per_eab_kid:
+                raise EabAccountLimitExceeded(
+                    kid=eab_kid,
+                    limit=max_accounts_per_eab_kid,
+                    count=count,
+                )
             record = self._insert_account(
                 conn,
                 jwk=jwk,
@@ -2488,7 +2522,7 @@ class Store:
         timestamp = _now_iso()
         # Bound the attacker-controlled parts before anything durable is
         # written (second daybreak rescan F4). ``details`` carries the client's
-        # EAB kid on the pre-authentication denial paths, and a peer that
+        # EAB kid on the account-creation denial paths, and a peer that
         # passes the network allowlist chooses its length. The bound preserves
         # a readable prefix plus a digest of the whole value, so nothing an
         # investigator needs survives only in the discarded tail.

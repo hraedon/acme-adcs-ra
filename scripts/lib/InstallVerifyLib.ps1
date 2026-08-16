@@ -14,6 +14,12 @@
 # The installer keeps the I/O (Invoke-WebRequest, Get-FileHash,
 # Get-AuthenticodeSignature) and calls these to decide.
 
+$script:IcaclsExe = if ($env:windir) {
+    Join-Path $env:windir 'System32\icacls.exe'
+} else {
+    'icacls.exe'
+}
+
 # Classify an -HttpPlatformHandlerMsi value: 'https', 'http', or 'local'.
 function Get-MsiSourceKind {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Source)
@@ -44,10 +50,11 @@ function Assert-MsiSourceAcceptable {
               "This artifact is executed by msiexec as Administrator on the issuance host. " +
               "Use an https:// URL with -HttpPlatformHandlerSha256, or pass a vetted local path."
     }
-    if ($kind -eq 'https' -and [string]::IsNullOrWhiteSpace($Sha256)) {
-        throw "Refusing to download the HttpPlatformHandler MSI without -HttpPlatformHandlerSha256. " +
-              "HTTPS authenticates the origin, not the bytes: supply the expected SHA-256 out of band " +
-              "(Microsoft publishes it; or hash a copy you have already vetted)."
+    if ([string]::IsNullOrWhiteSpace($Sha256)) {
+        throw "Refusing to install the HttpPlatformHandler MSI without -HttpPlatformHandlerSha256. " +
+              "The digest is required for local and remote sources because the elevated installer " +
+              "stages and verifies one exact artifact before msiexec opens it. Supply the expected " +
+              "SHA-256 out of band."
     }
     return $kind
 }
@@ -243,7 +250,7 @@ function Reset-TreeToInherited {
     $ownerFailures = @()
     $owned = $false
     foreach ($principal in (Get-AdministratorsOwnerCandidates)) {
-        $out = & icacls.exe $Path /setowner $principal /t /q /L 2>&1
+        $out = & $script:IcaclsExe $Path /setowner $principal /t /q /L 2>&1
         if (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out) { $owned = $true; break }
         $ownerFailures += ("{0} -> exit {1}: {2}" -f $principal, $LASTEXITCODE, (($out | Out-String).Trim()))
     }
@@ -260,7 +267,7 @@ function Reset-TreeToInherited {
     # protection tree-wide. Descendants become pure inheritors, so the caller's
     # protected root DACL propagates to all of them. We own every object by now,
     # so this cannot be denied.
-    $out = & icacls.exe $Path /reset /t /q /L 2>&1
+    $out = & $script:IcaclsExe $Path /reset /t /q /L 2>&1
     if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
         throw ("Reset-TreeToInherited: icacls /reset failed on $Path (exit $LASTEXITCODE): " +
                (($out | Out-String).Trim()) +
@@ -283,16 +290,143 @@ function Set-ObjectProtectedDacl {
         [Parameter(Mandatory = $true)][string[]]$Grants
     )
     $ErrorActionPreference = 'Stop'
-    $out = & icacls.exe $Path /reset /q /L 2>&1
+    $out = & $script:IcaclsExe $Path /reset /q /L 2>&1
     if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
         throw ("Set-ObjectProtectedDacl: icacls /reset failed on $Path (exit $LASTEXITCODE): " +
                (($out | Out-String).Trim()))
     }
-    $out = & icacls.exe $Path /inheritance:r /grant:r @Grants /L 2>&1
+    $out = & $script:IcaclsExe $Path /inheritance:r /grant:r @Grants /L 2>&1
     if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
         throw ("Set-ObjectProtectedDacl: icacls /inheritance:r /grant:r failed on " +
                "$Path (exit $LASTEXITCODE) with grants: $($Grants -join ' ') : " +
                (($out | Out-String).Trim()))
+    }
+}
+
+# Create one directory with its final protected DACL in the same kernel call.
+# Create-then-icacls leaves a window in which a low-privilege process can open
+# a create-capable handle and retain it after the DACL changes.
+if (-not ('ACMERA.AtomicDirectory' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace ACMERA {
+    public static class AtomicDirectory {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SECURITY_ATTRIBUTES {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            public int bInheritHandle;
+        }
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        private static extern bool CreateDirectoryW(string path, ref SECURITY_ATTRIBUTES attributes);
+        public static int Create(string path, byte[] securityDescriptor) {
+            GCHandle pinned = GCHandle.Alloc(securityDescriptor, GCHandleType.Pinned);
+            try {
+                SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES();
+                attributes.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+                attributes.lpSecurityDescriptor = pinned.AddrOfPinnedObject();
+                attributes.bInheritHandle = 0;
+                return CreateDirectoryW(path, ref attributes) ? 0 : Marshal.GetLastWin32Error();
+            } finally { pinned.Free(); }
+        }
+    }
+}
+"@
+}
+
+function New-AtomicProtectedDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Grants
+    )
+    $ErrorActionPreference = 'Stop'
+    if ($env:OS -ne 'Windows_NT') {
+        throw 'New-AtomicProtectedDirectory is supported only on Windows.'
+    }
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($grant in $Grants) {
+        if ($grant -notmatch '^(?<identity>.+):\(OI\)\(CI\)(?<rights>F|RX|M)$') {
+            throw "New-AtomicProtectedDirectory: unsupported grant '$grant'."
+        }
+        $identity = $Matches['identity'].TrimStart('*')
+        $rightsCode = $Matches['rights']
+        try {
+            $sid = if ($identity -match '^S-1-\d+(-\d+)+$') {
+                New-Object System.Security.Principal.SecurityIdentifier($identity)
+            } else {
+                (New-Object System.Security.Principal.NTAccount($identity)).Translate(
+                    [System.Security.Principal.SecurityIdentifier])
+            }
+        } catch {
+            throw "New-AtomicProtectedDirectory: cannot resolve grant identity '$identity'."
+        }
+        $rights = switch ($rightsCode) {
+            'F'  { [System.Security.AccessControl.FileSystemRights]::FullControl }
+            'RX' { [System.Security.AccessControl.FileSystemRights]::ReadAndExecute }
+            'M'  { [System.Security.AccessControl.FileSystemRights]::Modify }
+        }
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, $rights,
+            ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit -bor
+             [System.Security.AccessControl.InheritanceFlags]::ContainerInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule)
+    }
+
+    $errorCode = [ACMERA.AtomicDirectory]::Create(
+        $Path, $security.GetSecurityDescriptorBinaryForm())
+    if ($errorCode -eq 183) { return $false } # ERROR_ALREADY_EXISTS
+    if ($errorCode -ne 0) {
+        throw (New-Object ComponentModel.Win32Exception(
+            $errorCode, "Could not create protected directory '$Path' atomically"))
+    }
+
+    # Administrator-created objects are normally owned by the individual
+    # account. Normalize to the Administrators group while the final DACL is
+    # already active; this operation cannot reopen low-privilege access.
+    $owned = $false
+    $ownerFailures = @()
+    foreach ($principal in (Get-AdministratorsOwnerCandidates)) {
+        $out = & $script:IcaclsExe $Path /setowner $principal /q /L 2>&1
+        if (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out) {
+            $owned = $true
+            break
+        }
+        $ownerFailures += ("{0}: {1}" -f $principal, (($out | Out-String).Trim()))
+    }
+    if (-not $owned) {
+        throw ("Protected directory '$Path' was created, but its owner could not be normalized " +
+               "to Administrators: " + ($ownerFailures -join '; '))
+    }
+    return $true
+}
+
+# Support ordinary local DOS paths only. Win32 strips trailing spaces/periods
+# and gives device/extended paths different alias rules; refusing those names
+# is safer than trying to duplicate every consuming API's normalization.
+function Assert-SafeLocalInstallPath {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+    if ($Path -notmatch '^[A-Za-z]:\\') {
+        throw "Install paths must be absolute local drive paths; refusing '$Path'."
+    }
+    if ($Path -match '[/?*"<>|]' -or $Path.StartsWith('\\?\') -or $Path.StartsWith('\\.\')) {
+        throw "Install path '$Path' uses an unsupported Win32 namespace or character."
+    }
+    $tail = $Path.Substring(3).TrimEnd('\')
+    if (-not $tail) { throw "A drive root is not a safe install tree: '$Path'." }
+    foreach ($component in ($tail -split '\\')) {
+        if (-not $component -or $component -eq '.' -or $component -eq '..' -or
+            $component.EndsWith('.') -or $component.EndsWith(' ') -or
+            $component.Contains(':')) {
+            throw "Install path '$Path' contains an ambiguous Win32 component '$component'."
+        }
+        $stem = ($component -split '\.')[0]
+        if ($stem -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
+            throw "Install path '$Path' contains reserved device name '$component'."
+        }
     }
 }
 
@@ -345,6 +479,8 @@ function Get-PathRelation {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$A,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$B
     )
+    Assert-SafeLocalInstallPath -Path $A
+    Assert-SafeLocalInstallPath -Path $B
     $na = Get-CanonicalPathString -Path $A
     $nb = Get-CanonicalPathString -Path $B
     $na = (@($na -split '\\') | Where-Object { $_ }) -join '\'
@@ -582,7 +718,7 @@ function Get-InstallTreeViolations {
     try {
         # /L: dump the links themselves rather than following them, so the
         # read-back cannot be redirected any more than the writes can.
-        $out = & icacls.exe $Root /save $tmp /t /q /L 2>&1
+        $out = & $script:IcaclsExe $Root /save $tmp /t /q /L 2>&1
         if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
             return @("$Root : icacls /save failed (exit $LASTEXITCODE): " +
                      (($out | Out-String).Trim()) +
@@ -616,7 +752,7 @@ function Get-InstallTreeViolations {
                                 "that can rewrite its DACL is an issuance-policy hole")
             }
             $tmpEntry = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
-            $out = & icacls.exe $entryPath /save $tmpEntry /q /L 2>&1
+            $out = & $script:IcaclsExe $entryPath /save $tmpEntry /q /L 2>&1
             if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
                 $violations += "$entryPath : icacls /save failed (exit $LASTEXITCODE): $(($out | Out-String).Trim())"
                 continue
@@ -1193,7 +1329,7 @@ function Get-CanonicalPathString {
                     $tail = if ($i -lt $segs.Count) { '\' + ($segs[$i..($segs.Count - 1)] -join '\') } else { '' }
                     return ($resolved + $tail)
                 }
-                break
+                throw "Kernel final-path resolution failed for existing path '$prefix'; refusing lexical fallback."
             }
         }
     }
@@ -1207,13 +1343,31 @@ function Get-CanonicalPathString {
 # roots, whose Users ACEs are read/execute or (IO)-flagged; flagging it would
 # condemn every legitimate location. The gMSA and the running administrator
 # are added by callers where appropriate.
-$script:BroadTrusteeSids = @(
-    'S-1-1-0',            # Everyone
-    'S-1-5-32-545',       # BUILTIN\Users
-    'S-1-5-11',           # NT AUTHORITY\Authenticated Users
-    'S-1-5-4',            # NT AUTHORITY\Interactive
-    'S-1-5-3'             # NT AUTHORITY\Batch
-)
+function Resolve-IdentitySidValue {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Identity)
+    if ([string]::IsNullOrWhiteSpace($Identity)) { return $null }
+    $candidate = $Identity.Trim().TrimStart('*')
+    if ($candidate -match '^S-1-\d+(-\d+)+$') { return $candidate }
+    $wellKnown = @{
+        'Everyone' = 'S-1-1-0'
+        'BUILTIN\Users' = 'S-1-5-32-545'
+        'BUILTIN\Administrators' = 'S-1-5-32-544'
+        'NT AUTHORITY\Authenticated Users' = 'S-1-5-11'
+        'NT AUTHORITY\Interactive' = 'S-1-5-4'
+        'NT AUTHORITY\Batch' = 'S-1-5-3'
+        'NT AUTHORITY\SYSTEM' = 'S-1-5-18'
+        'NT SERVICE\TrustedInstaller' = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+    }
+    foreach ($name in $wellKnown.Keys) {
+        if ($candidate -ieq $name) { return $wellKnown[$name] }
+    }
+    try {
+        return (New-Object System.Security.Principal.NTAccount($candidate)).Translate(
+            [System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return $null
+    }
+}
 
 # Pure decision over one ACE's raw fields (identity, rights, type, inheritance
 # flags): does it endanger the BYTES of an object in the tree (create/replace/
@@ -1233,7 +1387,9 @@ function Test-AceEndangersBytes {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$AceType,
         [Parameter(Mandatory = $true)][int]$InheritanceFlags,
         [Parameter(Mandatory = $true)][int]$PropagationFlags,
-        [Parameter(Mandatory = $true)][bool]$IsDirectory
+        [Parameter(Mandatory = $true)][bool]$IsDirectory,
+        [string[]]$AllowedWriterSids = @('S-1-5-32-544', 'S-1-5-18',
+            'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     )
     if ($AceType -ne 'Allow') { return $false }
     # INHERIT_ONLY ACEs do not apply to THIS object (live-probed 2026-08-15:
@@ -1246,13 +1402,6 @@ function Test-AceEndangersBytes {
     if (($PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
         return $false
     }
-    $broad = $false
-    foreach ($sid in $script:BroadTrusteeSids) {
-        if ($Identity -eq $sid) { $broad = $true; break }
-    }
-    if ($Identity -match '^(Everyone|BUILTIN\\Users|NT AUTHORITY\\Authenticated Users|NT AUTHORITY\\Interactive|NT AUTHORITY\\Batch)$') { $broad = $true }
-    if (-not $broad) { return $false }
-
     # The mask carries only bits that are dangerous ON THEIR OWN. FullControl
     # (0x1F01FF) and Modify (0x301BF) are deliberately NOT in it wholesale:
     # both contain AppendData, which is only CreateDirectories on a directory
@@ -1280,7 +1429,18 @@ function Test-AceEndangersBytes {
         # On a file, AppendData is byte-append: always dangerous.
         $mask = $mask -bor [int][System.Security.AccessControl.FileSystemRights]::AppendData
     }
-    return (($Rights -band $mask) -ne 0)
+    if (($Rights -band $mask) -eq 0) { return $false }
+
+    # Provenance is an allowlist, not a list of familiar broad groups.  A
+    # named low-privilege user or custom domain group with FullControl is just
+    # as able to replace executable bytes as Everyone.  Resolve every identity
+    # to a SID and fail closed when a dangerous ACE cannot be resolved.
+    $sid = Resolve-IdentitySidValue -Identity $Identity
+    if ($null -eq $sid) { return $true }
+    foreach ($allowed in @($AllowedWriterSids)) {
+        if ($sid -ieq $allowed) { return $false }
+    }
+    return $true
 }
 
 # Owners that may hold executable content or its containers, as SIDs
@@ -1307,14 +1467,12 @@ function Get-AllowedExecutableOwners {
 }
 
 # One object's owner + DACL as violations against the "administrator-only
-# bytes" rule. Empty list = trusted. -AlsoFlagTrustees extends the broad set
-# for callers with an additional principal to hold to the same standard (the
-# site tree check passes the gMSA: a worker that can write web.config can
-# rewrite its own launch configuration).
+# bytes" rule. Empty list = trusted. Every write-capable ACE is checked against
+# the authorized-writer SID allowlist, so callers do not maintain a second
+# denylist of principals that happen to be familiar.
 function Test-ObjectDaclTrusted {
     param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [string[]]$AlsoFlagTrustees = @()
+        [Parameter(Mandatory = $true)][string]$Path
     )
     $violations = @()
     $acl = $null
@@ -1331,19 +1489,8 @@ function Test-ObjectDaclTrusted {
             -AceType ([string]$rule.AccessControlType) `
             -InheritanceFlags ([int]$rule.InheritanceFlags) `
             -PropagationFlags ([int]$rule.PropagationFlags) `
-            -IsDirectory $isDir
-        if (-not $flag -and @($AlsoFlagTrustees).Count -gt 0) {
-            $ioFlagged = ($rule.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0
-            foreach ($t in $AlsoFlagTrustees) {
-                if ($identity -and ($identity -ieq $t) -and (-not $ioFlagged) -and
-                    $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
-                    $writeBits = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
-                                 [int][System.Security.AccessControl.FileSystemRights]::Modify -bor
-                                 [int][System.Security.AccessControl.FileSystemRights]::FullControl
-                    if (([int]$rule.FileSystemRights -band $writeBits) -ne 0) { $flag = $true }
-                }
-            }
-        }
+            -IsDirectory $isDir `
+            -AllowedWriterSids @(Get-AllowedExecutableOwners)
         if ($flag) {
             $violations += ("$Path : '$identity' holds write-class access " +
                             "('$($rule.FileSystemRights)') -- a non-administrator can replace or rewrite bytes here")
@@ -1438,26 +1585,3 @@ function Assert-WebConfigLaunchTrusted {
 # single atomic DACL swap, and the emptiness check catches anything that
 # slipped through it: after the swap Users hold no create right, so nothing
 # new can appear.
-function Lock-FreshRoot {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string[]]$Grants,
-        [Parameter(Mandatory = $true)][string]$Purpose,
-        [string[]]$Preserve = @()
-    )
-    $ErrorActionPreference = 'Stop'
-    Set-ObjectProtectedDacl -Path $Path -Grants $Grants
-    $entries = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
-    if ($entries.Count -gt 0) {
-        $reasons = @("$Path was created empty moments ago and now contains content that was raced " +
-                     "into it while it still inherited create rights from its parent:") +
-                   ($entries | ForEach-Object { "raced entry: $($_.Name)" }) +
-                   @("This is the file-planting race from Daybreak round 5. Treat the content as " +
-                     "hostile: inspect it, delete it, and re-run.")
-        throw (Get-ForeignRootRefusal -Path $Path -Purpose $Purpose -Reasons $reasons -Preserve $Preserve)
-    }
-    foreach ($principal in (Get-AdministratorsOwnerCandidates)) {
-        $out = & icacls.exe $Path /setowner $principal /q /L 2>&1
-        if (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out) { break }
-    }
-}

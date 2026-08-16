@@ -34,7 +34,7 @@ from acme_adcs_ra.jws import (
 )
 from acme_adcs_ra.serializers import _account_to_json
 from acme_adcs_ra.server_jws import verify_new_account_jws
-from acme_adcs_ra.store import AccountStatus
+from acme_adcs_ra.store import AccountStatus, EabAccountLimitExceeded
 
 router = APIRouter()
 
@@ -189,7 +189,36 @@ async def new_account(
                 "outcome": "success",
                 "details": {"eab_kid": verified_kid, "alg": eab_header.get("alg")},
             },
+            max_accounts_per_eab_kid=ctx.config.max_accounts_per_eab_kid,
         )
+    except EabAccountLimitExceeded as exc:
+        # A concurrent retry for the same JWK may lose the quota transaction
+        # after the other request commits. Preserve newAccount idempotence in
+        # that case; only a genuinely new key is a quota denial.
+        winner = ctx.store.get_account_by_jwk(account_jwk)
+        if winner is not None:
+            return JSONResponse(
+                status_code=200,
+                content=_account_to_json(ctx, winner),
+                headers={"Location": _account_url(ctx, winner.id)},
+            )
+        # Keep the coalescing key fixed. The validated kid and server-side
+        # count are useful audit context, but attacker-chosen JWKs must not
+        # create a distinct durable denial row per request.
+        _audit(
+            ctx,
+            event_type="account-creation-denied",
+            outcome="failed",
+            details={
+                "reason": "eab-account-limit",
+                "kid": exc.kid,
+                "limit": exc.limit,
+                "count": exc.count,
+            },
+        )
+        raise bad_external_account_binding(
+            "the external account binding account limit has been reached"
+        ) from exc
     except sqlite3.IntegrityError:
         # A concurrent newAccount for the same key won the UNIQUE index. That
         # is exactly the case the index exists to stop, and the right answer is

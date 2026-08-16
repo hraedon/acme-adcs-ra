@@ -69,8 +69,10 @@ These are not style preferences. Each one is load-bearing:
 
 ## 2. What you must provide before running the installer
 
-The installer checks and reports on all of these. It installs some of them
-with `-InstallPrereqs`; it never guesses at any of them.
+The installer checks and reports on all of these. `-InstallPrereqs` installs
+the Windows IIS features and, when explicitly supplied, the pinned
+HttpPlatformHandler MSI. Python must already be installed: the elevated
+installer never runs PATH-selected `py`, `python`, or `winget`.
 
 | Requirement | How to satisfy it | Installer behaviour if missing |
 |---|---|---|
@@ -79,8 +81,8 @@ with `-InstallPrereqs`; it never guesses at any of them.
 | A gMSA, installed on this host | `New-ADServiceAccount`, then `Install-ADServiceAccount` on the RA host; `Test-ADServiceAccount` must return True | SID resolution failure is fatal; a False from `Test-ADServiceAccount` is a loud warning (the app pool will not start) |
 | gMSA has **Enroll** on a server-authentication-only template | ADCS template ACL | Not checked — **your responsibility**, and it is the control that bounds what the RA can ever mint |
 | IIS role + `Web-Mgmt-Console`, `Web-Scripting-Tools`, `Web-IP-Security` | `-InstallPrereqs`, or `Install-WindowsFeature` | Reported as MISSING |
-| HttpPlatformHandler v1.2 (amd64) | Download the MSI from iis.net and pass `-HttpPlatformHandlerMsi <path>`; or an `https://` URL **plus** `-HttpPlatformHandlerSha256` | Reported as MISSING; never auto-fetched |
-| Python 3.12+ | `-InstallPrereqs` (winget), or install machine-wide yourself | Fatal — the runtime cannot be built |
+| HttpPlatformHandler v1.2 (amd64) | Pass `-HttpPlatformHandlerMsi <path-or-https-url>` **and** an out-of-band `-HttpPlatformHandlerSha256` | Reported as MISSING; never auto-fetched |
+| Python 3.12+ | Install machine-wide before running this script | Fatal — the runtime cannot be built; `-InstallPrereqs` deliberately does not run winget |
 | A TLS server certificate in `LocalMachine\My` | Your PKI | Binding created without a certificate, with a warning |
 | A network allowlist in front of the endpoint | `<ipSecurity>` in web.config, or a scoped firewall rule | Not enforced by the installer — **your responsibility**, and it is a stated pilot condition in the threat model |
 
@@ -92,6 +94,17 @@ non-administrators cannot write. A **user-profile** interpreter
 (`%LOCALAPPDATA%`, Windows Store) is copied into the runtime tree, because the
 gMSA cannot read another account's profile. Prefer a machine-wide install:
 fewer bytes to copy, and one less thing that can drift.
+
+### A note on the installer source
+
+Run the script from a local release tree that only the invoking administrator,
+Administrators, SYSTEM, or TrustedInstaller can write. Do not run it from a
+shared checkout, a broadly writable tools directory, or a network share. Before
+dot-sourcing its helper library, the installer verifies the owner and write ACEs
+of every source/build/deployment input and their ancestor chain. It then copies
+those inputs into a fresh protected snapshot under `%ProgramFiles%` and builds
+only from that snapshot. A named user or custom group with write access is a
+refusal, even if the familiar broad `Users` groups are absent.
 
 ---
 
@@ -167,14 +180,28 @@ holding files, or a second install running concurrently.
 
 ### 3.5 Refusals on the prerequisite MSI
 
-`-HttpPlatformHandlerMsi` over plaintext `http://` is refused outright. An
-`https://` URL without `-HttpPlatformHandlerSha256` is refused — TLS
-authenticates the origin, not the bytes. Whatever the source, the MSI's
-Authenticode signature and publisher are checked before `msiexec` sees it.
-This is the one third-party executable the installer runs, and it runs
-elevated.
+`-HttpPlatformHandlerMsi` over plaintext `http://` is refused outright. Every
+source, local or HTTPS, requires `-HttpPlatformHandlerSha256`; TLS authenticates
+an origin, not an artifact. The input is copied/downloaded into a fresh
+administrator-only staging directory, and that staged file's digest,
+Authenticode signature, and publisher are checked before the absolute System32
+`msiexec.exe` path opens it. The source pathname is never the execution path.
 
-### 3.6 Refusals on the pinned dependency closure
+### 3.6 Refusals on install paths and source provenance
+
+The three install roots accept ordinary absolute local drive paths only. UNC,
+device/extended namespaces, ADS syntax, dot segments, reserved device names,
+and components ending in a period or space are refused rather than normalized.
+These spellings can alias one filesystem object and collapse the code/state ACL
+boundary. Existing ancestors are also resolved through the kernel for junction
+and 8.3 aliases.
+
+The installer source gate similarly refuses an unreadable/reparse input,
+untrusted owner, unresolved writer, or any write-class ACE for a principal
+outside the explicit administrator allowlist. Move the complete release tree
+to an administrator-only local directory; do not loosen the check.
+
+### 3.7 Refusals on the pinned dependency closure
 
 A missing `deploy/requirements.lock.txt` or `deploy/build-requirements.lock.txt`
 is fatal, and there is no unpinned fallback. Both are hash-pinned and installed

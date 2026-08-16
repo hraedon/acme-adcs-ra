@@ -1,4 +1,4 @@
-"""Time-windowed coalescing of pre-authentication denial audit rows.
+"""Time-windowed coalescing of account-creation denial audit rows.
 
 Daybreak 2026-08-15 second rescan, F4 (the standing WI-014), part two.
 
@@ -52,9 +52,10 @@ from acme_adcs_ra.store import Store, _now_iso
 
 # Which denials are coalesced, and why exactly these.
 #
-# Unauthenticated, pre-authentication denials (``account-creation-denied``):
-# an allowlisted peer needs no account and no valid EAB secret to make the RA
-# write a durable audit row, so their volume is pure attacker choice.
+# Account-creation denials (``account-creation-denied``): an allowlisted peer
+# needs no account and, for most paths, no valid EAB secret to make the RA write
+# a durable audit row. The lifetime EAB account-quota denial is also folded
+# here: it has no account id and a valid client can replay it indefinitely.
 #
 # Replayable authenticated denials (Daybreak round 5): a *valid* credential
 # replayed at line rate could grow the durable stores without bound even
@@ -116,7 +117,7 @@ class _Window:
 
 
 class DenialCoalescer:
-    """Fold repeated pre-auth denials into one durable row per time window.
+    """Fold repeated account-creation denials into one row per time window.
 
     ``window_seconds`` of 0 (or less) disables coalescing entirely: every
     denial gets its own row, which is the behaviour that shipped before this
@@ -156,15 +157,15 @@ class DenialCoalescer:
         details = dict(kwargs.get("details") or {})
         reason = str(details.get("reason", ""))
         kid = details.get("kid")
-        # The coalescing key. For pre-auth denials it is (type, reason) as
-        # before -- there is no account to key on, and keying on the
+        # The coalescing key. For account-creation denials it is (type, reason)
+        # as before -- there is no account to key on, and keying on the
         # attacker-chosen kid would let one character of variance defeat the
         # bound. For the replayable authenticated classes (round 5) the key
         # additionally carries account_id and order_id: different accounts'
         # denials stay in separate rows (each remains individually
         # accountable), while one account replaying one request folds into a
         # single window. Both key shapes tuple naturally; absent ids read as
-        # "" and keep the pre-auth behaviour byte-identical.
+        # "" and keep the no-account behaviour byte-identical.
         key = (
             event_type,
             reason,

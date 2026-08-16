@@ -28,6 +28,7 @@ def _make_config(tmp_path: Path) -> RAConfig:
         siem_jsonl_path=tmp_path / "test_ra.siem.jsonl",
         eab_allowlist=[EABEntry(kid="kid-001", mac_key=mac_key_b64)],
         san_scopes={"kid-001": {"dns_patterns": ["*.WORK-DOMAIN.local"]}},
+        max_accounts_per_eab_kid=2,
         adcs_template="ACME-ServerAuth",
         admin_token=SecretStr("test-admin-token-0123456789abcdef-32+"),
     )

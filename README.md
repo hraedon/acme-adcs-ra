@@ -245,13 +245,14 @@ to do.
 > and it runs as Administrator on the host holding the RA's gMSA context — so it
 > is verified before `msiexec` sees it:
 >
-> - a **local path** must carry a `Valid` Authenticode signature whose publisher
->   matches `-HttpPlatformHandlerPublisher` (default `CN=Microsoft
->   Corporation`); pass `-HttpPlatformHandlerSha256` to pin the bytes as well;
-> - an **`https://` URL** additionally *requires* `-HttpPlatformHandlerSha256`,
->   because TLS authenticates the origin, not the artifact;
+> - **every source**, local or HTTPS, requires an out-of-band
+>   `-HttpPlatformHandlerSha256` and a `Valid` Authenticode signature from the
+>   expected publisher;
 > - **plaintext `http://` is refused outright** — a digest delivered over a
 >   channel an attacker controls proves nothing.
+> - the source is copied/downloaded into fresh administrator-only staging; the
+>   staged bytes are verified and only that protected path reaches System32
+>   `msiexec.exe`.
 >
 > Any failure aborts the install rather than proceeding. See
 > [`docs/security-review-2026-08-17.md`](docs/security-review-2026-08-17.md)
@@ -259,14 +260,17 @@ to do.
 
 ### Install
 
-Run from an **elevated** PowerShell on the RA host, from the repo root:
+Run from an **elevated** PowerShell on the RA host, from an administrator-only
+local release tree. The installer verifies the consumed source tree before it
+dot-sources/builds anything, snapshots it into protected storage, and refuses a
+checkout writable by another user or group.
 
 ```powershell
-# 1. (optional) install the native prereqs first — IIS features + Python.
+# 1. Install Python 3.12+ machine-wide first. Optionally install the native
+#    IIS prerequisites with this script.
 #    HttpPlatformHandler is installed too if you point at its MSI. The MSI's
-#    Authenticode signature and publisher are always checked; -...Sha256 pins
-#    the bytes too, and is REQUIRED if you pass an https:// URL instead of a
-#    local path (Get-FileHash -Algorithm SHA256 gives you the digest).
+#    Authenticode signature, publisher, and SHA-256 are always checked for both
+#    local and HTTPS sources (Get-FileHash -Algorithm SHA256 gives the digest).
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
     -GmsaAccount "WORK-DOMAIN\gMSA-acme-ra$" -InstallPrereqs `
     -HttpPlatformHandlerMsi "C:\path\to\HttpPlatformHandler_amd64.msi" `
@@ -279,7 +283,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
     -TlsCertThumbprint "<thumbprint in LocalMachine\My>"
 ```
 
-Both can be combined in one invocation (`-InstallPrereqs -ConfigureIIS`). The
+Both can be combined in one invocation (`-InstallPrereqs -ConfigureIIS`).
+`-InstallPrereqs` does not run PATH-selected Python or winget; install Python
+separately first. The
 script always prints a **prerequisite check** up front (IIS role, IIS module,
 Python, RSAT) so you see what is missing before it does anything. It is **safe to
 re-run**: the secret env file and an existing `web.config` are never clobbered,

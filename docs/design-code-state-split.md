@@ -109,6 +109,14 @@ Honesty about the remaining surface matters more than a bigger deletion count.
   rescan-2 F3's hostile descendants have no premise — but a proof of what we
   just built is still worth having, and it is exactly what the next run's
   pre-flight consumes.
+- **Atomic fresh-root creation.** A protected `DirectorySecurity` descriptor is
+  passed to `CreateDirectoryW` in the creation call. This supersedes the former
+  `New-Item` then `Lock-FreshRoot` sequence: changing a DACL cannot revoke an
+  already-open create handle, so a detectable post-creation window was not a
+  sufficient design. Namespace collisions are still re-verified and refused.
+- **Trusted build inputs.** The installer validates every consumed repository
+  input before dot-sourcing the helper, then builds from an administrator-only
+  snapshot under `%ProgramFiles%`. The live checkout is never a PEP 517 input.
 - **The app-pool stop-and-prove-dead step**, unchanged. Handle-based access
   survives an ACL reset; killing the worker first is the only thing that
   addresses it.
@@ -141,6 +149,12 @@ where defects escape. Before any tag:
   uvicorn — `RX` on the runtime tree is a narrower grant than the old `M`, and
   it is the single most likely thing to be subtly wrong
 - the migration path in `operator-requirements.md` §4, walked end to end
+- native retained-handle proof: a standard-user process must never obtain a
+  create-capable handle while each fresh root is born with its final DACL
+- the source-provenance refusal against a named low-privilege user/group ACE,
+  and protected-snapshot build, under Windows PowerShell 5.1
+- MSI replacement attempts against both local and downloaded sources, proving
+  that only the verified protected staged file reaches System32 `msiexec.exe`
 
 `samples/lab-validation-runbook.md` and `samples/lab-harness/` are the starting
 point; Pester 5.7.1 and Windows PowerShell 5.1 are on the lab RA host (real

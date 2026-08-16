@@ -84,6 +84,10 @@ class RAConfig(BaseSettings):
 
     # --- EAB allowlist -------------------------------------------------------
     eab_allowlist: list[EABEntry] = []
+    # Lifetime cap on durable ACME accounts created under one EAB kid. The
+    # store counts every account row, including deactivated accounts, so a
+    # client cannot recycle durable capacity by deactivating an account.
+    max_accounts_per_eab_kid: int = Field(default=1, ge=1)
 
     # --- ADCS target (placeholders only) -------------------------------------
     adcs_host: str = "CA01.WORK-DOMAIN.local"
@@ -185,11 +189,11 @@ class RAConfig(BaseSettings):
     # refuse startup unless audit events leave the box (syslog or HEC).
     audit_offbox_required: bool = False
 
-    # Coalescing window for pre-authentication denial audit rows, in seconds
+    # Coalescing window for account-creation denial audit rows, in seconds
     # (second daybreak rescan F4 / the standing WI-014). A peer that passes the
-    # network allowlist needs no account and no valid EAB secret to make the RA
-    # write one durable SQLite row plus one JSONL line per rejected newAccount,
-    # which is unbounded growth on an issuance host's disk.
+    # network allowlist needs no account to make the RA write one durable SQLite
+    # row plus one JSONL line per rejected newAccount, which is unbounded growth
+    # on an issuance host's disk.
     #
     # Inside a window, repeats of the same denial reason update the row that is
     # already on disk — bumping an exact counter — instead of adding new ones,

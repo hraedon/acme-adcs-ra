@@ -92,8 +92,9 @@ param(
     [int]$Port = 443,
     [switch]$SharePort443,
     [string]$TlsCertThumbprint = "",
-    # Prerequisite handling. -InstallPrereqs installs the safely-native prereqs
-    # (IIS role + features via Install-WindowsFeature; Python 3.12+ via winget).
+    # Prerequisite handling. -InstallPrereqs installs the native IIS role and
+    # features. Python must be installed separately; this elevated script never
+    # runs PATH-selected py/python/winget.
     # HttpPlatformHandler is a third-party MSI with an unreliable download, so it
     # is NEVER auto-fetched from the internet: pass a vetted local path (or an
     # https:// URL plus -HttpPlatformHandlerSha256) via -HttpPlatformHandlerMsi
@@ -102,10 +103,9 @@ param(
     # third-party executable this installer runs, and it runs elevated.
     [switch]$InstallPrereqs,
     [string]$HttpPlatformHandlerMsi = "",
-    # Expected SHA-256 of the MSI. REQUIRED when -HttpPlatformHandlerMsi is a
-    # URL: TLS authenticates the origin, not the bytes, and this artifact is run
-    # by msiexec as Administrator on the issuance host. Optional (but checked
-    # when given) for a local path the operator has already vetted.
+    # Expected SHA-256 of the MSI. REQUIRED for every source. The installer
+    # copies/downloads into protected staging, then verifies those exact bytes
+    # before msiexec opens them as Administrator on the issuance host.
     [string]$HttpPlatformHandlerSha256 = "",
     # Expected Authenticode publisher, matched as a substring of the signer
     # certificate's Subject. HttpPlatformHandler is a Microsoft IIS module; a
@@ -116,9 +116,113 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Artifact-authenticity decisions for the prerequisite MSI (2026-08-17 F1).
-# Pure functions, so tests/pester/InstallVerify.Tests.ps1 covers the matrix
-# without a signed file or a live download.
+# --- Must be elevated (we write under ProgramData, set ACLs, configure IIS) ---
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run from an elevated (Administrator) PowerShell."
+}
+
+# The installer script is the operator's trust anchor. Before it executes any
+# sibling code, consumes a lock file, copies launch configuration, or asks PEP
+# 517 to build the project, prove that every consumed repository input and its
+# ancestor chain are owned and writable only by the invoking administrator,
+# Administrators, SYSTEM, or TrustedInstaller. This bootstrap is deliberately
+# inline: dot-sourcing the helper library before proving it would execute the
+# very mutable repository input this gate exists to reject.
+$repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
+function Resolve-BootstrapSid {
+    param([Parameter(Mandatory = $true)][string]$Identity)
+    $candidate = $Identity.Trim().TrimStart('*')
+    if ($candidate -match '^S-1-\d+(-\d+)+$') { return $candidate }
+    try {
+        return (New-Object System.Security.Principal.NTAccount($candidate)).Translate(
+            [System.Security.Principal.SecurityIdentifier]).Value
+    } catch { return $null }
+}
+function Assert-BootstrapObjectTrusted {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$AllowedWriterSids,
+        [switch]$AncestorOnly
+    )
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Installer source input '$Path' is a reparse point; refusing to execute or build from it."
+    }
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $ownerSid = Resolve-BootstrapSid -Identity $acl.Owner
+    if ($null -eq $ownerSid -or $AllowedWriterSids -notcontains $ownerSid) {
+        throw "Installer source input '$Path' has untrusted owner '$($acl.Owner)'."
+    }
+    $dangerous = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
+                 [int][System.Security.AccessControl.FileSystemRights]::Delete -bor
+                 [int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+                 [int][System.Security.AccessControl.FileSystemRights]::WriteDacl -bor
+                 [int][System.Security.AccessControl.FileSystemRights]::WriteOwner -bor
+                 0x40000000 -bor 0x10000000
+    if (-not $AncestorOnly -or -not $item.PSIsContainer) {
+        $dangerous = $dangerous -bor [int][System.Security.AccessControl.FileSystemRights]::AppendData
+    }
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+        if (([int]$rule.FileSystemRights -band $dangerous) -eq 0) { continue }
+        $sid = Resolve-BootstrapSid -Identity $rule.IdentityReference.Value
+        if ($null -eq $sid -or $AllowedWriterSids -notcontains $sid) {
+            throw ("Installer source input '$Path' grants write-class access to " +
+                   "'$($rule.IdentityReference.Value)'. Stage the release under an administrator-only " +
+                   "local directory before running this elevated installer.")
+        }
+    }
+}
+function Assert-BootstrapTreeTrusted {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$AllowedWriterSids
+    )
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    Assert-BootstrapObjectTrusted -Path $root.FullName -AllowedWriterSids $AllowedWriterSids
+    if (-not $root.PSIsContainer) { return }
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($root.FullName)
+    while ($stack.Count -gt 0) {
+        $dir = New-Object System.IO.DirectoryInfo($stack.Pop())
+        foreach ($entry in @($dir.EnumerateFileSystemInfos())) {
+            Assert-BootstrapObjectTrusted -Path $entry.FullName -AllowedWriterSids $AllowedWriterSids
+            if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                $stack.Push($entry.FullName)
+            }
+        }
+    }
+}
+$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$bootstrapWriters = @(
+    'S-1-5-32-544', 'S-1-5-18',
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464',
+    $currentSid
+)
+$sourceInputs = @(
+    (Join-Path $PSScriptRoot 'lib\InstallVerifyLib.ps1'),
+    (Join-Path $repoRoot 'pyproject.toml'),
+    (Join-Path $repoRoot 'README.md'),
+    (Join-Path $repoRoot 'src'),
+    (Join-Path $repoRoot 'deploy')
+)
+$ancestor = $repoRoot
+$isRepoRoot = $true
+while ($ancestor) {
+    Assert-BootstrapObjectTrusted -Path $ancestor -AllowedWriterSids $bootstrapWriters `
+        -AncestorOnly:(-not $isRepoRoot)
+    $isRepoRoot = $false
+    $parent = Split-Path -Parent $ancestor
+    if (-not $parent -or $parent -eq $ancestor) { break }
+    $ancestor = $parent
+}
+foreach ($inputPath in $sourceInputs) {
+    Assert-BootstrapTreeTrusted -Path $inputPath -AllowedWriterSids $bootstrapWriters
+}
+
+# Artifact and filesystem decisions are now safe to load from the proven tree.
 . "$PSScriptRoot/lib/InstallVerifyLib.ps1"
 
 # Bare executable names handed to `cmd /c` resolve from the CURRENT DIRECTORY
@@ -130,13 +234,6 @@ $ErrorActionPreference = "Stop"
 # never searches the CWD for commands, so only the cmd /c call sites needed it.
 $env:NoDefaultCurrentDirectoryInExePath = '1'
 
-# --- Must be elevated (we write under ProgramData, set ACLs, configure IIS) ---
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "Run from an elevated (Administrator) PowerShell."
-}
-
-$repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
 # CODE (RuntimeDir): rebuilt every run, gMSA read+execute, never written by the
 # app. STATE (InstallDir): survives every run, gMSA modify, never executed.
 # Keeping those two sets in one directory with one ACL is what made a
@@ -236,20 +333,23 @@ function Install-Prerequisites {
         # 2026-08-17 F1: nothing reaches msiexec unverified. This is the only
         # third-party executable the installer runs, it runs elevated, and it
         # runs on the host that holds the RA's gMSA context.
-        $msi = $HttpPlatformHandlerMsi
-        $sourceKind = Assert-MsiSourceAcceptable -Source $msi -Sha256 $HttpPlatformHandlerSha256
+        $source = $HttpPlatformHandlerMsi
+        $sourceKind = Assert-MsiSourceAcceptable -Source $source -Sha256 $HttpPlatformHandlerSha256
+        $msi = Join-Path $installerScratch ('HttpPlatformHandler-' + [guid]::NewGuid().ToString('N') + '.msi')
+        try {
+            if ($sourceKind -eq 'https') {
+                Write-Host "  [..]   Downloading HttpPlatformHandler from $source into protected staging ..."
+                try { Invoke-WebRequest -Uri $source -OutFile $msi -UseBasicParsing } catch { throw "Download failed: $($_.Exception.Message)" }
+            } else {
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                    throw "HttpPlatformHandler MSI not found: $source"
+                }
+                Copy-Item -LiteralPath $source -Destination $msi -ErrorAction Stop
+            }
 
-        if ($sourceKind -eq 'https') {
-            $dest = Join-Path $env:TEMP "HttpPlatformHandler.msi"
-            Write-Host "  [..]   Downloading HttpPlatformHandler from $msi ..."
-            try { Invoke-WebRequest -Uri $msi -OutFile $dest -UseBasicParsing } catch { throw "Download failed: $($_.Exception.Message)" }
-            $msi = $dest
-        }
-        if (-not (Test-Path $msi)) { throw "HttpPlatformHandler MSI not found: $msi" }
-
-        # 1. Digest, when one was supplied (always, for a downloaded artifact --
-        #    Assert-MsiSourceAcceptable refuses a remote source without it).
-        if ($HttpPlatformHandlerSha256) {
+            # Verify the protected staged copy, not the caller-controlled source
+            # path. No non-administrator can replace these bytes between this
+            # check and msiexec reopening them.
             $actualHash = (Get-FileHash -Algorithm SHA256 -Path $msi).Hash
             if (-not (Test-Sha256Match -Actual $actualHash -Expected $HttpPlatformHandlerSha256)) {
                 throw ("HttpPlatformHandler MSI SHA-256 mismatch. Expected {0}, got {1}. " -f
@@ -257,30 +357,29 @@ function Install-Prerequisites {
                       "NOT installing. Delete the downloaded copy and obtain the artifact again."
             }
             Write-Host "  [ok]   MSI SHA-256 matches the expected digest."
-        } else {
-            Write-Host "  [..]   No -HttpPlatformHandlerSha256 given for this local MSI; relying on the Authenticode check below."
-        }
 
-        # 2. Authenticode signature and publisher. The digest proves the bytes
-        #    are the ones the operator named; this proves who made them, which
-        #    is what catches a wrong-but-consistently-hashed artifact.
-        $sig = Get-AuthenticodeSignature -FilePath $msi
-        $signerSubject = ""
-        if ($sig.SignerCertificate) { $signerSubject = $sig.SignerCertificate.Subject }
-        if (-not (Test-MsiSignatureAcceptable -Status ([string]$sig.Status) `
-                    -SignerSubject $signerSubject `
-                    -ExpectedPublisher $HttpPlatformHandlerPublisher)) {
-            throw ("HttpPlatformHandler MSI failed Authenticode verification. Status '{0}', signer '{1}', expected publisher '{2}'. " -f
-                   $sig.Status, $signerSubject, $HttpPlatformHandlerPublisher) +
-                  "NOT installing. If your deployment repackages this module, pass -HttpPlatformHandlerPublisher."
-        }
-        Write-Host ("  [ok]   MSI Authenticode signature valid, signed by {0}." -f $signerSubject)
+            # 2. Authenticode signature and publisher.
+            $sig = Get-AuthenticodeSignature -FilePath $msi
+            $signerSubject = ""
+            if ($sig.SignerCertificate) { $signerSubject = $sig.SignerCertificate.Subject }
+            if (-not (Test-MsiSignatureAcceptable -Status ([string]$sig.Status) `
+                        -SignerSubject $signerSubject `
+                        -ExpectedPublisher $HttpPlatformHandlerPublisher)) {
+                throw ("HttpPlatformHandler MSI failed Authenticode verification. Status '{0}', signer '{1}', expected publisher '{2}'. " -f
+                       $sig.Status, $signerSubject, $HttpPlatformHandlerPublisher) +
+                      "NOT installing. If your deployment repackages this module, pass -HttpPlatformHandlerPublisher."
+            }
+            Write-Host ("  [ok]   MSI Authenticode signature valid, signed by {0}." -f $signerSubject)
 
-        Write-Host "  [..]   Installing HttpPlatformHandler from $msi ..."
-        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
-        if ($p.ExitCode -ne 0) { throw "msiexec failed installing HttpPlatformHandler (exit $($p.ExitCode))." }
-        if (Test-HttpPlatformHandler) { Write-Host "  [ok]   HttpPlatformHandler installed." }
-        else { Write-Host "  [warn] HttpPlatformHandler MSI ran but the module is not detected; verify in IIS." }
+            Write-Host "  [..]   Installing the verified staged HttpPlatformHandler MSI ..."
+            $msiexec = Join-Path $env:windir 'System32\msiexec.exe'
+            $p = Start-Process $msiexec -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "msiexec failed installing HttpPlatformHandler (exit $($p.ExitCode))." }
+            if (Test-HttpPlatformHandler) { Write-Host "  [ok]   HttpPlatformHandler installed." }
+            else { Write-Host "  [warn] HttpPlatformHandler MSI ran but the module is not detected; verify in IIS." }
+        } finally {
+            Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+        }
     } else {
         Write-Host "  [warn] HttpPlatformHandler is MISSING and no -HttpPlatformHandlerMsi was given."
         Write-Host "         It is a separate Microsoft IIS module (the download has been unreliable, so"
@@ -289,24 +388,12 @@ function Install-Prerequisites {
         Write-Host "         by hand or re-run with -HttpPlatformHandlerMsi <path-to-msi>."
     }
 
-    # 3. Python 3.12+ via winget (winget verifies its own packages). Best-effort.
-    $havePy = $false
-    foreach ($probe in @("py -3.12 --version", "py -3 --version", "python --version")) {
-        $parts = $probe.Split(" ")
-        if (Get-Command $parts[0] -ErrorAction SilentlyContinue) {
-            $out = & cmd /c "$probe 2>&1"
-            if ($out -match "Python\s+3\.(1[2-9]|[2-9]\d)") { $havePy = $true; break }
-        }
-    }
-    if ($havePy) {
-        Write-Host "  [ok]   Python 3.12+ already present."
-    } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Host "  [..]   Installing Python 3.12 via winget ..."
-        & winget install --id Python.Python.3.12 -e --source winget --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
-        Write-Host "  [ok]   winget install attempted (the discovery step below confirms)."
-    } else {
-        Write-Host "  [warn] No Python 3.12+ and winget is unavailable. Install Python 3.12+ manually."
-    }
+    # Python is deliberately not installed here. Running a PATH-selected py,
+    # python, or winget from an elevated bootstrapper turns a writable PATH
+    # entry into Administrator code execution. The discovery step below accepts
+    # only an exact executable whose complete ACL/owner chain is trusted; if no
+    # such Python exists, install it separately and re-run.
+    Write-Host "  [..]   Python is not auto-installed; trusted discovery runs below."
     Write-Host ""
 }
 
@@ -363,12 +450,12 @@ $adminOnlyTrustees = @(
 # for the gMSA anywhere in this tree -- a compromised app pool must not be able
 # to rewrite the interpreter it is about to be relaunched with.
 $runtimeGrants = @(
-    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)RX')
+    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ('*' + $gmsaSid + ':(OI)(CI)RX')
 )
 # STATE: modify for the worker (it writes the database and the log), full for
 # administrators. Nothing here is ever executed.
 $stateGrants = @(
-    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)M')
+    '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ('*' + $gmsaSid + ':(OI)(CI)M')
 )
 # The gMSA legitimately OWNS files it creates in the state tree (log lines, the
 # SQLite journal). It can own nothing in the runtime tree, having no write
@@ -411,29 +498,13 @@ function Initialize-SecuredRoot {
                        -Reasons $prov.Reasons -Preserve $Preserve)
         }
         'absent' {
-            # TOCTOU (round 4): between the provenance check above and this
-            # creation, a local attacker can pre-create the predictable path.
-            # Create WITHOUT -Force -- on an existing path that THROWS -- and on
-            # the collision, re-run the verdict on what actually appeared. A
-            # non-administrator cannot set owner to Administrators, so their
-            # tree can only re-verify as 'foreign' and hit the refusal above;
-            # 'ours' is unreachable for them and the retry cannot loop.
-            #
-            # TOCTOU (round 5, high -- the FILE race the round-4 fix did not
-            # cover): a file planted into the fresh directory while it still
-            # INHERITED the parent's Users-create rights rode the entire claim
-            # (the claim proof verifies shape, and a plain inherited-DACL
-            # dotenv has exactly the shape the tree walk expects of a
-            # descendant), survived setowner as Administrators-owned, and was
-            # preserved by the no-clobber branch -- shipping attacker-chosen
-            # EAB/SAN policy. Lock-FreshRoot closes it: protect the DACL in
-            # one atomic swap the instant the directory exists, then PROVE the
-            # directory empty -- anything present was raced in during the only
-            # window that remained, and the install refuses.
-            try {
-                New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
-            } catch {
-                if (-not (Test-Path -LiteralPath $Path)) { throw }
+            # CreateDirectoryW receives the final protected DACL in the same
+            # kernel call that creates the directory. Unlike create-then-icacls,
+            # there is no inherited-DACL interval in which a local user can open
+            # a create-capable handle and retain it after lockdown. A namespace
+            # collision is reported separately and re-verified, never adopted.
+            $created = New-AtomicProtectedDirectory -Path $Path -Grants $Grants
+            if (-not $created) {
                 Write-Host "  [!!]  $Path appeared between the absence check and creation -- re-verifying it"
                 $prov = Get-RootProvenance -Path $Path -AllowedTrustees $AllowedTrustees `
                     -AllowedOwnerSids $AllowedOwnerSids -ProtectedEntries $ProtectedEntries `
@@ -445,9 +516,8 @@ function Initialize-SecuredRoot {
                 Write-Host "  [ok]   $Path recognised as a previous install of this RA"
                 break
             }
-            Lock-FreshRoot -Path $Path -Grants $Grants -Purpose $Purpose -Preserve $Preserve
             $fresh = $true
-            Write-Host "  [ok]   created $Path (protected at creation and verified empty)"
+            Write-Host "  [ok]   created $Path atomically with its final protected DACL"
         }
         default {
             Write-Host "  [ok]   $Path recognised as a previous install of this RA"
@@ -457,9 +527,9 @@ function Initialize-SecuredRoot {
     # then apply exactly our grants, then read the whole tree back and prove
     # it. The proof is not ceremony: "we ran icacls" is not evidence, and this
     # is the same evidence the NEXT run's pre-flight will demand. A FRESH tree
-    # skips the reset deliberately: /reset would strip the DACL Lock-FreshRoot
-    # just applied and reopen the window it exists to close (and there is
-    # nothing in an empty tree to normalise).
+    # skips the reset deliberately: /reset would strip the DACL the
+    # CreateDirectoryW call just applied and reopen the window it exists to
+    # close (and there is nothing in an empty tree to normalise).
     if (-not $fresh) {
         Assert-NoReparsePoints -Path $Path -Context "$Purpose claim"
         Reset-TreeToInherited -Path $Path
@@ -483,12 +553,60 @@ $stateForbiddenEntries = @('venv', 'python', 'scripts')
 Initialize-SecuredRoot -Path $RuntimeDir -Purpose 'runtime (code)' `
     -Grants $runtimeGrants -AllowedTrustees $raTrustees
 
+# Re-resolve after the runtime object exists and before any state grant is
+# applied. If an alias escaped the lexical gate, fail before Modify can ever
+# land on runtime bytes.
+if ((Get-PathRelation -A $RuntimeDir -B $InstallDir) -ne 'disjoint') {
+    throw 'Runtime and state roots resolve to overlapping filesystem trees.'
+}
+if ((Get-PathRelation -A $SitePath -B $RuntimeDir) -ne 'disjoint') {
+    throw 'Site and runtime roots resolve to overlapping filesystem trees after runtime creation.'
+}
+
 Initialize-SecuredRoot -Path $InstallDir -Purpose 'state (database, logs, secrets)' `
     -Grants $stateGrants -AllowedTrustees $raTrustees `
     -AllowedOwnerSids $stateOwnerSids `
     -ProtectedEntries @{ 'acme-ra.env' = $raTrustees } `
     -ForbiddenTopLevelEntries $stateForbiddenEntries `
     -Preserve @("$InstallDir\acme_ra.db", "$InstallDir\acme-ra.env", "$InstallDir\logs")
+
+if ((Get-PathRelation -A $SitePath -B $InstallDir) -ne 'disjoint') {
+    throw 'Site and state roots resolve to overlapping filesystem trees after state creation.'
+}
+
+# All transient installer inputs live in a fresh protected directory under
+# Program Files, never in a shared/caller-selected TEMP directory or inside a
+# managed tree whose next-run provenance a failed install could poison. The
+# source snapshot makes PEP 517 consume an immutable namespace rather than
+# repeatedly reopening the checkout after its provenance check.
+$installerScratch = Join-Path $env:ProgramFiles ('.acme-adcs-ra-installer-' + [guid]::NewGuid().ToString('N'))
+function Remove-InstallerScratch {
+    if ($installerScratch -and (Test-Path -LiteralPath $installerScratch)) {
+        Assert-NoReparsePoints -Path $installerScratch -Context 'installer scratch cleanup'
+        Remove-Item -LiteralPath $installerScratch -Recurse -Force
+    }
+}
+trap {
+    $originalError = $_
+    try { Remove-InstallerScratch } catch {
+        Write-Warning "Could not remove protected installer scratch $installerScratch after failure: $($_.Exception.Message)"
+    }
+    throw $originalError
+}
+$adminScratchGrants = @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F')
+if (-not (New-AtomicProtectedDirectory -Path $installerScratch -Grants $adminScratchGrants)) {
+    throw "Unexpected installer scratch collision at $installerScratch."
+}
+$sourceSnapshot = Join-Path $installerScratch 'source'
+if (-not (New-AtomicProtectedDirectory -Path $sourceSnapshot -Grants $adminScratchGrants)) {
+    throw "Unexpected source-snapshot collision at $sourceSnapshot."
+}
+Copy-Item -LiteralPath (Join-Path $repoRoot 'pyproject.toml') -Destination $sourceSnapshot
+Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination $sourceSnapshot
+Copy-Item -LiteralPath (Join-Path $repoRoot 'src') -Destination $sourceSnapshot -Recurse
+Copy-Item -LiteralPath (Join-Path $repoRoot 'deploy') -Destination $sourceSnapshot -Recurse
+Assert-NoReparsePoints -Path $sourceSnapshot -Context 'protected source snapshot'
+Write-Host "  [ok]   build inputs copied to protected snapshot $sourceSnapshot"
 
 # The /reset inside the claim just stripped EVERY descendant's explicit DACL --
 # including the dotenv's protected one. It is normally re-applied after the
@@ -554,8 +672,9 @@ function Invoke-PyProbe {
         if ($resolved -and $resolved.Source) { $Exe = $resolved.Source }
     }
     $argStr = ($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
-    $tmp = Join-Path $env:TEMP "ra-py-probe.txt"
-    & cmd /c "`"$Exe`" $argStr > `"$tmp`" 2>&1"
+    $tmp = Join-Path $installerScratch ("ra-py-probe-" + [guid]::NewGuid().ToString('N') + ".txt")
+    $cmdExe = Join-Path $env:windir 'System32\cmd.exe'
+    & $cmdExe /d /c "`"$Exe`" $argStr > `"$tmp`" 2>&1"
     $exit = $LASTEXITCODE
     $out = ""
     if (Test-Path $tmp) { $out = (Get-Content $tmp -Raw); Remove-Item $tmp -Force }
@@ -599,6 +718,11 @@ foreach ($l in $launchers) {
     $label = "$($l.Exe) $($l.Args -join `" `")"
     $cmd = Get-Command $l.Exe -ErrorAction SilentlyContinue
     if (-not $cmd) { Write-Host "  [skip] $label -- exe not found on PATH"; continue }
+    if ($cmd.CommandType -ne [System.Management.Automation.CommandTypes]::Application -or
+        -not $cmd.Source -or -not [System.IO.Path]::IsPathRooted($cmd.Source)) {
+        Write-Host "  [skip] $label -- command is not an exact executable path ($($cmd.CommandType))"
+        continue
+    }
     if ($cmd.Source -and $cmd.Source -match "\\WindowsApps\\") {
         Write-Host "  [skip] $label -- Windows Store alias ($($cmd.Source)), unusable non-interactively"
         continue
@@ -687,11 +811,8 @@ try {
     $runtimePy = Join-Path $runtimeCurrent "python"
     if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
         Write-Host "  Python is user-scoped ($($python.Exe)); copying it into the runtime ..."
-        $r = Invoke-PyProbe -Exe "py" -Arguments @("install", "--target=$runtimePy", "$major.$minor")
-        if ($r.ExitCode -ne 0) {
-            $pySrc = Split-Path $python.Exe
-            if (Test-Path $pySrc) { Copy-Item -Path $pySrc -Destination $runtimePy -Recurse -Force }
-        }
+        $pySrc = Split-Path $python.Exe
+        if (Test-Path $pySrc) { Copy-Item -LiteralPath $pySrc -Destination $runtimePy -Recurse -Force }
         $runtimePyExe = Join-Path $runtimePy "python.exe"
         if (-not (Test-Path $runtimePyExe)) {
             $nested = Get-ChildItem -Path $runtimePy -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -702,7 +823,7 @@ try {
         }
         foreach ($vl in @("Lib\venv\scripts\nt\venvlauncher.exe", "Lib\venv\scripts\nt\venvwlauncher.exe")) {
             $vlPath = Join-Path (Split-Path $runtimePyExe) $vl
-            if (Test-Path $vlPath) { attrib -H -S $vlPath 2>$null | Out-Null }
+            if (Test-Path $vlPath) { & (Join-Path $env:windir 'System32\attrib.exe') -H -S $vlPath 2>$null | Out-Null }
         }
         $python = @{ Exe = $runtimePyExe; Args = @() }
         Write-Host "  [ok]   runtime interpreter at $runtimePyExe"
@@ -715,7 +836,7 @@ try {
     $pyPrefix = Split-Path $python.Exe
     foreach ($vl in @("Lib\venv\scripts\nt\venvlauncher.exe", "Lib\venv\scripts\nt\venvwlauncher.exe")) {
         $vlPath = Join-Path $pyPrefix $vl
-        if (Test-Path $vlPath) { attrib -H -S $vlPath 2>$null | Out-Null }
+        if (Test-Path $vlPath) { & (Join-Path $env:windir 'System32\attrib.exe') -H -S $vlPath 2>$null | Out-Null }
     }
 
     # No delete-before-create dance any more: `current` was created empty
@@ -775,7 +896,7 @@ if ($pipMajor -ge 0) {
 # carries a hash for every artifact; --require-hashes makes pip refuse anything
 # that does not match. The project itself is then installed --no-deps, so this
 # file is the only thing that decides dependency versions.
-$lockFile = Join-Path $repoRoot "deploy\requirements.lock.txt"
+$lockFile = Join-Path $sourceSnapshot "deploy\requirements.lock.txt"
 if (Test-Path $lockFile) {
     Write-Host "  Installing pinned dependencies from deploy/requirements.lock.txt ..."
     & $venvPy -m pip install --require-hashes --only-binary :all: -r $lockFile
@@ -792,7 +913,7 @@ if (Test-Path $lockFile) {
     # runtime pinning above made that easy to miss: everything in the install
     # log was hash-verified, and the build closure never appeared in the log.
     # Preinstall it by hash, then build with isolation OFF so nothing is fetched.
-    $buildLock = Join-Path $repoRoot "deploy\build-requirements.lock.txt"
+    $buildLock = Join-Path $sourceSnapshot "deploy\build-requirements.lock.txt"
     if (-not (Test-Path $buildLock)) {
         throw ("deploy/build-requirements.lock.txt is missing. It pins the PEP 517 " +
                "build closure by hash and is required for an issuance-path install. " +
@@ -806,7 +927,7 @@ if (Test-Path $lockFile) {
                "build backend from the index unpinned. Regenerate the lock for this " +
                "platform and Python version instead.")
     }
-    & $venvPy -m pip install --no-deps --no-build-isolation --upgrade $repoRoot
+    & $venvPy -m pip install --no-deps --no-build-isolation --upgrade $sourceSnapshot
     if ($LASTEXITCODE -ne 0) { throw "pip install of acme-adcs-ra failed (exit $LASTEXITCODE)." }
 } else {
     # The lock file ships with the repo; its absence means an incomplete copy.
@@ -983,11 +1104,12 @@ if (Test-Path -LiteralPath $siteWcPath) {
 function Grant-ServiceLogonRight {
     param([string]$AccountSid)
     try {
-        $tmpDir = Join-Path $env:TEMP ("ra-secpol-" + [guid]::NewGuid().ToString("N"))
+        $tmpDir = Join-Path $installerScratch ("ra-secpol-" + [guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
         $cfg = Join-Path $tmpDir "secpol.cfg"
         $db  = Join-Path $tmpDir "secpol.sdb"
-        & secedit /export /cfg $cfg /areas USER_RIGHTS | Out-Null
+        $secedit = Join-Path $env:windir 'System32\secedit.exe'
+        & $secedit /export /cfg $cfg /areas USER_RIGHTS | Out-Null
         $lines = Get-Content $cfg
         $rightLine = ($lines | Where-Object { $_ -match "^SeServiceLogonRight" } | Select-Object -First 1)
         if ($rightLine -and ($rightLine -match [regex]::Escape($AccountSid))) {
@@ -1005,8 +1127,8 @@ function Grant-ServiceLogonRight {
             $out = foreach ($l in $lines) { $l; if ($l -match "^\[Privilege Rights\]") { $newLine } }
         }
         Set-Content -Path $cfg -Value $out -Encoding Unicode
-        & secedit /import /db $db /cfg $cfg /areas USER_RIGHTS | Out-Null
-        & secedit /configure /db $db /areas USER_RIGHTS | Out-Null
+        & $secedit /import /db $db /cfg $cfg /areas USER_RIGHTS | Out-Null
+        & $secedit /configure /db $db /areas USER_RIGHTS | Out-Null
         Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
         return $true
     } catch { return $false }
@@ -1029,11 +1151,15 @@ if ($ConfigureIIS) {
         # install refuses; a fresh one is created locked-at-birth exactly like
         # the managed roots. The earlier code adopted whatever was on disk.
         $siteGrants = @(
-            '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ($GmsaAccount + ':(OI)(CI)RX')
+            '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', ('*' + $gmsaSid + ':(OI)(CI)RX')
         )
         $siteFresh = $false
         if (Test-Path -LiteralPath $SitePath) {
             Write-Host "  Proving the pre-existing site tree $SitePath ..."
+            $siteRoot = Get-Item -LiteralPath $SitePath -Force -ErrorAction Stop
+            if (-not (Test-InstallRootAttributesAcceptable $siteRoot.Attributes)) {
+                throw "$SitePath is not an ordinary directory; a site-root reparse point is refused."
+            }
             $reparse = @(Find-ReparsePoints -Path $SitePath)
             if ($reparse.Count -gt 0) {
                 throw ("$SitePath contains reparse points ($($reparse -join ', ')). A link inside the " +
@@ -1042,7 +1168,7 @@ if ($ConfigureIIS) {
             }
             $siteViol = @()
             foreach ($obj in @(Get-Item -LiteralPath $SitePath -Force; Get-ChildItem -LiteralPath $SitePath -Recurse -Force)) {
-                $siteViol += Test-ObjectDaclTrusted -Path $obj.FullName -AlsoFlagTrustees @($GmsaAccount, $gmsaSid)
+                $siteViol += Test-ObjectDaclTrusted -Path $obj.FullName
             }
             if (@($siteViol).Count -gt 0) {
                 throw ("The pre-existing site tree $SitePath is not administrator-only:`n  " +
@@ -1053,13 +1179,14 @@ if ($ConfigureIIS) {
             }
             Write-Host "  [ok]   site tree proven: administrator-only, no reparse points"
         } else {
-            New-Item -ItemType Directory -Path $SitePath -ErrorAction Stop | Out-Null
-            Lock-FreshRoot -Path $SitePath -Grants $siteGrants -Purpose 'site (web.config, launch configuration)' -Preserve @()
+            if (-not (New-AtomicProtectedDirectory -Path $SitePath -Grants $siteGrants)) {
+                throw "$SitePath appeared during creation; refusing to adopt a raced site tree."
+            }
             $siteFresh = $true
-            Write-Host "  [ok]   created $SitePath (protected at creation and verified empty)"
+            Write-Host "  [ok]   created $SitePath atomically with its final protected DACL"
         }
 
-        $webConfigSrc = Join-Path $repoRoot "deploy\iis\web.config"
+        $webConfigSrc = Join-Path $sourceSnapshot "deploy\iis\web.config"
         $webConfigDst = Join-Path $SitePath "web.config"
         # Do NOT clobber an existing web.config -- it holds operator-set BASE_URL,
         # ADCS_HOST/TEMPLATE/CA_NAME, etc. Lay the template down only on a fresh
@@ -1147,12 +1274,13 @@ if ($ConfigureIIS) {
         # TLS binding (add-before-delete so HTTPS is never left unbound on a switch).
         function Ensure-SslCertBinding {
             param([string]$BindingArgument, [string]$Thumbprint, [string]$AppId)
-            $show = & netsh http show sslcert $BindingArgument 2>&1 | Out-String
+            $netsh = Join-Path $env:windir 'System32\netsh.exe'
+            $show = & $netsh http show sslcert $BindingArgument 2>&1 | Out-String
             if ($show -match [regex]::Escape($Thumbprint)) { Write-Host "    Certificate already bound to $BindingArgument."; return }
-            & netsh http delete sslcert $BindingArgument 2>$null | Out-Null
-            $addOut = & netsh http add sslcert $BindingArgument certhash="$Thumbprint" appid="$AppId" certstorename=MY 2>&1
+            & $netsh http delete sslcert $BindingArgument 2>$null | Out-Null
+            $addOut = & $netsh http add sslcert $BindingArgument certhash="$Thumbprint" appid="$AppId" certstorename=MY 2>&1
             if ($LASTEXITCODE -ne 0) { Write-Host ($addOut | Out-String); throw "Failed to bind TLS cert to $BindingArgument (netsh exit $LASTEXITCODE)." }
-            $show = & netsh http show sslcert $BindingArgument 2>&1 | Out-String
+            $show = & $netsh http show sslcert $BindingArgument 2>&1 | Out-String
             if ($show -notmatch [regex]::Escape($Thumbprint)) { throw "TLS binding verification failed for $BindingArgument." }
         }
 
@@ -1163,16 +1291,17 @@ if ($ConfigureIIS) {
             $hostPort = "$HostName`:$Port"
             if ($SharePort443) {
                 Ensure-SslCertBinding -BindingArgument "hostnameport=$hostPort" -Thumbprint $TlsCertThumbprint -AppId $appId
-                $catchallShow = & netsh http show sslcert ipport="$ipport" 2>&1 | Out-String
+                $netsh = Join-Path $env:windir 'System32\netsh.exe'
+                $catchallShow = & $netsh http show sslcert ipport="$ipport" 2>&1 | Out-String
                 if ($catchallShow -match [regex]::Escape($TlsCertThumbprint)) {
-                    & netsh http delete sslcert ipport="$ipport" 2>$null | Out-Null
+                    & $netsh http delete sslcert ipport="$ipport" 2>$null | Out-Null
                 } elseif ($catchallShow -match "Certificate Hash") {
                     Write-Warning "A catch-all $ipport bound to a DIFFERENT cert (a sibling tool?) WILL shadow this SNI binding. Convert that tool to SNI or remove its catch-all."
                 }
                 Write-Host "    TLS bound to hostnameport=$hostPort (SNI)."
             } else {
                 Ensure-SslCertBinding -BindingArgument "ipport=$ipport" -Thumbprint $TlsCertThumbprint -AppId $appId
-                if ($HostName) { & netsh http delete sslcert hostnameport="$hostPort" 2>$null | Out-Null }
+                if ($HostName) { & $netsh http delete sslcert hostnameport="$hostPort" 2>$null | Out-Null }
                 Write-Host "    TLS bound to $ipport (catch-all)."
             }
         } else {
@@ -1182,10 +1311,10 @@ if ($ConfigureIIS) {
         # /L: the site path is as predictable as the install root, and this
         # grant runs elevated -- it must not be redirectable by a link either
         # (2026-08-15 rescan-2 F2). A site tree created THIS run already
-        # carries the grant (Lock-FreshRoot), and a duplicate /grant would add
-        # a second gMSA ACE to the protected DACL.
+        # carries the grant (New-AtomicProtectedDirectory), and a duplicate
+        # /grant would add a second gMSA ACE to the protected DACL.
         if (-not $siteFresh) {
-            $siteAclOut = & icacls.exe $SitePath /grant "${GmsaAccount}:(OI)(CI)R" /L 2>&1
+            $siteAclOut = & $script:IcaclsExe $SitePath /grant "${GmsaAccount}:(OI)(CI)R" /L 2>&1
             if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $siteAclOut)) {
                 throw ("Failed to grant the gMSA read access to $SitePath (exit $LASTEXITCODE): " +
                        (($siteAclOut | Out-String).Trim()))
@@ -1208,6 +1337,8 @@ if ($script:poolWasStopped -and -not $script:iisActuallyConfigured) {
     Write-Host "Restarting app pool `"$AppPool`" (was stopped to release files) ..."
     & $appcmdExe start apppool /apppool.name:"$AppPool" 2>$null | Out-Null
 }
+
+Remove-InstallerScratch
 
 Write-Host ""
 Write-Host "Done. acme-adcs-ra is installed in two separate trees, on purpose:"

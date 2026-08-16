@@ -50,6 +50,11 @@ The minimum to serve an enterprise client:
   its `status` is `valid` **and** its EAB kid is still in the allowlist — both
   re-checked on every authenticated request, so pulling a kid is a complete
   eviction rather than an issuance-only block.
+- Each EAB kid has a lifetime durable-account quota (default: one). The store
+  counts all account rows, including deactivated accounts, and performs the
+  count, account insert, and `account-created` audit insert under one
+  `BEGIN IMMEDIATE` transaction. Deactivation therefore never frees a slot,
+  and concurrent distinct JWK requests cannot exceed the configured quota.
 
 ## Enrollment leg (RA → ADCS)
 

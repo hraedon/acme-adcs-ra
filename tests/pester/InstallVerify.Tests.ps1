@@ -53,8 +53,11 @@ Describe 'Assert-MsiSourceAcceptable' {
             -Sha256 ('a' * 64) | Should -Be 'https'
     }
 
-    It 'accepts a vetted local path without a digest' {
-        Assert-MsiSourceAcceptable -Source 'C:\vetted\h.msi' | Should -Be 'local'
+    It 'requires an out-of-band digest for a local path too' {
+        { Assert-MsiSourceAcceptable -Source 'C:\vetted\h.msi' } |
+            Should -Throw -ExpectedMessage '*-HttpPlatformHandlerSha256*'
+        Assert-MsiSourceAcceptable -Source 'C:\vetted\h.msi' -Sha256 ('a' * 64) |
+            Should -Be 'local'
     }
 }
 
@@ -595,8 +598,8 @@ Describe 'install-windows.ps1 separates code from state' {
     }
 
     It 'grants the gMSA execute on code and modify on state -- never write on code' {
-        $script:installer | Should -Match "\`$runtimeGrants = @\(\s*\r?\n\s*'\*S-1-5-32-544:\(OI\)\(CI\)F', '\*S-1-5-18:\(OI\)\(CI\)F', \(\`$GmsaAccount \+ ':\(OI\)\(CI\)RX'\)"
-        $script:installer | Should -Match "\`$stateGrants = @\(\s*\r?\n\s*'\*S-1-5-32-544:\(OI\)\(CI\)F', '\*S-1-5-18:\(OI\)\(CI\)F', \(\`$GmsaAccount \+ ':\(OI\)\(CI\)M'\)"
+        $script:installer | Should -Match "\`$runtimeGrants = @\(\s*\r?\n\s*'\*S-1-5-32-544:\(OI\)\(CI\)F', '\*S-1-5-18:\(OI\)\(CI\)F', \('\*' \+ \`$gmsaSid \+ ':\(OI\)\(CI\)RX'\)"
+        $script:installer | Should -Match "\`$stateGrants = @\(\s*\r?\n\s*'\*S-1-5-32-544:\(OI\)\(CI\)F', '\*S-1-5-18:\(OI\)\(CI\)F', \('\*' \+ \`$gmsaSid \+ ':\(OI\)\(CI\)M'\)"
         # The runtime tree must never carry a Modify or Full grant for the gMSA.
         $script:installer | Should -Not -Match "runtimeGrants[^)]*GmsaAccount \+ ':\(OI\)\(CI\)M'"
         $script:installer | Should -Not -Match "runtimeGrants[^)]*GmsaAccount \+ ':\(OI\)\(CI\)F'"
@@ -750,7 +753,7 @@ Describe 'install-windows.ps1 never adopts a namespace' {
     It 'still refuses every link-following privileged operation' {
         $script:lib       | Should -Not -Match 'takeown\.exe'
         $script:installer | Should -Not -Match 'takeown\.exe'
-        $calls = @([regex]::Matches($script:lib, '&\s+icacls\.exe[^\r\n]*'))
+        $calls = @([regex]::Matches($script:lib, '&\s+\$script:IcaclsExe[^\r\n]*'))
         $calls.Count | Should -BeGreaterOrEqual 5
         foreach ($c in $calls) {
             $c.Value | Should -Match '\s/L\b'
@@ -928,9 +931,8 @@ Describe 'Get-PathRelation / Test-PathInsideTree (L2: the boundary must be two t
         Get-PathRelation -A 'C:\ra' -B 'C:\ra\state' | Should -Be 'b-inside-a'
     }
 
-    It 'treats a drive root as containing its children, not as equal' {
-        Get-PathRelation -A 'C:\x' -B 'C:' | Should -Be 'a-inside-b'
-        Get-PathRelation -A 'C:' -B 'C:\x' | Should -Be 'b-inside-a'
+    It 'refuses a drive root as an install tree' {
+        { Get-PathRelation -A 'C:\x' -B 'C:\' } | Should -Throw '*drive root*'
     }
 
     It 'identifies the two default roots as disjoint' {
@@ -1005,13 +1007,12 @@ Describe 'install-windows.ps1: Daybreak round 4 fixes' {
         $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
     }
 
-    It 'M1: creates an absent root WITHOUT -Force and re-verifies on collision' {
+    It 'M1: atomically creates an absent root with its final DACL and re-verifies on collision' {
         $absent = $script:installer.IndexOf("'absent' {")
         $absent | Should -BeGreaterThan 0
         $branch = $script:installer.Substring($absent, [Math]::Min(2200, $script:installer.Length - $absent))
-        # Creation that THROWS on an existing path -- no -Force anywhere in it.
-        $branch | Should -Match 'New-Item -ItemType Directory -Path \$Path -ErrorAction Stop'
-        $branch | Should -Not -Match 'New-Item -ItemType Directory -Force'
+        $branch | Should -Match 'New-AtomicProtectedDirectory -Path \$Path -Grants \$Grants'
+        $branch | Should -Not -Match 'New-Item -ItemType Directory'
         # ...and the collision path re-runs the provenance verdict rather than
         # adopting whatever appeared.
         $branch | Should -Match 'Get-RootProvenance -Path \$Path'
@@ -1068,28 +1069,29 @@ Describe 'install-windows.ps1: Daybreak round 4 fixes' {
 #       (app-side; pytest covers it)
 
 Describe 'Get-CanonicalPathString / Get-PathRelation (round 5: aliases)' {
-    It 'dot-segment aliases collapse to the same canonical string' {
-        Get-PathRelation -A 'C:\Program Files\acme-adcs-ra\current\..\..\acme-adcs-ra' -B 'C:\Program Files\acme-adcs-ra' |
+    It 'refuses dot-segment aliases rather than trying to normalize them' {
+        { Get-PathRelation -A 'C:\Program Files\acme-adcs-ra\current\..\..\acme-adcs-ra' -B 'C:\Program Files\acme-adcs-ra' } |
+            Should -Throw '*ambiguous Win32 component*'
+    }
+
+    It 'refuses forward-slash spellings while case noise still normalises' {
+        { Get-PathRelation -A 'c:/program files/acme-adcs-ra' -B 'C:\Program Files\ACME-ADCS-RA\' } |
+            Should -Throw '*absolute local drive paths*'
+        Get-PathRelation -A 'c:\program files\acme-adcs-ra' -B 'C:\Program Files\ACME-ADCS-RA\' |
             Should -Be 'equal'
     }
 
-    It 'forward slashes and case noise normalise' {
-        Get-PathRelation -A 'c:/program files/acme-adcs-ra' -B 'C:\Program Files\ACME-ADCS-RA\' |
-            Should -Be 'equal'
+    It 'refuses trailing-dot and trailing-space Win32 aliases' {
+        { Get-PathRelation -A 'C:\ProgramData\acme-ra' -B 'C:\ProgramData\acme-ra.' } |
+            Should -Throw '*ambiguous Win32 component*'
+        { Get-PathRelation -A 'C:\ProgramData\acme-ra' -B 'C:\ProgramData\acme-ra ' } |
+            Should -Throw '*ambiguous Win32 component*'
     }
 
-    It 'a dot-segment alias of a NESTED root is detected, not "disjoint"' {
-        # The exact bypass class: -InstallDir written with .. so the lexical
-        # prefix test used to answer disjoint while Windows resolves nesting.
-        Get-PathRelation -A 'C:\ProgramData\acme-ra\state' -B 'C:\ProgramData\acme-ra\code\..\state' |
-            Should -Be 'equal'
-        Get-PathRelation -A 'C:\ProgramData\acme-ra\code' -B 'C:\ProgramData\acme-ra\code\sub\..\..\state' |
-            Should -Be 'disjoint'
-    }
-
-    It 'UNC and drive roots survive normalisation' {
-        Get-CanonicalPathString -Path 'C:\' | Should -Be 'C:'
-        Get-CanonicalPathString -Path '\\\\server\\share\\dir/' | Should -Be '\\server\share\dir'
+    It 'refuses UNC, device, ADS, and reserved-device paths' {
+        { Get-PathRelation -A '\\server\share\dir' -B 'C:\safe\dir' } | Should -Throw '*absolute local drive paths*'
+        { Get-PathRelation -A 'C:\safe:stream' -B 'C:\other' } | Should -Throw '*ambiguous Win32 component*'
+        { Get-PathRelation -A 'C:\NUL\dir' -B 'C:\other' } | Should -Throw '*reserved device name*'
     }
 
     It 'genuinely disjoint roots stay disjoint (no false positives)' {
@@ -1182,6 +1184,22 @@ Describe 'Test-AceEndangersBytes (round 5: the interpreter chain rule)' {
             Should -BeTrue
     }
 
+    It 'THE FINDING: flags arbitrary named users and groups with write access' {
+        Test-AceEndangersBytes -Identity 'WORK-DOMAIN\LowPrivUser' -Rights $FC `
+            -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
+            Should -BeTrue
+        Test-AceEndangersBytes -Identity 'WORK-DOMAIN\DelegatedOperators' -Rights $WD `
+            -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 |
+            Should -BeTrue
+    }
+
+    It 'allows a write ACE only when its resolved SID is explicitly authorized' {
+        $sid = 'S-1-5-21-99-88-77-1104'
+        Test-AceEndangersBytes -Identity $sid -Rights $FC -AceType 'Allow' `
+            -InheritanceFlags 0 -IsDirectory $true -PropagationFlags 0 `
+            -AllowedWriterSids @($sid) | Should -BeFalse
+    }
+
     It 'on a FILE, byte-append (AppendData) is dangerous regardless of inheritance' {
         Test-AceEndangersBytes -Identity 'Everyone' -Rights $AD -AceType 'Allow' -InheritanceFlags 0 -IsDirectory $false -PropagationFlags 0 |
             Should -BeTrue
@@ -1242,28 +1260,24 @@ Describe 'install-windows.ps1: round-5 fixes' {
         $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
     }
 
-    It 'H: a fresh root is locked at creation (Lock-FreshRoot) and SKIPS the reset that would reopen the window' {
+    It 'H: a fresh root is created with the protected DACL atomically and SKIPS reset' {
         $absent = $script:installer.IndexOf("'absent' {")
         $branch = $script:installer.Substring($absent, [Math]::Min(2600, $script:installer.Length - $absent))
-        $branch | Should -Match 'Lock-FreshRoot -Path \$Path'
+        $branch | Should -Match 'New-AtomicProtectedDirectory -Path \$Path -Grants \$Grants'
         $freshSkip = $script:installer.IndexOf('if (-not $fresh)')
         $reset = $script:installer.IndexOf('Reset-TreeToInherited -Path $Path')
         $freshSkip | Should -BeGreaterThan 0
         $reset | Should -BeGreaterThan $freshSkip
     }
 
-    It 'H: Lock-FreshRoot protects FIRST, then proves emptiness, then setowner (source order)' {
+    It 'H: CreateDirectoryW receives the security descriptor in the creation call' {
         $lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
-        $fn = $lib.IndexOf('function Lock-FreshRoot')
-        $body = $lib.Substring($fn, [Math]::Min(2600, $lib.Length - $fn))
-        $protect = $body.IndexOf('Set-ObjectProtectedDacl')
-        $empty = $body.IndexOf('Get-ChildItem -LiteralPath $Path -Force')
-        $refusal = $body.IndexOf('Get-ForeignRootRefusal')
-        $owner = $body.IndexOf('/setowner')
-        foreach ($x in @($protect, $empty, $refusal, $owner)) { $x | Should -BeGreaterThan 0 }
-        $protect | Should -BeLessThan $empty
-        $empty | Should -BeLessThan $refusal
-        $refusal | Should -BeLessThan $owner
+        $lib | Should -Match 'CreateDirectoryW\(string path, ref SECURITY_ATTRIBUTES attributes\)'
+        $lib | Should -Match 'lpSecurityDescriptor = pinned\.AddrOfPinnedObject\(\)'
+        $lib | Should -Match '\[ACMERA\.AtomicDirectory\]::Create'
+        $fn = $lib.IndexOf('function New-AtomicProtectedDirectory')
+        $body = $lib.Substring($fn, [Math]::Min(5000, $lib.Length - $fn))
+        $body | Should -Not -Match '/reset'
     }
 
     It 'M: interpreter candidates are chain-gated BEFORE the first probe executes them' {
@@ -1277,22 +1291,62 @@ Describe 'install-windows.ps1: round-5 fixes' {
     }
 
     It 'M: SitePath is disjointness-checked against BOTH managed roots' {
-        @([regex]::Matches($script:installer, 'Get-PathRelation -A \$SitePath')).Count | Should -Be 2
+        @([regex]::Matches($script:installer, 'Get-PathRelation -A \$SitePath')).Count | Should -Be 4
+        $postRuntime = $script:installer.IndexOf("throw 'Site and runtime roots resolve")
+        $postState = $script:installer.IndexOf("throw 'Site and state roots resolve")
+        $runtimeCreate = $script:installer.IndexOf('Initialize-SecuredRoot -Path $RuntimeDir')
+        $stateCreate = $script:installer.IndexOf('Initialize-SecuredRoot -Path $InstallDir')
+        $postRuntime | Should -BeGreaterThan $runtimeCreate
+        $postRuntime | Should -BeLessThan $stateCreate
+        $postState | Should -BeGreaterThan $stateCreate
     }
 
     It 'M: -ConfigureIIS proves a pre-existing site tree (reparse + per-object DACL) or refuses' {
         $script:installer | Should -Match 'Find-ReparsePoints -Path \$SitePath'
-        $script:installer | Should -Match 'Test-ObjectDaclTrusted -Path \$obj\.FullName -AlsoFlagTrustees'
+        $script:installer | Should -Match 'Test-ObjectDaclTrusted -Path \$obj\.FullName'
+        $script:installer | Should -Not -Match 'AlsoFlagTrustees'
         $script:installer | Should -Match 'is not administrator-only'
     }
 
     It 'M: a fresh SitePath is locked at creation like the managed roots' {
-        $script:installer | Should -Match 'Lock-FreshRoot -Path \$SitePath'
+        $script:installer | Should -Match 'New-AtomicProtectedDirectory -Path \$SitePath -Grants \$siteGrants'
     }
 
     It 'M: the post-install web.config check is a THROW on every run, not a warning' {
         $script:installer | Should -Match 'Assert-WebConfigLaunchTrusted -WebConfigPath \$siteWcPath'
         # the old warning-only text is gone
         $script:installer | Should -Not -Match '\[!!\] .*INSIDE the state tree'
+    }
+
+    It 'validates repository inputs before dot-sourcing and builds only from the protected snapshot' {
+        $gate = $script:installer.IndexOf('Assert-BootstrapTreeTrusted -Path $inputPath')
+        $dotSource = $script:installer.IndexOf('. "$PSScriptRoot/lib/InstallVerifyLib.ps1"')
+        $copy = $script:installer.IndexOf("Copy-Item -LiteralPath (Join-Path `$repoRoot 'src')")
+        $build = $script:installer.IndexOf('pip install --no-deps --no-build-isolation --upgrade $sourceSnapshot')
+        $gate | Should -BeGreaterThan 0
+        $dotSource | Should -BeGreaterThan $gate
+        $copy | Should -BeGreaterThan $dotSource
+        $build | Should -BeGreaterThan $copy
+        $script:installer | Should -Not -Match 'pip install --no-deps --no-build-isolation --upgrade \$repoRoot'
+    }
+
+    It 'does not execute PATH-selected Python or winget in -InstallPrereqs' {
+        $start = $script:installer.IndexOf('function Install-Prerequisites')
+        $end = $script:installer.IndexOf('# --- Stop the worker', $start)
+        $body = $script:installer.Substring($start, $end - $start)
+        $body | Should -Not -Match '&\s+(py|python|python3|winget)\b'
+        $body | Should -Not -Match 'cmd\s+/c.*(py|python)'
+        $body | Should -Match 'Python is not auto-installed'
+    }
+
+    It 'stages, hashes, and executes the MSI only under protected installer scratch' {
+        $stage = $script:installer.IndexOf("`$msi = Join-Path `$installerScratch")
+        $hash = $script:installer.IndexOf('Get-FileHash -Algorithm SHA256 -Path $msi')
+        $exec = $script:installer.IndexOf('Start-Process $msiexec')
+        $stage | Should -BeGreaterThan 0
+        $hash | Should -BeGreaterThan $stage
+        $exec | Should -BeGreaterThan $hash
+        $script:installer | Should -Match "Join-Path \`$env:windir 'System32\\msiexec\.exe'"
+        $script:installer | Should -Not -Match 'Start-Process msiexec\.exe'
     }
 }

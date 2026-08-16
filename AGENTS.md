@@ -72,6 +72,20 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**Daybreak round 6 (review of `d1d7c17`) found seven more issues: 4 high,
+3 medium; all are remediated in source, but the exact tip still requires the
+full native Windows re-proof before pilot.** The six installer findings were
+treated as one trust-boundary redesign: fresh roots are created with their final
+protected DACL in `CreateDirectoryW` (no retained-handle window), executable
+provenance uses an authorized-writer SID allowlist, ambiguous Win32 paths are
+refused, PATH-selected prerequisite execution is gone, repository inputs are
+proven then built from protected staging, and MSI verification/execution occurs
+only on a protected staged copy. The application finding is an atomic lifetime
+per-EAB account quota (default one). See
+`docs/security-review-2026-08-16-daybreak-round6.md` and the new first entry in
+`docs/pre-pilot-checklist.md`'s validation log. Local gates: 807 pytest + 1
+skipped, 264 Pester + 1 skipped, ruff, mypy. This is not live Windows evidence.
+
 **Status update (2026-08-15, post-validation):** Daybreak's review of `f495092`
 (the E2E-proven tip) found the installer's ACL claim was bypassable —
 `/inheritance:r` removes only *inherited* ACEs, so an attacker's explicit ACEs
@@ -311,4 +325,3 @@ disabled, off-box audit gate, the previously-404 order/account resource
 endpoints, and the PKCS#7 chain now bound to the leaf.
 **Consequence for operators: `ACME_RA_BASE_URL` is now security configuration** —
 wrong value ⇒ everything fail-closes.
-

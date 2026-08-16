@@ -18,6 +18,15 @@ EAB key allows rogue account creation within that kid's SAN scope until it is
 rotated, so kids must be high-entropy and the MAC key must be treated like a
 password.
 
+Each EAB kid has a lifetime durable-account quota, configured with
+`ACME_RA_MAX_ACCOUNTS_PER_EAB_KID` (default `1`). Deactivated accounts still
+consume their slot; the quota is not a concurrency hint or a rolling limit.
+The RA enforces it in the store transaction that inserts the account and its
+`account-created` audit row, so concurrent distinct account keys cannot exceed
+the configured value. A rejected creation returns
+`badExternalAccountBinding` and is coalesced with other account-limit denials
+for audit-growth control.
+
 ### Minting a new EAB credential
 
 Use `scripts/eab.py` to mint a high-entropy kid (UUID4, 32 hex chars, 128

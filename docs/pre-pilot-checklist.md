@@ -163,6 +163,36 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Daybreak round-6 review remediated in source (2026-08-16); native Windows
+  re-proof is still required before pilot.** Seven findings at `d1d7c17` (four
+  high, three medium) were independently reproduced and addressed as one
+  boundary redesign rather than seven local predicates:
+
+  - fresh runtime/state/site/scratch roots now receive their final protected
+    DACL in the `CreateDirectoryW` call itself. The old create-then-lock design
+    could not revoke a create-capable directory handle opened in its window;
+  - executable/site ACL provenance is an authorized-writer SID allowlist.
+    Arbitrary named users/groups with write rights fail closed;
+  - install paths are restricted to unambiguous local DOS paths, and runtime is
+    kernel-re-resolved before any state Modify grant is applied;
+  - `-InstallPrereqs` no longer executes PATH-selected Python or winget;
+  - consumed repository inputs and ancestors are proven before the helper is
+    dot-sourced, copied into administrator-only staging, and PEP 517 builds only
+    the snapshot;
+  - local/remote MSI inputs both require a digest, are staged under the same
+    protected namespace, verified there, and opened only by the absolute
+    System32 `msiexec.exe` path;
+  - account creation has an atomic lifetime per-EAB-kid quota (default one),
+    counting deactivated accounts and committing the count/insert/audit under
+    `BEGIN IMMEDIATE`.
+
+  Local gates: **807 pytest + 1 skipped, 264 Pester + 1 skipped, ruff, mypy**.
+  The native tests still owed are explicit: retained low-privilege directory
+  handles, named-user/group ACE refusals, trailing-dot/space paths, PATH marker
+  executables, mutable source refusal/snapshot build, MSI replacement attempts,
+  clean install/reinstall/rollback, and gMSA launch. Source-only success is not
+  pilot evidence for this installer.
+
 - **Daybreak round-5 findings validated and fixed (2026-08-15), final tip
   `88e9c07`, live-proven on the lab RA host.** Five findings on the round-4
   fixes (1 high, 4 medium), all closed; the live run itself found and fixed
