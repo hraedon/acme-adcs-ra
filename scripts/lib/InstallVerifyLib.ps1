@@ -275,6 +275,28 @@ function Reset-TreeToInherited {
     }
 }
 
+# Reset DESCENDANT subtrees only; the root itself is never passed to
+# /setowner+/reset. A protected root that is /reset re-inherits the parent's
+# create-class ACEs for the interval before /inheritance:r restores protection
+# (%ProgramData% grants Users (CI)(WD,AD,WEA,WA); a looping standard-user
+# process planted 3 entries into the state root through exactly that interval,
+# live-proven 2026-08-16 during the round-6 re-proof -- caught by the post-claim
+# proof, so nothing was adopted, but the write itself must be impossible).
+# The root is instead re-asserted with Set-ObjectProtectedDacl -SkipReset,
+# which never has an unprotected interval: it already carries exactly the
+# protected grants (provenance verified it, or CreateDirectoryW set it), and
+# /inheritance:r /grant:r re-applies that shape with no inherited-DACL window.
+function Reset-TreeChildrenToInherited {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Reset-TreeChildrenToInherited: $Path does not exist; nothing to reset."
+    }
+    foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force)) {
+        Reset-TreeToInherited -Path $child.FullName
+    }
+}
+
 # Give ONE object a deterministic, protected DACL: drop every explicit ACE it
 # carries (/reset -- the same trap as the tree: /inheritance:r alone leaves
 # explicit ACEs untouched), then protect it with EXACTLY the grants given.
@@ -284,16 +306,26 @@ function Reset-TreeToInherited {
 # /L on both calls (second rescan F2): these run against the install root, the
 # dotenv and the Python manifest, and a file symlink raced into any of those
 # paths would otherwise redirect an elevated ACL rewrite onto its target.
+#
+# -SkipReset is for roots that ALREADY carry exactly the protected grants (a
+# CreateDirectoryW birth DACL, or a tree the provenance verdict just accepted
+# as 'ours'): their /reset would strip the protected DACL and re-inherit the
+# parent's create-class ACEs until /inheritance:r re-protects -- the
+# create-capable window this library exists never to open. /inheritance:r
+# /grant:r alone re-asserts the same shape with no unprotected interval.
 function Set-ObjectProtectedDacl {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string[]]$Grants
+        [Parameter(Mandatory = $true)][string[]]$Grants,
+        [switch]$SkipReset
     )
     $ErrorActionPreference = 'Stop'
-    $out = & $script:IcaclsExe $Path /reset /q /L 2>&1
-    if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
-        throw ("Set-ObjectProtectedDacl: icacls /reset failed on $Path (exit $LASTEXITCODE): " +
-               (($out | Out-String).Trim()))
+    if (-not $SkipReset) {
+        $out = & $script:IcaclsExe $Path /reset /q /L 2>&1
+        if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
+            throw ("Set-ObjectProtectedDacl: icacls /reset failed on $Path (exit $LASTEXITCODE): " +
+                   (($out | Out-String).Trim()))
+        }
     }
     $out = & $script:IcaclsExe $Path /inheritance:r /grant:r @Grants /L 2>&1
     if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {

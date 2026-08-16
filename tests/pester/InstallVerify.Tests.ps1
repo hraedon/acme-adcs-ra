@@ -670,7 +670,7 @@ Describe 'install-windows.ps1 never adopts a namespace' {
         $script:installer | Should -Match 'Initialize-SecuredRoot -Path \$InstallDir'
         # ... and the claim inside it is gated on the verdict.
         $iProv  = $script:installer.IndexOf('$prov = Get-RootProvenance -Path $Path')
-        $iClaim = $script:installer.IndexOf('Reset-TreeToInherited -Path $Path')
+        $iClaim = $script:installer.IndexOf('Reset-TreeChildrenToInherited -Path $Path')
         $iProv  | Should -BeGreaterThan -1
         $iClaim | Should -BeGreaterThan $iProv
     }
@@ -1265,7 +1265,7 @@ Describe 'install-windows.ps1: round-5 fixes' {
         $branch = $script:installer.Substring($absent, [Math]::Min(2600, $script:installer.Length - $absent))
         $branch | Should -Match 'New-AtomicProtectedDirectory -Path \$Path -Grants \$Grants'
         $freshSkip = $script:installer.IndexOf('if (-not $fresh)')
-        $reset = $script:installer.IndexOf('Reset-TreeToInherited -Path $Path')
+        $reset = $script:installer.IndexOf('Reset-TreeChildrenToInherited -Path $Path')
         $freshSkip | Should -BeGreaterThan 0
         $reset | Should -BeGreaterThan $freshSkip
     }
@@ -1348,5 +1348,52 @@ Describe 'install-windows.ps1: round-5 fixes' {
         $exec | Should -BeGreaterThan $hash
         $script:installer | Should -Match "Join-Path \`$env:windir 'System32\\msiexec\.exe'"
         $script:installer | Should -Not -Match 'Start-Process msiexec\.exe'
+    }
+}
+
+Describe 'install-windows.ps1: the protected root is never /reset mid-install' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+    }
+
+    # Live-found 2026-08-16 during the round-6 re-proof: the post-build state
+    # re-assert ran icacls /reset on the state ROOT, re-inheriting
+    # %ProgramData%'s Users (CI)(WD,AD,WEA,WA) for the interval before
+    # /inheritance:r restored -- a looping standard-user process planted 3
+    # entries through it (caught by the post-claim proof, but the write itself
+    # must be impossible). Atomic creation only covers birth; every LATER
+    # re-assert must keep the root protected throughout.
+    It 'every root-level reset+protect site uses children-only reset + SkipReset' {
+        # three sites: the claim's existing-tree branch, the runtime re-assert,
+        # the state re-assert
+        @([regex]::Matches($script:installer, 'Reset-TreeChildrenToInherited -Path \$\w+')).Count |
+            Should -Be 3
+        @([regex]::Matches($script:installer, 'Set-ObjectProtectedDacl -Path \$\w+ -Grants \$\w+ -SkipReset')).Count |
+            Should -Be 3
+    }
+
+    It 'no bare root-level Reset-TreeToInherited or unskipped root protect remains' {
+        $script:installer | Should -Not -Match 'Reset-TreeToInherited -Path \$(Path|RuntimeDir|InstallDir)\b'
+        $script:installer | Should -Not -Match 'Set-ObjectProtectedDacl -Path \$(Path|RuntimeDir|InstallDir) -Grants \$\w+\s*$'
+    }
+
+    It 'the dotenv keeps its explicit-ACE-stripping /reset (files may reset; roots may not)' {
+        $script:installer | Should -Match 'Set-ObjectProtectedDacl -Path \$envFile'
+    }
+
+    It 'the lib guards /reset behind -SkipReset and resets only child subtrees' {
+        $fn = $script:lib.IndexOf('function Set-ObjectProtectedDacl')
+        $body = $script:lib.Substring($fn, [Math]::Min(2400, $script:lib.Length - $fn))
+        $body | Should -Match '\[switch\]\$SkipReset'
+        $body | Should -Match 'if \(-not \$SkipReset\) \{'
+        $childFn = $script:lib.IndexOf('function Reset-TreeChildrenToInherited')
+        $childFn | Should -BeGreaterThan 0
+        $nextFn = $script:lib.IndexOf('function ', $childFn + 10)
+        $childBody = $script:lib.Substring($childFn, $nextFn - $childFn)
+        $childBody | Should -Match 'foreach \(\$child in @\(Get-ChildItem -LiteralPath \$Path -Force\)\)'
+        $childBody | Should -Match 'Reset-TreeToInherited -Path \$child\.FullName'
+        # the child walker must not ACL the root itself
+        $childBody | Should -Not -Match '\$script:IcaclsExe \$Path\b'
     }
 }

@@ -523,17 +523,20 @@ function Initialize-SecuredRoot {
             Write-Host "  [ok]   $Path recognised as a previous install of this RA"
         }
     }
-    # An existing tree: normalise ownership and discard every explicit ACE,
-    # then apply exactly our grants, then read the whole tree back and prove
-    # it. The proof is not ceremony: "we ran icacls" is not evidence, and this
-    # is the same evidence the NEXT run's pre-flight will demand. A FRESH tree
-    # skips the reset deliberately: /reset would strip the DACL the
-    # CreateDirectoryW call just applied and reopen the window it exists to
-    # close (and there is nothing in an empty tree to normalise).
+    # An existing tree: normalise ownership and discard every explicit ACE on
+    # the DESCENDANTS, then re-assert exactly our grants on the root, then read
+    # the whole tree back and prove it. The proof is not ceremony: "we ran
+    # icacls" is not evidence, and this is the same evidence the NEXT run's
+    # pre-flight will demand. The ROOT itself is never /reset: it already
+    # carries exactly the protected grants (provenance just verified it), and a
+    # /reset would re-inherit the parent's create-class ACEs for the interval
+    # before /inheritance:r restores -- the create-capable window atomic
+    # creation exists to eliminate (live-proven 2026-08-16). A FRESH tree has
+    # nothing to normalise at all.
     if (-not $fresh) {
         Assert-NoReparsePoints -Path $Path -Context "$Purpose claim"
-        Reset-TreeToInherited -Path $Path
-        Set-ObjectProtectedDacl -Path $Path -Grants $Grants
+        Reset-TreeChildrenToInherited -Path $Path
+        Set-ObjectProtectedDacl -Path $Path -Grants $Grants -SkipReset
     }
     Assert-InstallTreeLocked -Root $Path -AllowedTrustees $AllowedTrustees `
         -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18') `
@@ -961,11 +964,14 @@ Write-Host "  Installed acme-adcs-ra version: $installedVer"
     # Normalise ownership across everything pip just created (files an
     # administrator creates are owned by that ACCOUNT, not the Administrators
     # group), re-assert the exact runtime DACL, and prove the whole tree. Only
-    # now is the runtime allowed to be considered live.
+    # now is the runtime allowed to be considered live. The ROOT keeps its
+    # protected DACL throughout (children-only reset + SkipReset re-assert):
+    # a root-level /reset would re-inherit the parent's create-class ACEs
+    # until /inheritance:r restores (live-proven 2026-08-16).
     Write-Host "Securing and proving the runtime at $RuntimeDir ..."
     Assert-NoReparsePoints -Path $RuntimeDir -Context 'runtime proof'
-    Reset-TreeToInherited -Path $RuntimeDir
-    Set-ObjectProtectedDacl -Path $RuntimeDir -Grants $runtimeGrants
+    Reset-TreeChildrenToInherited -Path $RuntimeDir
+    Set-ObjectProtectedDacl -Path $RuntimeDir -Grants $runtimeGrants -SkipReset
     Assert-InstallTreeLocked -Root $RuntimeDir -AllowedTrustees $raTrustees `
         -AllowedOwnerSids @('S-1-5-32-544', 'S-1-5-18')
     Write-Host "  [ok]   runtime verified (Administrators/SYSTEM own every object; gMSA read+execute only)"
@@ -1066,10 +1072,17 @@ ACME_RA_SAN_SCOPES={"REPLACE-WITH-UUID":{"dns_patterns":["*.work-domain.local"]}
 # the manifest that used to vouch for them. Code lives under %ProgramFiles%
 # with no gMSA write ACE at all, so the app pool can no longer rewrite what it
 # is about to be relaunched with.
+#
+# The root keeps its protected DACL throughout this pass (children-only reset +
+# SkipReset re-assert). A root-level /reset re-inherits %ProgramData%'s
+# Users (CI)(WD,AD,WEA,WA) for the interval before /inheritance:r restores --
+# a live standard-user loop planted entries through exactly that window
+# (2026-08-16 re-proof; caught by this same proof, but the write must be
+# impossible, not merely detected).
 Write-Host "Securing and proving the state tree at $InstallDir ..."
 Assert-NoReparsePoints -Path $InstallDir -Context 'post-install ACL pass'
-Reset-TreeToInherited -Path $InstallDir
-Set-ObjectProtectedDacl -Path $InstallDir -Grants $stateGrants
+Reset-TreeChildrenToInherited -Path $InstallDir
+Set-ObjectProtectedDacl -Path $InstallDir -Grants $stateGrants -SkipReset
 # The dotenv carries its own DACL: gMSA READ-ONLY. The worker must never be
 # able to rewrite its own EAB credentials or SAN scope -- those decide what it
 # is allowed to issue.
