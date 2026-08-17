@@ -70,6 +70,59 @@ raise it. A short "accepted, and why" note in `SECURITY.md` ends the cycle — o
 if the posture should actually change, that is a deliberate decision to take
 rather than a finding to keep re-triaging.
 
+### 5. **WI-053 IS ALREADY FIXED — close it**
+
+Checked 2026-08-17. The item (filed 08-13) says `-AdminToken` is a mandatory
+parameter and `Build-SyncActionCommand` always emits `$env:ACME_ADMIN_TOKEN`
+into the revocation-sync action. Neither is true any more:
+
+- **Code** — `-AdminToken` is a `[switch]`, and is required only when
+  `$registerGeneral` (`Register-MaintenanceTasks.ps1:204`). `-RevocationSyncOnly`
+  skips the general tasks entirely, so `-RevocationSyncOnly -ConfirmToken`
+  registers the sync task with no admin authority on the host. The admin env is
+  gated behind `-LoadAdminToken` (default `$false`), wired from
+  `([bool]$AdminToken)`. `Build-SyncActionCommand` has **no token parameter at
+  all** — tokens are loaded from the ACL'd dotenv at run time, so a value cannot
+  reach the action even by mistake.
+- **Test** — `tests/pester/TaskAction.Tests.ps1`, *"Omits the admin-token load
+  entirely in confirm-only mode"*, asserts exactly the WI's ask. Suite 39/39
+  green on pwsh 7.
+- **Docs** — `docs/operations.md:419-425` and `:956` document
+  `-RevocationSyncOnly -ConfirmToken`; `docs/pre-pilot-checklist.md:722`
+  *requires* it. So the "documented way to deploy it", which was the item's
+  actual complaint, is fixed too.
+
+Closed by the 2026-08-15 review (`-AdminToken` made non-mandatory plus the new
+`-RevocationSyncOnly` switch — see `docs/security-review-2026-08-15.md:114`) and
+hardened by 2026-08-19 F2 in `71e7d8a` (tokens became dotenv loads). The tracker
+entry is simply stale. Only residual: it sits in the D1–D7 officer/registration
+class that has never been live-proven, so live assurance rides the lab session.
+
+### 6. Split **WI-014** — it is ~80% shipped and reads as untouched
+
+Parts one and two are **done**: `audit_bounds.py` bounds each row's *size*
+(attacker-chosen `kid` truncated with a SHA-256 of the whole), and
+`audit_coalesce.py` bounds row *count* for five replayable denial classes within
+a window, without deleting anything. What is left is two very different jobs
+that should not share one item:
+
+- **14a (small)** — bound *repeatable successful* transitions. Daybreak F1's
+  `keyChange` is the case: the coalescer deliberately excludes successes
+  ("one-time state transitions keep one row per event"), and that rule is right
+  for issuance but wrong for an action a client can chain forever at no cost.
+  Coalescing is the wrong tool here — a successful key rotation is individually
+  meaningful. Mirror `_check_rate_limit` (`routes/orders.py:42`) instead, keyed
+  per **EAB kid** (so a leaked EAB cannot spread rotations across fresh
+  accounts), and make it **atomic** rather than count-then-check — the reviewer
+  explicitly asks for it, and the round-6 lifetime per-EAB account quota is the
+  in-repo precedent for the transactional pattern.
+- **14b (open-ended, needs an owner decision first)** — retention/archival.
+  Still absent, and still correctly deferred: a pruner is the operation an
+  attacker most wants, so this is a subsystem with its own threat model, not a
+  patch. Wants an explicit retention window with no default, admin-token gating,
+  its own audit rows, tamper-evident continuity across the prune boundary so a
+  gap is detectable, and preferably archive-off-box-then-delete.
+
 ---
 
 ## Standing validation debt (not work items, but do not lose them)
