@@ -14,9 +14,11 @@ Config lives on ``RAConfig`` so it is env/file-driven like the rest of the RA.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +33,83 @@ from urllib.request import Request, urlopen
 from acme_adcs_ra.config import RAConfig
 
 logger = logging.getLogger("acme_adcs_ra.siem")
+
+
+class _RaisingSysLogHandler(SysLogHandler):
+    """A ``SysLogHandler`` whose transport failures reach the caller.
+
+    The stock handler funnels every :meth:`emit` exception into
+    ``logging.Handler.handleError``, which reports to stderr and **returns**.
+    ``Logger.info()`` therefore returns normally after a send that never left
+    the host, so any delivery accounting that infers success from that return
+    counts a dead collector as delivered — which is exactly what
+    :meth:`SiemEmitter.probe_offbox_delivery` and
+    :meth:`SiemEmitter._syslog_send` do.
+
+    Measured against a killed TCP collector, the stock handler swallowed a
+    ``ConnectionResetError`` followed by four ``BrokenPipeError``s while the
+    emitter recorded five successful deliveries and the ``audit_offbox_required``
+    startup probe still answered "syslog accepted the probe over TCP". The
+    off-box trail is the control meant to survive a compromise of this host, so
+    it must fail loudly. Found by the 2026-08-17 Daybreak review (F4); it is the
+    same defect class as wave-3 F2, which was fixed for the HEC sink only.
+
+    Two behaviours the stock handler does not give us:
+
+    * ``handleError`` re-raises, so a failed send propagates out of
+      ``Logger.info()`` to the caller's ``try/except``.
+    * A failed TCP send drops the dead socket. ``emit`` calls ``createSocket``
+      whenever ``self.socket`` is falsy, so the next event reconnects instead of
+      wedging the sink until the process restarts. ``createSocket`` re-applies
+      the send timeout, which the stock implementation does not carry across a
+      reconnect (and never applied at all when the *initial* connect failed and
+      the socket was created lazily on first emit).
+    """
+
+    def __init__(self, *args: Any, send_timeout: float | None = None, **kwargs: Any) -> None:
+        self._send_timeout = send_timeout
+        super().__init__(*args, **kwargs)
+        self._apply_send_timeout()
+
+    def _apply_send_timeout(self) -> None:
+        """Bound a TCP send so a collector that stops reading cannot park us.
+
+        A TCP syslog socket with no timeout blocks indefinitely once the
+        receiver stops draining: ``SysLogHandler`` does a plain ``sendall`` and
+        a full send buffer parks the caller. UDP cannot block this way, so the
+        timeout is only meaningful — though harmless — for streams. ``socket``
+        exists at runtime for both socket types but is not declared in typeshed,
+        hence the getattr.
+        """
+        if self._send_timeout is None or self.socktype != socket.SOCK_STREAM:
+            return
+        sock: socket.socket | None = getattr(self, "socket", None)
+        if sock is not None:
+            sock.settimeout(self._send_timeout)
+
+    def createSocket(self) -> None:
+        super().createSocket()
+        self._apply_send_timeout()
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        exc = sys.exc_info()[1]
+        # Drop the dead stream so the next emit reconnects via createSocket().
+        # Datagram sockets are connectionless, so there is nothing to rebuild.
+        if self.socktype == socket.SOCK_STREAM and not self.unixsocket:
+            sock: socket.socket | None = getattr(self, "socket", None)
+            if sock is not None:
+                # Best-effort: this socket is already broken, and the caller is
+                # about to get the real transport error re-raised below. A
+                # failure to close it must not mask that.
+                with contextlib.suppress(Exception):
+                    sock.close()
+            self.socket = None
+        if exc is None:
+            # handleError is only reached from an active except block, so this
+            # is defensive; still raise, because returning would silently
+            # restore the "failure counts as delivery" bug.
+            raise OSError("syslog emit failed with no exception in flight")
+        raise exc
 
 
 def _instance_id() -> str:
@@ -197,19 +276,16 @@ class SiemEmitter:
             socktype = (
                 socket.SOCK_STREAM if self._config.syslog_proto == "tcp" else socket.SOCK_DGRAM
             )
-            handler = SysLogHandler(
+            # _RaisingSysLogHandler, not the stock SysLogHandler: the stock one
+            # swallows transport errors, which made every failed send count as
+            # a delivery and let the audit_offbox_required probe pass with the
+            # collector dead. It also owns the send timeout, so a reconnect
+            # cannot silently come back unbounded.
+            handler = _RaisingSysLogHandler(
                 address=(self._config.syslog_host, self._config.syslog_port),
                 socktype=socktype,
+                send_timeout=self._config.syslog_timeout_seconds,
             )
-            # A TCP syslog socket with no timeout blocks indefinitely once the
-            # receiver stops reading: `SysLogHandler` does a plain `sendall`,
-            # and a full send buffer parks the caller until the peer drains it.
-            # UDP cannot block this way, but the timeout is harmless there.
-            # `SysLogHandler.socket` exists at runtime for both socket types but
-            # is not declared in typeshed, hence getattr.
-            sock: socket.socket | None = getattr(handler, "socket", None)
-            if socktype == socket.SOCK_STREAM and sock is not None:
-                sock.settimeout(self._config.syslog_timeout_seconds)
             handler.setFormatter(logging.Formatter("acme-adcs-ra: %(message)s"))
             lg = logging.getLogger("acme_adcs_ra.siem.syslog")
             lg.setLevel(logging.INFO)
@@ -423,15 +499,26 @@ class SiemEmitter:
             except Exception as exc:  # noqa: BLE001
                 return False, f"syslog refused the startup probe: {exc}"
             if cfg.syslog_proto.lower() == "udp":
-                # Worth stating rather than implying: UDP cannot acknowledge, so
+                # Worth stating rather than implying: UDP is fire-and-forget, so
                 # this proves the socket accepted the datagram and nothing about
-                # whether a collector received it. Use TCP to get more than that.
+                # whether anything is listening. TCP is strictly better here —
+                # it at least detects a refused or broken connection — but
+                # neither proves receipt, because syslog has no acknowledgment.
                 return True, (
-                    "syslog accepted the probe over UDP, which cannot "
-                    "acknowledge delivery; reachability of the collector is "
-                    "NOT proven. Use syslog_proto=tcp for an acknowledged path."
+                    "syslog accepted the probe over UDP, which cannot detect a "
+                    "missing collector at all; reachability is NOT proven. Use "
+                    "syslog_proto=tcp to at least detect transport failure, or "
+                    "the HEC sink to prove receipt."
                 )
-            return True, "syslog accepted the probe over TCP"
+            # Precise about what this proves: the TCP connection was
+            # established and the send completed without error. That is a live
+            # transport, NOT an application-level acknowledgment — syslog has no
+            # such thing, so a collector that accepts bytes and drops them still
+            # passes. HEC is the sink that can prove receipt.
+            return True, (
+                "syslog TCP send completed with no transport error; the "
+                "collector is reachable but syslog cannot acknowledge receipt"
+            )
         return False, f"sink {cfg.sink!r} is not an off-box sink"
 
     def _hec_post(self, event: dict[str, Any]) -> None:

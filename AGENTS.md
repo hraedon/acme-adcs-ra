@@ -72,6 +72,36 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**Daybreak standard pass (review of `7325cdb`, 2026-08-17) found four medium
+issues, no high or critical. One fixed, three triaged and consciously left.**
+Fixed: syslog transport failures were counted as successful off-box audit
+delivery, and the `audit_offbox_required` startup probe passed with the
+collector dead — a stock `SysLogHandler` swallows send errors, and both the
+counters and the probe inferred success from `Logger.info()` returning.
+Confirmed by execution (five sends to a killed collector recorded five
+deliveries and zero failures); rated **high** rather than the reported medium,
+because it is the same defect class as wave-3 F2 which was fixed for HEC only,
+and the shipped `web.config` selects TCP syslog. Fixed with
+`_RaisingSysLogHandler` (re-raises, drops the dead stream so the next event
+reconnects, re-applies the send timeout across a reconnect). Eight tests, each
+mutation-checked — the first version of the timeout test was vacuous and only
+earned its place after a rewrite. Not fixed, with reasons: unlimited `keyChange`
+rotations is a second vector on open WI-014; the commented-out IIS `ipSecurity`
+allowlist is the posture adopted in the 2026-08-11 review (second reviewer to
+re-report it — record the decision in `SECURITY.md`); the unauthenticated
+privileged script tree is valid and converges with WI-015/WI-053. Coverage was
+partial (37 of 167 files) and the reviewer's own follow-ups are
+*live-windows-validation* and *remaining-file-review*. See
+`docs/security-review-2026-08-17-daybreak-standard.md`. Local gates: 840 pytest
++ 1 skipped, ruff, mypy. **Not a live Windows proof.**
+
+> **The binding constraint is lab time, not review.** Rverify, the sync/queue
+> drain and the officer class D1–D7 have never been executed on this branch, and
+> `01417b5` (a 5.1 installer fix) postdates the last live proof. Round 7 blamed
+> a CA DCOM fault; that was **retracted 2026-08-17** — it was the SSH logon
+> session holding no Kerberos TGT (runbook §1), so nothing is blocked. Work-item
+> writes are also down estate-wide; see `docs/UNFILED-WORK-ITEMS.md`.
+
 **Daybreak round 6 (review of `d1d7c17`) found seven more issues: 4 high,
 3 medium; all are remediated in source, and the full native Windows re-proof
 has now been EXECUTED on the final tip `8964eba` (2026-08-16, lab RA host,

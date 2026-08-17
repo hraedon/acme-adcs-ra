@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
+import struct
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -317,3 +321,253 @@ class TestSiemStartupProbe:
         with caplog.at_level(logging.ERROR, logger="acme_adcs_ra.siem"):
             emitter = SiemEmitter(SiemConfig(sink="syslog", syslog_host=""))
         assert emitter.enabled is False
+
+
+class _DeadStreamSocket:
+    """Stands in for a stream socket whose peer has gone away.
+
+    Killing a real collector mid-test is racy: after an RST the *first*
+    ``sendall`` is often absorbed by the local send buffer and the error only
+    surfaces on the next write, so a test that asserts on the first send flakes
+    (measured at roughly one run in three). The defect under test is not "how
+    fast does TCP notice" — it is "when the transport raises, does the emitter
+    count a delivery". Injecting the raise makes that deterministic.
+    """
+
+    def __init__(self, timeout: float | None) -> None:
+        self._timeout = timeout
+        self.closed = False
+
+    def sendall(self, *_args: Any, **_kwargs: Any) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def close(self) -> None:
+        self.closed = True
+
+    def gettimeout(self) -> float | None:
+        return self._timeout
+
+    def settimeout(self, value: float | None) -> None:
+        self._timeout = value
+
+
+class TestSyslogDeliveryIntegrity:
+    """Daybreak 2026-08-17 F4 — a failed syslog send must not count as delivered.
+
+    The stock ``SysLogHandler`` routes transport errors into ``handleError``,
+    which returns rather than raising, so ``Logger.info()`` succeeds after a send
+    that never left the host. Both the ``audit_offbox_required`` startup probe
+    and the runtime delivery counters inferred success from that return, so a
+    dead collector read as a healthy off-box audit trail.
+
+    Measured against the pre-fix code with a killed TCP collector: five sends
+    produced a ``ConnectionResetError`` followed by four ``BrokenPipeError``s,
+    every one swallowed, while the emitter recorded five deliveries, zero
+    failures, and the startup probe still answered "syslog accepted the probe
+    over TCP".
+    """
+
+    SEND_TIMEOUT = 2.0
+
+    @staticmethod
+    def _listener() -> tuple[socket.socket, int]:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        return srv, srv.getsockname()[1]
+
+    @staticmethod
+    def _accept_in_background(srv: socket.socket, sink: list[socket.socket]) -> None:
+        def run() -> None:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                sink.append(conn)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _emitter(self, port: int) -> SiemEmitter:
+        return SiemEmitter(
+            SiemConfig(
+                sink="syslog",
+                syslog_host="127.0.0.1",
+                syslog_port=port,
+                syslog_proto="tcp",
+                syslog_timeout_seconds=self.SEND_TIMEOUT,
+            )
+        )
+
+    @staticmethod
+    def _handler(emitter: SiemEmitter) -> Any:
+        assert emitter._syslog is not None
+        return emitter._syslog.handlers[0]
+
+    def _kill_transport(self, emitter: SiemEmitter) -> None:
+        """Make the established connection behave as if the peer vanished."""
+        handler = self._handler(emitter)
+        handler.socket = _DeadStreamSocket(self.SEND_TIMEOUT)
+
+    # ---- control: the healthy path must still work, or nothing below proves anything
+
+    def test_live_collector_probe_passes_and_counts_delivery(self) -> None:
+        srv, port = self._listener()
+        conns: list[socket.socket] = []
+        self._accept_in_background(srv, conns)
+        emitter = self._emitter(port)
+        try:
+            ok, detail = emitter.probe_offbox_delivery()
+            assert ok is True, detail
+            emitter._syslog_send({"event_type": "test"})
+            assert emitter._offbox_delivered == 1
+            assert emitter._offbox_failures == 0
+        finally:
+            emitter.close()
+            srv.close()
+
+    def test_tcp_probe_does_not_claim_collector_acknowledgment(self) -> None:
+        """A completed TCP send is a live transport, not proof of receipt."""
+        srv, port = self._listener()
+        conns: list[socket.socket] = []
+        self._accept_in_background(srv, conns)
+        emitter = self._emitter(port)
+        try:
+            ok, detail = emitter.probe_offbox_delivery()
+            assert ok is True
+            assert "cannot acknowledge receipt" in detail
+        finally:
+            emitter.close()
+            srv.close()
+
+    def test_absent_collector_disables_the_sink_at_construction(self) -> None:
+        """Nothing listening at all: connect refused, sink disabled, probe fails."""
+        probe, port = self._listener()
+        probe.close()  # free the port so the connect is refused
+        emitter = self._emitter(port)
+        try:
+            assert emitter.enabled is False
+            assert emitter.probe_offbox_delivery()[0] is False
+        finally:
+            emitter.close()
+
+    # ---- the defect: an established connection that has died
+
+    def test_dead_transport_fails_the_startup_probe(self) -> None:
+        """The audit_offbox_required gate must refuse when the transport is dead."""
+        srv, port = self._listener()
+        conns: list[socket.socket] = []
+        self._accept_in_background(srv, conns)
+        emitter = self._emitter(port)
+        try:
+            assert emitter.probe_offbox_delivery()[0] is True
+            self._kill_transport(emitter)
+            ok, detail = emitter.probe_offbox_delivery()
+            assert ok is False, "a dead transport was reported as a healthy off-box sink"
+            assert "syslog refused the startup probe" in detail
+            assert "Broken pipe" in detail
+        finally:
+            emitter.close()
+            srv.close()
+
+    def test_dead_transport_counts_failures_not_deliveries(self) -> None:
+        srv, port = self._listener()
+        conns: list[socket.socket] = []
+        self._accept_in_background(srv, conns)
+        emitter = self._emitter(port)
+        try:
+            for i in range(5):
+                self._kill_transport(emitter)  # re-kill: each failure drops the socket
+                emitter._syslog_send({"event_type": "test", "n": i})
+            assert emitter._offbox_delivered == 0
+            assert emitter._offbox_failures == 5
+            assert emitter._offbox_last_error is not None
+            assert "BrokenPipeError" in emitter._offbox_last_error
+        finally:
+            emitter.close()
+            srv.close()
+
+    def test_failed_send_drops_the_socket_so_the_next_send_reconnects(self) -> None:
+        """A blip must not wedge the sink until the process restarts.
+
+        The stock handler never clears a dead stream socket, so without the
+        reset in ``handleError`` the first failure would be permanent.
+        """
+        srv, port = self._listener()
+        conns: list[socket.socket] = []
+        self._accept_in_background(srv, conns)
+        emitter = self._emitter(port)
+        try:
+            dead = _DeadStreamSocket(self.SEND_TIMEOUT)
+            self._handler(emitter).socket = dead
+
+            emitter._syslog_send({"event_type": "during-outage"})
+            assert emitter._offbox_failures == 1
+            assert dead.closed is True, "the dead socket was not closed"
+            assert self._handler(emitter).socket is None, (
+                "the dead socket was not dropped, so emit() will never reconnect"
+            )
+
+            # The collector was never actually down, so the reconnect succeeds.
+            emitter._syslog_send({"event_type": "after-recovery"})
+            assert emitter._offbox_delivered == 1, "the sink did not reconnect"
+        finally:
+            emitter.close()
+            srv.close()
+
+    def test_reconnected_stream_keeps_its_send_timeout(self) -> None:
+        """A reconnect must not silently restore an unbounded blocking send."""
+        srv, port = self._listener()
+        conns: list[socket.socket] = []
+        self._accept_in_background(srv, conns)
+        emitter = self._emitter(port)
+        try:
+            handler = self._handler(emitter)
+            assert handler.socket.gettimeout() == self.SEND_TIMEOUT
+            handler.socket = _DeadStreamSocket(self.SEND_TIMEOUT)
+            emitter._syslog_send({"event_type": "during-outage"})
+            emitter._syslog_send({"event_type": "after-recovery"})
+            assert emitter._offbox_delivered == 1
+            assert handler.socket is not None
+            assert handler.socket.gettimeout() == self.SEND_TIMEOUT, (
+                "the reconnected socket lost its send timeout"
+            )
+        finally:
+            emitter.close()
+            srv.close()
+
+    # ---- one real-transport test, bounded so it cannot flake
+
+    def test_real_collector_death_is_detected(self) -> None:
+        """End-to-end over a real socket, without asserting on TCP timing.
+
+        "Within a few sends" rather than "on the first send": after the peer
+        RSTs, the first ``sendall`` is often absorbed locally and the error
+        surfaces on the next write. What must hold is that the failure is
+        detected and accounted, not that it is instantaneous.
+        """
+        srv, port = self._listener()
+        conns: list[socket.socket] = []
+        self._accept_in_background(srv, conns)
+        emitter = self._emitter(port)
+        try:
+            assert emitter.probe_offbox_delivery()[0] is True
+            deadline = time.monotonic() + 5.0
+            while not conns and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert conns, "the collector never accepted a connection"
+            for conn in conns:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                conn.close()
+            srv.close()  # nothing to reconnect to either
+
+            for _ in range(10):
+                emitter._syslog_send({"event_type": "post-mortem"})
+                if emitter._offbox_failures:
+                    break
+            assert emitter._offbox_failures > 0, (
+                "a genuinely dead collector was never reported as a delivery failure"
+            )
+        finally:
+            emitter.close()

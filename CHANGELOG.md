@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — Daybreak standard pass (2026-08-17; four findings, one fixed)
+
+- **Syslog send failures were counted as successful off-box audit delivery
+  (reported medium; rated high).** `_setup_syslog` used a stock
+  `SysLogHandler`, whose `handleError` reports and returns rather than raising,
+  so `Logger.info()` succeeded after a send that never left the host. Both
+  `_syslog_send`'s counters and the `audit_offbox_required` startup probe
+  inferred delivery from that return. Measured against a killed TCP collector,
+  the emitter recorded five deliveries and zero failures while swallowing a
+  `ConnectionResetError` and four `BrokenPipeError`s, and the startup gate still
+  passed. Same defect class as wave-3 F2, which was fixed for HEC only; the
+  shipped `web.config` selects TCP syslog, so this was the default production
+  audit path. Fixed with `_RaisingSysLogHandler`, which re-raises transport
+  errors, drops the dead stream so the next event reconnects instead of wedging
+  the sink, and re-applies the send timeout across a reconnect (the stock
+  handler never did, including when the initial connect failed and the socket
+  was created lazily on first emit). The TCP probe no longer reports "accepted",
+  which overclaimed — a completed `sendall` is a live transport, not receipt.
+  Eight tests, each mutation-checked. See
+  `docs/security-review-2026-08-17-daybreak-standard.md`.
+- Findings 1–3 triaged and **not** fixed, with reasons recorded in that
+  document: unlimited `keyChange` rotations is a second vector on open WI-014;
+  the commented-out IIS `ipSecurity` allowlist is the posture consciously
+  adopted in the 2026-08-11 review and documented in
+  `docs/operator-requirements.md`; the unauthenticated privileged script tree is
+  valid and converges with open WI-015 and WI-053.
+
 ### Security — round-6 follow-up, round 4 (2026-08-16; seven findings, all fixed)
 
 - **The R2-11 `@()` wrapping inverted the readback verdict (medium).**
