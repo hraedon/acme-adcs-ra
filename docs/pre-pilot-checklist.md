@@ -253,6 +253,79 @@ engineered to. Until then it has not — regardless of a green local test run.
   clean install/reinstall/rollback, and gMSA launch. Source-only success is not
   pilot evidence for this installer.
 
+- **Round-7 validation on tip `45643f8` (2026-08-17) — the accumulated
+  follow-up rounds executed on Windows for the first time.** The five rounds
+  landed since the last live proof (`8964eba`) had only ever been
+  source-verified; the round-6-followup doc said so explicitly. This run
+  executed them. Full record: `samples/lab-run-2026-08-17-round7-validation.md`
+  (gitignored).
+
+  **Proven live on the tip's own bytes** (staging hash-verified equal to
+  `git archive HEAD`):
+
+  - **Install at tip**: reinstall over the two-tree layout, exit 0; both roots
+    recognised as a previous install and re-proven; `web.config` launch
+    configuration verified; **zero** `.retired-*` leftovers; **zero** installer
+    scratch left under `%ProgramFiles%`; **zero** `icacls /save` dumps in
+    `%TEMP%` or `C:\Windows\Temp` (the evidence stays in the protected
+    scratch); pool Started, `/directory` 200; store fingerprint **unchanged**.
+  - **web.config gate — 31/31**, driving the shipped
+    `Assert-WebConfigLaunchTrusted` against real files on real 5.1. The
+    deployed `web.config` is accepted unchanged (control); all 25 refusal
+    shapes owed by rounds 2/3/5/6 refuse (arguments, PYTHON* vars, issuance
+    policy vars, redirected AND absent `ACME_RA_DOTENV`, processPath mismatch,
+    `<location>`-scoped `httpPlatform`, nested `__` env names, `<add>`-shaped
+    entries, `scriptProcessor` and managed `type=` handlers, the SIEM token,
+    the per-kid quota, both CRL strength knobs, and the five control-removing
+    settings); and all 5 **false-refusal guards accept** (`"1"` for a pinned
+    bool, a trailing space in the dotenv path, forward-slash paths, a
+    namespaced `<configuration>`, `REQUIRE_CRL_EVIDENCE="true"`).
+  - **appcmd family — 5/5.** A genuinely broken appcmd aborts with the
+    worker-still-live message rather than "[ok] no such app pool yet"; the
+    tip's own shielded stop no longer aborts the install when appcmd writes to
+    stderr, falling through to the prove loop (**and the control proves it is
+    not vacuous**: the same fixture through the unshielded path *does* abort).
+  - **Bootstrap ACE refusals — 5/5, full installer runs.** A `WDAC`/`WO`-only
+    ACE — the two rights the dead `::WriteDacl`/`::WriteOwner` spellings
+    dropped from the mask — is refused for a **named user** and a **custom
+    group**, on the release root, on `scripts\lib\` (so
+    `Get-BootstrapInteriorDirectories` works), and on `src\`; a plain write ACE
+    on `scripts\` alone is refused. Every case exits non-zero, names the path,
+    and refuses **before any build step**.
+  - **App re-proof**: A 14/14, A1 14/14, G 5/5, Q both branches 6/6 each
+    (chain → quarantined row + ReqID; leaf → **no row written**, by design),
+    R 5/5. CRL 4/5 — the failure is **WI-052 re-observed unchanged** (CA CRL
+    window 649200s vs the 604800s default ceiling, short by 12.3h).
+
+  **Defect found live and fixed** (`01417b5`): the `icacls` owner-candidate
+  **fallback loops could not fall back** on Windows PowerShell 5.1.
+  `Reset-TreeToInherited` and `New-ProtectedDirectory` ran
+  `& $script:IcaclsExe … 2>&1` under an explicit `EAP=Stop`, so the first
+  candidate that wrote to stderr terminated the loop — the documented
+  name-form fallback was dead code, and the actionable hostile-namespace throw
+  was unreachable on the very path it was written for. Still fail-closed (the
+  install refuses either way), so it is a defeated fallback plus lost
+  diagnostics, not a bypass. Fixed with one primitive,
+  `Invoke-NativeShielded`, replacing the seven-line shield at all seven icacls
+  sites — the repetition being the actual defect, this family having now
+  escaped **seven** times. Tests mutation-verified, with the honest caveat that
+  the three behavioural ones **only fail on 5.1** and pass on pwsh 7: they are
+  meaningful solely on the `pester-windows-powershell` job.
+
+  **Still owed — blocked on lab infrastructure, not on the code.** The lab CA's
+  remote DCOM/RPC path is broken: `certutil -ping` succeeds locally on the CA
+  and fails from the RA host with `RPC_S_SERVER_UNAVAILABLE` **as a plain
+  administrator, outside the product**, with every relevant port open, the
+  firewall rules correct, certsvc running and the DCOM class registered. It
+  broke at 05:02Z on 2026-08-17, mid-way through the previous session, and a
+  reboot did not clear it. Because enrollment rides HTTP `/certsrv/` while
+  revocation rides DCOM, issuance kept working and hid it. **Unproven as a
+  result**: `Rverify`/the queue drain, and the whole officer-script class —
+  `Revoke-Cert.ps1 -ReqID`, malformed and truncated `OfficerRights`, the
+  spoofed-`$env:windir` regression proof, the `net stop`/`net start` fallback,
+  the 5.1 `certutil 2>&1` exit-code contract, and
+  `Reconcile-Revocation.ps1`. These carry over intact.
+
 - **Round-6 follow-up review remediated in source (2026-08-16); native Windows
   re-proof required before pilot.** An internal review of the round-6 fixes
   themselves found four defects — three of them in code round 6 added — and two
