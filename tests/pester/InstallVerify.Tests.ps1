@@ -2248,44 +2248,90 @@ Describe 'Stop-AppPoolAndWait separates "no such pool" from "appcmd failed" (rou
         $script:fakeDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ra-appcmd-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:fakeDir | Out-Null
 
+        # The stand-ins must be NATIVE processes with real stdout/stderr --
+        # appcmd is a native exe, and the probe/prove logic classifies its
+        # streams. The first run of this suite under Windows PowerShell 5.1
+        # caught the original sh-only fixtures doing NOTHING on Windows (`&
+        # x.sh` cannot execute there), so every stand-in invocation came back
+        # empty and the tests passed or failed by how an unrunnable command
+        # surfaces on 5.1 -- three failed, none measured anything. .cmd files
+        # are native on Windows; sh scripts are native on Linux.
+        # NB: do not call this variable $IsWindows in any scope spelling --
+        # pwsh 7 makes the automatic variable read-only and 5.1 lacks it.
+        # Prefer the automatic $IsWindows (reliable, cannot be spoofed by a
+        # test that mutates $env:OS -- which this file's platform tests do);
+        # $env:OS is the fallback ONLY where $IsWindows does not exist (5.1).
+        $iw = Get-Variable -Name IsWindows -ErrorAction SilentlyContinue
+        if ($iw) { $script:onWindows = [bool]$iw.Value }
+        else { $script:onWindows = ($env:OS -eq 'Windows_NT') }
+
+        function script:New-AppcmdFixture([string]$Name, [string[]]$CmdLines, [string[]]$ShLines) {
+            if ($script:onWindows) {
+                $p = Join-Path $script:fakeDir "$Name.cmd"
+                # cmd wants CRLF; the bodies are pure ASCII either way.
+                [System.IO.File]::WriteAllText($p, ($CmdLines -join "`r`n") + "`r`n")
+            } else {
+                $p = Join-Path $script:fakeDir "$Name.sh"
+                [System.IO.File]::WriteAllText($p, ($ShLines -join "`n") + "`n")
+                chmod +x $p
+            }
+            return $p
+        }
+
         # A stand-in appcmd that writes to STDERR and exits 0 -- the shape a
         # broken applicationHost.config or an access denial takes.
-        $script:noisy = Join-Path $script:fakeDir 'noisy.sh'
-        Set-Content -LiteralPath $script:noisy -Value "#!/bin/sh`necho 'ERROR ( message:Configuration error )' >&2`nexit 0`n"
-        chmod +x $script:noisy
+        $script:noisy = New-AppcmdFixture 'noisy' @(
+            '@echo off',
+            'echo ERROR ( message:Configuration error ) 1>&2',
+            'exit /b 0'
+        ) @(
+            '#!/bin/sh',
+            "echo 'ERROR ( message:Configuration error )' >&2",
+            'exit 0'
+        )
 
         # A stand-in that says nothing at all -- a genuinely absent pool.
-        $script:silent = Join-Path $script:fakeDir 'silent.sh'
-        Set-Content -LiteralPath $script:silent -Value "#!/bin/sh`nexit 0`n"
-        chmod +x $script:silent
+        $script:silent = New-AppcmdFixture 'silent' @(
+            '@echo off',
+            'exit /b 0'
+        ) @(
+            '#!/bin/sh',
+            'exit 0'
+        )
 
         # The REAL shape of `appcmd list apppool <absent>`: the documented error
         # on stderr, a non-zero exit, and no live workers.
-        $script:notfound = Join-Path $script:fakeDir 'notfound.sh'
-        Set-Content -LiteralPath $script:notfound -Value @'
-#!/bin/sh
-case "$1 $2" in
-  "list apppool") echo 'ERROR ( message:Cannot find APPPOOL object with identifier "acme-adcs-ra". )' >&2; exit 1 ;;
-  "stop apppool") exit 0 ;;
-  "list wp")      exit 0 ;;
-esac
-exit 0
-'@
-        chmod +x $script:notfound
+        $script:notfound = New-AppcmdFixture 'notfound' @(
+            '@echo off',
+            'if not "%1 %2"=="list apppool" exit /b 0',
+            'echo ERROR ( message:Cannot find APPPOOL object with identifier "acme-adcs-ra". ) 1>&2',
+            'exit /b 1'
+        ) @(
+            '#!/bin/sh',
+            'case "$1 $2" in',
+            '  "list apppool") echo ''ERROR ( message:Cannot find APPPOOL object with identifier "acme-adcs-ra". )'' >&2; exit 1 ;;',
+            '  "stop apppool") exit 0 ;;',
+            '  "list wp")      exit 0 ;;',
+            'esac',
+            'exit 0'
+        )
 
         # Ambiguous everywhere: stderr on the probe AND `list wp` output that
         # Test-AppPoolWorkersGone cannot classify.
-        $script:garbage = Join-Path $script:fakeDir 'garbage.sh'
-        Set-Content -LiteralPath $script:garbage -Value @'
-#!/bin/sh
-case "$1 $2" in
-  "list apppool") echo 'ERROR ( message:Configuration error )' >&2; exit 1 ;;
-  "stop apppool") exit 0 ;;
-  "list wp")      echo 'something we cannot parse' ;;
-esac
-exit 0
-'@
-        chmod +x $script:garbage
+        $script:garbage = New-AppcmdFixture 'garbage' @(
+            '@echo off',
+            'if "%1 %2"=="list wp" echo something we cannot parse & exit /b 0',
+            'if "%1 %2"=="list apppool" echo ERROR ( message:Configuration error ) 1>&2 & exit /b 1',
+            'exit /b 0'
+        ) @(
+            '#!/bin/sh',
+            'case "$1 $2" in',
+            '  "list apppool") echo ''ERROR ( message:Configuration error )'' >&2; exit 1 ;;',
+            '  "stop apppool") exit 0 ;;',
+            '  "list wp")      echo ''something we cannot parse'' ;;',
+            'esac',
+            'exit 0'
+        )
     }
     AfterAll { Remove-Item -LiteralPath $script:fakeDir -Recurse -Force -ErrorAction SilentlyContinue }
 
@@ -2464,12 +2510,18 @@ Describe 'Get-OfficerRights parser: the descending-slice guard (round 7.3)' {
     # returns two reversed bytes, which can satisfy a length guard and mis-parse
     # sidCount out of reversed data. An ACE whose declared size leaves no room
     # for application data after the SID produces exactly that.
+    #
+    # Round 6 of the follow-up turned the silent `break` into a THROW: this is
+    # the verify-by-readback tool, and half-parsing a malformed value (then
+    # printing "Found N ACE(s)" + exit 0) is the failure mode R6-3 exists to
+    # remove. The mis-parse is now prevented by refusing, not by skipping.
     # SKIPPED off Windows: Parse-SidAt constructs a SecurityIdentifier, which
-    # throws "Windows Principal functionality is not supported on this platform"
-    # under .NET on Linux. The `pester-windows-powershell` CI job (real 5.1) and
-    # the Pester install on the lab RA host are where this one actually runs --
-    # which is also where the .Count-on-a-scalar half of this finding lives.
-    It 'does not mis-parse an ACE whose declared size leaves no application data' -Skip:($env:OS -ne 'Windows_NT') {
+    # throws "Windows Principal functionality is not supported on this
+    # platform" under .NET on Linux. The `pester-windows-powershell` CI job
+    # (real 5.1) and the Pester install on the lab RA host are where this one
+    # actually runs. (Its first-ever execution was that 5.1 CI run -- the
+    # rounds 1-4 diff had never been pushed when it was written.)
+    It 'refuses an ACE whose declared size leaves no application data' -Skip:($env:OS -ne 'Windows_NT') {
         # self-relative SD header (20 bytes) + ACL header (8) + one callback ACE
         # sized so appDataEnd lands at or before appDataStart.
         $sd = New-Object byte[] 64
@@ -2482,10 +2534,6 @@ Describe 'Get-OfficerRights parser: the descending-slice guard (round 7.3)' {
         [BitConverter]::GetBytes([uint16]20).CopyTo($sd, 30) # AceSize: SID only
         [BitConverter]::GetBytes([uint32]0x00010000).CopyTo($sd, 32)
         $sd[36] = 1; $sd[37] = 1; $sd[43] = 5; $sd[44] = 18  # S-1-5-18
-        { Parse-OfficerRightsSD $sd } | Should -Not -Throw
-        $aces = @(Parse-OfficerRightsSD $sd)
-        # Whatever it decides, it must not invent subject SIDs out of reversed
-        # bytes read backwards past the end of the ACE.
-        foreach ($a in $aces) { @($a.Subjects).Count | Should -BeLessOrEqual 1 }
+        { Parse-OfficerRightsSD $sd } | Should -Throw '*no application data*'
     }
 }
