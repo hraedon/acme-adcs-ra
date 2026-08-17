@@ -20,6 +20,55 @@ $script:IcaclsExe = if ($env:windir) {
     'icacls.exe'
 }
 
+# Where `icacls /save` dumps are written before being parsed back.
+#
+# That dump is not scratch, it is EVIDENCE: Get-InstallTreeViolations decides
+# whether a tree is locked -- and Get-RootProvenance decides whether a
+# pre-existing root is ours -- by reading it. It used to be written to the
+# ambient TEMP directory, which is %windir%\Temp (Users-writable) when the
+# installer runs as SYSTEM under configuration management. The installer sets
+# this to its own administrator-only scratch directory before the first proof
+# runs; the TEMP fallback is for the Pester suite and for any caller that
+# dot-sources this library on its own.
+$script:InstallVerifyScratchDir = $null
+
+# Platform, read from the runtime rather than from $env:OS.
+#
+# The scratch guard below refuses to name a dump path on Windows when no
+# protected directory is configured. Gating that on $env:OS -- an inherited,
+# caller-settable environment variable -- meant anything starting the installer
+# with OS unset silently got the ambient-TEMP fallback the guard exists to
+# remove, in the one function whose whole thesis is not trusting the ambient
+# environment. Overridable as a script variable so the Pester suite can drive
+# both branches; that requires code execution in the session, which an
+# environment variable does not.
+$script:InstallVerifyIsWindows = ([System.Environment]::OSVersion.Platform -eq 'Win32NT')
+
+function Get-InstallVerifyScratchPath {
+    param([Parameter(Mandatory = $true)][string]$FileName)
+    $dir = $script:InstallVerifyScratchDir
+    if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) {
+        # ON WINDOWS THIS THROWS rather than falling back.
+        #
+        # The first draft of this function fell back to ambient TEMP whenever no
+        # scratch was configured -- which is the single path that reopens the
+        # hole it was written to close, because %windir%\Temp is Users-writable
+        # when the installer runs as SYSTEM. A fallback that silently restores
+        # the unsafe behaviour is not a fallback, it is the bug with a longer
+        # code path. Off Windows there is no such directory and no icacls, so
+        # the Pester run keeps the TEMP path.
+        if ($script:InstallVerifyIsWindows) {
+            throw ("InstallVerify scratch directory is not configured or no longer exists " +
+                   "('$dir'). The icacls read-back dump is the evidence every provenance " +
+                   "verdict and lockdown proof is decided from; it is not written to an " +
+                   "ambient TEMP directory. Set `$script:InstallVerifyScratchDir to a " +
+                   "protected administrator-only directory before proving any tree.")
+        }
+        $dir = [System.IO.Path]::GetTempPath()
+    }
+    return (Join-Path $dir $FileName)
+}
+
 # Classify an -HttpPlatformHandlerMsi value: 'https', 'http', or 'local'.
 function Get-MsiSourceKind {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Source)
@@ -373,7 +422,7 @@ function New-AtomicProtectedDirectory {
         [Parameter(Mandatory = $true)][string[]]$Grants
     )
     $ErrorActionPreference = 'Stop'
-    if ($env:OS -ne 'Windows_NT') {
+    if (-not $script:InstallVerifyIsWindows) {
         throw 'New-AtomicProtectedDirectory is supported only on Windows.'
     }
     $security = New-Object System.Security.AccessControl.DirectorySecurity
@@ -535,6 +584,31 @@ function Test-PathInsideTree {
     return ($rel -eq 'equal' -or $rel -eq 'a-inside-b')
 }
 
+# Do two path strings name the same object? Canonicalised through the same
+# machinery as Get-PathRelation, so case, trailing separators, dot segments,
+# 8.3 names and junction aliases cannot make one object read as two. Used where
+# "inside the right tree" is too weak an answer and only one exact path will do
+# (the web.config processPath, the dotenv location).
+function Test-PathsEquivalent {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$A,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$B
+    )
+    if (-not $A -or -not $B) { return $false }
+    # Forward slashes are normalised, not refused.
+    #
+    # Assert-SafeLocalInstallPath rejects '/' outright, which is right for an
+    # install ROOT the operator passes on the command line -- there, refusing an
+    # ambiguous spelling is cheaper than normalising it. But this helper compares
+    # paths read out of web.config, where both IIS and Python accept
+    # `C:/ProgramData/...`; refusing it aborted the install of a live issuance
+    # host with a message ("must be absolute local drive paths") about a path
+    # that IS one. Get-CanonicalPathString already handles '^[A-Za-z]:[\\/]'.
+    $na = $A -replace '/', '\'
+    $nb = $B -replace '/', '\'
+    return ((Get-PathRelation -A $na -B $nb) -eq 'equal')
+}
+
 # Pure decision function over an `icacls <root> /save <file> [/t]` dump: does
 # the dump describe a LOCKED tree? Returns an array of violation strings --
 # EMPTY means locked. No I/O, so tests/pester can drive it with fixture dumps
@@ -577,13 +651,19 @@ function Test-AclDumpLocked {
             if ($null -ne $currentPath) { $currentSddl += $line.Trim() }
             continue
         }
-        if ($null -ne $currentPath -and $currentSddl -ne '') {
+        # An entry whose SDDL line is MISSING used to be dropped silently: the
+        # commit was guarded on `$currentSddl -ne ''`, so a dump naming a path
+        # and then moving straight on to the next one left that object
+        # unexamined and the tree "locked" with zero violations. Record it as an
+        # entry with no DACL string instead; the check below turns that into a
+        # violation naming the path, which is the fail-closed direction.
+        if ($null -ne $currentPath) {
             $entries.Add(@{ Path = $currentPath; Sddl = $currentSddl })
         }
         $currentPath = $line.Trim()
         $currentSddl = ''
     }
-    if ($null -ne $currentPath -and $currentSddl -ne '') {
+    if ($null -ne $currentPath) {
         $entries.Add(@{ Path = $currentPath; Sddl = $currentSddl })
     }
     if ($entries.Count -eq 0) {
@@ -602,6 +682,11 @@ function Test-AclDumpLocked {
         if (-not $skip) {
             $mustBeProtected = $AllEntriesMustBeProtected -or ($idx -eq 0)
 
+            if ($sddl -eq '') {
+                $violations += "$path : no DACL line in the dump for this object -- an object that cannot be read back cannot be proven locked"
+                $idx++
+                continue
+            }
             $firstParen = $sddl.IndexOf('(')
             if ($firstParen -lt 0) {
                 # A DACL string with no ACE at all: either a deny-everyone
@@ -746,7 +831,7 @@ function Get-InstallTreeViolations {
         return @($_.Exception.Message)
     }
 
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
+    $tmp = Get-InstallVerifyScratchPath -FileName ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
     try {
         # /L: dump the links themselves rather than following them, so the
         # read-back cannot be redirected any more than the writes can.
@@ -783,7 +868,7 @@ function Get-InstallTreeViolations {
                                 "SYSTEM) -- this file decides what the RA may issue, so an owner " +
                                 "that can rewrite its DACL is an issuance-policy hole")
             }
-            $tmpEntry = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
+            $tmpEntry = Get-InstallVerifyScratchPath -FileName ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
             $out = & $script:IcaclsExe $entryPath /save $tmpEntry /q /L 2>&1
             if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
                 $violations += "$entryPath : icacls /save failed (exit $LASTEXITCODE): $(($out | Out-String).Trim())"
@@ -1256,8 +1341,57 @@ function Stop-AppPoolAndWait {
     )
     $ErrorActionPreference = 'Stop'
     if (-not (Test-Path -LiteralPath $AppcmdExe)) { return $false }
-    $exists = & $AppcmdExe list apppool "$AppPool" 2>$null
-    if (-not $exists) { return $false }
+    # "appcmd said nothing" and "appcmd could not answer" are NOT the same thing.
+    #
+    # This used to be `& $AppcmdExe list apppool "$AppPool" 2>$null`, which
+    # discards stderr and ignores the exit code, so an appcmd that FAILED --
+    # a broken applicationHost.config, WAS not running, access denied -- was
+    # indistinguishable from "no such pool". The installer then printed
+    # "[ok] no such app pool yet (first install)" and went on to claim, reset and
+    # rebuild trees that a live gMSA worker may hold write handles into. Windows
+    # evaluates access at handle-open time, so those handles survive the ACL
+    # reset: that is rescan-2 F3, reached through the check that exists to
+    # prevent it. Test-AppPoolWorkersGone two lines below already fails closed on
+    # unparseable input for exactly this reason.
+    #
+    # Deliberately keyed on STDERR rather than the exit code: appcmd's exit code
+    # for a non-existent object is not something this can verify off Windows,
+    # while "wrote nothing to stderr" cleanly separates the two cases either way.
+    $probeEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $probe = & $AppcmdExe list apppool "$AppPool" 2>&1
+    } finally {
+        $ErrorActionPreference = $probeEap
+    }
+    $probeErr = (@($probe) |
+        Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+        ForEach-Object { $_.ToString() }) -join "`n"
+    # STDOUT only. Building this from every element folded the ErrorRecords back
+    # in, so $exists was never empty whenever stderr had fired -- which made the
+    # $probeErr clause below dead code that happened to produce the right answer.
+    # A mutation removing that clause changed nothing, which is how it was found.
+    $exists = (@($probe) |
+        Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+        ForEach-Object { $_.ToString() }) -join "`n"
+    # ONLY a clean, silent answer means "no such pool".
+    #
+    # The first version of this guard THREW on any stderr, which would have
+    # aborted every first install: `appcmd list apppool <absent>` writes
+    # `ERROR ( message:Cannot find APPPOOL object with identifier ... )` to
+    # stderr and exits non-zero, and the installer does not create the pool until
+    # ~800 lines below here, so on a first install the pool is absent BY
+    # CONSTRUCTION. That is the same shape as the netsh catch-all defect: a guard
+    # that only the untravelled path reaches.
+    #
+    # Ambiguity is resolved by doing MORE work rather than less. If anything
+    # reached stderr we do not decide at all -- we fall through to stop the pool
+    # and PROVE the worker is gone, which is the check that actually matters.
+    # Test-AppPoolWorkersGone fails closed on output it cannot classify, so an
+    # unanswerable appcmd ends in the timeout throw below rather than in a silent
+    # "[ok] no such app pool yet". Nothing here depends on appcmd's exit code or
+    # on the wording of a localizable message.
+    if (-not $exists.Trim() -and -not $probeErr.Trim()) { return $false }
     & $AppcmdExe stop apppool /apppool.name:"$AppPool" 2>$null | Out-Null
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
@@ -1349,7 +1483,12 @@ function Get-CanonicalPathString {
     } else {
         try { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $Path }
     }
-    if ($env:OS -eq 'Windows_NT') {
+    # Also off $env:OS: with it unset on a real Windows host this skipped kernel
+    # final-path resolution entirely, so a junction, symlink or 8.3 alias would
+    # not be collapsed and two spellings of one physical tree could read as
+    # 'disjoint' -- which is the RX/Modify boundary between the code and state
+    # roots. Fail-open in the same shape as the scratch guard, one function over.
+    if ($script:InstallVerifyIsWindows) {
         $segs = @($full -split '\\') | Where-Object { $_ }
         for ($i = $segs.Count; $i -ge 1; $i--) {
             $prefix = ($segs[0..($i - 1)] -join '\')
@@ -1445,11 +1584,16 @@ function Test-AceEndangersBytes {
     # GenericAll 0x10000000. Only the write/all two belong here -- the first
     # live run shipped 0x80000000 as "GenericAll" and flagged every %ProgramFiles%
     # Users GR,GE ACE as write-class.
+    # ChangePermissions (0x40000) and TakeOwnership (0x80000) ARE WRITE_DAC and
+    # WRITE_OWNER -- those are the FileSystemRights member names. The enum has no
+    # WriteDacl and no WriteOwner member, so those spellings silently evaluate to
+    # $null and contribute 0 to a -bor chain. This mask used to list both pairs;
+    # the dead half has been removed because carrying it here is what made the
+    # installer's inline bootstrap copy (which listed ONLY the dead half) look
+    # correct while covering neither right.
     $mask = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
              [int][System.Security.AccessControl.FileSystemRights]::Delete -bor
              [int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
-             [int][System.Security.AccessControl.FileSystemRights]::WriteDacl -bor
-             [int][System.Security.AccessControl.FileSystemRights]::WriteOwner -bor
              [int][System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
              [int][System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
              0x40000000 -bor 0x10000000      # GenericWrite, GenericAll raw bits
@@ -1510,6 +1654,25 @@ function Test-ObjectDaclTrusted {
     $acl = $null
     try { $acl = Get-Acl -LiteralPath $Path } catch { return @("$Path : ACL unreadable ($($_.Exception.Message))") }
     $isDir = (Test-Path -LiteralPath $Path -PathType Container)
+    # NO ACE AT ALL IS A REFUSAL, not a pass.
+    #
+    # This function decided trust purely from inside the foreach below, so an
+    # empty rule collection produced zero violations and the object was called
+    # administrator-only. A NULL DACL -- SE_DACL_PRESENT clear -- means EVERYONE
+    # HAS FULL CONTROL, and .NET surfaces it exactly like a deny-everyone empty
+    # DACL: Access.Count is 0 either way. Sloppy third-party installers do
+    # produce NULL DACLs, and one anywhere in the interpreter's ancestor chain
+    # reopened round 5's finding: the chain reports clean, the installer runs
+    # python.exe from it elevated, and every local user could rewrite those
+    # bytes.
+    #
+    # Test-AclDumpLocked already treats this condition as tampering and fails
+    # closed on it ("DACL carries no ACEs"), so the file disagreed with itself.
+    # Both directions of the same question now give the same answer.
+    if (@($acl.Access).Count -eq 0) {
+        $violations += ("$Path : DACL carries no ACEs -- a NULL DACL grants EVERYONE full control " +
+                        "and is indistinguishable here from a deny-everyone one; both fail closed")
+    }
     if (-not (Test-OwnerAllowed -Owner $acl.Owner -AllowedOwnerSids @(Get-AllowedExecutableOwners))) {
         $violations += "$Path : owner is '$($acl.Owner)' (expected Administrators, SYSTEM or TrustedInstaller)"
     }
@@ -1581,23 +1744,205 @@ function Assert-WebConfigLaunchTrusted {
         throw ("$WebConfigPath is not parseable XML ($($_.Exception.Message)). It is the gMSA " +
                "launch configuration; an unparseable launch configuration is refused, not adopted.")
     }
-    $procPath = $xml.configuration.'system.webServer'.httpPlatform.processPath
-    if (-not $procPath) {
+    # EVERY httpPlatform node, not the first one a dotted property lookup finds.
+    #
+    # `$xml.configuration.'system.webServer'.httpPlatform` reads exactly one
+    # place in the document. A `<location>` element carrying its own
+    # `<system.webServer><httpPlatform processPath="...">` is invisible to it, so
+    # a web.config with a benign top-level processPath and a hostile
+    # location-scoped override was accepted. SelectNodes('//httpPlatform') sees
+    # all of them and the loop below holds each to the same rules.
+    # local-name() so a default xmlns on <configuration> (VS and older tooling
+    # emit .NetConfiguration/v2.0) does not make SelectNodes return zero nodes
+    # and produce a 'there is no httpPlatform' diagnostic about a file that
+    # plainly has one. Fail-closed either way, but the message must be true.
+    $platformNodes = @($xml.SelectNodes("//*[local-name()='httpPlatform']"))
+    if (@($platformNodes).Count -eq 0) {
         throw ("$WebConfigPath has no httpPlatform/@processPath. The gMSA launch configuration " +
-               "must name an executable, and it must be the runtime venv:")
+               "must name an executable, and it must be the runtime venv: " +
+               "`"$ExpectedProcessPath`".")
     }
-    $procPath = [string]$procPath
-    if (Test-PathInsideTree -Path $procPath -Tree $InstallDir) {
-        throw ("$WebConfigPath launches `"$procPath`", which is INSIDE the state tree $InstallDir. " +
-               "The gMSA holds Modify on that tree: a worker-writable interpreter is exactly what " +
-               "the code/state split removes. Set processPath to `"$ExpectedProcessPath`" " +
-               "(docs/operator-requirements.md section 4, step 8).")
+
+    # Environment variable names that decide what the RA may ISSUE, or where it
+    # reads that decision from. web.config <environmentVariables> reach the
+    # worker's environment, and pydantic-settings ranks an environment variable
+    # ABOVE the dotenv -- so an ACME_RA_EAB_ALLOWLIST here silently overrides the
+    # one in acme-ra.env, the file this installer protects with its own DACL, a
+    # strict owner check, a rollback re-protect and a dedicated -ProtectedEntries
+    # proof. Redirecting ACME_RA_DOTENV achieves the same in one line.
+    # ACME_RA_BASE_URL, ACME_RA_ADCS_* and the SIEM settings are deliberately NOT
+    # here: those are the operator's to set in this file and the template ships
+    # them.
+    $forbiddenEnvNames = @(
+        'ACME_RA_EAB_ALLOWLIST', 'ACME_RA_SAN_SCOPES', 'ACME_RA_ADMIN_TOKEN',
+        'ACME_RA_REVOCATION_CONFIRM_TOKEN', 'ACME_RA_ALLOW_WEAK_CREDENTIALS',
+        'ACME_RA_RATE_LIMIT_OVERRIDES',
+        'ACME_RA_ALLOW_FAKE_ADCS_BACKENDS'
+    )
+    # Settings with exactly ONE defensible production value. Unlike the base URL,
+    # the ADCS target or the SIEM host -- which are per-deployment and are the
+    # operator's to set here -- turning these off only ever removes a control.
+    # ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE is pinned-when-present,
+    # not forbidden outright: absent, the worker defers to the dotenv/default
+    # (the documented optional mode); PRESENT with any value but "true", the
+    # only thing it can do is override a dotenv that turned the CRL proof ON
+    # back to the weaker agent-asserted confirmation -- and this file outranks
+    # the dotenv, so that override would be silent. The lab harness sets it to
+    # true here, which is the one present-value that passes.
+    $pinnedEnvValues = @{
+        'ACME_RA_AUDIT_OFFBOX_REQUIRED' = 'true'
+        'ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE' = 'true'
     }
-    if (-not (Test-PathInsideTree -Path $procPath -Tree $RuntimeDir)) {
-        throw ("$WebConfigPath launches `"$procPath`", which is OUTSIDE the runtime tree $RuntimeDir. " +
-               "The runtime tree is the only tree whose bytes the gMSA never writes and the only " +
-               "tree permitted to hold executed content. Set processPath to " +
-               "`"$ExpectedProcessPath`" (docs/operator-requirements.md section 1).")
+
+    # <handlers> IS launch configuration too, and the installer itself is what
+    # makes a site-level entry authoritative: it runs
+    # `appcmd unlock config -section:system.webServer/handlers`. A handler with a
+    # scriptProcessor executes an arbitrary binary as the app pool identity --
+    # the gMSA -- which is the same primitive that pinning processPath removes,
+    # reached through a section nothing looked at.
+    foreach ($h in @($xml.SelectNodes("//*[local-name()='handlers']/*"))) {
+        if ($h.LocalName -ieq 'clear' -or $h.LocalName -ieq 'remove') { continue }
+        $sp = [string]$h.scriptProcessor
+        if ($sp) {
+            throw ("$WebConfigPath declares a handler with scriptProcessor `"$sp`". That runs " +
+                   "an arbitrary executable as the gMSA, which is exactly what pinning " +
+                   "httpPlatform/@processPath exists to prevent. Remove the handler entry.")
+        }
+        $mods = [string]$h.modules
+        if ($mods -and ($mods.Trim() -ne 'httpPlatformHandler')) {
+            throw ("$WebConfigPath declares a handler bound to modules `"$mods`". This site " +
+                   "hands every request to httpPlatformHandler and nothing else; another " +
+                   "module in the launch configuration is refused, not adopted.")
+        }
+    }
+    foreach ($sectionName in @('modules', 'isapiFilters')) {
+        $entries = @(@($xml.SelectNodes("//*[local-name()='$sectionName']/*")) |
+            Where-Object { $_.LocalName -ine 'clear' -and $_.LocalName -ine 'remove' })
+        if (@($entries).Count -gt 0) {
+            throw ("$WebConfigPath declares a <$sectionName> entry. Native code loaded into " +
+                   "the worker runs as the gMSA; the launch configuration may name the RA " +
+                   "module and nothing else.")
+        }
+    }
+
+    $sawDotenv = $false
+    foreach ($node in $platformNodes) {
+        $procPathRaw = [string]$node.processPath
+        # Normalise separators ONCE, before any of the checks below: IIS and
+        # Python both accept `C:/Program Files/...`, and Get-PathRelation ->
+        # Assert-SafeLocalInstallPath refuses '/' outright, so a forward-slash
+        # processPath aborted the install with "must be absolute local drive
+        # paths" about a path that is one. Messages still quote what the operator
+        # actually wrote.
+        $procPath = $procPathRaw -replace '/', '\'
+        if (-not $procPath) {
+            throw ("$WebConfigPath has an httpPlatform element with no processPath. The gMSA " +
+                   "launch configuration must name an executable, and it must be " +
+                   "`"$ExpectedProcessPath`".")
+        }
+        if (Test-PathInsideTree -Path $procPath -Tree $InstallDir) {
+            throw ("$WebConfigPath launches `"$procPathRaw`", which is INSIDE the state tree $InstallDir. " +
+                   "The gMSA holds Modify on that tree: a worker-writable interpreter is exactly what " +
+                   "the code/state split removes. Set processPath to `"$ExpectedProcessPath`" " +
+                   "(docs/operator-requirements.md section 4, step 8).")
+        }
+        if (-not (Test-PathInsideTree -Path $procPath -Tree $RuntimeDir)) {
+            throw ("$WebConfigPath launches `"$procPathRaw`", which is OUTSIDE the runtime tree $RuntimeDir. " +
+                   "The runtime tree is the only tree whose bytes the gMSA never writes and the only " +
+                   "tree permitted to hold executed content. Set processPath to " +
+                   "`"$ExpectedProcessPath`" (docs/operator-requirements.md section 1).")
+        }
+        # "Inside the runtime tree" is not the same as "is the interpreter this
+        # install built". $ExpectedProcessPath was a MANDATORY parameter that
+        # appeared only inside these error strings and was never compared to
+        # anything, so any executable anywhere under the runtime tree passed.
+        if (-not (Test-PathsEquivalent -A $procPath -B $ExpectedProcessPath)) {
+            throw ("$WebConfigPath launches `"$procPathRaw`", which is not the interpreter this " +
+                   "install built. Set processPath to exactly `"$ExpectedProcessPath`" " +
+                   "(docs/operator-requirements.md section 4, step 8).")
+        }
+        # `arguments` is the rest of the command line for that interpreter, so
+        # leaving it unread meant `-c "<any python>"` launched as the gMSA with a
+        # processPath that passed every check above. Only the module launch the
+        # RA actually uses is accepted.
+        $args = [string]$node.arguments
+        # Collapse internal whitespace before comparing: `-m  acme_adcs_ra` runs the
+        # same module, and aborting the install of a live issuance host over a
+        # double space is not a security outcome.
+        $argsNorm = ($args -replace '\s+', ' ').Trim()
+        if ($argsNorm -ne '-m acme_adcs_ra') {
+            $shownArgs = if ($args) { '"' + $args + '"' } else { 'no arguments at all' }
+            throw ("$WebConfigPath launches the runtime interpreter with $shownArgs. The " +
+                   "gMSA launch configuration must run the RA module and nothing else: set " +
+                   "arguments to `"-m acme_adcs_ra`".")
+        }
+        # EVERY element child of <environmentVariables>, not only those literally
+        # named <environmentVariable>. IIS collections commonly also honour
+        # <add>/<clear>/<remove>, and reading one element name meant
+        # `<environmentVariables><add name="ACME_RA_EAB_ALLOWLIST" .../></...>`
+        # was never examined at all.
+        foreach ($ev in @($node.SelectNodes(".//*[local-name()='environmentVariables']/*"))) {
+            $name = [string]$ev.name
+            if (-not $name) { continue }
+            # SPLIT ON THE NESTED DELIMITER BEFORE MATCHING.
+            #
+            # config.py sets env_nested_delimiter='__', so pydantic-settings reads
+            # ACME_RA_SAN_SCOPES__<kid>__DNS_PATTERNS as a path INTO san_scopes.
+            # An exact-string match against the forbidden list walked straight
+            # past it: verified live, a nested variable replaced the protected
+            # dotenv's dns_patterns for an existing kid, which IS that kid's
+            # issuance authorisation, while the installer printed
+            # "[ok] launch configuration verified". Compare the FIRST segment.
+            $upper = $name.ToUpperInvariant()
+            $rootName = $upper
+            if ($upper.StartsWith('ACME_RA_')) {
+                $rootName = 'ACME_RA_' + (($upper.Substring(8) -split '__')[0])
+            }
+            if ($pinnedEnvValues.ContainsKey($rootName)) {
+                $wantValue = $pinnedEnvValues[$rootName]
+                if (([string]$ev.value).Trim().ToLowerInvariant() -ne $wantValue) {
+                    throw ("$WebConfigPath sets `"$name`" to `"$($ev.value)`" in " +
+                           "<environmentVariables>. That setting has one production value " +
+                           "(`"$wantValue`") and this file is not a protected one; the only " +
+                           "thing another value can do is remove a control.")
+                }
+                continue
+            }
+            if ($forbiddenEnvNames -contains $rootName) {
+                throw ("$WebConfigPath sets `"$name`" in <environmentVariables>. An environment " +
+                       "variable outranks the dotenv, so this silently overrides the value in " +
+                       "the protected acme-ra.env -- which is what decides who may enrol and " +
+                       "for which names. Remove it from web.config and set it in the dotenv.")
+            }
+            if ($rootName -match '^PYTHON(PATH|HOME|STARTUP)$') {
+                throw ("$WebConfigPath sets `"$name`" in <environmentVariables>. That redirects " +
+                       "what the gMSA interpreter imports, which makes the runtime tree's " +
+                       "read-only DACL decorative. Remove it.")
+            }
+            if ($rootName -eq 'ACME_RA_DOTENV') {
+                $sawDotenv = $true
+                # String concat, not Join-Path: Join-Path is provider-aware and throws
+                # "Cannot find drive" for a Windows path on a non-Windows host, which
+                # would make this whole gate unrunnable from the Linux Pester job.
+                $want = ($InstallDir.TrimEnd('\') + '\acme-ra.env')
+                if (-not (Test-PathsEquivalent -A ([string]$ev.value) -B $want)) {
+                    throw ("$WebConfigPath points ACME_RA_DOTENV at `"$($ev.value)`" rather than " +
+                           "the protected `"$want`". The secret-bearing file is the one the " +
+                           "installer locks and proves; a different path is neither.")
+                }
+            }
+        }
+    }
+    # Declared, not merely correct-if-declared. With no ACME_RA_DOTENV the worker
+    # falls back to `.env` resolved against its own working directory, so the
+    # protected file this installer locks, owns, re-protects on rollback and
+    # proves as a -ProtectedEntries item is simply not the file the RA reads.
+    if (-not $sawDotenv) {
+        $wantDotenv = ($InstallDir.TrimEnd('\') + '\acme-ra.env')
+        throw ("$WebConfigPath does not set ACME_RA_DOTENV. Without it the RA resolves " +
+               "`".env`" against the worker's own working directory instead of reading the " +
+               "protected `"$wantDotenv`" -- the only file the installer locks and proves. " +
+               "Add it to <environmentVariables>.")
     }
 }
 

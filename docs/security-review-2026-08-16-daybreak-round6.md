@@ -45,7 +45,18 @@ another principal could not modify the tree.
 
 Fixed in two stages. A small inline bootstrap checks the owner, reparse status,
 and write ACEs of every consumed input and its ancestor chain before any sibling
-code is loaded. After the managed roots are established, those inputs are copied
+code is loaded.
+
+> **Corrected 2026-08-16 (round-6 follow-up, findings 1 and 2).** As shipped in
+> `b625247` this gate did neither of the two things this paragraph claims. Its
+> write-ACE mask named `FileSystemRights::WriteDacl`/`::WriteOwner`, which are
+> not members of that enum, so it covered neither WRITE_DAC nor WRITE_OWNER; and
+> "ancestor chain" meant the *release root's* ancestors, not each input's, so
+> `scripts\` and `scripts\lib\` — the directories holding the helper — were never
+> inspected. Both are fixed; see
+> `docs/security-review-2026-08-16-round6-followup.md`.
+
+After the managed roots are established, those inputs are copied
 to a fresh administrator-only snapshot under `%ProgramFiles%`; dependency locks,
 the project build, and the IIS template are consumed only from that snapshot.
 The script itself remains the operator-selected trust anchor, so the operator

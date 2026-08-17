@@ -209,6 +209,14 @@ def _finalize_parse_and_validate_csr(
             outcome="denied",
             details={
                 "reason": "CSR SANs not in order identifiers",
+                # Same reason/reason_code split as the policy-denied call
+                # below: the reason is currently a fixed string, but
+                # out_of_order -- the attacker-chosen SAN list -- sits in this
+                # same dict one refactor away from being interpolated into it,
+                # which would put it straight back into the coalescing key.
+                # The sibling call site was the R2-5 finding; this one is
+                # pinned now rather than after that refactor.
+                "reason_code": "csr-san-mismatch",
                 "out_of_order": out_of_order,
             },
         )
@@ -233,7 +241,15 @@ def _finalize_parse_and_validate_csr(
             order_id=order_id,
             sans=requested_sans,
             outcome="denied",
-            details={"reason": decision.reason},
+            # ``reason`` is prose and contains the offending SAN, which the
+            # client chooses; ``reason_code`` is the stable coalescing identity.
+            # Without the split, varying one identifier per finalize produced one
+            # durable audit row per request on a single order — the bound-defeat
+            # the coalescer excludes attacker-chosen data to prevent.
+            details={
+                "reason": decision.reason,
+                "reason_code": decision.reason_code,
+            },
         )
         if "out of scope" in decision.reason or "no SANs" in decision.reason:
             raise rejected_identifier(decision.reason)

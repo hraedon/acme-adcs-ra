@@ -155,6 +155,25 @@ Describe 'Test-SerialRevokedAtCa (extracted from Revoke-Cert.ps1)' {
             $n.Name -eq 'Test-SerialRevokedAtCa' }, $true) | Select-Object -First 1
         if ($null -eq $fn) { throw 'Test-SerialRevokedAtCa not found in Revoke-Cert.ps1' }
         Invoke-Expression $fn.Extent.Text
+        # Round 7.4: Test-SerialRevokedAtCa's certutil calls now go through
+        # Invoke-CertUtilCapture (the EAP shield that keeps the exit-code
+        # contract reachable on Windows PowerShell 5.1), so the lift needs the
+        # sibling too or every test below dies on CommandNotFoundException --
+        # the same lifted-function dependency the harness already documents for
+        # $script:CertUtilExe.
+        $cap = $ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -eq 'Invoke-CertUtilCapture' }, $true) | Select-Object -First 1
+        if ($null -eq $cap) { throw 'Invoke-CertUtilCapture not found in Revoke-Cert.ps1' }
+        Invoke-Expression $cap.Extent.Text
+        # Supply the script-scope context the lifted function expects. The shipped
+        # script resolves certutil to an absolute System32 path (round 7.3, so a
+        # writable PATH entry is not code execution with CA-officer rights); these
+        # tests stub certutil as a COMMAND, so the harness points the variable at
+        # the bare name. Without it the lifted function invokes $null -- which is
+        # the same "& $null" class these rounds keep finding, surfaced here by the
+        # AST lift rather than in production.
+        $script:CertUtilExe = 'certutil'
     }
 
     It 'returns a value that is FALSE at the call site for a reason-8 row' {
@@ -162,8 +181,12 @@ Describe 'Test-SerialRevokedAtCa (extracted from Revoke-Cert.ps1)' {
         # Every restrict matches: disposition 21 yes, disposition 20 no, reason 8 yes.
         function certutil {
             $global:LASTEXITCODE = 0
-            $restrict = $args[0] | Where-Object { $_ -like 'SerialNumber=*' }
-            if (-not $restrict) { $restrict = ($args | Where-Object { $_ -like 'SerialNumber=*' }) }
+            # Round 7.4: the shipped calls now go through
+            # Invoke-CertUtilCapture, which SPLATS the argument array, so the
+            # restrict string is one element among several in $args rather
+            # than inside a single array-valued $args[0]. Scan all of $args:
+            # correct under both shapes.
+            $restrict = $args | Where-Object { $_ -like 'SerialNumber=*' }
             if ("$restrict" -like '*Disposition=20*') { return @('no rows') }
             return @("  Serial Number: `"$serial`"")
         }
@@ -194,7 +217,8 @@ Describe 'Test-SerialRevokedAtCa (extracted from Revoke-Cert.ps1)' {
         $serial = '6C000000C053029C6A2F5FA7A70000000000C0'
         function certutil {
             $global:LASTEXITCODE = 0
-            $restrict = $args[0] | Where-Object { $_ -like 'SerialNumber=*' }
+            # Round 7.4: shape-agnostic restrict scan (see the stub above).
+            $restrict = $args | Where-Object { $_ -like 'SerialNumber=*' }
             if ("$restrict" -like '*Disposition=20*') { return @('no rows') }
             if ("$restrict" -like '*RevokedReason=8*') { return @('no rows') }
             return @("  Serial Number: `"$serial`"")
@@ -202,5 +226,105 @@ Describe 'Test-SerialRevokedAtCa (extracted from Revoke-Cert.ps1)' {
         $result = Test-SerialRevokedAtCa 'CA\ca' $serial
         $truthy = if ($result) { $true } else { $false }
         $truthy | Should -BeTrue -Because 'a plain disposition-21 row with no reason 8 IS revoked'
+    }
+}
+
+# 2026-08-16 round 7.2. The 2026-08-18 wave-3 round fixed exactly this defect in
+# Test-SerialRevokedAtCa: a PowerShell function returns EVERYTHING written to
+# the success stream, so Write-Output diagnostics become part of the return
+# value. Get-SerialFromReqId, 130 lines further down the SAME file, still did
+# it -- so `$targetSerial` was a 5-element array of banner lines with the serial
+# last, and the next statement pasted the whole thing into
+# `-restrict SerialNumber=<banner...>`. -ReqID could not revoke anything: it
+# died at exit 4 or on a certutil parse error. It fails SAFE, but it takes out
+# the manual containment path an operator reaches for during an incident.
+# Sync-Revocations.ps1 always passes -Serial, which is why no live re-proof has
+# ever exercised this branch.
+Describe 'Get-SerialFromReqId returns a serial, not a transcript' {
+    BeforeAll {
+        $scriptPath = "$PSScriptRoot/../../scripts/Revoke-Cert.ps1"
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $scriptPath, [ref]$null, [ref]$null)
+        $fn = $ast.Find({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -eq 'Get-SerialFromReqId'
+        }, $true)
+        if (-not $fn) { throw 'Get-SerialFromReqId is missing from Revoke-Cert.ps1' }
+        . ([scriptblock]::Create($fn.Extent.Text))
+
+        # Stand in for the real certutil call with a faithful -view transcript.
+        function script:Invoke-CertUtil {
+            param([string[]]$CertUtilArgs)
+            return @(
+                'Row 1:',
+                '  Serial Number: "6c000000c053029c6a2f5fa7a7000000000012"',
+                'CertUtil: -view command completed successfully.'
+            )
+        }
+        function script:Die { param([string]$Message, [int]$Code) throw $Message }
+    }
+
+    It 'returns a bare string, not an array' {
+        $serial = Get-SerialFromReqId 'CA01\lab-ca' '77'
+        # The bug produced System.Object[] with the banner lines in front.
+        $serial | Should -BeOfType [string]
+        $serial | Should -Be '6C000000C053029C6A2F5FA7A7000000000012'
+    }
+
+    It 'the value is usable as a certutil -restrict argument' {
+        $serial = Get-SerialFromReqId 'CA01\lab-ca' '77'
+        $restrict = "SerialNumber=$serial"
+        $restrict | Should -Be 'SerialNumber=6C000000C053029C6A2F5FA7A7000000000012'
+        $restrict | Should -Not -Match 'Looking up'
+        $restrict | Should -Not -Match 'CertUtil:'
+    }
+
+    It 'the shipped function writes its diagnostics to stderr, not the success stream' {
+        $src = Get-Content -Raw "$PSScriptRoot/../../scripts/Revoke-Cert.ps1"
+        $start = $src.IndexOf('function Get-SerialFromReqId')
+        $body = $src.Substring($start, [Math]::Min(1800, $src.Length - $start))
+        $body | Should -Not -Match 'Write-Output'
+        $body | Should -Match '\[Console\]::Error\.WriteLine'
+    }
+}
+
+# Round 7.4: the R2-11 @() wrapping at the Get-OfficerRights.ps1 call site
+# turned a $null parse into a one-element array CONTAINING $null (@($null).Count
+# is 1), so a corrupt or DACL-less OfficerRights value printed "Found 1
+# OfficerRights ACE(s)" and exited 0 -- the verify-by-readback tool affirming a
+# restriction that is not in force. The function now returns @() on its early
+# exits (the OfficerRightsLib convention), which the call-site wrapper counts
+# as zero. Extracted by AST so the assertion runs against the shipped text.
+Describe 'Parse-OfficerRightsSD empty-return semantics (round 7.4)' {
+    BeforeAll {
+        $script:src = Join-Path $PSScriptRoot '../../scripts/Get-OfficerRights.ps1'
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $script:src).Path, [ref]$null, [ref]$null)
+        $fn = $ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -eq 'Parse-OfficerRightsSD' }, $true) | Select-Object -First 1
+        if ($null -eq $fn) { throw 'Parse-OfficerRightsSD not found in Get-OfficerRights.ps1' }
+        Invoke-Expression $fn.Extent.Text
+    }
+
+    It 'a truncated (<20 byte) value unwraps to ZERO ACEs at the call-site idiom' {
+        # Mutation: revert the early return to `return $null` -- @($null).Count
+        # is 1, so the no-ACEs guard at the call site is skipped.
+        $short = [byte[]](1, 0, 0, 0)
+        @(Parse-OfficerRightsSD $short).Count | Should -Be 0
+    }
+
+    It 'a descriptor with no DACL unwraps to ZERO ACEs at the call-site idiom' {
+        # 20+ bytes with a zero Dacl offset: present but unrestricted/unusable.
+        $bytes = [byte[]]::new(40)
+        $bytes[0] = 1
+        @(Parse-OfficerRightsSD $bytes).Count | Should -Be 0
+    }
+
+    It 'the shipped function text never returns bare $null' {
+        # Belt and braces: the AST text itself must not contain `return $null`,
+        # so the defect cannot re-enter through either early exit.
+        $fn.Extent.Text | Should -Not -Match 'return\s+\$null'
     }
 }

@@ -59,6 +59,45 @@ if (-not (Test-Path -Path $DbPath)) {
     Die "RA database not found: $DbPath" 2
 }
 
+# Elevated helpers are resolved to absolute paths, never left to ambient PATH.
+#
+# This script ran `& certutil ...` and `& python @arguments` by bare name. A
+# writable PATH entry -- or, for a child launched through cmd, the current
+# directory -- turns either into code execution with this script's privileges on
+# the host that holds the RA's CA-officer context. Same class as round-6
+# finding 3, which removed PATH-selected py/python/winget from the installer;
+# this sibling was missed. certutil is a System32 binary, so it is addressed
+# absolutely. Python is not, so it is resolved through Get-Command and required
+# to be an Application with a rooted source -- and the current directory is
+# removed from the child search path either way.
+$env:NoDefaultCurrentDirectoryInExePath = '1'
+$certutilExe = Join-Path $env:windir 'System32\certutil.exe'
+if (-not (Test-Path -LiteralPath $certutilExe)) {
+    Die "certutil.exe not found at $certutilExe." 2
+}
+$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCmd -or
+    $pythonCmd.CommandType -ne [System.Management.Automation.CommandTypes]::Application -or
+    -not $pythonCmd.Source -or -not [System.IO.Path]::IsPathRooted($pythonCmd.Source)) {
+    Die "No python interpreter resolved to an absolute executable path; install Python 3.12+ machine-wide." 2
+}
+$pythonExe = $pythonCmd.Source
+# `Get-Command python` IS the PATH lookup -- resolving it to an absolute path
+# proves only that SOMETHING was found, not that a non-administrator could not
+# have planted it. A binary in a writable PATH directory is an Application with
+# a rooted Source and satisfies every condition above. Hold it to the same
+# provenance rule the installer applies before it executes an interpreter:
+# the file and its whole ancestor chain must be administrator-only.
+if ($pythonExe -like '*\WindowsApps\*') {
+    Die "Refusing the Windows Store python stub at $pythonExe; install Python 3.12+ machine-wide." 2
+}
+. (Join-Path $PSScriptRoot 'lib\InstallVerifyLib.ps1')
+$pyChainViolations = @(Test-PathChainTrusted -Path $pythonExe)
+if ($pyChainViolations.Count -gt 0) {
+    Die ("Refusing to run ${pythonExe}: it or its ancestor chain is not administrator-only.`n  " +
+         (($pyChainViolations | Select-Object -First 4) -join "`n  ")) 2
+}
+
 $pythonScript = Join-Path $PSScriptRoot 'reconcile_revocation.py'
 if (-not (Test-Path -Path $pythonScript)) {
     Die "Reconciliation script not found: $pythonScript" 2
@@ -78,8 +117,20 @@ try {
     # Request.RevokedReason is exported because Disposition=21 alone does not
     # prove revocation: reason 8 (removeFromCRL) leaves the disposition at 21
     # while the certificate is off the CRL and valid (2026-08-18 wave 3 F1).
-    $viewOut = & certutil @('-view', '-config', $CaConfig, '-out', 'SerialNumber,Disposition,RequestID,Request.RevokedReason') 2>&1
-    $exportExitCode = $LASTEXITCODE
+    # The EAP shield exists because this script runs under EAP=Stop and, on
+    # Windows PowerShell 5.1, the first line certutil writes to a MERGED
+    # stderr terminates the pipeline before $LASTEXITCODE is read (SyncLib's
+    # documented live observation) -- the exit-status contract this whole
+    # block was written to enforce would be unreachable exactly when it
+    # matters, on a failing export.
+    $priorEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $viewOut = & $certutilExe @('-view', '-config', $CaConfig, '-out', 'SerialNumber,Disposition,RequestID,Request.RevokedReason') 2>&1
+        $exportExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $priorEap
+    }
     $viewOut | Out-File -FilePath $exportPath -Encoding utf8 -ErrorAction Stop
     if ($exportExitCode -ne 0) {
         Die ("certutil -view exited {0}; the export is incomplete and no comparison was attempted. Check CA connectivity and reader rights on '{1}'." -f $exportExitCode, $CaConfig) 2
@@ -96,7 +147,7 @@ try {
     }
 
     Write-Output "Running reconciliation against RA store..."
-    & python @arguments
+    & $pythonExe @arguments
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -eq 0) {

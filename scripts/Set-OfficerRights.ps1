@@ -94,6 +94,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Elevated native helpers resolve to absolute System32 paths, never to ambient
+# PATH. Round-6 finding 3 removed PATH-selected programs from the installer;
+# these scripts were missed, and they are the higher-value half -- this one
+# runs with CA-officer context. A writable PATH entry would be code execution
+# with that context.
+$script:CertUtilExe = if ($env:windir) { Join-Path $env:windir 'System32\certutil.exe' } else { 'certutil' }
+$script:NetExe = if ($env:windir) { Join-Path $env:windir 'System32\net.exe' } else { 'net' }
+
 . "$PSScriptRoot/lib/OfficerRightsLib.ps1"
 
 function Die([string]$Message, [int]$Code) {
@@ -122,7 +130,18 @@ function Get-OfficerRightsBytes([string]$Config) {
         # The key exists and the value does not: definitively absent.
         return $null
     }
-    $out = & certutil -getreg CA\OfficerRights 2>&1
+    # EAP shield: this script runs under EAP=Stop, and on Windows PowerShell
+    # 5.1 the first line a native command writes to a MERGED stderr terminates
+    # the pipeline before $LASTEXITCODE is read (SyncLib's documented live
+    # observation, 2026-08-13) -- so a failing certutil would kill the script
+    # with exit 1 instead of reaching the parse/fallback logic below.
+    $getregEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $script:CertUtilExe -getreg CA\OfficerRights 2>&1
+    } finally {
+        $ErrorActionPreference = $getregEap
+    }
     if ($LASTEXITCODE -eq 0) {
         $hexPairs = @()
         foreach ($line in $out) {
@@ -282,10 +301,22 @@ try {
     Write-Output "PASS: certsvc restarted."
 } catch {
     Write-Warning "Restart-Service failed; attempting net stop/net start: $($_.Exception.Message)"
-    & net stop certsvc 2>&1 | ForEach-Object { Write-Output $_ }
-    $stopCode = $LASTEXITCODE
-    & net start certsvc 2>&1 | ForEach-Object { Write-Output $_ }
-    $startCode = $LASTEXITCODE
+    # EAP shield, and it matters MORE here than anywhere else in this file:
+    # this is already a catch block, so a terminating error from the merged
+    # stderr below is not caught by anything -- the script dies with the CA
+    # still stopped. `net stop` writes ordinary status to stderr in several
+    # locales, which on 5.1 under EAP=Stop would abort exactly the fallback
+    # path that exists to bring certsvc back up.
+    $netEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $script:NetExe stop certsvc 2>&1 | ForEach-Object { Write-Output $_ }
+        $stopCode = $LASTEXITCODE
+        & $script:NetExe start certsvc 2>&1 | ForEach-Object { Write-Output $_ }
+        $startCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $netEap
+    }
     # `net stop` returning non-zero is tolerable (the service may already have
     # been stopped); `net start` failing is not -- it means the CA is DOWN.
     if ($startCode -ne 0) {

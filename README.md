@@ -231,7 +231,7 @@ to do.
 |---|---|
 | **IIS** role + `Web-Mgmt-Console`, `Web-Scripting-Tools`, `Web-IP-Security` | `install-windows.ps1 -InstallPrereqs` (uses `Install-WindowsFeature`) |
 | **HttpPlatformHandler** (IIS module — third-party MSI) | Get the v1.2 amd64 MSI from [iis.net](https://www.iis.net/downloads/microsoft/httpplatformhandler); install by hand or pass `-HttpPlatformHandlerMsi <path>` (see note below) |
-| **Python 3.12+** on the host | `install-windows.ps1 -InstallPrereqs` (uses `winget`), or `winget install Python.Python.3.12` |
+| **Python 3.12+** on the host, machine-wide | Install it **separately, before** running the installer (e.g. `winget install Python.Python.3.12` from your own elevated session). `-InstallPrereqs` deliberately does **not** do this: an elevated bootstrapper running a PATH-selected `py`/`python`/`winget` turns a writable PATH entry into Administrator code execution on the issuance host |
 | **A gMSA installed on this host** | `Install-ADServiceAccount`; `Test-ADServiceAccount` must return `True` |
 | **CA: Web Enrollment + `ACME-ServerAuth` template** (server-auth-only EKU, subject from request, gMSA granted Enroll only) | one-time per CA — see [`docs/certsrv-setup.md`](docs/certsrv-setup.md) |
 

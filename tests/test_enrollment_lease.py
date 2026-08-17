@@ -269,7 +269,10 @@ class TestTheDurableLeaseStopsAStaleWorker:
             ["a.example.com"],
             csr,
             "CN=a.example.com",
-            PolicyDecision(allowed=True, reason="ok", template="ACME-ServerAuth"),
+            PolicyDecision(
+                allowed=True, reason="ok", reason_code="allowed",
+                template="ACME-ServerAuth",
+            ),
             generation,
         )
 

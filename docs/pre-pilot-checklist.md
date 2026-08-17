@@ -253,6 +253,150 @@ engineered to. Until then it has not — regardless of a green local test run.
   clean install/reinstall/rollback, and gMSA launch. Source-only success is not
   pilot evidence for this installer.
 
+- **Round-6 follow-up review remediated in source (2026-08-16); native Windows
+  re-proof required before pilot.** An internal review of the round-6 fixes
+  themselves found four defects — three of them in code round 6 added — and two
+  were PowerShell evaluating to something other than what it reads as. See
+  `docs/security-review-2026-08-16-round6-followup.md`.
+
+  - **H** the bootstrap's dangerous-rights mask named `FileSystemRights::WriteDacl`
+    and `::WriteOwner`, **which are not members of that enum** (they are
+    `ChangePermissions` and `TakeOwnership`): both terms resolved to `$null`,
+    contributed 0 to the `-bor` chain, and the gate covered neither WRITE_DAC nor
+    WRITE_OWNER. An ACE granting a named non-administrator only those two rights
+    over the helper or the build inputs passed;
+  - **H** the bootstrap's ancestor walk runs *upward* from the release root and
+    its input list names the helper *file*, so `scripts\` and `scripts\lib\` were
+    never inspected — and delete-child on a parent replaces the child whatever the
+    child's own DACL says;
+  - **M** the `-ConfigureIIS` catch-all TLS branch invoked an unassigned variable
+    (round 6 assigned the `netsh` path only function-locally and inside the
+    `-SharePort443` branch), killing the install after the certificate was bound
+    and before the pool was started. Reachable **only** without `-SharePort443`,
+    which is why no live re-proof of any round could have found it;
+  - **M** the audit coalescer's open-window index had no bound (the round-5 keys
+    carry `order_id`, and the app pool is configured never to recycle).
+
+  Adjacent: the `icacls /save` dump — the evidence for every provenance verdict —
+  moved out of ambient `%TEMP%` into the protected installer scratch, which is now
+  created before the first root claim.
+
+  Local gates: **816 pytest + 1 skipped, 285 Pester + 1 skipped, ruff, mypy**;
+  every new test mutation-verified (8 PowerShell, 4 Python), and one test that did
+  not survive its own mutation was deleted rather than shipped.
+
+  **Native cases owed on top of round 6's list**: a `WDAC`/`WO`-only ACE (named
+  user and custom group) on the release tree, on `scripts\lib\`, and on `src\` is
+  refused before the helper loads, with a clean control; a write ACE on `scripts\`
+  alone is refused; `-ConfigureIIS -HostName <name> -TlsCertThumbprint <t>`
+  **without** `-SharePort443` completes and starts the pool; the `/save` dumps
+  appear under `%ProgramFiles%\.acme-adcs-ra-installer-*` and nowhere else, on
+  both the success and failure paths; and round 6's standard-user race loop
+  re-run unchanged.
+
+- **Round-6 follow-up, ROUND 2 remediated in source (2026-08-16); native Windows
+  re-proof required before pilot.** Three independent hazard-scoped reviews of
+  the fixes above found twelve more defects, **two of them in those fixes**. One
+  high: `Get-SerialFromReqId` returned its own diagnostics, so
+  `Revoke-Cert.ps1 -ReqID` could never revoke — the same success-stream defect the
+  wave-3 round fixed 130 lines above it in the same file. Medium: the
+  launch-configuration gate validated one attribute of four and never compared
+  `$ExpectedProcessPath` to anything (an `<environmentVariables>` entry in
+  `web.config` overrides the protected dotenv — verified against the running
+  code); an ACE-less DACL read as administrator-only; the nonce-cleanup and
+  expired-order-sweep task actions re-tokenised at run time and could never have
+  run; the coalescing key absorbed an attacker-chosen SAN; `Stop-AppPoolAndWait`
+  read an appcmd failure as "no such pool"; and `distinct_kids` was unbounded
+  within a window. Six low. Full detail in
+  `docs/security-review-2026-08-16-round6-followup.md`.
+
+  Local gates: **826 pytest + 1 skipped, 319 Pester + 3 skipped, ruff, mypy**;
+  10 PowerShell and 12 Python mutations run, all detected.
+
+  **Operator-breaking:** a preserved `web.config` carrying `arguments` other than
+  `-m acme_adcs_ra`, `PYTHONPATH`/`PYTHONHOME`/`PYTHONSTARTUP`, an issuance-policy `ACME_RA_*`
+  variable, a redirected `ACME_RA_DOTENV`, a `<location>`-scoped `httpPlatform`,
+  or a `processPath` that is not exactly the built interpreter now **fails the
+  install** instead of being adopted.
+
+  **Native cases owed, adding to the two lists above:**
+  - `Revoke-Cert.ps1 -ReqID <n>` resolves a serial and revokes it at the CA;
+  - the nonce-cleanup task runs once and reports `LastTaskResult 0`;
+  - the deployed `web.config` is accepted unchanged, and each refused shape above
+    is refused;
+  - `Reconcile-Revocation.ps1` still reconciles after the interpreter change;
+  - **under real Windows PowerShell 5.1**: the whole Pester suite, plus the
+    `& certutil … 2>&1` behaviour in `Revoke-Cert.ps1` under `EAP=Stop` — pwsh 7
+    cannot demonstrate it either way, and `SyncLib` documents that on 5.1 the
+    first stderr line terminates, which would break the documented exit-code
+    contract. **Open and unresolved.**
+  - **`C:\inetpub` chain survey** — `-SitePath` has no ancestor-chain provenance
+    and the fix was deliberately withheld pending a live DACL baseline. If the
+    chain passes `Test-PathChainTrusted` on the lab host, add the refusal.
+
+- **Round-6 follow-up, ROUND 3 remediated in source (2026-08-16); native Windows
+  re-proof required before pilot.** Three more hazard-scoped reviews, of the
+  round-2 fixes. Sixteen findings, **all but two in those fixes**. One high:
+  `Stop-AppPoolAndWait` would have aborted every FIRST install (it threw on the
+  stderr `appcmd list apppool <absent>` legitimately produces, and the pool does
+  not exist until ~800 lines later) — the netsh defect's shape again, invisible
+  to a lab whose host already has the pool. Medium: the forbidden-env-name list
+  was defeated by `env_nested_delimiter="__"` (verified live against the running
+  config); `<handlers>`/`<modules>`/`<isapiFilters>` unchecked while the
+  installer itself unlocks the handlers section; `<add>`-shaped env entries
+  unread; `ACME_RA_AUDIT_OFFBOX_REQUIRED=false` and
+  `ACME_RA_ALLOW_WEAK_CREDENTIALS=true` accepted; three platform gates reading
+  `$env:OS`; `PolicyDecision.reason_code` defaulting to `"allowed"`; and the
+  privileged CA-officer scripts still on bare-PATH `certutil` while the
+  read-only one had been hardened. Full detail in
+  `docs/security-review-2026-08-16-round6-followup.md`.
+
+  Local gates: **827 pytest + 1 skipped, 337 Pester + 4 skipped, ruff, mypy.**
+
+  **Additionally operator-breaking:** a preserved `web.config` that does not set
+  `ACME_RA_DOTENV` at all now fails the install (absent, the worker reads `.env`
+  from its own working directory rather than the protected file).
+
+  **Native cases owed, adding to the lists above:**
+  - `appcmd list apppool "<absent>"` on a real host — record the exit code and
+    stderr. The design is deliberately independent of both, but this is the
+    command that settles it;
+  - a FIRST install (no pre-existing app pool) completes end to end;
+  - a `web.config` with a nested `ACME_RA_SAN_SCOPES__<kid>__DNS_PATTERNS`, an
+    `<add>`-shaped env entry, a `scriptProcessor` handler, or no
+    `ACME_RA_DOTENV` is refused; forward-slash paths and a namespaced
+    `<configuration>` are handled without a false refusal;
+  - `Reconcile-Revocation.ps1` and the officer scripts still run after the
+    absolute-path change;
+  - whether IIS honours a `<location>`-scoped `httpPlatform`, and whether
+    `IsapiModule`/`CgiModule` are registered by the installer's feature set —
+    these set the severity of a refusal already in place, not the fix.
+
+- **Round-6 follow-up, ROUND 4 remediated in source (2026-08-16); native
+  Windows re-proof required before pilot.** Three hazard-scoped reviews of the
+  three rounds above, run before lab validation. Seven findings: the R2-11
+  `@()` wrapping inverted the readback tool's verdict (`@($null).Count` is 1,
+  so a corrupt OfficerRights value printed "Found 1 ACE(s)" and exited 0);
+  `ACME_RA_ALLOW_FAKE_ADCS_BACKENDS` and
+  `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE` were still settable from
+  web.config (the latter now pinned-when-present — the lab sets it to true
+  there, which passes); `finalize-csr-mismatch` still lacked a `reason_code`;
+  the 5.1 `2>&1`-under-`Stop` exit-code hazard was unshielded in every
+  CA-officer script including the `net stop`/`net start` fallback that runs
+  inside a catch; plus marker-forgery, sample-cap-at-open, whitespace and
+  descending-range edges. The mutation-blind
+  `test_a_live_window_survives_below_the_cap` was rewritten a third time, now
+  asserting what the mutation actually changes. Full detail:
+  `docs/security-review-2026-08-16-round6-followup.md` (Round 4).
+
+  Local gates: **830 pytest + 1 skipped, 345 Pester + 4 skipped, ruff, mypy**;
+  9 mutations run against the new tests, all detected.
+
+  **Native cases owed, adding to the lists above:** Get-OfficerRights against a
+  truncated/no-DACL value exits 1 (never "Found 1 ACE(s)"); the
+  net stop/net start fallback completes on 5.1; a failing `certutil -revoke`
+  relays the exit code on 5.1 (item 12 becomes a confirmation).
+
 - **Daybreak round-5 findings validated and fixed (2026-08-15), final tip
   `88e9c07`, live-proven on the lab RA host.** Five findings on the round-4
   fixes (1 high, 4 medium), all closed; the live run itself found and fixed

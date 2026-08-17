@@ -29,6 +29,21 @@ Durable growth therefore becomes a function of *time* — at most one row per
 of attempts stays exact. Because the counter is updated on a row that is
 already committed, even a hard crash cannot lose it.
 
+That bound holds while the number of distinct keys live in a window stays under
+``MAX_OPEN_WINDOWS``. **Above it the bound degrades back toward one row per
+request**, because round-robin across more keys than the index can hold makes
+every lookup a miss. At shipped defaults this is out of reach — it needs >1024
+live ``finalize`` keys inside one 60s window against a 50-orders/hour/kid limit
+— but an operator who sets ``rate_limit_orders_per_window=0`` (documented as a
+supported "rely on the reverse proxy" mode) removes the thing keeping it out of
+reach, and a LONGER coalesce window makes it easier rather than harder, because
+keys stay resident. ``coalescer_evictions`` on the rows is the signal.
+
+The in-memory index of open windows is separately capped (``MAX_OPEN_WINDOWS``).
+Bounding the durable rows says nothing about the dictionary that tracks them,
+and the round-5 keys carry an ``order_id``, so distinct keys accrue with orders
+in a worker process the installer configures never to recycle.
+
 The coalescing key deliberately excludes the ``kid`` and the requester. Both
 are attacker-chosen; keying on them would let a peer defeat the bound by
 varying one character per request. The distinct kids seen in a window are
@@ -87,6 +102,30 @@ COALESCED_EVENT_TYPES = frozenset(
 # regardless; this bounds only how many are named.
 MAX_KID_SAMPLES = 10
 
+# How many open windows the in-memory index may hold at once.
+#
+# Durable growth is bounded by time -- at most one row per (reason x window) --
+# but the index that makes that true was not bounded by anything. A key was only
+# ever dropped when that same key was seen again after its window lapsed, and
+# nothing swept. For account-creation denials the key set is small and fixed
+# (event type x server-chosen reason). For the replayable authenticated classes
+# added in round 5 the key also carries ``order_id``, so a client that finalizes
+# many orders badly mints a new, never-collected key each time -- and the
+# installer configures the app pool with ``idleTimeout=00:00:00`` and
+# ``periodicRestart.time=00:00:00``, so the worker process never recycles to
+# reclaim it.
+#
+# The cap is enforced only when a NEW window is opened, and expired entries are
+# dropped before any live one is: below the cap the behaviour -- including the
+# ``previous_window`` hand-off to a reopened key -- is byte-identical to before.
+MAX_OPEN_WINDOWS = 1024
+
+# How many DISTINCT kid digests one window may retain. The denial count stays
+# exact regardless; this bounds only the set used to answer "how many different
+# kids were offered", which is attacker-controlled in both content and
+# cardinality.
+MAX_DISTINCT_KIDS = 4096
+
 
 def _kid_digest(kid: str) -> str:
     return "sha256:" + hashlib.sha256(kid.encode("utf-8", "surrogatepass")).hexdigest()[:16]
@@ -98,6 +137,10 @@ class _Window:
 
     audit_id: int
     opened_at: float
+    # Monotonic clock reading of the most recent fold into this window. Drives
+    # LRU eviction; ``last_seen`` is the human-facing ISO timestamp and is not
+    # usable for ordering.
+    last_touch: float
     first_seen: str
     last_seen: str
     # The details the row was opened with. Kept because an in-place update
@@ -107,6 +150,9 @@ class _Window:
     count: int = 1
     kid_samples: list[str] = field(default_factory=list)
     distinct_kids: set[str] = field(default_factory=set)
+    # True once distinct-kid tracking hit its cap: ``distinct_kids`` is then a
+    # floor, not a total, and the row says so.
+    distinct_kids_truncated: bool = False
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -129,13 +175,66 @@ class DenialCoalescer:
         window_seconds: float,
         *,
         max_kid_samples: int = MAX_KID_SAMPLES,
+        max_open_windows: int = MAX_OPEN_WINDOWS,
+        max_distinct_kids: int = MAX_DISTINCT_KIDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._window_seconds = float(window_seconds)
         self._max_kid_samples = max_kid_samples
+        if max_distinct_kids < 1:
+            raise ValueError("max_distinct_kids must be at least 1")
+        self._max_distinct_kids = max_distinct_kids
+        if max_open_windows < 1:
+            raise ValueError("max_open_windows must be at least 1")
+        self._max_open_windows = max_open_windows
         self._clock = clock
         self._lock = threading.Lock()
         self._windows: dict[tuple[str, str, str, str], _Window] = {}
+        # Monotonic count of windows dropped to stay under the cap. An evicted
+        # window's successor cannot carry ``previous_window``, so without this an
+        # investigator could not tell "first window for this key" from "the index
+        # dropped my predecessor". Stamped onto every row opened after the first
+        # eviction.
+        self._evicted = 0
+
+    def _evict_for_new_window(self, now: float) -> None:
+        """Make room for one more open window. Caller holds the lock.
+
+        Nothing durable is touched: every window's tally was written to its row
+        on each increment, so dropping the in-memory entry loses only the
+        ability to fold FUTURE repeats into that already-committed row, and the
+        ``previous_window`` breadcrumb the key would have carried if it reopened.
+        Expired windows go first -- they can no longer be folded into anyway --
+        and only then the longest-open live ones.
+        """
+        if len(self._windows) < self._max_open_windows:
+            return
+        for key in [
+            k
+            for k, w in self._windows.items()
+            if (now - w.opened_at) >= self._window_seconds
+        ]:
+            del self._windows[key]
+            # Counted as well. Only the LRU loop below used to increment, and
+            # this is the branch an attacker actually drives: minting fresh keys
+            # to reach the cap is what triggers the sweep. A victim key whose
+            # lapsed window was swept here then reopened with no
+            # ``previous_window`` AND no ``coalescer_evictions`` -- byte-identical
+            # to a first-ever window, which is the ambiguity the marker exists to
+            # remove.
+            self._evicted += 1
+        if len(self._windows) < self._max_open_windows:
+            return
+        # Least-recently-TOUCHED, not longest-open. Ordering by ``opened_at``
+        # preferentially destroyed the window that had been folding the longest
+        # — the one whose survival saves the most rows — and an attacker minting
+        # fresh keys steers that choice. ``last_touch`` moves on every fold, so
+        # a hot window survives a flood of cold ones.
+        for key, _ in sorted(
+            self._windows.items(), key=lambda item: item[1].last_touch
+        )[: len(self._windows) - self._max_open_windows + 1]:
+            del self._windows[key]
+            self._evicted += 1
 
     @property
     def enabled(self) -> bool:
@@ -155,7 +254,28 @@ class DenialCoalescer:
             return store.record_audit(**kwargs)
 
         details = dict(kwargs.get("details") or {})
+        # The coalescer's own markers are stripped from caller-supplied
+        # details before anything is decided, then re-added from authoritative
+        # state. No call site sends these keys today, but they are the fields
+        # an investigator uses to distinguish "first window for this key" from
+        # "the index dropped my predecessor" -- exactly the judgement a buggy
+        # or future call site must not be able to forge by passing them in.
+        details.pop("previous_window", None)
+        details.pop("coalescer_evictions", None)
+        # ``reason_code`` is the coalescing identity; ``reason`` is prose for a
+        # human and MAY contain attacker-chosen text.
+        #
+        # This distinction was missing, and one call site made the omission
+        # matter: ``IssuancePolicy.evaluate`` returns
+        # ``f"SAN out of scope for kid {kid}: {san}"``, which ``finalize`` passed
+        # straight into ``details["reason"]``. The requested SAN was therefore
+        # IN THE COALESCING KEY, so varying one identifier per request produced
+        # one durable row per request — exactly the bound-defeating move this
+        # module's own docstring says the key excludes attacker-chosen data to
+        # prevent. Call sites that can carry variable prose now send a stable
+        # ``reason_code`` alongside it; ``reason`` remains on the row.
         reason = str(details.get("reason", ""))
+        reason_key = str(details.get("reason_code") or reason)
         kid = details.get("kid")
         # The coalescing key. For account-creation denials it is (type, reason)
         # as before -- there is no account to key on, and keying on the
@@ -168,7 +288,7 @@ class DenialCoalescer:
         # "" and keep the no-account behaviour byte-identical.
         key = (
             event_type,
-            reason,
+            reason_key,
             str(kwargs.get("account_id") or ""),
             str(kwargs.get("order_id") or ""),
         )
@@ -192,6 +312,14 @@ class DenialCoalescer:
             new_details["coalesce_window_seconds"] = self._window_seconds
             if closed is not None:
                 new_details["previous_window"] = closed
+            if self._evicted:
+                # Absence of ``previous_window`` is ambiguous once the index has
+                # been shedding windows; say so on the row rather than leaving
+                # the reader to guess. CUMULATIVE for the life of the process and
+                # never reset, so it answers "has the index been shedding?" and
+                # not "is it shedding now" -- successive rows are diffable, a
+                # single row is not.
+                new_details["coalescer_evictions"] = self._evicted
             new_kwargs["details"] = new_details
             event = store.record_audit(**new_kwargs)
             audit_id = event.get("id")
@@ -200,6 +328,7 @@ class DenialCoalescer:
                 fresh = _Window(
                     audit_id=audit_id,
                     opened_at=now,
+                    last_touch=now,
                     first_seen=timestamp,
                     last_seen=timestamp,
                     base_details=dict(event.get("details") or new_details),
@@ -207,7 +336,19 @@ class DenialCoalescer:
                 if isinstance(kid, str):
                     digest = _kid_digest(kid)
                     fresh.distinct_kids.add(digest)
-                    fresh.kid_samples.append(digest)
+                    # The sample cap applies at window open too, not only in
+                    # _extend: with max_kid_samples=0 the first kid still
+                    # landed in the list, so the cap was enforced on the Nth
+                    # kid but never the first. (max_distinct_kids has a floor
+                    # of 1 in __init__, so the set add above is always within
+                    # its cap.)
+                    if len(fresh.kid_samples) < self._max_kid_samples:
+                        fresh.kid_samples.append(digest)
+                # Unconditional: a key that is still in the index here is one
+                # whose own window has lapsed (a LIVE key folds and returns
+                # above), so the expiry pass inside collects that entry first
+                # and no live bystander is displaced to make room for it.
+                self._evict_for_new_window(now)
                 self._windows[key] = fresh
             else:
                 # No row id means nothing to update in place later, so do not
@@ -223,13 +364,26 @@ class DenialCoalescer:
         exists, which is the caller's signal to open a fresh one.
         """
         window.count += 1
+        window.last_touch = self._clock()
         window.last_seen = _now_iso()
         if isinstance(kid, str):
             digest = _kid_digest(kid)
             if digest not in window.distinct_kids:
-                window.distinct_kids.add(digest)
-                if len(window.kid_samples) < self._max_kid_samples:
-                    window.kid_samples.append(digest)
+                # The DISTINCT-kid set is bounded too, not just the named
+                # sample. ``kid_samples`` was capped and ``distinct_kids`` was
+                # not, so an attacker varying the kid every request retained one
+                # 16-byte digest each inside a single window -- ~5 MB per 50,000
+                # kids, freed only when the window rolls -- and a longer
+                # coalesce window, which reduces row growth, multiplies exactly
+                # this. Past the cap the exact count is no
+                # longer knowable, so the row says so rather than reporting a
+                # number that has quietly stopped counting.
+                if len(window.distinct_kids) < self._max_distinct_kids:
+                    window.distinct_kids.add(digest)
+                    if len(window.kid_samples) < self._max_kid_samples:
+                        window.kid_samples.append(digest)
+                else:
+                    window.distinct_kids_truncated = True
         # The update rewrites the whole details blob, so start from what the
         # row already said (reason, the first offered kid) and layer the
         # aggregate on top. Nothing the first denial recorded is lost.
@@ -242,6 +396,7 @@ class DenialCoalescer:
                 "last_seen": window.last_seen,
                 "kid_digests": list(window.kid_samples),
                 "distinct_kids": len(window.distinct_kids),
+                "distinct_kids_truncated": window.distinct_kids_truncated,
             }
         )
         return store.update_audit_details(window.audit_id, details)

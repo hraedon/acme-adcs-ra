@@ -1212,7 +1212,14 @@ Describe 'Assert-WebConfigLaunchTrusted (round 5: launch config fails closed)' {
         $script:good = @'
 <?xml version="1.0" encoding="utf-8"?>
 <configuration><system.webServer>
-  <httpPlatform processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" arguments="-m acme_adcs_ra" />
+  <httpPlatform processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" arguments="-m acme_adcs_ra">
+    <environmentVariables>
+      <!-- Round 7.3: declaring the protected dotenv is now REQUIRED. Without
+           it the worker resolves ".env" against its own working directory, so
+           the file the installer locks and proves is not the one the RA reads. -->
+      <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />
+    </environmentVariables>
+  </httpPlatform>
 </system.webServer></configuration>
 '@
         $script:inState = $script:good.Replace(
@@ -1282,12 +1289,19 @@ Describe 'install-windows.ps1: round-5 fixes' {
 
     It 'M: interpreter candidates are chain-gated BEFORE the first probe executes them' {
         $gate = $script:installer.IndexOf('Test-PathChainTrusted -Path $chainProbePath')
-        $probe = $script:installer.IndexOf('Invoke-PyProbe -Exe $l.Exe -Arguments ($l.Args + @("--version"))')
+        $probe = $script:installer.IndexOf('Invoke-PyProbe -Exe $chainProbePath -Arguments ($l.Args + @("--version"))')
         $gate | Should -BeGreaterThan 0
         $probe | Should -BeGreaterThan $gate
         # ...and the self-resolved interpreter gets its own gate before adoption
         $selfGate = $script:installer.IndexOf('Test-PathChainTrusted -Path $resolved')
         $selfGate | Should -BeGreaterThan 0
+        # Round 7: the PROVEN path is the one that gets executed. Passing the
+        # bare name made Invoke-PyProbe re-resolve it independently, so the
+        # object checked and the object run were two lookups with a gap between
+        # them. No probe may take $l.Exe any more.
+        $script:installer | Should -Not -Match 'Invoke-PyProbe -Exe \$l\.Exe'
+        @([regex]::Matches($script:installer, 'Invoke-PyProbe -Exe \$chainProbePath')).Count |
+            Should -Be 2
     }
 
     It 'M: SitePath is disjointness-checked against BOTH managed roots' {
@@ -1395,5 +1409,926 @@ Describe 'install-windows.ps1: the protected root is never /reset mid-install' {
         $childBody | Should -Match 'Reset-TreeToInherited -Path \$child\.FullName'
         # the child walker must not ACL the root itself
         $childBody | Should -Not -Match '\$script:IcaclsExe \$Path\b'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Round-7 pre-Daybreak review: three gaps in the round-6 fixes themselves.
+# ---------------------------------------------------------------------------
+
+Describe 'The elevated bootstrap gate (round 7: WRITE_DAC/WRITE_OWNER, interior directories)' {
+    BeforeAll {
+        $script:installerPath = "$PSScriptRoot/../../scripts/install-windows.ps1"
+        $script:installer = Get-Content -Raw $script:installerPath
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $script:installerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:installerPath, [ref]$null, [ref]$null)
+
+        # The bootstrap cannot be dot-sourced: install-windows.ps1 has a
+        # mandatory parameter, and sourcing it would run an install. Nor may the
+        # gate move into the library -- loading library code before proving it
+        # is precisely what it exists to prevent. So the SHIPPED text is lifted
+        # out through the AST and executed here. That is what makes these
+        # behavioural tests of the real thing rather than string matching.
+        $script:bootstrapFn = $script:installerAst.Find({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -eq 'Get-BootstrapInteriorDirectories'
+        }, $true)
+        if (-not $script:bootstrapFn) {
+            throw 'Get-BootstrapInteriorDirectories is missing from install-windows.ps1'
+        }
+        . ([scriptblock]::Create($script:bootstrapFn.Extent.Text))
+    }
+
+    # ROUND-7 FINDING 1. FileSystemRights has ChangePermissions and
+    # TakeOwnership; it has NO WriteDacl and NO WriteOwner. PowerShell resolves
+    # a missing static member to $null, [int]$null is 0, and `-bor 0` is a
+    # silent no-op -- so the round-6 mask, which named only the two that do not
+    # exist, covered neither right. An ACE granting a named non-administrator
+    # nothing but WRITE_DAC + WRITE_OWNER on the helper (or on src\ / deploy\)
+    # passed the gate, after which that principal owns the bytes the elevated
+    # installer dot-sources and builds.
+    It 'the mask VALUE carries WRITE_DAC and WRITE_OWNER (not just the words)' {
+        $gate = $script:installerAst.Find({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -eq 'Assert-BootstrapObjectTrusted'
+        }, $true)
+        $gate | Should -Not -BeNullOrEmpty
+        $assign = @($gate.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$dangerous'
+        }, $true)) | Where-Object { $_.Right.Extent.Text -match 'WriteData' } |
+            Select-Object -First 1
+        $assign | Should -Not -BeNullOrEmpty
+
+        $mask = [int](& ([scriptblock]::Create($assign.Right.Extent.Text)))
+        ($mask -band 0x40000)    | Should -Not -Be 0    # WRITE_DAC
+        ($mask -band 0x80000)    | Should -Not -Be 0    # WRITE_OWNER
+        ($mask -band 0x2)        | Should -Not -Be 0    # WriteData
+        ($mask -band 0x10000)    | Should -Not -Be 0    # Delete
+        ($mask -band 0x40)       | Should -Not -Be 0    # DeleteSubdirectoriesAndFiles
+        ($mask -band 0x40000000) | Should -Not -Be 0    # GenericWrite
+        ($mask -band 0x10000000) | Should -Not -Be 0    # GenericAll
+    }
+
+    It 'no shipped file names a FileSystemRights member that does not exist' {
+        $names = [enum]::GetNames([System.Security.AccessControl.FileSystemRights])
+        $names | Should -Not -Contain 'WriteDacl'
+        $names | Should -Not -Contain 'WriteOwner'
+        $names | Should -Contain 'ChangePermissions'
+        $names | Should -Contain 'TakeOwnership'
+        $script:installer | Should -Not -Match 'FileSystemRights\]::WriteDacl'
+        $script:installer | Should -Not -Match 'FileSystemRights\]::WriteOwner'
+        $script:lib       | Should -Not -Match 'FileSystemRights\]::WriteDacl'
+        $script:lib       | Should -Not -Match 'FileSystemRights\]::WriteOwner'
+    }
+
+    It 'the library agrees: a WRITE_DAC-only or WRITE_OWNER-only ACE endangers bytes' {
+        # The two gates make the same decision now. A principal that can rewrite
+        # the DACL can grant itself everything else a moment later, so holding
+        # only that right is not a lesser case.
+        Test-AceEndangersBytes -Identity 'CONTOSO\joiner' -Rights 0x40000 -AceType 'Allow' `
+            -InheritanceFlags 0 -PropagationFlags 0 -IsDirectory $true | Should -BeTrue
+        Test-AceEndangersBytes -Identity 'CONTOSO\joiner' -Rights 0x80000 -AceType 'Allow' `
+            -InheritanceFlags 0 -PropagationFlags 0 -IsDirectory $false | Should -BeTrue
+        # ...and an administrator holding them is still fine.
+        Test-AceEndangersBytes -Identity 'S-1-5-32-544' -Rights 0xC0000 -AceType 'Allow' `
+            -InheritanceFlags 0 -PropagationFlags 0 -IsDirectory $true | Should -BeFalse
+    }
+
+    # ROUND-7 FINDING 2. The ancestor loop walks UPWARD from the release root,
+    # and the input list names the helper FILE. Nothing inspected scripts\ or
+    # scripts\lib\ -- and DeleteSubdirectoriesAndFiles on a parent is
+    # delete-and-recreate on the child whatever the child's own DACL says.
+    It 'returns every directory between the release root and a consumed input' {
+        (@(Get-BootstrapInteriorDirectories -Root 'C:\rel' `
+            -Path 'C:\rel\scripts\lib\InstallVerifyLib.ps1') -join ';') |
+            Should -Be 'C:\rel\scripts;C:\rel\scripts\lib'
+    }
+
+    It 'returns nothing for an input sitting directly in the release root' {
+        @(Get-BootstrapInteriorDirectories -Root 'C:\rel' -Path 'C:\rel\pyproject.toml').Count |
+            Should -Be 0
+        @(Get-BootstrapInteriorDirectories -Root 'C:\rel' -Path 'C:\rel\src').Count |
+            Should -Be 0
+    }
+
+    It 'is insensitive to root case and to a trailing separator' {
+        (@(Get-BootstrapInteriorDirectories -Root 'C:\ReL\' `
+            -Path 'C:\rel\scripts\lib\x.ps1') -join ';') |
+            Should -Be 'C:\rel\scripts;C:\rel\scripts\lib'
+    }
+
+    It 'handles a release tree at a drive root' {
+        (@(Get-BootstrapInteriorDirectories -Root 'C:\' -Path 'C:\scripts\lib\x.ps1') -join ';') |
+            Should -Be 'C:\scripts;C:\scripts\lib'
+    }
+
+    It 'REFUSES a path outside the release tree rather than silently returning nothing' {
+        # Fail closed: "no interior directories" and "this input is not where I
+        # think it is" must not be the same answer.
+        { Get-BootstrapInteriorDirectories -Root 'C:\rel' -Path 'C:\other\x.ps1' } |
+            Should -Throw -ExpectedMessage '*not inside the release tree*'
+        { Get-BootstrapInteriorDirectories -Root 'C:\rel' -Path 'C:\relative\x.ps1' } |
+            Should -Throw -ExpectedMessage '*not inside the release tree*'
+        { Get-BootstrapInteriorDirectories -Root 'C:\rel' -Path 'C:\rel' } |
+            Should -Throw -ExpectedMessage '*not inside the release tree*'
+    }
+
+    It 'the installer proves those interiors, before the helper is dot-sourced' {
+        $walk = $script:installer.IndexOf('Get-BootstrapInteriorDirectories -Root $repoRoot -Path $inputPath')
+        $check = $script:installer.IndexOf('Assert-BootstrapObjectTrusted -Path $interior')
+        $dotSource = $script:installer.IndexOf('. "$PSScriptRoot/lib/InstallVerifyLib.ps1"')
+        $walk | Should -BeGreaterThan 0
+        $check | Should -BeGreaterThan $walk
+        $dotSource | Should -BeGreaterThan $check
+    }
+}
+
+Describe 'install-windows.ps1: elevated native tools resolve once, at script scope' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    # ROUND-7 FINDING 3. Round 6 moved the elevated native utilities off ambient
+    # PATH, but assigned the netsh path in two places that were not in scope
+    # where it was used: once function-locally inside Ensure-SslCertBinding, and
+    # once inside the -SharePort443 branch. The catch-all branch's stale-SNI
+    # cleanup therefore ran `& $null` -- a RuntimeException under EAP=Stop, which
+    # kills the install AFTER the TLS binding is written and BEFORE the app pool
+    # is started. Reachable on -ConfigureIIS -HostName X -TlsCertThumbprint Y
+    # without -SharePort443; the lab always exercises the SNI path, so no live
+    # re-proof could have found it.
+    It 'netsh is one script-scope absolute path, assigned before every use' {
+        $def = $script:installer.IndexOf('$netshExe = Join-Path $env:windir')
+        $def | Should -BeGreaterThan 0
+        @([regex]::Matches($script:installer, '\$netshExe\s*=')).Count | Should -Be 1
+        $uses = @([regex]::Matches($script:installer, '&\s+\$netshExe\b'))
+        $uses.Count | Should -BeGreaterThan 3
+        foreach ($u in $uses) { $u.Index | Should -BeGreaterThan $def }
+    }
+
+    It 'no branch-local or function-local netsh spelling survives' {
+        # `\b` after "netsh" does not match inside "$netshExe", so this catches
+        # exactly the reintroduced local variable.
+        $script:installer | Should -Not -Match '\$netsh\b'
+    }
+
+    It 'the other elevated natives are still absolute System32 paths' {
+        $script:installer.IndexOf('$msiexec = Join-Path $env:windir ') | Should -BeGreaterThan 0
+        $script:installer.IndexOf('$secedit = Join-Path $env:windir ') | Should -BeGreaterThan 0
+        $script:installer.IndexOf('$cmdExe = Join-Path $env:windir ') | Should -BeGreaterThan 0
+        # nothing elevated is invoked by bare name
+        $script:installer | Should -Not -Match '&\s+(msiexec|secedit|netsh|icacls|attrib)\b'
+    }
+}
+
+Describe 'ACL read-back dumps are written to protected scratch, not ambient TEMP' {
+    BeforeAll {
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    AfterEach { $script:InstallVerifyScratchDir = $null }
+
+    # ROUND-7 FINDING 4 (adjacent variant). Round 6 moved the Python probe
+    # output and the secedit policy files out of caller-selected %TEMP%, but the
+    # `icacls /save` dump stayed. That dump is not scratch: it is the ENTIRE
+    # evidence for "is this pre-existing root ours?" and for every post-claim
+    # lockdown proof. GetTempPath() is %windir%\Temp -- Users-writable --
+    # whenever the installer runs as SYSTEM under configuration management.
+    It 'uses the configured scratch directory when one is set' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('ra-scratch-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        try {
+            $script:InstallVerifyScratchDir = $dir
+            Get-InstallVerifyScratchPath -FileName 'ra-aclcheck-1.txt' |
+                Should -Be (Join-Path $dir 'ra-aclcheck-1.txt')
+        } finally { Remove-Item -LiteralPath $dir -Recurse -Force }
+    }
+
+    # ON WINDOWS AN UNCONFIGURED SCRATCH THROWS. The first draft fell back to
+    # ambient TEMP, which is the single path that restores the behaviour this
+    # was written to remove -- %windir%\Temp is Users-writable when the
+    # installer runs as SYSTEM. A fallback that silently reopens the hole is the
+    # bug with a longer code path. Off Windows there is no icacls and no such
+    # directory, so the Pester run keeps the TEMP path.
+    It 'refuses to name a dump path when no scratch is configured (Windows)' -Skip:($env:OS -ne 'Windows_NT') {
+        $script:InstallVerifyScratchDir = $null
+        { Get-InstallVerifyScratchPath -FileName 'ra-aclcheck-2.txt' } |
+            Should -Throw -ExpectedMessage '*scratch directory is not configured*'
+    }
+
+    It 'refuses when the configured scratch has gone (Windows)' -Skip:($env:OS -ne 'Windows_NT') {
+        $script:InstallVerifyScratchDir = Join-Path ([System.IO.Path]::GetTempPath()) 'ra-scratch-absent-0000'
+        { Get-InstallVerifyScratchPath -FileName 'ra-aclcheck-3.txt' } |
+            Should -Throw -ExpectedMessage '*no longer exists*'
+    }
+
+    It 'uses TEMP off Windows, where there is no protected namespace to use' -Skip:($env:OS -eq 'Windows_NT') {
+        $script:InstallVerifyScratchDir = $null
+        Get-InstallVerifyScratchPath -FileName 'ra-aclcheck-2.txt' |
+            Should -Be (Join-Path ([System.IO.Path]::GetTempPath()) 'ra-aclcheck-2.txt')
+    }
+
+    # The platform is read from the runtime, NOT from $env:OS. Gating the guard
+    # on an inherited, caller-settable environment variable meant anything
+    # starting the installer with OS unset silently got the ambient-TEMP fallback
+    # the guard exists to remove -- in the one function whose thesis is not
+    # trusting the ambient environment. Driving the script variable takes code
+    # execution in the session, which an environment variable does not.
+    It 'refuses on the Windows branch regardless of $env:OS' {
+        $saved = $script:InstallVerifyIsWindows
+        try {
+            $script:InstallVerifyIsWindows = $true
+            $script:InstallVerifyScratchDir = $null
+            $env:OS = ''
+            { Get-InstallVerifyScratchPath -FileName 'x.txt' } |
+                Should -Throw -ExpectedMessage '*scratch directory is not configured*'
+            $script:InstallVerifyScratchDir = '/definitely/not/here'
+            { Get-InstallVerifyScratchPath -FileName 'x.txt' } |
+                Should -Throw -ExpectedMessage '*no longer exists*'
+        } finally {
+            $script:InstallVerifyIsWindows = $saved
+            $env:OS = 'Windows_NT'
+        }
+    }
+
+    It 'falls back on the non-Windows branch, where there is no protected namespace' {
+        $saved = $script:InstallVerifyIsWindows
+        try {
+            $script:InstallVerifyIsWindows = $false
+            $script:InstallVerifyScratchDir = $null
+            Get-InstallVerifyScratchPath -FileName 'y.txt' |
+                Should -Be (Join-Path ([System.IO.Path]::GetTempPath()) 'y.txt')
+        } finally { $script:InstallVerifyIsWindows = $saved }
+    }
+
+    It 'no platform decision in this library is taken from $env:OS' {
+        $script:lib | Should -Not -Match '\$env:OS -(eq|ne) '
+    }
+
+    It 'no /save target is built straight from GetTempPath any more' {
+        $script:lib | Should -Not -Match 'GetTempPath\(\)\) \("ra-aclcheck-'
+        @([regex]::Matches($script:lib, 'Get-InstallVerifyScratchPath -FileName')).Count |
+            Should -Be 2
+    }
+
+    It 'the installer creates protected scratch and points the library at it BEFORE the first claim' {
+        $create = $script:installer.IndexOf('New-AtomicProtectedDirectory -Path $installerScratch')
+        $point = $script:installer.IndexOf('$script:InstallVerifyScratchDir = $installerScratch')
+        $firstClaim = $script:installer.IndexOf('Initialize-SecuredRoot -Path $RuntimeDir')
+        $create | Should -BeGreaterThan 0
+        $point | Should -BeGreaterThan $create
+        $firstClaim | Should -BeGreaterThan $point
+        # ...and the snapshot still lands inside that same protected directory.
+        $script:installer | Should -Match "\`$sourceSnapshot = Join-Path \`$installerScratch 'source'"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Round-7 review round 2: findings in the round-7 fixes and their neighbours.
+# ---------------------------------------------------------------------------
+
+Describe 'An ACE-less DACL fails closed everywhere (round 7.2)' {
+    BeforeAll {
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    # A NULL DACL -- SE_DACL_PRESENT clear -- means EVERYONE HAS FULL CONTROL,
+    # and .NET renders it exactly like a deny-everyone empty DACL: Access.Count
+    # is 0 either way. Test-ObjectDaclTrusted and the installer's bootstrap both
+    # decided trust purely from inside a foreach over that collection, so an
+    # empty one produced zero violations and the object was called
+    # administrator-only. For the interpreter chain that reopens round 5's
+    # finding: the chain reports clean and the installer executes python.exe
+    # from it elevated. Test-AclDumpLocked already failed closed on the same
+    # condition, so the file disagreed with itself.
+    It 'Test-AclDumpLocked refuses a DACL with no ACEs (the pre-existing precedent)' {
+        $v = @(Test-AclDumpLocked -DumpText "root`nD:`n" -AllowedTrustees @('BA'))
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'no ACEs'
+    }
+
+    It 'Test-ObjectDaclTrusted now refuses one too' {
+        $script:lib | Should -Match '@\(\$acl\.Access\)\.Count -eq 0'
+        $fn = $script:lib.IndexOf('function Test-ObjectDaclTrusted')
+        $fn | Should -BeGreaterThan 0
+        $body = $script:lib.Substring($fn, [Math]::Min(2200, $script:lib.Length - $fn))
+        $body | Should -Match 'NULL DACL grants EVERYONE full control'
+    }
+
+    It 'the installer bootstrap refuses one too' {
+        $gate = $script:installer.IndexOf('function Assert-BootstrapObjectTrusted')
+        $gate | Should -BeGreaterThan 0
+        $body = $script:installer.Substring($gate, [Math]::Min(2600, $script:installer.Length - $gate))
+        $body | Should -Match '@\(\$acl\.Access\)\.Count -eq 0'
+    }
+}
+
+Describe 'Test-AclDumpLocked: an entry with no DACL line fails closed (round 7.2)' {
+    # The commit was guarded on `$currentSddl -ne ''`, so a dump naming a path
+    # and moving straight to the next one left that object unexamined and the
+    # tree "locked" with zero violations.
+    It 'reports the path rather than silently dropping it' {
+        $dump = "root`nD:P(A;OICI;FA;;;BA)`nroot\evil`n"
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees @('BA'))
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'no DACL line'
+        ($v -join ' ') | Should -Match 'evil'
+    }
+
+    It 'a well-formed dump is still clean' {
+        $dump = "root`nD:P(A;OICI;FA;;;BA)`nroot\child`nD:(A;OICIID;FA;;;BA)`n"
+        @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees @('BA')).Count | Should -Be 0
+    }
+
+    It 'an empty dump still fails closed' {
+        @(Test-AclDumpLocked -DumpText '' -AllowedTrustees @('BA')).Count | Should -BeGreaterThan 0
+    }
+}
+
+Describe 'Assert-WebConfigLaunchTrusted validates the whole launch configuration (round 7.2)' {
+    BeforeAll {
+        $script:wcDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ra-wc-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:wcDir | Out-Null
+        $script:runtime = 'C:\Program Files\acme-adcs-ra'
+        $script:state = 'C:\ProgramData\acme-adcs-ra'
+        $script:expected = 'C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe'
+
+        function script:New-WebConfig {
+            param([string]$Body)
+            $path = Join-Path $script:wcDir ((New-Guid).ToString('N') + '.config')
+            [System.IO.File]::WriteAllText($path, $Body)
+            return $path
+        }
+        function script:Assert-WcRefused {
+            param([string]$Body, [string]$Expect)
+            $p = script:New-WebConfig $Body
+            { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+                -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+                Should -Throw -ExpectedMessage $Expect
+        }
+    }
+    AfterAll { Remove-Item -LiteralPath $script:wcDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # THE POSITIVE CONTROL, and the one that matters most: the web.config this
+    # repository actually ships must pass. A launch-configuration gate that
+    # refuses the shipped template breaks every install.
+    It 'accepts the shipped deploy/iis/web.config template unchanged' {
+        $tpl = "$PSScriptRoot/../../deploy/iis/web.config"
+        { Assert-WebConfigLaunchTrusted -WebConfigPath $tpl -InstallDir $script:state `
+            -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+            Should -Not -Throw
+    }
+
+    # $ExpectedProcessPath was a MANDATORY parameter that appeared only inside
+    # error strings and was never compared to anything, so any executable
+    # anywhere under the runtime tree passed.
+    It 'refuses an executable that is inside the runtime tree but is not the built interpreter' {
+        script:Assert-WcRefused @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\other.exe"
+  arguments="-m acme_adcs_ra" /></system.webServer></configuration>
+'@ '*not the interpreter this install built*'
+    }
+
+    # A dotted property lookup reads ONE place in the document, so a
+    # location-scoped override was invisible to it.
+    It 'refuses a <location>-scoped httpPlatform override' {
+        script:Assert-WcRefused @'
+<configuration>
+  <system.webServer><httpPlatform
+    processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+    arguments="-m acme_adcs_ra" /></system.webServer>
+  <location path="."><system.webServer><httpPlatform
+    processPath="C:\ProgramData\acme-adcs-ra\evil\python.exe"
+    arguments="-m acme_adcs_ra" /></system.webServer></location>
+</configuration>
+'@ '*INSIDE the state tree*'
+    }
+
+    # `arguments` is the rest of the command line for that interpreter.
+    It 'refuses arbitrary interpreter arguments' {
+        script:Assert-WcRefused @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-c import os;os.system('net user hax /add')" /></system.webServer></configuration>
+'@ '*must run the RA module and nothing else*'
+    }
+
+    # An environment variable outranks the dotenv in pydantic-settings, so these
+    # silently override the file the installer protects with its own DACL, a
+    # strict owner check, a rollback re-protect and a -ProtectedEntries proof.
+    It 'refuses an EAB allowlist or SAN scope set in web.config' {
+        foreach ($name in @('ACME_RA_EAB_ALLOWLIST', 'ACME_RA_SAN_SCOPES')) {
+            script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+                'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+                'arguments="-m acme_adcs_ra"><environmentVariables>' +
+                "<environmentVariable name=`"$name`" value=`"x`" />" +
+                '</environmentVariables></httpPlatform></system.webServer></configuration>'
+            ) '*outranks the dotenv*'
+        }
+    }
+
+    It 'refuses PYTHONPATH and friends' {
+        script:Assert-WcRefused @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="PYTHONPATH" value="C:\Users\Public\evil" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@ '*what the gMSA interpreter imports*'
+    }
+
+    It 'refuses a redirected ACME_RA_DOTENV' {
+        script:Assert-WcRefused @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\logs\attacker.env" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@ '*rather than the protected*'
+    }
+
+    It 'still refuses the round-5 cases (processPath outside the runtime tree, or in state)' {
+        script:Assert-WcRefused @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\ProgramData\acme-adcs-ra\python\python.exe"
+  arguments="-m acme_adcs_ra" /></system.webServer></configuration>
+'@ '*INSIDE the state tree*'
+        script:Assert-WcRefused @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Users\Public\python.exe" arguments="-m acme_adcs_ra" />
+</system.webServer></configuration>
+'@ '*OUTSIDE the runtime tree*'
+    }
+
+    It 'still refuses unparseable XML and a missing httpPlatform' {
+        script:Assert-WcRefused '<configuration><system.webServer>' '*not parseable XML*'
+        script:Assert-WcRefused '<configuration><system.webServer /></configuration>' '*no httpPlatform*'
+    }
+
+    # ---- round 7.3: the forbidden list was one delimiter deep -------------
+    #
+    # config.py sets env_nested_delimiter='__', so pydantic-settings reads
+    # ACME_RA_SAN_SCOPES__<kid>__DNS_PATTERNS as a path INTO san_scopes. An exact
+    # string match walked straight past it. Verified against the running config:
+    # a nested variable replaced the protected dotenv's dns_patterns for an
+    # existing kid -- which IS that kid's issuance authorisation -- while the
+    # installer printed "[ok] launch configuration verified".
+    It 'refuses a NESTED spelling of a forbidden setting' {
+        foreach ($n in @('ACME_RA_SAN_SCOPES__prod-kid__DNS_PATTERNS',
+                         'ACME_RA_RATE_LIMIT_OVERRIDES__prod-kid',
+                         'ACME_RA_EAB_ALLOWLIST__0__KID')) {
+            script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+                'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+                'arguments="-m acme_adcs_ra"><environmentVariables>' +
+                '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+                "<environmentVariable name=`"$n`" value=`"x`" />" +
+                '</environmentVariables></httpPlatform></system.webServer></configuration>'
+            ) '*outranks the dotenv*'
+        }
+    }
+
+    It 'refuses a forbidden setting smuggled in as an <add> child' {
+        # The loop read only elements literally named <environmentVariable>;
+        # IIS collections commonly also honour <add>/<clear>/<remove>.
+        script:Assert-WcRefused @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />
+  <add name="ACME_RA_EAB_ALLOWLIST" value="pwn" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@ '*outranks the dotenv*'
+    }
+
+    It 'refuses turning OFF a control that has one production value' {
+        script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+            'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+            'arguments="-m acme_adcs_ra"><environmentVariables>' +
+            '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+            '<environmentVariable name="ACME_RA_AUDIT_OFFBOX_REQUIRED" value="false" />' +
+            '</environmentVariables></httpPlatform></system.webServer></configuration>'
+        ) '*one production value*'
+        script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+            'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+            'arguments="-m acme_adcs_ra"><environmentVariables>' +
+            '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+            '<environmentVariable name="ACME_RA_ALLOW_WEAK_CREDENTIALS" value="true" />' +
+            '</environmentVariables></httpPlatform></system.webServer></configuration>'
+        ) '*outranks the dotenv*'
+    }
+
+    # Round 7.4: the lab/CI-only fake-backend switch was missing from the
+    # forbidden list entirely. Inert on Windows today (the platform gate still
+    # selects CertsrvEnrollmentLeg), but its own docstring says production must
+    # leave it False, and a future code change gating Windows behaviour on it
+    # would silently inherit the gap -- the exact completeness hole R3-5 closed
+    # for ALLOW_WEAK_CREDENTIALS.
+    It 'refuses the lab-only fake-ADCS backend switch' {
+        script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+            'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+            'arguments="-m acme_adcs_ra"><environmentVariables>' +
+            '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+            '<environmentVariable name="ACME_RA_ALLOW_FAKE_ADCS_BACKENDS" value="true" />' +
+            '</environmentVariables></httpPlatform></system.webServer></configuration>'
+        ) '*outranks the dotenv*'
+    }
+
+    # Round 7.4: pin-when-present for the CRL-evidence control. Absent, the
+    # worker defers to the dotenv/default (the optional mode); present with
+    # "false", the only thing it can do is silently override a dotenv that
+    # turned the proof ON -- this file outranks the dotenv. The lab harness
+    # legitimately sets it to true HERE, so the true spelling must pass.
+    It 'refuses ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=false but accepts =true' {
+        script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+            'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+            'arguments="-m acme_adcs_ra"><environmentVariables>' +
+            '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+            '<environmentVariable name="ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE" value="false" />' +
+            '</environmentVariables></httpPlatform></system.webServer></configuration>'
+        ) '*one production value*'
+        $p = script:New-WebConfig @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />
+  <environmentVariable name="ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE" value="true" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@
+        { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+            -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+            Should -Not -Throw
+    }
+
+    # <handlers> is launch configuration too, and install-windows.ps1 itself runs
+    # `appcmd unlock config -section:system.webServer/handlers`, which is what
+    # makes a site-level entry authoritative.
+    It 'refuses a handler that names its own executable, or a foreign module' {
+        script:Assert-WcRefused @'
+<configuration><system.webServer>
+<handlers><add name="pwn" path="*.evil" verb="*" modules="CgiModule"
+  scriptProcessor="C:\ProgramData\acme-adcs-ra\evil.exe" resourceType="Unspecified" /></handlers>
+<httpPlatform processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@ '*scriptProcessor*'
+    }
+
+    It 'refuses a <modules> or <isapiFilters> entry' {
+        foreach ($sec in @('modules', 'isapiFilters')) {
+            script:Assert-WcRefused ('<configuration><system.webServer>' +
+                "<$sec><add name=`"x`" path=`"C:\evil.dll`" /></$sec>" +
+                '<httpPlatform processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+                'arguments="-m acme_adcs_ra"><environmentVariables>' +
+                '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+                '</environmentVariables></httpPlatform></system.webServer></configuration>'
+            ) "*<$sec> entry*"
+        }
+    }
+
+    It 'refuses a web.config that never declares ACME_RA_DOTENV at all' {
+        # Without it the worker resolves ".env" against its own working
+        # directory, so the protected file is simply not the one the RA reads.
+        script:Assert-WcRefused @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_BASE_URL" value="https://ra.example/" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@ '*does not set ACME_RA_DOTENV*'
+    }
+
+    # ---- round 7.3: false refusals that would abort a live upgrade --------
+    It 'ACCEPTS forward-slash paths, which IIS and Python both take' {
+        $p = script:New-WebConfig @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:/Program Files/acme-adcs-ra/current/venv/Scripts/python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:/ProgramData/acme-adcs-ra/acme-ra.env" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@
+        { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+            -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+            Should -Not -Throw
+    }
+
+    It 'ACCEPTS equivalent argument spellings' {
+        $p = script:New-WebConfig @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="  -m   acme_adcs_ra "><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@
+        { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+            -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+            Should -Not -Throw
+    }
+
+    # Round 7.4: IIS trims attribute values itself, so a whitespace-padded
+    # modules=" httpPlatformHandler " is a valid configuration the exact-string
+    # compare refused -- a false refusal on a live host, not a bypass.
+    It 'ACCEPTS a whitespace-padded modules attribute on the shipped handler shape' {
+        $p = script:New-WebConfig @'
+<configuration><system.webServer>
+<handlers><add name="httpPlatformHandler" path="*" verb="*"
+  modules=" httpPlatformHandler " resourceType="Unspecified" /></handlers>
+<httpPlatform processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@
+        { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+            -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+            Should -Not -Throw
+    }
+
+    It 'sees through a default xmlns instead of claiming there is no httpPlatform' {
+        # SelectNodes('//httpPlatform') returns zero nodes under a default
+        # namespace: fail-closed, but with a false diagnostic about a file that
+        # plainly has one. VS and older tooling really emit this xmlns.
+        script:Assert-WcRefused @'
+<configuration xmlns="http://schemas.microsoft.com/.NetConfiguration/v2.0">
+<system.webServer><httpPlatform
+  processPath="C:\ProgramData\acme-adcs-ra\evil.exe"
+  arguments="-m acme_adcs_ra" /></system.webServer></configuration>
+'@ '*INSIDE the state tree*'
+    }
+
+    It 'the operator settings the template DOES carry are still allowed' {
+        # ACME_RA_BASE_URL / ADCS / SIEM settings are the operator's to set here.
+        $p = script:New-WebConfig @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_BASE_URL" value="https://ra.example/" />
+  <environmentVariable name="ACME_RA_ADCS_TEMPLATE" value="ACME-ServerAuth" />
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@
+        { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+            -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+            Should -Not -Throw
+    }
+}
+
+Describe 'Test-PathsEquivalent (round 7.2)' {
+    It 'folds case and trailing separators' {
+        Test-PathsEquivalent -A 'C:\A\B\x.exe' -B 'c:\a\b\x.exe' | Should -BeTrue
+        Test-PathsEquivalent -A 'C:\A\B\' -B 'C:\A\B' | Should -BeTrue
+    }
+    It 'inherits Assert-SafeLocalInstallPath: an ambiguous spelling is REFUSED, not folded' {
+        # Deliberate. Get-PathRelation refuses dot segments, forward slashes,
+        # trailing dot/space and device namespaces outright rather than
+        # normalising them, so equivalence never has to guess.
+        { Test-PathsEquivalent -A 'C:\A\.\B' -B 'C:\A\B' } |
+            Should -Throw -ExpectedMessage '*ambiguous Win32 component*'
+    }
+    It 'separates genuinely different paths, including parent/child' {
+        Test-PathsEquivalent -A 'C:\A\B' -B 'C:\A\B\C' | Should -BeFalse
+        Test-PathsEquivalent -A 'C:\A\B' -B 'C:\A\C' | Should -BeFalse
+    }
+    It 'is false for an empty side rather than throwing' {
+        Test-PathsEquivalent -A '' -B 'C:\A' | Should -BeFalse
+    }
+}
+
+Describe 'Stop-AppPoolAndWait separates "no such pool" from "appcmd failed" (round 7.2)' {
+    BeforeAll {
+        $script:fakeDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ra-appcmd-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:fakeDir | Out-Null
+
+        # A stand-in appcmd that writes to STDERR and exits 0 -- the shape a
+        # broken applicationHost.config or an access denial takes.
+        $script:noisy = Join-Path $script:fakeDir 'noisy.sh'
+        Set-Content -LiteralPath $script:noisy -Value "#!/bin/sh`necho 'ERROR ( message:Configuration error )' >&2`nexit 0`n"
+        chmod +x $script:noisy
+
+        # A stand-in that says nothing at all -- a genuinely absent pool.
+        $script:silent = Join-Path $script:fakeDir 'silent.sh'
+        Set-Content -LiteralPath $script:silent -Value "#!/bin/sh`nexit 0`n"
+        chmod +x $script:silent
+
+        # The REAL shape of `appcmd list apppool <absent>`: the documented error
+        # on stderr, a non-zero exit, and no live workers.
+        $script:notfound = Join-Path $script:fakeDir 'notfound.sh'
+        Set-Content -LiteralPath $script:notfound -Value @'
+#!/bin/sh
+case "$1 $2" in
+  "list apppool") echo 'ERROR ( message:Cannot find APPPOOL object with identifier "acme-adcs-ra". )' >&2; exit 1 ;;
+  "stop apppool") exit 0 ;;
+  "list wp")      exit 0 ;;
+esac
+exit 0
+'@
+        chmod +x $script:notfound
+
+        # Ambiguous everywhere: stderr on the probe AND `list wp` output that
+        # Test-AppPoolWorkersGone cannot classify.
+        $script:garbage = Join-Path $script:fakeDir 'garbage.sh'
+        Set-Content -LiteralPath $script:garbage -Value @'
+#!/bin/sh
+case "$1 $2" in
+  "list apppool") echo 'ERROR ( message:Configuration error )' >&2; exit 1 ;;
+  "stop apppool") exit 0 ;;
+  "list wp")      echo 'something we cannot parse' ;;
+esac
+exit 0
+'@
+        chmod +x $script:garbage
+    }
+    AfterAll { Remove-Item -LiteralPath $script:fakeDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # Discarding stderr made an appcmd that FAILED indistinguishable from "no
+    # such pool", so the installer printed "[ok] no such app pool yet" and went
+    # on to claim trees a live gMSA worker still held write handles into --
+    # rescan-2 F3, reached through the check that exists to prevent it.
+    #
+    # But throwing on ANY stderr was worse: `appcmd list apppool <absent>` writes
+    # `ERROR ( message:Cannot find APPPOOL object ... )` and exits non-zero, and
+    # the installer does not create the pool until ~800 lines later -- so on a
+    # FIRST INSTALL the pool is absent by construction and that guard would have
+    # aborted every one of them. Same shape as the netsh catch-all: a guard only
+    # the untravelled path reaches.
+    #
+    # The design now resolves ambiguity by doing MORE work: anything on stderr
+    # falls through to stop-and-prove-the-worker-gone, and
+    # Test-AppPoolWorkersGone fails closed on output it cannot classify.
+    It 'does NOT abort a first install when appcmd reports the pool is absent' {
+        # The real not-found message, on stderr, exit 1 -- and no workers.
+        Stop-AppPoolAndWait -AppcmdExe $script:notfound -AppPool 'acme-adcs-ra' -TimeoutSeconds 6 |
+            Should -BeTrue
+    }
+
+    It 'still fails closed when appcmd cannot be classified at all' {
+        # Ambiguous probe AND unclassifiable `list wp` output: no silent
+        # all-clear, the wait loop times out and throws.
+        { Stop-AppPoolAndWait -AppcmdExe $script:garbage -AppPool 'acme-adcs-ra' -TimeoutSeconds 1 } |
+            Should -Throw -ExpectedMessage '*still has a live worker process*'
+    }
+
+    It 'returns false for a genuinely absent pool (silent, clean exit)' {
+        Stop-AppPoolAndWait -AppcmdExe $script:silent -AppPool 'acme-adcs-ra' | Should -BeFalse
+    }
+
+    It 'returns false when appcmd is not present at all' {
+        Stop-AppPoolAndWait -AppcmdExe (Join-Path $script:fakeDir 'nope.exe') -AppPool 'x' |
+            Should -BeFalse
+    }
+}
+
+Describe 'Get-BootstrapInteriorDirectories refuses dot segments (round 7.2)' {
+    BeforeAll {
+        $installerPath = "$PSScriptRoot/../../scripts/install-windows.ps1"
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($installerPath, [ref]$null, [ref]$null)
+        $fn = $ast.Find({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -eq 'Get-BootstrapInteriorDirectories'
+        }, $true)
+        if (-not $fn) { throw 'Get-BootstrapInteriorDirectories is missing' }
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+
+    # The function's own contract says it refuses anything not under the root.
+    # A dot segment lexically escapes the root while still passing the prefix
+    # test, so it returned 'C:\rel\..' and 'C:\rel\..\evil' as "interior"
+    # directories. Not reachable today; the contract has to hold for the reason
+    # it claims, not by luck of the call sites.
+    It 'refuses a path that climbs out of the root with ..' {
+        { Get-BootstrapInteriorDirectories -Root 'C:\rel' -Path 'C:\rel\..\evil\x.ps1' } |
+            Should -Throw -ExpectedMessage '*dot segment*'
+    }
+    It 'refuses a single-dot segment too' {
+        { Get-BootstrapInteriorDirectories -Root 'C:\rel' -Path 'C:\rel\.\scripts\x.ps1' } |
+            Should -Throw -ExpectedMessage '*dot segment*'
+    }
+    It 'still returns the ordinary interiors' {
+        (@(Get-BootstrapInteriorDirectories -Root 'C:\rel' -Path 'C:\rel\scripts\lib\x.ps1') -join ';') |
+            Should -Be 'C:\rel\scripts;C:\rel\scripts\lib'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Round 7.3: guards that were asserted only by source-grep now have behaviour.
+# ---------------------------------------------------------------------------
+#
+# A review pass demonstrated that six of round 7.2's new guards could be
+# neutered -- leaving the source TEXT intact so the string-matching tests kept
+# passing -- without a single failure. "Every new test mutation-verified" was
+# not true of those. These drive the real functions instead.
+
+Describe 'Empty-DACL refusal: behaviour, not source text (round 7.3)' {
+    BeforeAll {
+        # Get-Acl does not exist off Windows, so stand in for it with an object
+        # of the same shape. The DECISION under test is entirely about the rule
+        # collection and the owner string, both of which are portable.
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            [pscustomobject]@{
+                Owner  = 'S-1-5-32-544'
+                Access = $script:FakeAccessRules
+                Sddl   = 'O:BAG:BAD:'
+            }
+        }
+    }
+    AfterAll { Remove-Item function:global:Get-Acl -ErrorAction SilentlyContinue }
+
+    It 'a NULL/empty DACL is a violation, not a pass' {
+        $script:FakeAccessRules = @()
+        $v = @(Test-ObjectDaclTrusted -Path '/tmp')
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'no ACEs'
+    }
+
+    It 'an ordinary administrator-only DACL still passes' {
+        $script:FakeAccessRules = @(
+            [pscustomobject]@{
+                IdentityReference = [pscustomobject]@{ Value = 'S-1-5-32-544' }
+                FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                AccessControlType = 'Allow'
+                InheritanceFlags  = 0
+                PropagationFlags  = 0
+            })
+        @(Test-ObjectDaclTrusted -Path '/tmp').Count | Should -Be 0
+    }
+
+    It 'and the whole ancestor chain inherits the same answer' {
+        $script:FakeAccessRules = @()
+        @(Test-PathChainTrusted -Path '/tmp').Count | Should -BeGreaterThan 0
+    }
+}
+
+Describe 'Test-AclDumpLocked: a mid-dump entry with no DACL line (round 7.3)' {
+    # Both earlier tests put the SDDL-less path LAST, so only the trailing commit
+    # was exercised; the in-loop branch had no coverage at all.
+    It 'reports an SDDL-less entry that is followed by more entries' {
+        $dump = "root`nD:P(A;OICI;FA;;;BA)`nroot\evil`nroot\ok`nD:(A;OICIID;FA;;;BA)`n"
+        $v = @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees @('BA'))
+        ($v -join ' ') | Should -Match 'no DACL line'
+        ($v -join ' ') | Should -Match 'evil'
+    }
+
+    It 'and one that is the very last line' {
+        $dump = "root`nD:P(A;OICI;FA;;;BA)`nroot\evil`n"
+        (@(Test-AclDumpLocked -DumpText $dump -AllowedTrustees @('BA')) -join ' ') |
+            Should -Match 'no DACL line'
+    }
+
+    It 'a trailing blank line does not mint a phantom entry' {
+        $dump = "root`nD:P(A;OICI;FA;;;BA)`n`n`n"
+        @(Test-AclDumpLocked -DumpText $dump -AllowedTrustees @('BA')).Count | Should -Be 0
+    }
+}
+
+Describe 'Get-OfficerRights parser: the descending-slice guard (round 7.3)' {
+    BeforeAll {
+        $src = "$PSScriptRoot/../../scripts/Get-OfficerRights.ps1"
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $src).Path, [ref]$null, [ref]$null)
+        foreach ($name in @('Parse-SidAt', 'Parse-OfficerRightsSD')) {
+            $fn = $ast.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq $name }, $true) | Select-Object -First 1
+            if ($null -eq $fn) { throw "$name not found in Get-OfficerRights.ps1" }
+            Invoke-Expression $fn.Extent.Text
+        }
+    }
+
+    # A DESCENDING range is not an empty slice: $b[5..4] reads BACKWARDS and
+    # returns two reversed bytes, which can satisfy a length guard and mis-parse
+    # sidCount out of reversed data. An ACE whose declared size leaves no room
+    # for application data after the SID produces exactly that.
+    # SKIPPED off Windows: Parse-SidAt constructs a SecurityIdentifier, which
+    # throws "Windows Principal functionality is not supported on this platform"
+    # under .NET on Linux. The `pester-windows-powershell` CI job (real 5.1) and
+    # the Pester install on the lab RA host are where this one actually runs --
+    # which is also where the .Count-on-a-scalar half of this finding lives.
+    It 'does not mis-parse an ACE whose declared size leaves no application data' -Skip:($env:OS -ne 'Windows_NT') {
+        # self-relative SD header (20 bytes) + ACL header (8) + one callback ACE
+        # sized so appDataEnd lands at or before appDataStart.
+        $sd = New-Object byte[] 64
+        $sd[0] = 1; $sd[1] = 0; $sd[2] = 4; $sd[3] = 0x80   # rev, sbz, control
+        [BitConverter]::GetBytes([uint32]20).CopyTo($sd, 16) # DACL offset
+        $sd[20] = 2; $sd[21] = 0                             # ACL rev
+        [BitConverter]::GetBytes([uint16]44).CopyTo($sd, 22) # AclSize
+        [BitConverter]::GetBytes([uint16]1).CopyTo($sd, 24)  # AceCount
+        $sd[28] = 0x09                                       # ACCESS_ALLOWED_CALLBACK
+        [BitConverter]::GetBytes([uint16]20).CopyTo($sd, 30) # AceSize: SID only
+        [BitConverter]::GetBytes([uint32]0x00010000).CopyTo($sd, 32)
+        $sd[36] = 1; $sd[37] = 1; $sd[43] = 5; $sd[44] = 18  # S-1-5-18
+        { Parse-OfficerRightsSD $sd } | Should -Not -Throw
+        $aces = @(Parse-OfficerRightsSD $sd)
+        # Whatever it decides, it must not invent subject SIDs out of reversed
+        # bytes read backwards past the end of the ACE.
+        foreach ($a in $aces) { @($a.Subjects).Count | Should -BeLessOrEqual 1 }
     }
 }

@@ -15,6 +15,18 @@
 function ConvertTo-PsSingleQuotedLiteral {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Value)
     if ($null -eq $Value) { $Value = "" }
+    # A double quote cannot be represented here. The literal itself would be
+    # fine, but every caller's output is wrapped in an OUTER -Command "..."
+    # (Register-MaintenanceTasks.ps1), and CommandLineToArgvW re-splits on the
+    # embedded quote -- the R2-4 defect, reachable again through any input
+    # value that carries one. Escaping it was F4's job for single quotes
+    # because a single quote IS representable (by doubling); a double quote is
+    # not representable in this position at all, so refusing it is the only
+    # sound answer. Inputs are URLs, Windows paths and DOMAIN\name values --
+    # none can legitimately contain one.
+    if ($Value.IndexOf('"') -ge 0) {
+        throw ("Task-action input contains a double quote, which cannot be embedded in a -Command-wrapped action: '{0}'" -f $Value)
+    }
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
@@ -54,20 +66,37 @@ function Build-DotEnvTokenLoad {
 function Build-ActionScriptBlock([string]$EndpointUrl, [string]$DotEnvPath) {
     $urlLit = ConvertTo-PsSingleQuotedLiteral $EndpointUrl
     $pathLit = ConvertTo-PsSingleQuotedLiteral $DotEnvPath
-    return @"
-`$ErrorActionPreference = 'Stop'
-`$lines = @(Get-Content -LiteralPath $pathLit -ErrorAction Stop)
-`$hit = @(`$lines | Where-Object { `$_.StartsWith('ACME_RA_ADMIN_TOKEN=') }) | Select-Object -First 1
-if (-not `$hit) { Write-Error 'ACME_RA_ADMIN_TOKEN not found in the RA dotenv'; exit 1 }
-`$tok = `$hit.Substring(`$hit.IndexOf('=') + 1)
-try {
-    `$resp = Invoke-RestMethod -Method Delete -Uri $urlLit -Headers @{ 'Authorization' = "Bearer `$tok" } -TimeoutSec 60
-    Write-Output ("`$(`$resp | ConvertTo-Json -Compress)")
-} catch {
-    Write-Error ("`$(`$_.Exception.Message)")
-    exit 1
-}
-"@
+    # SAME TWO INVARIANTS AS Build-SyncActionCommand, and for the same reason:
+    # the caller wraps this whole string in `-Command "..."`, so
+    #   1. it must contain NO double quote, or the embedded quote closes the
+    #      outer one and CommandLineToArgvW re-splits the action into tokens;
+    #   2. it must be ONE line, so what Task Scheduler shows an operator is what
+    #      actually runs.
+    # This builder honoured neither. It emitted `"Bearer $tok"` and two
+    # `("$(...)")` interpolations -- six double quotes across eleven lines -- so
+    # the registered action re-tokenised at run time into
+    # `... = Bearer $tok }` and died with "The term 'Bearer' is not recognized".
+    # Registration still reported success (New-ScheduledTaskAction only stores
+    # the string, and the post-register check reads NextRunTime, never
+    # LastTaskResult), so nonce GC and the RFC 8555 7.1.6 expired-order sweep
+    # would have failed silently on every run. Build-SyncActionCommand had the
+    # invariant, a comment explaining it, and two tests; this sibling had none.
+    # Single quotes and string concatenation only below.
+    return (
+        "`$ErrorActionPreference = 'Stop'; " +
+        "`$lines = @(Get-Content -LiteralPath $pathLit -ErrorAction Stop); " +
+        "`$hit = @(`$lines | Where-Object { `$_.StartsWith('ACME_RA_ADMIN_TOKEN=') }) | Select-Object -First 1; " +
+        "if (-not `$hit) { Write-Error 'ACME_RA_ADMIN_TOKEN not found in the RA dotenv'; exit 1 }; " +
+        "`$tok = `$hit.Substring(`$hit.IndexOf('=') + 1); " +
+        "try { " +
+            "`$resp = Invoke-RestMethod -Method Delete -Uri $urlLit " +
+                "-Headers @{ 'Authorization' = ('Bearer ' + `$tok) } -TimeoutSec 60; " +
+            "Write-Output (`$resp | ConvertTo-Json -Compress); " +
+        "} catch { " +
+            "Write-Error (`$_.Exception.Message); " +
+            "exit 1; " +
+        "}"
+    )
 }
 
 # Action builder for the revocation-sync task. Unlike Build-ActionScriptBlock

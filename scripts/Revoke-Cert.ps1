@@ -116,6 +116,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Elevated native helpers resolve to absolute System32 paths, never to ambient
+# PATH. Round-6 finding 3 removed PATH-selected programs from the installer;
+# these scripts were missed, and they are the higher-value half -- this one
+# runs with CA-officer context. A writable PATH entry would be code execution
+# with that context.
+$script:CertUtilExe = if ($env:windir) { Join-Path $env:windir 'System32\certutil.exe' } else { 'certutil' }
+
 # Shared pure logic (serial normalization, reason/requester rules), covered by
 # tests/pester/Revocation.Tests.ps1. Deploy scripts/lib/ alongside this script
 # -- see docs/operations.md; copying individual .ps1 files breaks provisioning.
@@ -157,8 +164,31 @@ if ([string]::IsNullOrWhiteSpace($RequesterName)) {
     Die "-RequesterName is empty or whitespace. Pass the expected enrollment identity (e.g. WORK-DOMAIN\gMSA-acme-ra$)." 3
 }
 
+# Capture certutil output with stderr merged, WITHOUT the Windows PowerShell
+# 5.1 redirection trap. Under EAP=Stop a merged stderr line terminates the
+# pipeline before $LASTEXITCODE is ever read -- SyncLib documents the
+# behaviour from a live 2026-08-13 observation -- which makes the documented
+# exit-code contract ("exit N = certutil's own code") unreachable and replaces
+# it with an unhandled terminating error (powershell.exe exits 1 instead of
+# N, so batch automation cannot distinguish failure classes). EAP is lowered
+# ONLY around the native call; pwsh 7 behaviour is unchanged (there
+# $PSNativeCommandUseErrorActionPreference defaults off and merged stderr
+# arrives as ErrorRecords either way). Every `2>&1` call to certutil in this
+# file goes through here -- Invoke-CertUtil and the three direct -view calls
+# in Test-SerialRevokedAtCa, which deliberately do NOT Die so they can treat
+# "certutil could not answer" as not-revoked and re-revoke on the next pass.
+function Invoke-CertUtilCapture([string[]]$CertutilArgs) {
+    $prior = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        return (& $script:CertUtilExe @CertutilArgs 2>&1)
+    } finally {
+        $ErrorActionPreference = $prior
+    }
+}
+
 function Invoke-CertUtil([string[]]$CertutilArgs) {
-    $out = & certutil @CertutilArgs 2>&1
+    $out = Invoke-CertUtilCapture @CertutilArgs
     $code = $LASTEXITCODE
     if ($code -ne 0) {
         Die ("certutil exited {0}: {1}" -f $code, ($out -join "`n")) $code
@@ -236,12 +266,12 @@ function Confirm-SerialAtCa([string]$CaConfig, [string]$SerialHex, [string]$Expe
 function Test-SerialRevokedAtCa([string]$CaConfig, [string]$SerialHex) {
     $escaped = [regex]::Escape($SerialHex)
 
-    $revokedOut = & certutil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=21", '-out', 'SerialNumber') 2>&1
+    $revokedOut = Invoke-CertUtilCapture @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=21", '-out', 'SerialNumber')
     if ($LASTEXITCODE -ne 0) { return $false }
     if (($revokedOut -join "`n") -notmatch $escaped) { return $false }
 
     # It claims revoked. Prove the filter actually filters before acting on it.
-    $issuedOut = & certutil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=20", '-out', 'SerialNumber') 2>&1
+    $issuedOut = Invoke-CertUtilCapture @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=20", '-out', 'SerialNumber')
     if ($LASTEXITCODE -eq 0 -and (($issuedOut -join "`n") -match $escaped)) {
         # stderr, NOT Write-Output: this function's value is consumed as a
         # boolean by `if (Test-SerialRevokedAtCa ...)`, and anything written to
@@ -271,7 +301,7 @@ function Test-SerialRevokedAtCa([string]$CaConfig, [string]$SerialHex) {
     # numeric reason rather than parsing a localized column, and treat an
     # inconclusive answer as "not revoked" so the caller re-revokes. Re-revoking
     # a genuinely revoked certificate is harmless; skipping a live one is not.
-    $unrevokedOut = & certutil @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=21,Request.RevokedReason=8", '-out', 'SerialNumber') 2>&1
+    $unrevokedOut = Invoke-CertUtilCapture @('-view', '-config', $CaConfig, '-restrict', "SerialNumber=$SerialHex,Disposition=21,Request.RevokedReason=8", '-out', 'SerialNumber')
     if ($LASTEXITCODE -eq 0 -and (($unrevokedOut -join "`n") -match $escaped)) {
         # stderr, NOT Write-Output. The 2026-08-14 live re-proof caught this
         # branch firing correctly and then being defeated by its own
@@ -295,9 +325,25 @@ function Test-SerialRevokedAtCa([string]$CaConfig, [string]$SerialHex) {
 # certutil -view output pairs the column with its value; the SerialNumber
 # value is a hex string (locale-independent). Parse it with a hex regex.
 function Get-SerialFromReqId([string]$CaConfig, [string]$Rid) {
-    Write-Output ("Looking up serial for ReqID {0} at CA '{1}'..." -f $Rid, $CaConfig)
+    # Diagnostics go to STDERR, never the success stream.
+    #
+    # A PowerShell function returns EVERYTHING written to the success stream, so
+    # emitting a banner there does not print it -- it prepends banner lines to
+    # the return value. `$targetSerial` at the call site became a 5-element
+    # array, and the very next statement pasted it into
+    # `-restrict SerialNumber=<banner lines...>`, so -ReqID could never revoke
+    # anything: it dies at exit 4 ("no certificate with serial ... found") or on
+    # a certutil parse error.
+    #
+    # This is the same defect the 2026-08-18 wave-3 round fixed in
+    # Test-SerialRevokedAtCa, 130 lines above, in this file -- the sibling was
+    # missed. It fails SAFE (nothing wrong is revoked) but it takes out the
+    # manual containment path an operator reaches for during an incident.
+    # Sync-Revocations.ps1 always passes -Serial, which is why no live re-proof
+    # has ever exercised this branch.
+    [Console]::Error.WriteLine(("Looking up serial for ReqID {0} at CA '{1}'..." -f $Rid, $CaConfig))
     $viewOut = Invoke-CertUtil @('-view', '-config', $CaConfig, '-restrict', "RequestID=$Rid", '-out', 'SerialNumber')
-    $viewOut | ForEach-Object { Write-Output $_ }
+    $viewOut | ForEach-Object { [Console]::Error.WriteLine([string]$_) }
     # The serial is a hex string (0-9A-Fa-f). With -out SerialNumber the output
     # is restricted to the serial column, so the longest hex run is the serial
     # (row indices and other metadata are shorter / non-hex). Word-boundary

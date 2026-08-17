@@ -154,11 +154,29 @@ function Assert-BootstrapObjectTrusted {
     if ($null -eq $ownerSid -or $AllowedWriterSids -notcontains $ownerSid) {
         throw "Installer source input '$Path' has untrusted owner '$($acl.Owner)'."
     }
+    # An empty rule collection is a REFUSAL, not a pass. A NULL DACL grants
+    # everyone full control and .NET renders it exactly like a deny-everyone
+    # empty DACL; deciding trust only from inside the loop below let both
+    # through. Same rule as Test-ObjectDaclTrusted and Test-AclDumpLocked.
+    if (@($acl.Access).Count -eq 0) {
+        throw ("Installer source input '$Path' has a DACL with no ACEs. A NULL DACL grants " +
+               "EVERYONE full control and cannot be told apart from a deny-everyone one here; " +
+               "both are refused. Stage the release under an administrator-only local directory.")
+    }
+    # WRITE_DAC and WRITE_OWNER are spelled ChangePermissions and TakeOwnership
+    # in FileSystemRights. There is NO WriteDacl and NO WriteOwner member: those
+    # spellings resolve to $null, [int]$null is 0, and `-bor 0` is a silent
+    # no-op -- so the round-6 version of this gate carried neither bit. An ACE
+    # granting a named non-administrator nothing but the right to rewrite the
+    # DACL and take ownership (icacls /grant user:(WDAC,WO)) passed it, and that
+    # principal then owns the helper this bootstrap exists to prove, plus every
+    # byte the elevated build consumes. Test-AceEndangersBytes in the library had
+    # the correct pair all along; the two gates now agree.
     $dangerous = [int][System.Security.AccessControl.FileSystemRights]::WriteData -bor
                  [int][System.Security.AccessControl.FileSystemRights]::Delete -bor
                  [int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
-                 [int][System.Security.AccessControl.FileSystemRights]::WriteDacl -bor
-                 [int][System.Security.AccessControl.FileSystemRights]::WriteOwner -bor
+                 [int][System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                 [int][System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
                  0x40000000 -bor 0x10000000
     if (-not $AncestorOnly -or -not $item.PSIsContainer) {
         $dangerous = $dangerous -bor [int][System.Security.AccessControl.FileSystemRights]::AppendData
@@ -195,6 +213,50 @@ function Assert-BootstrapTreeTrusted {
         }
     }
 }
+# The directories BETWEEN the release-tree root and a consumed input decide
+# whether that input can be swapped out: DeleteSubdirectoriesAndFiles on a parent
+# is delete-and-recreate on the child WHATEVER the child's own DACL says, and the
+# replacement lands in the window between this gate and the dot-source below. The
+# ancestor loop walks UPWARD from the release root, so it never inspected
+# `scripts\` or `scripts\lib\` -- the two directories holding the very helper this
+# bootstrap exists to prove. Pure string work rather than Split-Path, so the
+# Pester suite can drive it on Linux (Split-Path rewrites Windows separators
+# there). Refuses, rather than skipping, anything that is not under the root.
+function Get-BootstrapInteriorDirectories {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $rootKey = $Root.TrimEnd('\')
+    $rootSegments = @($rootKey -split '\\')
+    $segments = @(($Path.TrimEnd('\')) -split '\\')
+    # A dot segment lexically escapes the root while still passing the prefix
+    # test below ('C:\rel\..\evil\x.ps1' starts with 'C:\rel'), so the function
+    # would have returned 'C:\rel\..' and 'C:\rel\..\evil' as "interior"
+    # directories of the release tree. Not reachable today -- every input is
+    # Join-Path'ed onto a Resolve-Path'ed root -- but the contract this function
+    # advertises is "refuses anything not under the root", and it has to be true
+    # for the reason it is true, not by luck of the call sites.
+    foreach ($seg in $segments) {
+        if ($seg -eq '.' -or $seg -eq '..') {
+            throw "Installer source input '$Path' contains a dot segment; refusing to treat it as inside '$Root'."
+        }
+    }
+    if ($segments.Count -le $rootSegments.Count) {
+        throw "Installer source input '$Path' is not inside the release tree '$Root'."
+    }
+    $prefix = ($segments[0..($rootSegments.Count - 1)] -join '\')
+    if (-not [string]::Equals($prefix, $rootKey, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Installer source input '$Path' is not inside the release tree '$Root'."
+    }
+    # Every component below the root except the input's own leaf: the leaf is
+    # checked by the caller (as an object or as a whole tree).
+    $dirs = @()
+    for ($i = $rootSegments.Count; $i -lt ($segments.Count - 1); $i++) {
+        $dirs += (($segments[0..$i]) -join '\')
+    }
+    return @($dirs)
+}
 $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $bootstrapWriters = @(
     'S-1-5-32-544', 'S-1-5-18',
@@ -219,6 +281,9 @@ while ($ancestor) {
     $ancestor = $parent
 }
 foreach ($inputPath in $sourceInputs) {
+    foreach ($interior in (Get-BootstrapInteriorDirectories -Root $repoRoot -Path $inputPath)) {
+        Assert-BootstrapObjectTrusted -Path $interior -AllowedWriterSids $bootstrapWriters
+    }
     Assert-BootstrapTreeTrusted -Path $inputPath -AllowedWriterSids $bootstrapWriters
 }
 
@@ -280,6 +345,50 @@ if ($rel -ne 'disjoint') {
            "the gMSA holds Modify on the state tree, so the launch configuration must not " +
            "live there (see docs/operator-requirements.md section 1).")
 }
+
+# --- The protected installer scratch directory, created FIRST ----------------
+#
+# All transient installer inputs live in a fresh administrator-only directory
+# under %ProgramFiles%, never in a shared/caller-selected TEMP directory or
+# inside a managed tree whose next-run provenance a failed install could poison.
+#
+# It is created BEFORE the roots are claimed, not after, for one reason: the
+# claim's pre-flight (Get-RootProvenance -> Get-InstallTreeViolations) writes an
+# `icacls /save` dump and then decides whether a pre-existing root is ours by
+# PARSING IT BACK. That dump is a privileged input -- it is the entire evidence
+# for the provenance verdict -- and it was still being written to the ambient
+# TEMP directory, which is %windir%\Temp (Users-writable) whenever the installer
+# runs as SYSTEM from configuration management. Round 6's own rule is that
+# privileged inputs live in a namespace with an explicit writer allowlist, so
+# this one does too, from the first proof onward.
+$installerScratch = Join-Path $env:ProgramFiles ('.acme-adcs-ra-installer-' + [guid]::NewGuid().ToString('N'))
+function Remove-InstallerScratch {
+    if ($installerScratch -and (Test-Path -LiteralPath $installerScratch)) {
+        Assert-NoReparsePoints -Path $installerScratch -Context 'installer scratch cleanup'
+        Remove-Item -LiteralPath $installerScratch -Recurse -Force
+    }
+}
+trap {
+    $originalError = $_
+    # PowerShell registers a trap for the WHOLE scope at parse time, but a
+    # function only exists once its definition has executed -- so a failure in
+    # the path checks above enters this handler before Remove-InstallerScratch
+    # is defined. Calling it there produced a CommandNotFoundException warning
+    # about an empty scratch path, printed immediately before the real error the
+    # operator needs to read. There is nothing to clean up in that window.
+    if (Get-Command Remove-InstallerScratch -ErrorAction SilentlyContinue) {
+        try { Remove-InstallerScratch } catch {
+            Write-Warning "Could not remove protected installer scratch $installerScratch after failure: $($_.Exception.Message)"
+        }
+    }
+    throw $originalError
+}
+$adminScratchGrants = @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F')
+if (-not (New-AtomicProtectedDirectory -Path $installerScratch -Grants $adminScratchGrants)) {
+    throw "Unexpected installer scratch collision at $installerScratch."
+}
+# Point the library's ACL read-back dumps here for the rest of the run.
+$script:InstallVerifyScratchDir = $installerScratch
 
 # --- Prerequisites -----------------------------------------------------------
 # IIS features the installer relies on:
@@ -409,6 +518,15 @@ function Install-Prerequisites {
 # has to come first, or none of the verification below binds anything.
 $script:poolWasStopped = $false
 $appcmdExe = "$env:windir\system32\inetsrv\appcmd.exe"
+# Absolute System32 path, resolved ONCE at script scope. Round 6 moved the
+# elevated native utilities off ambient PATH, but assigned this one twice in
+# places that were not in scope where it was used: function-locally inside
+# Ensure-SslCertBinding, and again inside the -SharePort443 branch. The
+# catch-all branch's stale-SNI cleanup therefore invoked a null command --
+# a RuntimeException under EAP=Stop, killing the install after the TLS binding
+# was written and before the app pool was started. One script-scope variable,
+# used everywhere.
+$netshExe = Join-Path $env:windir 'System32\netsh.exe'
 if (Test-Path $appcmdExe) {
     Write-Host "Stopping app pool `"$AppPool`" (and waiting for its worker) before touching $InstallDir ..."
     $script:poolWasStopped = Stop-AppPoolAndWait -AppcmdExe $appcmdExe -AppPool $AppPool
@@ -577,29 +695,9 @@ if ((Get-PathRelation -A $SitePath -B $InstallDir) -ne 'disjoint') {
     throw 'Site and state roots resolve to overlapping filesystem trees after state creation.'
 }
 
-# All transient installer inputs live in a fresh protected directory under
-# Program Files, never in a shared/caller-selected TEMP directory or inside a
-# managed tree whose next-run provenance a failed install could poison. The
-# source snapshot makes PEP 517 consume an immutable namespace rather than
-# repeatedly reopening the checkout after its provenance check.
-$installerScratch = Join-Path $env:ProgramFiles ('.acme-adcs-ra-installer-' + [guid]::NewGuid().ToString('N'))
-function Remove-InstallerScratch {
-    if ($installerScratch -and (Test-Path -LiteralPath $installerScratch)) {
-        Assert-NoReparsePoints -Path $installerScratch -Context 'installer scratch cleanup'
-        Remove-Item -LiteralPath $installerScratch -Recurse -Force
-    }
-}
-trap {
-    $originalError = $_
-    try { Remove-InstallerScratch } catch {
-        Write-Warning "Could not remove protected installer scratch $installerScratch after failure: $($_.Exception.Message)"
-    }
-    throw $originalError
-}
-$adminScratchGrants = @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F')
-if (-not (New-AtomicProtectedDirectory -Path $installerScratch -Grants $adminScratchGrants)) {
-    throw "Unexpected installer scratch collision at $installerScratch."
-}
+# The source snapshot makes PEP 517 consume an immutable namespace rather than
+# repeatedly reopening the checkout after its provenance check. It lives inside
+# the protected installer scratch directory created before the root claims.
 $sourceSnapshot = Join-Path $installerScratch 'source'
 if (-not (New-AtomicProtectedDirectory -Path $sourceSnapshot -Grants $adminScratchGrants)) {
     throw "Unexpected source-snapshot collision at $sourceSnapshot."
@@ -745,15 +843,24 @@ foreach ($l in $launchers) {
         foreach ($v in @($chainViol | Select-Object -First 4)) { Write-Host "         $v" }
         continue
     }
-    $r = Invoke-PyProbe -Exe $l.Exe -Arguments ($l.Args + @("--version"))
+    # Probe the EXACT path whose chain was just proven, not the bare name again.
+    # Passing $l.Exe made Invoke-PyProbe re-resolve the name independently, so
+    # the object that was checked and the object that was executed were two
+    # separate lookups of the same string with a gap in between.
+    $r = Invoke-PyProbe -Exe $chainProbePath -Arguments ($l.Args + @("--version"))
     if ($r.ExitCode -ne 0) { Write-Host "  [fail] $label -- exit $($r.ExitCode)"; continue }
-    $ver = ($r.Output -split "`n" | Where-Object { $_ -match "^Python\s+\d" } | Select-Object -First 1).Trim()
+    # `Select-Object -First 1` yields $null when nothing matches, and .Trim() on
+    # $null THROWS -- which made the "output not recognised" branch below
+    # unreachable and aborted the whole install on a candidate that should
+    # simply have been skipped.
+    $verLine = ($r.Output -split "`n" | Where-Object { $_ -match "^Python\s+\d" } | Select-Object -First 1)
+    $ver = if ($null -eq $verLine) { "" } else { ([string]$verLine).Trim() }
     if ($ver -match "Python\s+(\d+)\.(\d+)") {
         $mj = [int]$Matches[1]; $mn = [int]$Matches[2]
         if ($mj -ge 3 -and $mn -ge 12) {
             $resolved = ""
             try {
-                $selfProbe = Invoke-PyProbe -Exe $l.Exe -Arguments ($l.Args + @("-c", "import sys; print(sys.executable)"))
+                $selfProbe = Invoke-PyProbe -Exe $chainProbePath -Arguments ($l.Args + @("-c", "import sys; print(sys.executable)"))
                 if ($selfProbe.ExitCode -eq 0) {
                     $candidate = ($selfProbe.Output -split "`n" | Select-Object -First 1).Trim()
                     if ($candidate -and (Test-Path $candidate -ErrorAction SilentlyContinue)) { $resolved = $candidate }
@@ -1287,13 +1394,12 @@ if ($ConfigureIIS) {
         # TLS binding (add-before-delete so HTTPS is never left unbound on a switch).
         function Ensure-SslCertBinding {
             param([string]$BindingArgument, [string]$Thumbprint, [string]$AppId)
-            $netsh = Join-Path $env:windir 'System32\netsh.exe'
-            $show = & $netsh http show sslcert $BindingArgument 2>&1 | Out-String
+            $show = & $netshExe http show sslcert $BindingArgument 2>&1 | Out-String
             if ($show -match [regex]::Escape($Thumbprint)) { Write-Host "    Certificate already bound to $BindingArgument."; return }
-            & $netsh http delete sslcert $BindingArgument 2>$null | Out-Null
-            $addOut = & $netsh http add sslcert $BindingArgument certhash="$Thumbprint" appid="$AppId" certstorename=MY 2>&1
+            & $netshExe http delete sslcert $BindingArgument 2>$null | Out-Null
+            $addOut = & $netshExe http add sslcert $BindingArgument certhash="$Thumbprint" appid="$AppId" certstorename=MY 2>&1
             if ($LASTEXITCODE -ne 0) { Write-Host ($addOut | Out-String); throw "Failed to bind TLS cert to $BindingArgument (netsh exit $LASTEXITCODE)." }
-            $show = & $netsh http show sslcert $BindingArgument 2>&1 | Out-String
+            $show = & $netshExe http show sslcert $BindingArgument 2>&1 | Out-String
             if ($show -notmatch [regex]::Escape($Thumbprint)) { throw "TLS binding verification failed for $BindingArgument." }
         }
 
@@ -1304,17 +1410,16 @@ if ($ConfigureIIS) {
             $hostPort = "$HostName`:$Port"
             if ($SharePort443) {
                 Ensure-SslCertBinding -BindingArgument "hostnameport=$hostPort" -Thumbprint $TlsCertThumbprint -AppId $appId
-                $netsh = Join-Path $env:windir 'System32\netsh.exe'
-                $catchallShow = & $netsh http show sslcert ipport="$ipport" 2>&1 | Out-String
+                $catchallShow = & $netshExe http show sslcert ipport="$ipport" 2>&1 | Out-String
                 if ($catchallShow -match [regex]::Escape($TlsCertThumbprint)) {
-                    & $netsh http delete sslcert ipport="$ipport" 2>$null | Out-Null
+                    & $netshExe http delete sslcert ipport="$ipport" 2>$null | Out-Null
                 } elseif ($catchallShow -match "Certificate Hash") {
                     Write-Warning "A catch-all $ipport bound to a DIFFERENT cert (a sibling tool?) WILL shadow this SNI binding. Convert that tool to SNI or remove its catch-all."
                 }
                 Write-Host "    TLS bound to hostnameport=$hostPort (SNI)."
             } else {
                 Ensure-SslCertBinding -BindingArgument "ipport=$ipport" -Thumbprint $TlsCertThumbprint -AppId $appId
-                if ($HostName) { & $netsh http delete sslcert hostnameport="$hostPort" 2>$null | Out-Null }
+                if ($HostName) { & $netshExe http delete sslcert hostnameport="$hostPort" 2>$null | Out-Null }
                 Write-Host "    TLS bound to $ipport (catch-all)."
             }
         } else {
