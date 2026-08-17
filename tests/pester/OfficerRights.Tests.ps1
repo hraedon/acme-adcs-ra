@@ -255,4 +255,22 @@ Describe 'Get-ExistingAces' {
         $sd[$aceStart + 3] = 0
         { Get-ExistingAces $sd } | Should -Throw '*size*less than minimum*'
     }
+
+    It 'Throws when a declared ACE header extends past the buffer (follow-up round 6)' {
+        # The walk used to `break` here and return a PARTIAL list -- and
+        # Set-OfficerRights preserves every returned ACE verbatim in the
+        # descriptor it writes back, so officers beyond the truncation point
+        # were silently STRIPPED from the rewritten OfficerRights value.
+        # Removing officers' rights must be a decision, not a parse artifact.
+        # Mutation: revert the throw to `break` -- @(walk).Count is then 1
+        # over a descriptor that declares 2.
+        $ace = Build-CallbackAce 'S-1-5-21-1004336348-1177238915-682003330-517' '1.3.6.1.4.1.311.21.8.16593888.12298824.5193888.14804498.16898264.10598498.10498398'
+        $aceList = [System.Collections.Generic.List[byte[]]]::new()
+        $aceList.Add($ace)
+        $sd = Build-OfficerRightsSD $aceList
+        $daclOffset = [BitConverter]::ToUInt32($sd, 16)
+        # Declare TWO ACEs but ship one: bump AceCount (LE u16 at daclOffset+4).
+        $sd[$daclOffset + 4] = 2
+        { Get-ExistingAces $sd } | Should -Throw '*extends past the buffer*'
+    }
 }

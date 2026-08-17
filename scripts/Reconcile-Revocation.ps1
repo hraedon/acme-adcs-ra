@@ -71,7 +71,10 @@ if (-not (Test-Path -Path $DbPath)) {
 # to be an Application with a rooted source -- and the current directory is
 # removed from the child search path either way.
 $env:NoDefaultCurrentDirectoryInExePath = '1'
-$certutilExe = Join-Path $env:windir 'System32\certutil.exe'
+# The System directory comes from the RUNTIME, not $env:windir -- which is
+# caller-settable process state, the same class as the $env:OS gate the
+# round-3 review moved off the environment.
+$certutilExe = Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)) 'certutil.exe'
 if (-not (Test-Path -LiteralPath $certutilExe)) {
     Die "certutil.exe not found at $certutilExe." 2
 }

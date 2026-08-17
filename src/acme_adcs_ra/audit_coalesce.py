@@ -275,7 +275,13 @@ class DenialCoalescer:
         # prevent. Call sites that can carry variable prose now send a stable
         # ``reason_code`` alongside it; ``reason`` remains on the row.
         reason = str(details.get("reason", ""))
-        reason_key = str(details.get("reason_code") or reason)
+        # An EXPLICIT reason_code keys the window on itself even when falsy: the
+        # fallback to ``reason`` exists for call sites that predate the split,
+        # not as a licence to put attacker-chosen prose back into the key by
+        # passing an empty code. An empty-string code folds everything that
+        # sends it into one bounded window, which is the safe direction.
+        raw_reason_code = details.get("reason_code")
+        reason_key = str(raw_reason_code) if raw_reason_code is not None else reason
         kid = details.get("kid")
         # The coalescing key. For account-creation denials it is (type, reason)
         # as before -- there is no account to key on, and keying on the
@@ -306,6 +312,19 @@ class DenialCoalescer:
                 else:
                     return None
             closed = window.summary() if window is not None else None
+            # Make room BEFORE the row is built, not after. Stamp-first ordering
+            # read ``_evicted`` before the eviction this open caused, so the row
+            # that actually displaced an entry carried no
+            # ``coalescer_evictions`` -- byte-identical to a first-ever window,
+            # the exact ambiguity the marker exists to remove. ``closed`` is
+            # captured above, so the lapsed same-key entry's hand-off survives
+            # the sweep, and a key still in the index here is always one whose
+            # window has lapsed (a LIVE key folds and returns above), so the
+            # expiry pass inside collects that entry first and no live
+            # bystander is displaced to make room for it. If the record below
+            # fails and no window is inserted, entries were still only dropped,
+            # never rows -- fail-safe on both counts.
+            self._evict_for_new_window(now)
             new_kwargs = dict(kwargs)
             new_details = dict(details)
             new_details["denial_count"] = 1
@@ -344,11 +363,6 @@ class DenialCoalescer:
                     # its cap.)
                     if len(fresh.kid_samples) < self._max_kid_samples:
                         fresh.kid_samples.append(digest)
-                # Unconditional: a key that is still in the index here is one
-                # whose own window has lapsed (a LIVE key folds and returns
-                # above), so the expiry pass inside collects that entry first
-                # and no live bystander is displaced to make room for it.
-                self._evict_for_new_window(now)
                 self._windows[key] = fresh
             else:
                 # No row id means nothing to update in place later, so do not

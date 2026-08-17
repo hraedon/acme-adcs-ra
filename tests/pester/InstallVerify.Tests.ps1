@@ -1480,10 +1480,18 @@ Describe 'The elevated bootstrap gate (round 7: WRITE_DAC/WRITE_OWNER, interior 
         $names | Should -Not -Contain 'WriteOwner'
         $names | Should -Contain 'ChangePermissions'
         $names | Should -Contain 'TakeOwnership'
-        $script:installer | Should -Not -Match 'FileSystemRights\]::WriteDacl'
-        $script:installer | Should -Not -Match 'FileSystemRights\]::WriteOwner'
-        $script:lib       | Should -Not -Match 'FileSystemRights\]::WriteDacl'
-        $script:lib       | Should -Not -Match 'FileSystemRights\]::WriteOwner'
+        # Every PowerShell file under scripts/, ENUMERATED. The claim is
+        # "repository-wide"; an earlier draft asserted two hard-coded paths,
+        # which could not see a new file reintroduce the dead spelling.
+        # Mutation: point the enumeration at a subset that omits a file
+        # carrying the dead spelling.
+        $shipped = @(Get-ChildItem -LiteralPath "$PSScriptRoot/../../scripts" -Recurse -Filter '*.ps1' -File)
+        $shipped | Should -Not -BeNullOrEmpty
+        foreach ($f in $shipped) {
+            $text = Get-Content -LiteralPath $f.FullName -Raw
+            $text | Should -Not -Match 'FileSystemRights\]::WriteDacl' -Because $f.FullName
+            $text | Should -Not -Match 'FileSystemRights\]::WriteOwner' -Because $f.FullName
+        }
     }
 
     It 'the library agrees: a WRITE_DAC-only or WRITE_OWNER-only ACE endangers bytes' {
@@ -2063,6 +2071,140 @@ Describe 'Assert-WebConfigLaunchTrusted validates the whole launch configuration
 '@ '*INSIDE the state tree*'
     }
 
+    # ---- round 5 (inline): six more, found by driving the real gate --------
+    #
+    # Two of these are FALSE REFUSALS, which matter as much as bypasses here:
+    # this gate runs on every install, including against a preserved
+    # operator-edited web.config, so a wrong refusal aborts the upgrade of a
+    # live issuance host.
+
+    It 'ACCEPTS every spelling pydantic-settings reads as true for a pinned setting' {
+        # Demanding the literal string "true" refused a correct configuration.
+        foreach ($v in @('true', 'True', 'TRUE', '1', 'yes', 'y', 'on', 't')) {
+            $p = script:New-WebConfig ('<configuration><system.webServer><httpPlatform ' +
+                'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+                'arguments="-m acme_adcs_ra"><environmentVariables>' +
+                '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+                "<environmentVariable name=`"ACME_RA_AUDIT_OFFBOX_REQUIRED`" value=`"$v`" />" +
+                '</environmentVariables></httpPlatform></system.webServer></configuration>')
+            { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+                -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+                Should -Not -Throw -Because "pydantic reads '$v' as true"
+        }
+    }
+
+    It 'still refuses a pinned setting turned OFF, in any spelling' {
+        foreach ($v in @('false', 'False', '0', 'no', 'off')) {
+            script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+                'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+                'arguments="-m acme_adcs_ra"><environmentVariables>' +
+                '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+                "<environmentVariable name=`"ACME_RA_AUDIT_OFFBOX_REQUIRED`" value=`"$v`" />" +
+                '</environmentVariables></httpPlatform></system.webServer></configuration>'
+            ) '*one production value*'
+        }
+    }
+
+    It 'ACCEPTS a stray trailing space in the dotenv value' {
+        # XML preserves it, Windows strips it from a path; it is an operator
+        # typo, not an ambiguity worth aborting an upgrade over.
+        $p = script:New-WebConfig @'
+<configuration><system.webServer><httpPlatform
+  processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env " />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@
+        { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+            -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+            Should -Not -Throw
+    }
+
+    It 'refuses a MANAGED handler, which names its code with type= not scriptProcessor' {
+        # Checking only scriptProcessor left the .NET half of the same primitive
+        # open: this loads and runs managed code in the worker, as the gMSA.
+        script:Assert-WcRefused @'
+<configuration><system.webServer>
+<handlers><add name="pwn" path="*.x" verb="*" type="Evil.Handler, Evil" /></handlers>
+<httpPlatform processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe"
+  arguments="-m acme_adcs_ra"><environmentVariables>
+  <environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />
+</environmentVariables></httpPlatform></system.webServer></configuration>
+'@ '*managed handler*'
+    }
+
+    It 'refuses a secret, the account quota, and the CRL-strength knobs' {
+        foreach ($n in @('ACME_RA_SIEM_HEC_TOKEN',
+                         'ACME_RA_MAX_ACCOUNTS_PER_EAB_KID',
+                         'ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS',
+                         'ACME_RA_REVOCATION_CONFIRM_CRL_FOLLOW_REDIRECTS')) {
+            script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+                'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+                'arguments="-m acme_adcs_ra"><environmentVariables>' +
+                '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+                "<environmentVariable name=`"$n`" value=`"9999`" />" +
+                '</environmentVariables></httpPlatform></system.webServer></configuration>'
+            ) '*outranks the dotenv*'
+        }
+    }
+
+    It 'ACCEPTS a namespace-PREFIXED document and handler clear/remove entries' {
+        $p = script:New-WebConfig ('<c:configuration xmlns:c="http://x"><c:system.webServer>' +
+            '<c:handlers><c:clear /><c:remove name="x" /></c:handlers>' +
+            '<c:httpPlatform processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+            'arguments="-m acme_adcs_ra"><c:environmentVariables>' +
+            '<c:environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+            '</c:environmentVariables></c:httpPlatform></c:system.webServer></c:configuration>')
+        { Assert-WebConfigLaunchTrusted -WebConfigPath $p -InstallDir $script:state `
+            -RuntimeDir $script:runtime -ExpectedProcessPath $script:expected } |
+            Should -Not -Throw
+    }
+
+    # ---- follow-up round 6: control-removing knobs and the bool spelling ----
+    #
+    # Each name below, set from web.config, silently removes a control a past
+    # security round installed. pydantic ranks env over dotenv, so this file
+    # overrides the protected dotenv's value.
+
+    It 'refuses the control-removing knobs (rate limits, coalescer, body caps, reclaim age)' {
+        foreach ($n in @('ACME_RA_AUDIT_DENIAL_COALESCE_WINDOW_SECONDS',
+                         'ACME_RA_NONCE_RATE_LIMIT_PER_SECOND',
+                         'ACME_RA_NONCE_RATE_LIMIT_BURST',
+                         'ACME_RA_RATE_LIMIT_ORDERS_PER_WINDOW',
+                         'ACME_RA_RATE_LIMIT_WINDOW_SECONDS',
+                         'ACME_RA_MAX_JWS_BODY_SIZE_BYTES',
+                         'ACME_RA_MAX_ADMIN_BODY_SIZE_BYTES',
+                         'ACME_RA_MAX_CSR_SIZE_BYTES',
+                         'ACME_RA_MAX_IDENTIFIERS_PER_ORDER',
+                         'ACME_RA_RECLAIM_MINIMUM_PROCESSING_AGE_SECONDS')) {
+            # Mutation: remove any single name from the forbidden list.
+            script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+                'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+                'arguments="-m acme_adcs_ra"><environmentVariables>' +
+                '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+                "<environmentVariable name=`"$n`" value=`"0`" />" +
+                '</environmentVariables></httpPlatform></system.webServer></configuration>'
+            ) '*outranks the dotenv*'
+        }
+    }
+
+    It 'refuses a padded " true " exactly as pydantic refuses it at startup' {
+        # pydantic-settings parses bool env values WITHOUT trimming (verified:
+        # " true " is a validation error in the worker), so a gate that
+        # accepted padding green-lit an install that cannot boot. The gate is
+        # exactly as strict as the worker's own parser.
+        # Mutation: restore the .Trim() before the comparison.
+        foreach ($v in @(' true ', 'true ', ' true')) {
+            script:Assert-WcRefused ('<configuration><system.webServer><httpPlatform ' +
+                'processPath="C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" ' +
+                'arguments="-m acme_adcs_ra"><environmentVariables>' +
+                '<environmentVariable name="ACME_RA_DOTENV" value="C:\ProgramData\acme-adcs-ra\acme-ra.env" />' +
+                "<environmentVariable name=`"ACME_RA_AUDIT_OFFBOX_REQUIRED`" value=`"$v`" />" +
+                '</environmentVariables></httpPlatform></system.webServer></configuration>'
+            ) '*one production value*'
+        }
+    }
+
     It 'the operator settings the template DOES carry are still allowed' {
         # ACME_RA_BASE_URL / ADCS / SIEM settings are the operator's to set here.
         $p = script:New-WebConfig @'
@@ -2172,6 +2314,21 @@ exit 0
         # Ambiguous probe AND unclassifiable `list wp` output: no silent
         # all-clear, the wait loop times out and throws.
         { Stop-AppPoolAndWait -AppcmdExe $script:garbage -AppPool 'acme-adcs-ra' -TimeoutSeconds 1 } |
+            Should -Throw -ExpectedMessage '*still has a live worker process*'
+    }
+
+    It 'fails closed when appcmd writes ONLY to stderr (follow-up round 6)' {
+        # The prove step's `list wp` used to discard stderr, so a broken
+        # appcmd -- stderr ERROR text, EMPTY stdout, the exact shape a stopped
+        # WAS / corrupt applicationHost.config / access denial takes --
+        # produced an empty worker list, which Test-AppPoolWorkersGone
+        # classifies as "no workers": an ALL-CLEAR. The stop-and-prove path
+        # returned True and the installer went on to claim trees a live gMSA
+        # worker might still have held write handles into -- rescan-2 F3
+        # through the check that exists to prevent it. This fixture existed
+        # for exactly this shape and was never asserted.
+        # Mutation: revert the merged/shielded `list wp` to `2>$null`.
+        { Stop-AppPoolAndWait -AppcmdExe $script:noisy -AppPool 'acme-adcs-ra' -TimeoutSeconds 1 } |
             Should -Throw -ExpectedMessage '*still has a live worker process*'
     }
 

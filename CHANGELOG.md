@@ -147,6 +147,62 @@ root claim; a pre-scratch failure no longer prints a spurious
 table no longer tells operators that `-InstallPrereqs` installs Python with
 `winget`, which round-6 finding 3 removed.
 
+### Security — round-6 follow-up, round 6 (2026-08-17; cross-lineage review, six findings + three low, all fixed)
+
+Four hazard-scoped reviewers on three lineages went over the whole
+uncommitted follow-up before it was committed and lab-validated. One high:
+the stop-and-prove loop's `appcmd list wp 2>$null` discarded stderr, so a
+broken appcmd (stopped WAS, corrupt `applicationHost.config`, access denial)
+produced an EMPTY worker list — which `Test-AppPoolWorkersGone` classifies as
+"no workers", an all-clear — and the installer went on to claim trees a live
+gMSA worker might still hold handles into. The suite's `noisy` fixture
+modelled exactly this shape and had never been asserted. Also: both
+OfficerRights parsers `break`-ed out of malformed descriptors into partial
+success (the readback tool printed "Found 1 ACE(s)" + exit 0; the
+preservation path would silently strip officers from the rewritten value);
+the eviction marker was stamped one row late; "absolute" certutil/net
+resolution trusted caller-settable `$env:windir` with bare-NAME (PATH)
+fallbacks; ten control-REMOVING settings (the WI-014 coalescing bound, the
+2026-08-11 nonce bucket, the WI-016 order limits, the 2026-08-07 body caps,
+the M-2 reclaim age) were still settable from `web.config`; an explicit empty
+`reason_code` fell back to attacker-chosen prose keying; the pinned-bool
+comparison accepted `" true "` which pydantic rejects at worker startup; and
+the "repository-wide" dead-spelling test checked two hard-coded files. Nine
+mutations run against the new tests, all detected. See
+`docs/security-review-2026-08-16-round6-followup.md` (Round 6).
+
+### Security — round-6 follow-up, round 5 (2026-08-17; six findings, all fixed)
+
+An inline review of the `web.config` gate — the surface round 4 left unexamined
+when one of its two reviewers died before reading a file. Two of the six are
+**false refusals**, which matter as much as bypasses: this gate runs on every
+install including against a preserved operator-edited file, so a wrong refusal
+aborts the upgrade of a live issuance host. See
+`docs/security-review-2026-08-16-round6-followup.md`.
+
+- **A pinned setting demanded the literal string `true`**, so an operator
+  writing `ACME_RA_AUDIT_OFFBOX_REQUIRED="1"` — which pydantic reads as true —
+  had the install refused. Now compared on meaning; every "off" spelling is
+  still refused.
+- **A trailing space in the `ACME_RA_DOTENV` value** was refused as an ambiguous
+  Win32 path component. Trimmed.
+- **`ACME_RA_SIEM_HEC_TOKEN` was settable** — a secret, whose home is the
+  installer's own dotenv template.
+- **`ACME_RA_MAX_ACCOUNTS_PER_EAB_KID` was settable**, retiring round-6 finding
+  7's lifetime per-kid account quota in one line.
+- **The CRL proof's strength knobs were settable.** Pinning
+  `REQUIRE_CRL_EVIDENCE` on means nothing if `CRL_MAX_AGE_SECONDS` and
+  `CRL_FOLLOW_REDIRECTS` can be widened beside it — a decade-old CRL still
+  "proves" a serial revoked.
+- **A managed handler (`type=`) was accepted.** The check read `scriptProcessor`
+  and `modules` only; `type=` loads and runs .NET code in the worker as the
+  gMSA.
+
+`ACME_RA_REVOCATION_CONFIRM_CRL_URL` was examined and deliberately left
+settable: the CRL's signature is verified against the issuing CA certificate
+from the certificate's own stored chain, so the URL can deny evidence but not
+manufacture it, and the docs present it as an operator setting.
+
 ### Security — round-6 follow-up, round 3 (2026-08-16; sixteen findings, all fixed)
 
 Three more independent hazard-scoped reviews, this time of the round-2 fixes.

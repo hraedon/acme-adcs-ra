@@ -668,3 +668,235 @@ syntactic.
 15. A failing `certutil -revoke` (unknown serial, say) under 5.1 relays the
     certutil exit code, confirming `Invoke-CertUtilCapture` holds — the
     documented item 12, now a confirmation rather than an open risk.
+
+---
+
+# Round 5 — the web.config gate, reviewed inline
+
+Round 4 ran two reviewers; one completed and one died before reading a file, so
+round 3's and round 4's additions to `Assert-WebConfigLaunchTrusted` — the
+largest unexamined surface in the diff — had been seen by nobody. This round is
+that review, done inline rather than by a fresh reviewer (cost), using the same
+method: drive the real gate, do not read it.
+
+Six findings, **two of them false refusals**, which matter as much as bypasses
+here: this gate runs on every install including against a *preserved*,
+operator-edited `web.config`, so a wrong refusal aborts the upgrade of a live
+issuance host.
+
+Gates after: **830 pytest + 1 skipped, 351 Pester + 4 skipped, ruff, mypy.**
+Five mutations run, all detected.
+
+## The harness was wrong first
+
+The first run reported nine false refusals and six clean passes. All fifteen
+results were worthless: the harness used `$args` as a function parameter name,
+which collides with PowerShell's automatic variable, so every generated config
+carried empty `arguments` and was refused for that reason — producing false
+failures *and* false passes in the same table. Fixed and re-run before anything
+was concluded. This is the fifth time in this project's record that a
+repro-harness bug masqueraded as evidence, and the second time it did so in the
+same family (`$args`) the product code keeps hitting.
+
+## False refusals (would abort a live upgrade)
+
+- **A pinned setting demanded the literal string `true`.** pydantic-settings
+  reads `1`, `yes`, `y`, `on`, `t` and `True` as true, so an operator writing
+  `ACME_RA_AUDIT_OFFBOX_REQUIRED="1"` — a correct configuration — had the
+  install refused. The comparison is now on meaning, not spelling, and still
+  refuses every "off" spelling.
+- **A stray trailing space in the `ACME_RA_DOTENV` value** was refused as an
+  "ambiguous Win32 component". XML preserves it, Windows strips it from a path;
+  it is a typo, not an attack. Trimmed.
+
+## Bypasses
+
+- **`ACME_RA_SIEM_HEC_TOKEN` was settable.** It is a *secret*, and the
+  installer's own dotenv template is where it belongs ("put ONLY secrets / EAB
+  here"). Setting it here writes a credential into the file operators hand-edit
+  and preserve across installs, and overrides the protected one.
+- **`ACME_RA_MAX_ACCOUNTS_PER_EAB_KID` was settable**, which retires round-6
+  finding 7's lifetime per-kid account quota with one line, from the file this
+  gate exists to bound. Same family as `EAB_ALLOWLIST` and `SAN_SCOPES`: it
+  decides how many identities one credential may mint.
+- **The CRL proof's strength knobs were settable.** Round 4 pinned
+  `REQUIRE_CRL_EVIDENCE` to on — but a pinned switch means nothing if
+  `..._CRL_MAX_AGE_SECONDS` and `..._CRL_FOLLOW_REDIRECTS` can be widened beside
+  it. A decade-old CRL still "proves" a serial revoked, and this is the one
+  check that does not rest on the calling agent's honesty.
+- **A managed handler was accepted.** The handler check read `scriptProcessor`
+  and `modules` only; a managed handler names its code with `type=`. `<add
+  name="pwn" path="*.x" verb="*" type="Evil.Handler, Evil" />` loads and runs
+  .NET code in the worker, as the gMSA — the .NET half of the primitive round 3
+  closed for native executables.
+
+## Checked and deliberately NOT changed
+
+`ACME_RA_REVOCATION_CONFIRM_CRL_URL` stays settable from `web.config`. Pointing
+it elsewhere cannot forge evidence: the RA verifies the CRL's signature against
+the issuing CA certificate taken from **the certificate's own stored chain**, not
+from the URL, so a hostile CRL fails verification and the confirmation fails
+closed. It can deny evidence, not manufacture it, and `docs/operations.md`
+documents it as an operator setting. Refusing it would be the over-refusal this
+round is otherwise about avoiding.
+
+## Coverage note
+
+The gate's accept-side is now pinned by explicit cases (every truthy spelling, a
+namespace-prefixed document, handler `clear`/`remove`, the template's own
+`PYTHONDONTWRITEBYTECODE` and SIEM settings, a trailing space) alongside the
+refuse-side. The shipped `deploy/iis/web.config` passing unchanged remains the
+control, and it is asserted in the suite.
+
+---
+
+# Round 6 — cross-lineage review of the whole follow-up (2026-08-17)
+
+Scope: before committing and lab-validating rounds 1–5, the entire uncommitted
+follow-up diff was reviewed by four hazard-scoped reviewers on three model
+lineages (installer PowerShell; the Python coalescer/policy/finalize leg; the
+CA-officer scripts; a claims-vs-code audit of the document itself). Method as
+before: drive the code, do not read it. Six findings, one high; every fix is
+mutation-verified (nine mutations run, all detected — including one whose
+first "survival" was the harness failing to apply it, the exact class this
+project keeps meeting).
+
+Gates after: **832 pytest + 1 skipped, 356 Pester + 4 skipped, ruff, mypy.**
+
+## High
+
+### R6-1 — the stop-and-prove loop failed OPEN when appcmd could not answer `list wp`
+
+`Stop-AppPoolAndWait`. The R2-6/R3-1 rewrite made the *probe* refuse to decide
+on stderr — and the prove loop then ran `list wp 2>$null`, discarding it. A
+broken appcmd (stopped WAS, corrupt `applicationHost.config`, access denial)
+writes its ERROR text to **stderr and nothing to stdout**, so `$wp` came back
+empty, and `Test-AppPoolWorkersGone` classifies empty as "no workers" — an
+**all-clear**. The function returned True and the installer went on to claim
+and reset trees a live gMSA worker might still hold write handles into:
+rescan-2 F3, reached through the check that exists to prevent it. Round 4's
+"carried forward" note justified this exact call as "bounded by
+Test-AppPoolWorkersGone failing closed on unclassifiable output" — the
+justification was wrong, because the discard guaranteed the unclassifiable
+output never reached the classifier. The suite's own `noisy` stand-in fixture
+modelled precisely this shape (stderr-only, exit 0) and was **defined but
+never asserted** — the test that should have caught the round-2 rewrite used
+`garbage`, whose unclassifiable text is on *stdout*.
+
+Fixed: the prove step's `list wp` is merged (`2>&1`) behind the same EAP
+shield the probe uses, so an ERROR line reaches the classifier as a line it
+cannot recognize — which fails CLOSED into the timeout throw. `noisy` is now
+asserted.
+
+## Medium
+
+### R6-2 — the eviction marker was stamped one row late
+
+`audit_coalesce.py`. `coalescer_evictions` was written from `_evicted`
+**before** the eviction that made room for the row, so a brand-new key whose
+open displaced an entry carried neither `previous_window` (no predecessor) nor
+the marker — byte-identical to a first-ever window on an index that had never
+shed anything. Eviction now runs before the row is built (`closed` is
+captured first, so the same-key hand-off survives the sweep; if the record
+then fails and no window is inserted, entries were only dropped, never rows).
+
+Two test notes from the same finding: the expiry-sweep test's
+`previous_window OR coalescer_evictions` assertion was not a detector in this
+scenario (the victim's lapsed entry is collected at the cap *before* its
+reopen, so there is no hand-off to assert) — it now asserts the marker
+directly; and the new displacement test pins the exact shape the old ordering
+got wrong.
+
+### R6-3 — both OfficerRights parsers half-parsed malformed descriptors
+
+`Get-OfficerRights.ps1` `Parse-OfficerRightsSD` `break`-ed out of the ACE
+walk on truncation and returned a **partial** list, so a value declaring two
+ACEs with room for one printed "Found 1 OfficerRights ACE(s)" and exited 0 —
+the verify-by-readback tool affirming a restriction it stopped reading
+half-way. `OfficerRightsLib.ps1` `Get-ExistingAces` had the same `break`, and
+it is the **load-bearing** one: Set-OfficerRights preserves every returned
+ACE verbatim in the descriptor it writes back, so officers beyond the
+truncation point would be silently **stripped** from the rewritten
+OfficerRights value — removing officers' rights by parse artifact rather than
+by decision. Both now throw; a well-formed descriptor always walks its
+declared ACEs exactly.
+
+### R6-4 — "absolute" certutil/net resolution trusted `$env:windir` and fell back to PATH
+
+The R2-8/R3-8 hardening in `Revoke-Cert.ps1`, `Get/Set-OfficerRights.ps1`
+and `Reconcile-Revocation.ps1` built "absolute" paths from
+`Join-Path $env:windir System32\...` — caller-settable process state, the
+same class as the `$env:OS` gate round 3 moved off the environment — and
+three of the four sites fell back to the **bare name** (i.e. PATH) when
+`windir` was unset. All four now resolve from the runtime
+(`[Environment]::GetFolderPath([System+SpecialFolder]::System)`) and Die if
+the binary is not there.
+
+### R6-5 — the web.config gate still permitted control-REMOVING values
+
+The claims audit enumerated every `ACME_RA_*` setting in `config.py` against
+the gate's forbidden/pinned lists and found the round-4/5 additions had drawn
+the line at *secrets* and *evidence strength* only. Still settable, with value
+`0`/off silently removing a control a past security round installed:
+`AUDIT_DENIAL_COALESCE_WINDOW_SECONDS` (the WI-014 bound itself),
+`NONCE_RATE_LIMIT_PER_SECOND`/`_BURST` (the 2026-08-11 unauthenticated
+bucket), `RATE_LIMIT_ORDERS_PER_WINDOW`/`_WINDOW_SECONDS` (WI-016),
+`MAX_JWS_BODY_SIZE_BYTES`/`MAX_ADMIN_BODY_SIZE_BYTES`/`MAX_CSR_SIZE_BYTES`/
+`MAX_IDENTIFIERS_PER_ORDER` (the 2026-08-07 caps), and
+`RECLAIM_MINIMUM_PROCESSING_AGE_SECONDS` (the M-2 CAS guard's age). All ten
+are now forbidden here. The documented `rate_limit_orders_per_window=0`
+"rely on the reverse proxy" mode remains available — through the PROTECTED
+dotenv, which this file outranks and which is exactly why the file must not
+carry it. Deliberately left settable (each checked): `ORDER_EXPIRY_SECONDS`
+(retention shaping), the CRL fetch resource bounds (`TIMEOUT`, `MAX_BYTES`,
+`MAX_WORKERS`, `MAX_PENDING` — self-DoS only, and the evidence-strength knobs
+are already forbidden), `SIEM_HEC_QUEUE_MAX`, `SERVER_MAX_CONCURRENCY`, and
+`RATE_LIMIT_GLOBAL_PER_WINDOW` (the shipped template sets it).
+
+## Low
+
+- **R6-6 — an explicit empty `reason_code` fell back to prose keying.**
+  `str(details.get("reason_code") or reason)` treats `""` as absent and keys
+  on `reason` — attacker-chosen on the finalize paths. One missing keyword
+  away from silently defeating the bound. An explicit code now keys on itself
+  even when falsy (everything sending `""` folds into one bounded window).
+- **R6-7 — the truthy comparison trimmed what pydantic does not.** Verified
+  against the installed pydantic-settings: `" true "` is a validation error
+  at worker startup, so a gate that trimmed-and-accepted it green-lit an
+  install that cannot boot. The comparison is now on the untrimmed value —
+  the gate is exactly as strict as the worker's own parser (and still accepts
+  every spelling pydantic accepts).
+- **R6-8 — the "repository-wide" dead-spelling test checked two hard-coded
+  files.** It now enumerates every `*.ps1` under `scripts/`.
+
+## Disproved during review (so nobody re-reports them)
+
+- `modules="HttpPlatformHandler"` case variance is NOT a false refusal —
+  PowerShell `-ne` is case-insensitive.
+- `OfficerRights.Tests.ps1`'s bare `$result = Get-ExistingAces $null` +
+  `.Count` is safe on both engines (empty pipeline assignment is `$null`,
+  and `$null.Count` is 0 on 5.1 and pwsh 7; the suite is green on the 5.1 CI
+  runner with these exact tests).
+- The identifier gate skipping locally is by design — it is secret-driven
+  (`ACME_RA_FORBIDDEN_IDENTIFIERS`, wired in CI), not a drifted check.
+
+## Harness note
+
+This round's own Pester-count oracle printed empty strings for four "runs"
+(`Invoke-Pester -Configuration` returned no result object under the chosen
+verbosity) — the mutation runs "passed" because they printed nothing. Caught
+the way round 5 caught its `$args` bug: a baseline run of the harness alone,
+which showed the same emptiness. The oracle is now Pester's own summary line.
+
+## Native cases owed, added to the running list
+
+16. `appcmd list wp` against a genuinely broken appcmd (stop WAS by hand):
+    the installer must abort on the timeout throw, never print
+    "[ok] no such app pool yet".
+17. `Get-OfficerRights.ps1` against a malformed OfficerRights value (bump the
+    AceCount field of a real one): the throw, a non-zero exit, and never
+    "Found N OfficerRights ACE(s)" over a partial walk.
+18. With `$env:windir` spoofed to a writable directory, `Revoke-Cert.ps1` and
+    `Get-OfficerRights.ps1` still resolve the real System32 certutil
+    (regression proof of R6-4); the spoofed `System32\certutil.exe` is never
+    executed.

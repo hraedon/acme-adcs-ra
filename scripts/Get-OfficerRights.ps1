@@ -43,12 +43,18 @@ $ErrorActionPreference = "Stop"
 # PATH. Round-6 finding 3 removed PATH-selected programs from the installer;
 # these scripts were missed, and they are the higher-value half -- this one
 # runs with CA-officer context. A writable PATH entry would be code execution
-# with that context.
-$script:CertUtilExe = if ($env:windir) { Join-Path $env:windir 'System32\certutil.exe' } else { 'certutil' }
+# with that context. The System directory comes from the RUNTIME, not
+# $env:windir -- which is caller-settable process state, the same class as the
+# $env:OS gate the round-3 review moved off the environment.
 
 function Die([string]$Message, [int]$Code) {
     [Console]::Error.WriteLine("ERROR: $Message")
     exit $Code
+}
+
+$script:CertUtilExe = Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)) 'certutil.exe'
+if (-not (Test-Path -LiteralPath $script:CertUtilExe)) {
+    Die "certutil.exe not found at $script:CertUtilExe" 2
 }
 
 # Read the OfficerRights REG_BINARY from the CA. Returns a byte[], or $null
@@ -146,7 +152,15 @@ function Parse-OfficerRightsSD([byte[]]$Bytes) {
     $aces = @()
     $aceOffset = $daclOffset + 8
     for ($i = 0; $i -lt $aceCount; $i++) {
-        if ($aceOffset + 8 -gt $Bytes.Length) { break }
+        # Truncation and malformation THROW rather than `break`-ing into a
+        # partial list: this is the verify-by-readback tool, and "Found 1
+        # OfficerRights ACE(s)" + exit 0 over a descriptor that stopped walking
+        # after the first of two declared ACEs is the tool affirming a
+        # restriction it did not fully read. A well-formed descriptor always
+        # walks its declared ACEs exactly.
+        if ($aceOffset + 8 -gt $Bytes.Length) {
+            throw "OfficerRights DACL corrupt: ACE $($i + 1) of $aceCount has a header at offset $aceOffset that extends past the $($Bytes.Length)-byte value."
+        }
         $aceType = $Bytes[$aceOffset]
         $aceSize = [BitConverter]::ToUInt16($Bytes, $aceOffset + 2)
         $accessMask = [BitConverter]::ToUInt32($Bytes, $aceOffset + 4)
@@ -154,7 +168,9 @@ function Parse-OfficerRightsSD([byte[]]$Bytes) {
         # Trustee SID starts at aceOffset + 8 (the SidStart field).
         $sidStart = $aceOffset + 8
         $sidInfo = Parse-SidAt $Bytes $sidStart
-        if ($null -eq $sidInfo) { break }
+        if ($null -eq $sidInfo) {
+            throw "OfficerRights DACL corrupt: no parseable trustee SID at offset $sidStart (ACE $($i + 1) of $aceCount)."
+        }
 
         # ApplicationData (opaque callback blob) follows the SID:
         #   [SidCount u32 LE][subject SIDs][template UTF-16LE + null]
@@ -165,7 +181,9 @@ function Parse-OfficerRightsSD([byte[]]$Bytes) {
         # -ge 4 guard below and mis-parse sidCount out of reversed bytes. Reachable
         # on a malformed or non-callback ACE. OfficerRightsLib's Get-ExistingAces
         # guards the equivalent line; this copy did not.
-        if ($appDataEnd -le $appDataStart) { break }
+        if ($appDataEnd -le $appDataStart) {
+            throw "OfficerRights DACL corrupt: ACE $($i + 1) of $aceCount at offset $aceOffset declares no application data (size $aceSize, SID $($sidInfo.Length) bytes)."
+        }
         $appDataBytes = $Bytes[$appDataStart..($appDataEnd - 1)]
 
         $subjectSids = @()

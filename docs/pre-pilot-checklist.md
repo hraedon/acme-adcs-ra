@@ -334,6 +334,60 @@ engineered to. Until then it has not — regardless of a green local test run.
     and the fix was deliberately withheld pending a live DACL baseline. If the
     chain passes `Test-PathChainTrusted` on the lab host, add the refusal.
 
+- **Round-6 follow-up, ROUND 6 remediated in source (2026-08-17); native Windows
+  re-proof required before pilot.** Four cross-lineage reviewers over the whole
+  uncommitted follow-up (installer, Python leg, officer scripts, claims-vs-code
+  audit). One high: the stop-and-prove loop's `appcmd list wp 2>$null`
+  discarded stderr, so a *broken* appcmd yielded an empty worker list — which
+  the classifier reads as "no workers", an all-clear — and the installer went
+  on to claim trees a live gMSA worker might still hold write handles into
+  (rescan-2 F3 again; the suite's `noisy` fixture had modelled the shape and
+  was never asserted). Also: both OfficerRights parsers `break`-ed malformed
+  descriptors into partial success (the readback tool affirming half a
+  restriction; the Set-OfficerRights preservation path would silently strip
+  officers from the rewritten value); the eviction marker stamped one row
+  late; certutil/net "absolute" paths built from caller-settable
+  `$env:windir` with bare-name PATH fallbacks; ten control-removing settings
+  (WI-014 coalescing bound, nonce bucket, order limits, body caps, M-2
+  reclaim age) still settable from `web.config`; and three low findings
+  (empty `reason_code` falling back to prose keying; padded `" true "`
+  accepted where pydantic rejects it; the "repository-wide" dead-spelling
+  test checking two hard-coded files).
+
+  Local gates: **832 pytest + 1 skipped, 356 Pester + 4 skipped, ruff,
+  mypy**; nine mutations run against the new tests, all detected.
+
+  **Native cases owed (16–18 in the follow-up doc's list):**
+  - `appcmd list wp` against a genuinely broken appcmd (stop WAS by hand):
+    the installer aborts on the timeout throw, never "[ok] no such app pool";
+  - `Get-OfficerRights.ps1` against a malformed OfficerRights value throws
+    and exits non-zero — never "Found N ACE(s)" over a partial walk;
+  - with `$env:windir` spoofed, the officer scripts still resolve the real
+    System32 certutil and never execute the spoofed one.
+
+- **Round-6 follow-up, ROUND 5 remediated in source (2026-08-17); native Windows
+  re-proof required before pilot.** An inline review of the `web.config` gate,
+  the surface round 4 left unexamined. Six findings, **two of them false
+  refusals** — a pinned setting demanded the literal string `true` (so an
+  operator writing `1`, which pydantic reads as true, had the install refused),
+  and a trailing space in the `ACME_RA_DOTENV` value was refused as an ambiguous
+  path component. Four bypasses: `ACME_RA_SIEM_HEC_TOKEN` (a secret whose home
+  is the dotenv), `ACME_RA_MAX_ACCOUNTS_PER_EAB_KID` (retires the round-6
+  finding-7 quota in one line), the CRL proof's `MAX_AGE`/`FOLLOW_REDIRECTS`
+  strength knobs (a pinned `REQUIRE_CRL_EVIDENCE` means nothing if the freshness
+  bound can be widened beside it), and a managed handler declared with `type=`
+  rather than `scriptProcessor` — the .NET half of the primitive round 3 closed
+  for native executables.
+
+  Local gates: **830 pytest + 1 skipped, 351 Pester + 4 skipped, ruff, mypy**;
+  five mutations run, all detected.
+
+  **Native cases owed:**
+  - the deployed `web.config` is accepted unchanged (the control), and each of
+    the four refused shapes above is refused on the real host;
+  - a `web.config` written with `ACME_RA_AUDIT_OFFBOX_REQUIRED="1"` installs
+    cleanly — this is the false refusal that would have aborted an upgrade.
+
 - **Round-6 follow-up, ROUND 3 remediated in source (2026-08-16); native Windows
   re-proof required before pilot.** Three more hazard-scoped reviews, of the
   round-2 fixes. Sixteen findings, **all but two in those fixes**. One high:

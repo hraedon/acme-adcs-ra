@@ -184,7 +184,12 @@ class TestOpenWindowIndexIsBounded:
         neither ``previous_window`` nor ``coalescer_evictions``, making it
         byte-identical to a first-ever window.
 
-        Mutation: drop the ``self._evicted += 1`` from the expiry pass.
+        Mutation: drop the ``self._evicted += 1`` from the expiry pass. (An
+        earlier draft asserted ``previous_window OR coalescer_evictions``; this
+        scenario cannot rely on ``previous_window`` — the victim's lapsed entry
+        is collected by the cap eviction at filler-3, so its reopen finds no
+        dict entry to hand off. That is precisely the ambiguity the marker
+        exists to resolve, so the MARKER itself is asserted.)
         """
         store = _store(tmp_path)
         clock = _Clock()
@@ -207,9 +212,45 @@ class TestOpenWindowIndexIsBounded:
         assert len(rows) == 2
         assert json.loads(rows[0]["details"])["denial_count"] == 7
         successor = json.loads(rows[1]["details"])
-        assert (
-            "previous_window" in successor or "coalescer_evictions" in successor
-        ), "a swept predecessor must leave some trace on its successor"
+        assert "coalescer_evictions" in successor, (
+            "the expiry sweep is an eviction; the row it makes room for must say so"
+        )
+
+    def test_the_row_displacing_an_entry_carries_the_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """THE STAMP-ORDERING FINDING.
+
+        ``coalescer_evictions`` was stamped from ``_evicted`` BEFORE the
+        eviction that made room for the row, so a brand-new key whose open
+        displaced an LRU entry carried neither ``previous_window`` (it has no
+        predecessor) nor ``coalescer_evictions`` — byte-identical to a
+        first-ever window on an index that has never shed anything.
+
+        Mutation: move the ``_evict_for_new_window`` call back below the
+        ``store.record_audit`` that persists the row.
+        """
+        store = _store(tmp_path)
+        clock = _Clock()
+        coalescer = DenialCoalescer(3600, max_open_windows=4, clock=clock)
+
+        for i in range(4):
+            coalescer.record(store, **_finalize_denial(f"live-{i}"))
+        # All four windows are LIVE (no clock advance). One more NEW key must
+        # displace the least-recently-touched one, and its row is the affected
+        # row: no previous_window, so the marker is the only breadcrumb.
+        coalescer.record(store, **_finalize_denial("newcomer"))
+
+        newcomer = [
+            json.loads(r["details"])
+            for r in _rows(store)
+            if r["order_id"] == "newcomer"
+        ]
+        assert len(newcomer) == 1
+        assert "previous_window" not in newcomer[0]
+        assert newcomer[0]["coalescer_evictions"] >= 1, (
+            "the row that displaced a window carries no eviction marker"
+        )
 
     def test_the_previous_window_handoff_still_works(self, tmp_path: Path) -> None:
         """The ``previous_window`` breadcrumb is preserved under the cap.
@@ -399,6 +440,35 @@ class TestTheKeyExcludesAttackerChosenData:
                     details={"reason": reason},
                 )
         assert len(_rows(store)) == 2
+
+    def test_an_explicit_empty_reason_code_does_not_fall_back_to_prose(
+        self, tmp_path: Path
+    ) -> None:
+        """A falsy-but-present reason_code must not reopen the prose key.
+
+        ``str(details.get("reason_code") or reason)`` treated an explicitly
+        EMPTY code as absent and keyed on ``reason`` — which is attacker-chosen
+        prose on the finalize paths. No current call site sends an empty code,
+        but one typo away from it the bound would be silently defeated: five
+        requests with varying prose and reason_code="" produced five durable
+        rows. Keying on the explicit "" folds all of them into one window.
+
+        Mutation: revert the key line to ``str(... or reason)``.
+        """
+        store = _store(tmp_path)
+        coalescer = DenialCoalescer(3600, clock=_Clock())
+        for i in range(5):
+            coalescer.record(
+                store,
+                event_type="finalize-policy-denied",
+                outcome="denied",
+                account_id="acct-1",
+                order_id="order-1",
+                details={"reason": f"attacker-chosen prose {i}", "reason_code": ""},
+            )
+        rows = _rows(store)
+        assert len(rows) == 1, "an empty reason_code must not key on the prose"
+        assert json.loads(rows[0]["details"])["denial_count"] == 5
 
     def test_caller_supplied_markers_cannot_forge_eviction_state(
         self, tmp_path: Path

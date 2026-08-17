@@ -120,8 +120,9 @@ $ErrorActionPreference = "Stop"
 # PATH. Round-6 finding 3 removed PATH-selected programs from the installer;
 # these scripts were missed, and they are the higher-value half -- this one
 # runs with CA-officer context. A writable PATH entry would be code execution
-# with that context.
-$script:CertUtilExe = if ($env:windir) { Join-Path $env:windir 'System32\certutil.exe' } else { 'certutil' }
+# with that context. The System directory comes from the RUNTIME, not
+# $env:windir -- which is caller-settable process state, the same class as the
+# $env:OS gate the round-3 review moved off the environment.
 
 # Shared pure logic (serial normalization, reason/requester rules), covered by
 # tests/pester/Revocation.Tests.ps1. Deploy scripts/lib/ alongside this script
@@ -137,6 +138,11 @@ $script:CertUtilExe = if ($env:windir) { Join-Path $env:windir 'System32\certuti
 function Die([string]$Message, [int]$Code) {
     [Console]::Error.WriteLine("ERROR: $Message")
     exit $Code
+}
+
+$script:CertUtilExe = Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)) 'certutil.exe'
+if (-not (Test-Path -LiteralPath $script:CertUtilExe)) {
+    Die "certutil.exe not found at $script:CertUtilExe" 2
 }
 
 # RFC 5280 section 5.3.1 reason codes. certutil -revoke uses the same numeric

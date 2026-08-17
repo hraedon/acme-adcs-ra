@@ -1395,7 +1395,24 @@ function Stop-AppPoolAndWait {
     & $AppcmdExe stop apppool /apppool.name:"$AppPool" 2>$null | Out-Null
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
-        $wp = & $AppcmdExe list wp 2>$null
+        # `list wp` stderr is NOT discarded. A broken appcmd -- stopped WAS, a
+        # corrupt applicationHost.config, an access denial -- writes its ERROR
+        # text to STDERR and nothing to stdout, so `2>$null` produced an EMPTY
+        # $wp, and Test-AppPoolWorkersGone classifies empty as "no workers",
+        # i.e. ALL-CLEAR. The probe above refuses to decide on stderr; the
+        # prove step must not hand the same ambiguity to a classifier that
+        # answers it wrongly -- that was rescan-2 F3 reached through the check
+        # that exists to prevent it. Merged (and EAP-shielded: on Windows
+        # PowerShell 5.1 the first MERGED stderr line terminates a pipeline
+        # under EAP=Stop), the ERROR text reaches the classifier as a line it
+        # cannot recognize, which fails CLOSED into the timeout throw below.
+        $wpEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $wp = & $AppcmdExe list wp 2>&1
+        } finally {
+            $ErrorActionPreference = $wpEap
+        }
         if (Test-AppPoolWorkersGone -AppcmdWpOutput $wp -AppPool $AppPool) { return $true }
         if ((Get-Date) -ge $deadline) {
             throw ("Stop-AppPoolAndWait: app pool `"$AppPool`" still has a live worker process after " +
@@ -1777,7 +1794,42 @@ function Assert-WebConfigLaunchTrusted {
         'ACME_RA_EAB_ALLOWLIST', 'ACME_RA_SAN_SCOPES', 'ACME_RA_ADMIN_TOKEN',
         'ACME_RA_REVOCATION_CONFIRM_TOKEN', 'ACME_RA_ALLOW_WEAK_CREDENTIALS',
         'ACME_RA_RATE_LIMIT_OVERRIDES',
-        'ACME_RA_ALLOW_FAKE_ADCS_BACKENDS'
+        'ACME_RA_ALLOW_FAKE_ADCS_BACKENDS',
+        # A SECRET, and the installer's own dotenv template is where it belongs
+        # ("put ONLY secrets / EAB here"). Setting it in web.config both writes a
+        # credential into the file operators hand-edit and preserve across
+        # installs, and overrides the protected one.
+        'ACME_RA_SIEM_HEC_TOKEN',
+        # Round-6 finding 7's lifetime per-kid account quota. One value here
+        # retires it, from the file this gate exists to bound -- same family as
+        # EAB_ALLOWLIST and SAN_SCOPES: it decides how many identities one
+        # credential may mint.
+        'ACME_RA_MAX_ACCOUNTS_PER_EAB_KID',
+        # The strength knobs of the CRL proof. REQUIRE_CRL_EVIDENCE is pinned
+        # below, but a pinned "on" switch means nothing if the freshness bound
+        # and the redirect refusal can be widened beside it: the CRL is the one
+        # check that does not rest on the calling agent's honesty, and a
+        # decade-old CRL still "proves" a serial revoked.
+        'ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS',
+        'ACME_RA_REVOCATION_CONFIRM_CRL_FOLLOW_REDIRECTS',
+        # Settings whose value 0/off silently REMOVES a control a past security
+        # round installed: the nonce bucket and the JWS/admin-body caps
+        # (2026-08-07 / 2026-08-11), the per-account order limit (WI-016), the
+        # denial-coalescing bound (WI-014), and the processing-age half of the
+        # pending->ready CAS guard (M-2). A deployment that genuinely needs a
+        # different value -- the documented "rely on the reverse proxy" rate
+        # mode, an unusually large CSR ceiling -- sets it in the PROTECTED
+        # dotenv, which this file outranks; it may not be set here.
+        'ACME_RA_AUDIT_DENIAL_COALESCE_WINDOW_SECONDS',
+        'ACME_RA_NONCE_RATE_LIMIT_PER_SECOND',
+        'ACME_RA_NONCE_RATE_LIMIT_BURST',
+        'ACME_RA_RATE_LIMIT_ORDERS_PER_WINDOW',
+        'ACME_RA_RATE_LIMIT_WINDOW_SECONDS',
+        'ACME_RA_MAX_JWS_BODY_SIZE_BYTES',
+        'ACME_RA_MAX_ADMIN_BODY_SIZE_BYTES',
+        'ACME_RA_MAX_CSR_SIZE_BYTES',
+        'ACME_RA_MAX_IDENTIFIERS_PER_ORDER',
+        'ACME_RA_RECLAIM_MINIMUM_PROCESSING_AGE_SECONDS'
     )
     # Settings with exactly ONE defensible production value. Unlike the base URL,
     # the ADCS target or the SIEM host -- which are per-deployment and are the
@@ -1807,6 +1859,16 @@ function Assert-WebConfigLaunchTrusted {
             throw ("$WebConfigPath declares a handler with scriptProcessor `"$sp`". That runs " +
                    "an arbitrary executable as the gMSA, which is exactly what pinning " +
                    "httpPlatform/@processPath exists to prevent. Remove the handler entry.")
+        }
+        # A MANAGED handler names its code with type=, not scriptProcessor, and
+        # checking only the latter left the .NET half of the same primitive wide
+        # open: `<add ... type="Evil.Handler, Evil" />` loads and runs managed
+        # code in the worker, as the gMSA.
+        $ht = [string]$h.type
+        if ($ht) {
+            throw ("$WebConfigPath declares a managed handler of type `"$ht`". That loads and " +
+                   "runs .NET code in the worker as the gMSA. This site hands every request " +
+                   "to httpPlatformHandler and nothing else. Remove the handler entry.")
         }
         $mods = [string]$h.modules
         if ($mods -and ($mods.Trim() -ne 'httpPlatformHandler')) {
@@ -1900,7 +1962,20 @@ function Assert-WebConfigLaunchTrusted {
             }
             if ($pinnedEnvValues.ContainsKey($rootName)) {
                 $wantValue = $pinnedEnvValues[$rootName]
-                if (([string]$ev.value).Trim().ToLowerInvariant() -ne $wantValue) {
+                # Compare on MEANING, not on spelling. pydantic-settings reads
+                # 1/yes/y/on/t/true as true, so demanding the literal string
+                # "true" refused a correct configuration and aborted the install
+                # of a live issuance host over an operator writing "1".
+                # NOT trimmed: pydantic parses bool env values WITHOUT trimming
+                # (verified: " true " is a validation error at worker startup),
+                # so accepting padding here would green-light an install that
+                # cannot boot. The gate stays exactly as strict as the worker's
+                # own parser.
+                $seen = ([string]$ev.value).ToLowerInvariant()
+                $truthy = @('true', '1', 'yes', 'y', 'on', 't')
+                $ok = if ($wantValue -eq 'true') { $truthy -contains $seen }
+                      else { $seen -eq $wantValue }
+                if (-not $ok) {
                     throw ("$WebConfigPath sets `"$name`" to `"$($ev.value)`" in " +
                            "<environmentVariables>. That setting has one production value " +
                            "(`"$wantValue`") and this file is not a protected one; the only " +
@@ -1925,7 +2000,10 @@ function Assert-WebConfigLaunchTrusted {
                 # "Cannot find drive" for a Windows path on a non-Windows host, which
                 # would make this whole gate unrunnable from the Linux Pester job.
                 $want = ($InstallDir.TrimEnd('\') + '\acme-ra.env')
-                if (-not (Test-PathsEquivalent -A ([string]$ev.value) -B $want)) {
+                # Trim: XML preserves trailing whitespace in an attribute value
+                # and Windows strips it from a path, so an operator's stray space
+                # is not an ambiguity worth aborting an upgrade over.
+                if (-not (Test-PathsEquivalent -A (([string]$ev.value).Trim()) -B $want)) {
                     throw ("$WebConfigPath points ACME_RA_DOTENV at `"$($ev.value)`" rather than " +
                            "the protected `"$want`". The secret-bearing file is the one the " +
                            "installer locks and proves; a different path is neither.")

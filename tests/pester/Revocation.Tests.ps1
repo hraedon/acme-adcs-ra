@@ -327,4 +327,27 @@ Describe 'Parse-OfficerRightsSD empty-return semantics (round 7.4)' {
         # so the defect cannot re-enter through either early exit.
         $fn.Extent.Text | Should -Not -Match 'return\s+\$null'
     }
+
+    It 'a descriptor whose declared ACEs extend past the buffer THROWS (follow-up round 6)' {
+        # The loop used to `break` on truncation and return a PARTIAL list, so
+        # a value declaring 2 ACEs with room for 1 printed "Found 1 OfficerRights
+        # ACE(s)" and exited 0 -- the verify-by-readback tool affirming a
+        # restriction it stopped reading half-way. A well-formed descriptor
+        # always walks its declared ACEs exactly; anything else is corruption
+        # and must be loud.
+        # Mutation: revert the throw to `break` -- @(parse).Count is then 0
+        # instead of a terminating error.
+        # 26 bytes: a 20-byte header whose DACL offset is 20, an 8-byte ACL
+        # header at 20..27 -- no, 20+8=28 > 26 is the point: AceCount declares 1
+        # but even the first ACE header cannot fit.
+        $bytes = [byte[]]::new(26)
+        $bytes[0] = 1                                             # revision
+        [BitConverter]::GetBytes([uint16]0x8004).CopyTo($bytes, 2)   # control
+        [BitConverter]::GetBytes([uint32]20).CopyTo($bytes, 4)       # owner offset
+        [BitConverter]::GetBytes([uint32]20).CopyTo($bytes, 16)      # Dacl offset
+        $bytes[20] = 2                                            # ACL revision
+        [BitConverter]::GetBytes([uint16]8).CopyTo($bytes, 22)       # AclSize
+        [BitConverter]::GetBytes([uint16]1).CopyTo($bytes, 24)       # AceCount = 1
+        { Parse-OfficerRightsSD $bytes } | Should -Throw '*extends past the*'
+    }
 }
