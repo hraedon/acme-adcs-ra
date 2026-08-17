@@ -95,6 +95,26 @@ partial (37 of 167 files) and the reviewer's own follow-ups are
 `docs/security-review-2026-08-17-daybreak-standard.md`. Local gates: 840 pytest
 + 1 skipped, ruff, mypy. **Not a live Windows proof.**
 
+**Audit retention landed 2026-08-17 (WI-014 part three).** Deletion is now
+possible, and most of the code exists to make it hard to do by accident.
+`certificates.not_before`/`not_after` are recorded at issuance (and backfilled),
+so the retention floor is `longest observed certificate validity + a fixed 14-day
+grace` — configure `audit_retention_days` below it and **startup is refused**,
+because retaining for less than a certificate's own lifetime means a certificate
+can be valid and servable with no record of how it was issued. Derived from
+observed issuance, not the template, since ADCS can issue shorter than asked.
+The sweep additionally requires `audit_prune_enabled`, `audit_offbox_required`
+and a delivery probe that succeeds **at sweep time**; miss any gate and it
+reports and deletes nothing. **Local-only deployments never prune** — with no
+off-box copy the local table is the only evidence there is — and instead get
+footprint reporting plus JSONL rotation. Their stated cost is availability: the
+`certificate-issued` audit row commits in the same transaction as the
+certificate, so a full disk stops issuance rather than issuing unaudited. The
+`"DELETE FROM audit_log" not in source` tripwire was **narrowed, not removed**;
+it now pins deletion to one statement in one policy-free primitive callable only
+from `audit_retention`. Local gates: 869 pytest + 1 skipped, ruff, mypy.
+**Not a live Windows proof.**
+
 > **The binding constraint is lab time, not review.** Rverify, the sync/queue
 > drain and the officer class D1–D7 have never been executed on this branch, and
 > `01417b5` (a 5.1 installer fix) postdates the last live proof. Round 7 blamed

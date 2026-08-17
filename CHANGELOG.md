@@ -6,6 +6,51 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — audit retention, WI-014 part three (2026-08-17)
+
+Parts one and two bounded audit growth without ever deleting (`audit_bounds`
+capped row size, `audit_coalesce` capped rows-per-window for replayable
+denials). Part three makes deletion possible — and spends most of its code
+making it hard to do by accident.
+
+- **`certificates.not_before` / `not_after`** recorded at issuance and
+  backfilled from `cert_pem` for existing rows. Derived from observed issuance
+  rather than the template, because ADCS can issue shorter than the template
+  asks. Backfill is best-effort by design: an underived validity leaves the
+  retention floor unknown, which blocks pruning, which is the fail-safe
+  direction — unlike an underived serial, it should not stop the RA starting.
+- **`audit_retention_days`, validated against a floor** of longest observed
+  certificate validity + a fixed 14-day grace. Below the floor **startup is
+  refused**, because retaining for less than a certificate's own lifetime means
+  a certificate can be valid and servable with no record of how it was issued.
+  The grace is a constant, not a setting: it must not be tunable to zero, and it
+  must not collapse as certificate lifetimes shrink.
+- **A retention sweep behind four gates** — retention at or above the floor,
+  `audit_prune_enabled`, `audit_offbox_required`, and a delivery probe that
+  succeeds *at sweep time*. Off by default. With no off-box copy the local
+  `audit_log` is the only evidence there is and nothing is deleted from it, so
+  local-only deployments bound growth by capacity and monitoring instead. The
+  sweep audits itself; a retention pass that leaves no trace is
+  indistinguishable from an attacker's cleanup.
+- **Footprint reporting** at startup (rows, time span, database + JSONL bytes)
+  with a warning past `audit_store_warn_mib` (default 1024). This is the half
+  every deployment gets, and the whole control for local-only ones.
+- **JSONL mirror rotation** (`audit_jsonl_max_mib`, `audit_jsonl_keep`). It was
+  append-forever with no story at all, and it is the larger half of a default
+  install's local footprint.
+- **`audit_log(timestamp)` index.** The table carried no index beyond its
+  primary key, so every time-ranged read was a full scan — invisible while the
+  table was small, dominant once retention keeps months of rows.
+- The `"DELETE FROM audit_log" not in source` architecture test is **narrowed,
+  not removed**. It was a deliberate tripwire whose docstring said adding a
+  pruner "is the review conversation worth having before that ships"; that
+  conversation happened. It now pins deletion to exactly one statement, in one
+  policy-free primitive, callable only from `audit_retention`.
+- Documented the local-only posture alongside the other operator
+  responsibilities, including its real cost: the `certificate-issued` audit row
+  commits in the same transaction as the certificate, so **a full disk stops
+  issuance** rather than issuing unaudited.
+
 ### Security — Daybreak standard pass (2026-08-17; four findings, one fixed)
 
 - **Syslog send failures were counted as successful off-box audit delivery

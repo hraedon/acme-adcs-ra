@@ -137,6 +137,10 @@ class SiemConfig:
     # Seconds a TCP syslog send may block before it is abandoned. Without a
     # deadline a stalled receiver parks the sender indefinitely.
     syslog_timeout_seconds: float = 5.0
+    # Size at which the local JSONL mirror rolls, and how many rolled files are
+    # retained. 0 max_mib keeps the previous append-forever behaviour.
+    jsonl_max_mib: int = 256
+    jsonl_keep: int = 4
     # Maximum audit events held in memory awaiting OFF-BOX delivery (syslog
     # or HEC). See SiemEmitter._submit_bounded for why an unbounded queue
     # was a liability.
@@ -329,6 +333,72 @@ class SiemEmitter:
         line = json.dumps(event, default=str, sort_keys=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+        self._rotate_jsonl_if_needed(path)
+
+    def jsonl_bytes(self) -> int:
+        """Total on-disk size of the JSONL mirror including rotated files.
+
+        Reported to the footprint check because the mirror is the larger half of
+        the local audit footprint on a default install, and it was previously
+        append-forever with no story at all.
+        """
+        path = self._jsonl_path
+        if path is None:
+            return 0
+        total = 0
+        for candidate in [path, *self._rotated_paths(path)]:
+            if candidate.exists():
+                total += candidate.stat().st_size
+        return total
+
+    def _rotated_paths(self, path: Path) -> list[Path]:
+        keep = max(self._config.jsonl_keep, 0)
+        return [path.with_name(f"{path.name}.{i}") for i in range(1, keep + 1)]
+
+    def _rotate_jsonl_if_needed(self, path: Path) -> None:
+        """Roll the mirror at the configured size, keeping N previous files.
+
+        Size-based rather than time-based because the thing being bounded is
+        disk, and the mirror's growth rate is driven by request volume rather
+        than by the clock.
+
+        Rotation *does* discard the oldest file, which for a local-only
+        deployment is the only copy of those events. That is why this is bounded
+        by count rather than deleting outright, why the SQLite ``audit_log``
+        (not the mirror) is the durable local record, and why the mirror's own
+        retention is deliberately independent of ``audit_retention_days``: the
+        table's retention is gated on off-box audit, whereas a file that grows
+        without limit is a capacity fault on every deployment. Set
+        ``audit_jsonl_max_mib`` to 0 to keep the previous append-forever
+        behaviour.
+
+        Best-effort: a failed rotation must never propagate into the caller,
+        which is the audit emission path. The local SQLite row is already
+        durable by this point.
+        """
+        max_bytes = self._config.jsonl_max_mib * 1024 * 1024
+        if max_bytes <= 0:
+            return
+        try:
+            if path.stat().st_size < max_bytes:
+                return
+            keep = max(self._config.jsonl_keep, 0)
+            if keep == 0:
+                # Rotation on with nothing retained: truncate rather than grow.
+                path.write_text("", encoding="utf-8")
+                return
+            # No explicit unlink of the oldest file: the shift below ends with
+            # `.{keep-1}`.replace(`.{keep}`), and Path.replace overwrites its
+            # destination unconditionally on both POSIX and Windows. An unlink
+            # here was dead code (proven by mutation -- removing it changed no
+            # behaviour and failed no test).
+            for i in range(keep - 1, 0, -1):
+                src = path.with_name(f"{path.name}.{i}")
+                if src.exists():
+                    src.replace(path.with_name(f"{path.name}.{i + 1}"))
+            path.replace(path.with_name(f"{path.name}.1"))
+        except OSError:
+            logger.warning("JSONL audit mirror rotation failed", exc_info=True)
 
     def _to_syslog(self, event: dict[str, Any]) -> None:
         """Hand the event to the bounded worker, or drop it under backpressure.
@@ -595,6 +665,8 @@ def build_siem_config(config: RAConfig) -> SiemConfig:
         syslog_port=config.siem_syslog_port,
         syslog_proto=config.siem_syslog_proto,
         syslog_timeout_seconds=config.siem_syslog_timeout_seconds,
+        jsonl_max_mib=config.audit_jsonl_max_mib,
+        jsonl_keep=config.audit_jsonl_keep,
         hec_url=config.siem_hec_url,
         hec_token=hec_token,
         hec_index=config.siem_hec_index,

@@ -98,7 +98,11 @@ hardened by 2026-08-19 F2 in `71e7d8a` (tokens became dotenv loads). The tracker
 entry is simply stale. Only residual: it sits in the D1–D7 officer/registration
 class that has never been live-proven, so live assurance rides the lab session.
 
-### 6. Split **WI-014** — it is ~80% shipped and reads as untouched
+### 6. Split **WI-014** — parts one to three now shipped
+
+> **Update 2026-08-17: retention is BUILT** (floor, gates, sweep, footprint,
+> JSONL rotation, timestamp index). **14a, the `keyChange` limit, is the only
+> piece still open.** Detail in the two bullets below.
 
 Parts one and two are **done**: `audit_bounds.py` bounds each row's *size*
 (attacker-chosen `kid` truncated with a SHA-256 of the whole), and
@@ -106,22 +110,23 @@ Parts one and two are **done**: `audit_bounds.py` bounds each row's *size*
 a window, without deleting anything. What is left is two very different jobs
 that should not share one item:
 
-- **14a (small)** — bound *repeatable successful* transitions. Daybreak F1's
-  `keyChange` is the case: the coalescer deliberately excludes successes
-  ("one-time state transitions keep one row per event"), and that rule is right
-  for issuance but wrong for an action a client can chain forever at no cost.
-  Coalescing is the wrong tool here — a successful key rotation is individually
-  meaningful. Mirror `_check_rate_limit` (`routes/orders.py:42`) instead, keyed
-  per **EAB kid** (so a leaked EAB cannot spread rotations across fresh
-  accounts), and make it **atomic** rather than count-then-check — the reviewer
-  explicitly asks for it, and the round-6 lifetime per-EAB account quota is the
-  in-repo precedent for the transactional pattern.
-- **14b (open-ended, needs an owner decision first)** — retention/archival.
-  Still absent, and still correctly deferred: a pruner is the operation an
-  attacker most wants, so this is a subsystem with its own threat model, not a
-  patch. Wants an explicit retention window with no default, admin-token gating,
-  its own audit rows, tamper-evident continuity across the prune boundary so a
-  gap is detectable, and preferably archive-off-box-then-delete.
+- **14a — STILL OPEN.** Bound *repeatable successful* transitions: Daybreak F1's
+  `keyChange` has no rate, quota or cardinality check, and the coalescer
+  deliberately excludes successes. Mirror `_check_rate_limit`
+  (`routes/orders.py:42`), keyed per **EAB kid** so a leaked EAB cannot spread
+  rotations across fresh accounts, and make it **atomic** rather than
+  count-then-check (the round-6 lifetime per-EAB account quota is the in-repo
+  precedent). Descoped from the retention build deliberately: retention bounds
+  the *storage* consequence, but an unbounded authenticated action is a
+  rate-limiting defect in its own right and wants its own change. Small,
+  Python-only, no lab. **File this as its own item.**
+- **14b — BUILT 2026-08-17.** Retention shipped, and the owner decision it was
+  waiting on got made: the floor is `observed certificate validity + 14 days`
+  (enforced, startup refused below it), and deletion is gated on
+  `audit_offbox_required` *and* a live delivery probe, so the dangerous
+  capability only exists where the local table is a buffer rather than the
+  system of record. Local-only stays supported and never prunes. The sweep
+  audits itself. See the CHANGELOG and `docs/operations.md`.
 
 ---
 

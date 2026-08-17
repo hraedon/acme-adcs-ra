@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -132,6 +133,28 @@ def _serial_from_pem(cert_pem: str) -> str:
     """Return the certificate serial number in canonical uppercase hex."""
     cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
     return canonical_serial(format(cert.serial_number, "x"))
+
+
+def _validity_from_pem(cert_pem: str) -> tuple[str, str]:
+    """Return ``(not_before, not_after)`` as UTC ISO-8601 with a ``Z`` suffix.
+
+    Recorded as columns rather than re-parsed on demand because the audit
+    retention floor is a function of how long the certificates this RA actually
+    issues stay valid: retaining for less than that leaves a *live* certificate
+    with no issuance record, which is an evidence hole rather than a capacity
+    choice. Deriving it from observed issuance rather than from configuration is
+    deliberate — ADCS can issue shorter than the template asks (CA validity
+    clamping), so the template is a request and the certificate is the fact.
+
+    The ``Z`` format matches ``_now_iso`` so the columns sort and range-compare
+    against the rest of the schema's timestamps.
+    """
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    # The naive *_utc accessors are the non-deprecated ones and already UTC.
+    return (
+        cert.not_valid_before_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        cert.not_valid_after_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
 
 
 def _processing_cas(
@@ -359,7 +382,9 @@ CREATE TABLE IF NOT EXISTS certificates (
     status TEXT NOT NULL DEFAULT 'valid',
     revocation_reason TEXT,
     revoked_at TEXT,
-    ca_crl_updated INTEGER NOT NULL DEFAULT 0
+    ca_crl_updated INTEGER NOT NULL DEFAULT 0,
+    not_before TEXT,
+    not_after TEXT
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -374,6 +399,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
     details TEXT NOT NULL,  -- JSON object
     timestamp TEXT NOT NULL
 );
+
+-- audit_log carried no index at all beyond its primary key, so every
+-- time-ranged read was a full table scan. That was invisible while the table
+-- was small and becomes the dominant cost once retention keeps months of rows:
+-- the footprint report, the oldest/newest probe and the retention sweep are all
+-- range queries on timestamp. The column is fixed-width UTC (`...Z`, written by
+-- _now_iso), so lexicographic order is chronological order and BETWEEN/`<`
+-- comparisons are correct without parsing.
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
+    ON audit_log(timestamp);
 """
 
 
@@ -636,10 +671,13 @@ class Store:
             ("revocation_reason", "TEXT"),
             ("revoked_at", "TEXT"),
             ("ca_crl_updated", "INTEGER NOT NULL DEFAULT 0"),
+            ("not_before", "TEXT"),
+            ("not_after", "TEXT"),
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE certificates ADD COLUMN {column} {ddl}")
         self._backfill_certificate_serials(conn)
+        self._backfill_certificate_validity(conn)
 
     def _backfill_certificate_serials(self, conn: sqlite3.Connection) -> None:
         """Derive ``serial_number`` for rows that predate the column.
@@ -745,6 +783,55 @@ class Store:
             raise StoreMigrationError(
                 f"{remaining} certificate row(s) still have no serial_number "
                 "after the backfill; they would be unrevokable through ACME."
+            )
+
+    def _backfill_certificate_validity(self, conn: sqlite3.Connection) -> None:
+        """Derive ``not_before``/``not_after`` for rows that predate the columns.
+
+        Like the serial backfill this is a pure re-derivation of data the row
+        already holds in its own ``cert_pem``, so it runs unattended at startup.
+
+        **Best-effort, unlike the serial backfill, and deliberately so.** An
+        underived serial has no fallback — the certificate is simply unrevokable
+        — which is why that migration refuses to start. An underived *validity*
+        has a safe fallback: the row keeps NULL, and
+        :meth:`certificate_validity_summary` reports it as unknown, which makes
+        the retention floor unknowable and therefore blocks pruning. Refusing to
+        delete is the fail-safe direction, so a historical certificate with a
+        corrupt PEM should not take the RA down; it should cost the deployment
+        its ability to prune until someone looks. Warn loudly and carry on.
+        """
+        rows = conn.execute(
+            "SELECT id, cert_pem FROM certificates "
+            "WHERE not_after IS NULL OR not_after = ''"
+        ).fetchall()
+        if not rows:
+            return
+
+        derived: list[tuple[str, str, str]] = []
+        unparseable: list[str] = []
+        for row in rows:
+            try:
+                not_before, not_after = _validity_from_pem(row["cert_pem"])
+            except (ValueError, TypeError, AttributeError):
+                unparseable.append(str(row["id"]))
+                continue
+            derived.append((not_before, not_after, str(row["id"])))
+
+        if derived:
+            conn.executemany(
+                "UPDATE certificates SET not_before = ?, not_after = ? WHERE id = ?",
+                derived,
+            )
+        if unparseable:
+            logging.getLogger(__name__).warning(
+                "could not derive validity for %d certificate row(s) %s: their "
+                "cert_pem does not parse. The audit retention floor cannot be "
+                "computed while any certificate's validity is unknown, so the "
+                "retention sweep will refuse to run until these are repaired or "
+                "removed.",
+                len(unparseable),
+                sorted(unparseable),
             )
 
     def _migrate_orders_table(self, conn: sqlite3.Connection) -> None:
@@ -1891,14 +1978,15 @@ class Store:
         cert_id = uuid.uuid4().hex
         issued_at = _now_iso()
         serial_number = _serial_from_pem(cert_pem)
+        not_before, not_after = _validity_from_pem(cert_pem)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO certificates
                 (id, order_id, account_id, cert_pem, chain_pem, template,
                  requester, issued_at, metadata, serial_number, status,
-                 revocation_reason, revoked_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 revocation_reason, revoked_at, not_before, not_after)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cert_id,
@@ -1914,6 +2002,8 @@ class Store:
                     CertStatus.VALID,
                     None,
                     None,
+                    not_before,
+                    not_after,
                 ),
             )
         return CertificateRecord(
@@ -1972,6 +2062,7 @@ class Store:
         cert_id = existing.id if existing is not None else uuid.uuid4().hex
         issued_at = existing.issued_at if existing is not None else _now_iso()
         serial_number = _serial_from_pem(cert_pem)
+        not_before, not_after = _validity_from_pem(cert_pem)
         certificate_url = certificate_url_fn(cert_id)
 
         with self._connect() as conn:
@@ -1985,8 +2076,8 @@ class Store:
                     INSERT INTO certificates
                     (id, order_id, account_id, cert_pem, chain_pem, template,
                      requester, issued_at, metadata, serial_number, status,
-                     revocation_reason, revoked_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     revocation_reason, revoked_at, not_before, not_after)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cert_id,
@@ -2002,6 +2093,8 @@ class Store:
                         CertStatus.VALID,
                         None,
                         None,
+                        not_before,
+                        not_after,
                     ),
                 )
             cas_sql, cas_params = _processing_cas(
@@ -2118,6 +2211,7 @@ class Store:
         cert_id = uuid.uuid4().hex
         issued_at = _now_iso()
         serial_number = _serial_from_pem(cert_pem)
+        not_before, not_after = _validity_from_pem(cert_pem)
         req_id = (metadata or {}).get("req_id", "")
 
         with self._connect() as conn:
@@ -2127,8 +2221,9 @@ class Store:
                 INSERT INTO certificates
                 (id, order_id, account_id, cert_pem, chain_pem, template,
                  requester, issued_at, metadata, serial_number, status,
-                 revocation_reason, revoked_at, ca_crl_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                 revocation_reason, revoked_at, ca_crl_updated,
+                 not_before, not_after)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 (
                     cert_id,
@@ -2147,6 +2242,8 @@ class Store:
                     # list on the audit row and in metadata.
                     0,
                     issued_at,
+                    not_before,
+                    not_after,
                 ),
             )
             # Terminal: the client must not be able to retry this order into a
@@ -2577,6 +2674,83 @@ class Store:
                 (_dump_json(bound_details(details)), audit_id),
             )
             return cursor.rowcount > 0
+
+    def certificate_validity_summary(self) -> tuple[int | None, int]:
+        """Return ``(max_validity_days, unknown_count)`` over issued certificates.
+
+        The first element is the longest validity this RA has actually issued,
+        which is the input to the audit retention floor. It is ``None`` when the
+        answer cannot be trusted — no certificates yet, or at least one row whose
+        validity could not be derived. ``None`` must be read as "unknown", never
+        as "zero": the floor exists to stop retention dropping below the life of
+        a certificate that is still valid, so an unknown makes the floor
+        unknowable and the sweep must decline rather than guess low.
+
+        Computed from the stored columns rather than by parsing every PEM, which
+        is the reason those columns exist.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN not_before IS NULL OR not_before = '' "
+                "         OR not_after IS NULL OR not_after = '' "
+                "    THEN 1 ELSE 0 END) AS unknown "
+                "FROM certificates"
+            ).fetchone()
+            total = int(row["total"] or 0)
+            unknown = int(row["unknown"] or 0)
+            if total == 0 or unknown:
+                return None, unknown
+            # julianday() is days-as-float, so the difference is the validity in
+            # days directly. Ceil, so a 7-day-minus-a-second certificate does not
+            # round down and shave the floor.
+            longest = conn.execute(
+                "SELECT MAX(julianday(not_after) - julianday(not_before)) AS d "
+                "FROM certificates"
+            ).fetchone()["d"]
+            if longest is None:
+                return None, unknown
+            return math.ceil(float(longest)), unknown
+
+    def audit_footprint(self) -> dict[str, Any]:
+        """Row count and time span of ``audit_log``, plus the database size.
+
+        The database file covers every table, not just the audit log, so it is
+        reported as what it is — total on-disk cost — rather than attributed to
+        the audit rows. Both numbers are what an operator needs to answer "is
+        this growing in a way I should care about".
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS rows, MIN(timestamp) AS oldest, "
+                "MAX(timestamp) AS newest FROM audit_log"
+            ).fetchone()
+        db_bytes = 0
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(str(self._db_path) + suffix)
+            if path.exists():
+                db_bytes += path.stat().st_size
+        return {
+            "rows": int(row["rows"] or 0),
+            "oldest": row["oldest"],
+            "newest": row["newest"],
+            "db_bytes": db_bytes,
+        }
+
+    def delete_audit_rows_before(self, cutoff_iso: str) -> int:
+        """Delete audit rows strictly older than *cutoff_iso*; return the count.
+
+        Deliberately a dumb primitive with no policy in it. Every decision about
+        whether deleting is safe — off-box audit required, off-box audit
+        *healthy*, a known retention floor — lives in :mod:`audit_retention`, so
+        that this method can never be the thing that decides to destroy
+        evidence. Callers that have not made those checks should not be here.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM audit_log WHERE timestamp < ?", (cutoff_iso,)
+            )
+            return int(cursor.rowcount)
 
     def list_audit_events(
         self,

@@ -25,6 +25,7 @@ from acme_adcs_ra.app_state import (
     logger,
 )
 from acme_adcs_ra.audit_coalesce import DenialCoalescer
+from acme_adcs_ra.audit_retention import assert_retention_above_floor, log_footprint
 from acme_adcs_ra.routes.acme import router as acme_router
 from acme_adcs_ra.routes.admin import router as admin_router
 from acme_adcs_ra.siem import SiemEmitter
@@ -93,6 +94,19 @@ def create_app(context: ServerContext) -> FastAPI:
     context.crl_evidence_gate.set_limits(
         max_workers=context.config.revocation_confirm_crl_max_workers,
         max_pending=context.config.revocation_confirm_crl_max_pending,
+    )
+
+    # Retention floor, then footprint. The floor is a refusal rather than a
+    # warning: retaining for less than a certificate's own lifetime means a
+    # certificate can be valid and servable while the record of how it was
+    # issued has been deleted, which is an evidence hole rather than a tuning
+    # choice. The footprint report is the half every deployment gets, including
+    # the local-only ones that will never delete a row.
+    assert_retention_above_floor(context.config, context.store)
+    log_footprint(
+        context.config,
+        context.store,
+        _siem_emitter.jsonl_bytes() if _siem_emitter is not None else 0,
     )
 
     # H-3: shut down the SIEM emitter pool on app shutdown via lifespan.

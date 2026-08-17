@@ -203,6 +203,44 @@ class RAConfig(BaseSettings):
     # point. Set to 0 to write one row per denial, as before this existed.
     audit_denial_coalesce_window_seconds: int = Field(default=60, ge=0)
 
+    # How long audit rows are kept, in days. 0 (the default) keeps everything,
+    # which is the behaviour that existed before retention was configurable.
+    #
+    # When set, it is validated at startup against a floor of "longest
+    # certificate validity this RA has actually issued, plus a fixed grace
+    # period" — retaining for less than a certificate's own lifetime means a
+    # certificate can be valid and servable while the record of how it was
+    # issued has been deleted. Startup is refused below that floor rather than
+    # warned about; see audit_retention.
+    #
+    # Setting this alone does not delete anything: it declares the policy and
+    # makes the footprint report meaningful. Deletion additionally requires
+    # audit_prune_enabled AND audit_offbox_required AND a live off-box delivery
+    # probe at sweep time.
+    audit_retention_days: int = Field(default=0, ge=0)
+
+    # Arm the retention sweep. Off by default, and deliberately separate from
+    # audit_retention_days so that declaring a policy and destroying evidence
+    # are two decisions rather than one. Ignored unless off-box audit is
+    # required and healthy — with the local audit_log as the only copy, this
+    # RA does not delete from it.
+    audit_prune_enabled: bool = False
+
+    # Warn when the local audit footprint (database + JSONL mirror) exceeds this
+    # many MiB. 0 disables the warning. This is the half that local-only
+    # deployments rely on: they never prune, so measuring is the whole control.
+    # The default is generous against measured growth — a few GiB per 180 days
+    # even under sustained denial flooding — so crossing it means something has
+    # changed rather than that the RA is busy.
+    audit_store_warn_mib: int = Field(default=1024, ge=0)
+
+    # Rotate the JSONL audit mirror at this size, keeping audit_jsonl_keep
+    # files. 0 disables rotation (append forever, as before). The mirror is
+    # local, so rotation is capacity management on a copy — the durable trail is
+    # the SQLite table and, when configured, the off-box sink.
+    audit_jsonl_max_mib: int = Field(default=256, ge=0)
+    audit_jsonl_keep: int = Field(default=4, ge=0)
+
     # --- SIEM / audit emission -----------------------------------------------
     # Auditing every issuance is mandatory (hard rule). There is no toggle.
     # The default sink is JSON-lines next to the database; syslog and Splunk

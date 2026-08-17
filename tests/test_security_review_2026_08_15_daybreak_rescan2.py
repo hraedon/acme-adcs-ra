@@ -494,16 +494,48 @@ class TestUnauthenticatedFloodEndToEnd:
         con.close()
         assert created == 3
 
-    def test_no_store_method_deletes_audit_rows(self) -> None:
-        """The fix bounds growth without ever pruning evidence.
+    def test_audit_deletion_exists_in_exactly_one_gated_place(self) -> None:
+        """Audit deletion is possible, but only through one reviewed door.
 
-        Mutation: add a ``prune_audit_log`` helper and this fails, which is the
-        review conversation worth having before that ships.
+        This assertion used to be ``"DELETE FROM audit_log" not in source`` — a
+        tripwire whose docstring said adding a pruner "is the review
+        conversation worth having before that ships". That conversation happened
+        (2026-08-17, WI-014 part three): retention ships, but only because
+        ``audit_offbox_required`` turns the local table into a buffer whose
+        contents have already left the host. With it unset the local table is
+        still the only copy and nothing deletes from it.
+
+        So the invariant is narrowed rather than dropped. The tripwire's real
+        purpose was to stop deletion appearing *casually*, and that still holds:
+        exactly one statement, in one primitive that makes no policy decisions,
+        with every gate in ``audit_retention``.
+
+        Mutation: add a second ``DELETE FROM audit_log`` anywhere in the store,
+        or call the primitive from outside the retention module, and this fails.
         """
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "src"
-            / "acme_adcs_ra"
-            / "store.py"
-        ).read_text(encoding="utf-8")
-        assert "DELETE FROM audit_log" not in source
+        src_root = Path(__file__).resolve().parents[1] / "src" / "acme_adcs_ra"
+        store_source = (src_root / "store.py").read_text(encoding="utf-8")
+
+        assert store_source.count("DELETE FROM audit_log") == 1, (
+            "audit deletion must exist in exactly one place in the store"
+        )
+        # ...and that place must be the dumb primitive, not some other method
+        # that happens to have grown a delete.
+        after = store_source.split("def delete_audit_rows_before", 1)[1]
+        next_def = after.find("\n    def ")
+        assert "DELETE FROM audit_log" in after[:next_def], (
+            "the only audit deletion must live in delete_audit_rows_before"
+        )
+
+        # No caller outside the retention module may reach the primitive: the
+        # gates are useless if a route can bypass them.
+        callers = [
+            path.name
+            for path in src_root.rglob("*.py")
+            if "delete_audit_rows_before" in path.read_text(encoding="utf-8")
+            and path.name not in {"store.py", "audit_retention.py"}
+        ]
+        assert callers == [], (
+            f"delete_audit_rows_before must only be called from audit_retention; "
+            f"found callers in {callers}"
+        )

@@ -85,6 +85,34 @@ installer never runs PATH-selected `py`, `python`, or `winget`.
 | Python 3.12+ | Install machine-wide before running this script | Fatal — the runtime cannot be built; `-InstallPrereqs` deliberately does not run winget |
 | A TLS server certificate in `LocalMachine\My` | Your PKI | Binding created without a certificate, with a warning |
 | A network allowlist in front of the endpoint | `<ipSecurity>` in web.config, or a scoped firewall rule | Not enforced by the installer — **your responsibility**, and it is a stated pilot condition in the threat model |
+| Capacity for the local audit store, **or** off-box audit | Monitor the footprint warning; or set `audit_offbox_required` with a working sink | Not enforced — **your responsibility**. The `certificate-issued` audit row commits in the *same transaction* as the certificate, so **a full disk stops issuance** rather than issuing unaudited. See below. |
+
+### Local-only audit: a supported posture with a stated cost
+
+`audit_offbox_required` is **off by default**, and running without an off-box
+sink is supported rather than merely tolerated. The cost is explicit, and it is
+availability rather than confidentiality:
+
+- **A full disk stops issuance.** Auditing every issuance is a hard rule of this
+  project, enforced by committing the audit row in the same transaction as the
+  certificate. When that transaction cannot commit, issuance fails. This is the
+  intended failure direction — the alternative is issuing certificates with no
+  record — but it makes audit-store capacity an issuance dependency.
+- **The retention sweep will not run.** With no off-box copy, the local
+  `audit_log` is the only evidence there is, so this RA refuses to delete from
+  it regardless of `audit_retention_days` or `audit_prune_enabled`. Local-only
+  deployments bound growth by *capacity and monitoring*, not by pruning.
+
+What you get instead is measurement: the footprint (SQLite database plus the
+JSONL mirror and its rotated files) is reported at startup and warns past
+`audit_store_warn_mib` (default 1024). Growth is slow — a few GiB per 180 days
+even under sustained denial flooding, because denial rows are coalesced per
+time window rather than per request — so crossing the threshold means something
+has changed rather than that the RA is busy.
+
+To enable pruning you need **all** of: `audit_retention_days` at or above the
+floor, `audit_prune_enabled`, `audit_offbox_required`, and a delivery probe that
+succeeds at sweep time.
 
 ### A note on the Python you provide
 

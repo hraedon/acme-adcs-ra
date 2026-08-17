@@ -665,11 +665,43 @@ operation:
   (the audit is the matching half of the revocation trail; see the
   revocation runbook below).
 
-A retention script is operator-owned (not shipped) — the schema is stable
-(`SELECT * FROM audit_log WHERE timestamp < ?`), so a simple cron/export
-suffices. The RA itself never deletes an audit row; pruning evidence is
-exactly the operation an attacker wants, so it stays a deliberate operator
-action rather than a background job.
+#### Built-in retention (`audit_retention_days`)
+
+The RA can now enforce that window itself, but only in the one deployment shape
+where deleting a local row is not destroying evidence.
+
+**The floor.** `audit_retention_days` is validated at startup against the
+longest certificate validity this RA has *actually issued* (recorded per row in
+`certificates.not_before` / `not_after`) plus a fixed 14-day grace. Configure it
+below that and **startup is refused**, not warned: retaining for less than a
+certificate's own lifetime means a certificate can be valid and servable while
+the record of how it was issued has been deleted. The floor is derived from
+observed issuance rather than from the template, because ADCS can issue shorter
+than the template asks — the template is a request, the certificate is the fact.
+The grace term is a constant rather than a setting, so it cannot be tuned to
+zero, and so it does not collapse as certificate lifetimes shrink.
+
+**The gates.** Deletion requires *all* of:
+
+| Gate | Why |
+|---|---|
+| `audit_retention_days` ≥ floor | see above |
+| `audit_prune_enabled` | declaring a policy and destroying evidence are two decisions |
+| `audit_offbox_required` | with no off-box copy the local table is the only evidence, so nothing is deleted from it |
+| A delivery probe that succeeds **at sweep time** | a sink that worked at startup and has since died is the exact state where deleting is unrecoverable |
+
+Miss any one and the sweep reports what it would have done and deletes nothing.
+That is the expected outcome for most deployments, and for **every** local-only
+one — see the local-only note in `operator-requirements.md` for the trade.
+
+The sweep audits itself (`audit-retention-swept`, carrying the cutoff, the row
+count and the floor). A retention pass that leaves no trace is indistinguishable
+from an attacker's cleanup.
+
+Deleting is still the last resort rather than the first tool: `audit_bounds`
+caps each row's size, `audit_coalesce` caps rows-per-window for replayable
+denials, and the footprint report tells you whether any of it matters. Measured
+growth is a few GiB per 180 days even under sustained flooding.
 
 Attacker-supplied fields inside `details` (notably the offered EAB `kid`) are
 truncated to 256 characters with a SHA-256 of the full value appended, and the
@@ -694,9 +726,16 @@ needed for revocation lookups (serial → cert) and audit. Retention guidance:
 
 - The JSONL sink (`<db>.siem.jsonl`, next to the DB) is the secondary
   emission. Back it up with the DB (see Backup and restore below).
-- Rotate / compress old JSONL on a schedule (operator-owned) so it does not
-  grow unbounded. The SIEM ingest should be the authoritative copy; the
-  local JSONL is the fail-open buffer.
+- **The RA rotates it.** `audit_jsonl_max_mib` (default 256) rolls the mirror to
+  `<name>.1`, `.2`, … and `audit_jsonl_keep` (default 4) bounds how many are
+  retained; set the size to 0 for the previous append-forever behaviour. This is
+  independent of `audit_retention_days` on purpose — the table's retention is
+  gated on off-box audit, whereas a file that grows without limit is a capacity
+  fault on *every* deployment, and the mirror is the larger half of a default
+  install's local footprint. The SIEM ingest should be the authoritative copy;
+  the local JSONL is the fail-open buffer.
+- Rotated files count toward the startup footprint report, so the measured
+  number does not drop simply because the mirror rolled.
 - Coalesced denials reach this sink once per window, not once per request:
   the SIEM sees the window's opening event, and the *next* window's event
   carries the closed one's final tally in `previous_window`. For an exact

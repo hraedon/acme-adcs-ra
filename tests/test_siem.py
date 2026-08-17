@@ -571,3 +571,80 @@ class TestSyslogDeliveryIntegrity:
             )
         finally:
             emitter.close()
+
+
+class TestJsonlRotation:
+    """The JSONL mirror was append-forever, silently doubling the local footprint.
+
+    It is the larger half of a default install's audit footprint, so a retention
+    story that covers only the SQLite table leaves most of the problem in place.
+    """
+
+    def _emitter(self, tmp_path: Path, max_mib: int = 1, keep: int = 2) -> SiemEmitter:
+        return SiemEmitter(
+            SiemConfig(
+                sink="jsonl",
+                jsonl_path=tmp_path / "audit.jsonl",
+                jsonl_max_mib=max_mib,
+                jsonl_keep=keep,
+            )
+        )
+
+    @staticmethod
+    def _fill(emitter: SiemEmitter, payload_bytes: int, rounds: int) -> None:
+        for i in range(rounds):
+            emitter.export({"event_type": "e", "n": i, "pad": "x" * payload_bytes})
+
+    def test_rotates_at_the_configured_size(self, tmp_path: Path) -> None:
+        emitter = self._emitter(tmp_path)
+        try:
+            self._fill(emitter, 4096, 400)  # comfortably past 1 MiB
+            assert (tmp_path / "audit.jsonl.1").exists(), "the mirror never rolled"
+            assert (tmp_path / "audit.jsonl").stat().st_size < 1024 * 1024
+        finally:
+            emitter.close()
+
+    def test_keeps_only_the_configured_number_of_files(self, tmp_path: Path) -> None:
+        emitter = self._emitter(tmp_path, keep=2)
+        try:
+            self._fill(emitter, 4096, 1600)  # several rotations
+            assert (tmp_path / "audit.jsonl.1").exists()
+            assert (tmp_path / "audit.jsonl.2").exists()
+            assert not (tmp_path / "audit.jsonl.3").exists(), (
+                "retained more files than audit_jsonl_keep allows"
+            )
+        finally:
+            emitter.close()
+
+    def test_zero_max_keeps_the_append_forever_behaviour(self, tmp_path: Path) -> None:
+        emitter = self._emitter(tmp_path, max_mib=0)
+        try:
+            self._fill(emitter, 4096, 400)
+            assert not (tmp_path / "audit.jsonl.1").exists()
+            assert (tmp_path / "audit.jsonl").stat().st_size > 1024 * 1024
+        finally:
+            emitter.close()
+
+    def test_jsonl_bytes_counts_rotated_files(self, tmp_path: Path) -> None:
+        """The footprint must not shrink just because the mirror rolled."""
+        emitter = self._emitter(tmp_path)
+        try:
+            self._fill(emitter, 4096, 400)
+            live = (tmp_path / "audit.jsonl").stat().st_size
+            assert (tmp_path / "audit.jsonl.1").exists()
+            assert emitter.jsonl_bytes() > live
+        finally:
+            emitter.close()
+
+    def test_rotation_failure_never_breaks_emission(self, tmp_path: Path) -> None:
+        """Emission is the audit path; a capacity chore must not raise into it."""
+        emitter = self._emitter(tmp_path)
+        try:
+            self._fill(emitter, 4096, 400)
+            # A directory where the rolled file belongs makes replace() fail.
+            (tmp_path / "audit.jsonl.1").exists() and (tmp_path / "audit.jsonl.1").unlink()
+            (tmp_path / "audit.jsonl.1").mkdir()
+            emitter.export({"event_type": "after-broken-rotation"})
+            assert "after-broken-rotation" in (tmp_path / "audit.jsonl").read_text()
+        finally:
+            emitter.close()
