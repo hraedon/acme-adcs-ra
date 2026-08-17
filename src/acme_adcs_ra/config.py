@@ -172,6 +172,17 @@ class RAConfig(BaseSettings):
     # Per-kid overrides: {kid: limit}. If a kid is not listed, the default
     # rate_limit_orders_per_window applies.
     rate_limit_overrides: dict[str, int] = {}
+    # Per-kid ceiling on SUCCESSFUL account-key rollovers per rolling window
+    # (14a / daybreak 2026-08-17 F1). keyChange was the one authenticated
+    # transition with no rate, quota or cardinality check: a valid — or stolen —
+    # account key could chain rotations indefinitely, each one a non-coalesced
+    # audit row. Retention bounds the storage consequence; this bounds the
+    # action. Shares rate_limit_window_seconds with the order limiter, and is
+    # keyed per EAB kid for the same reason: a leaked EAB credential must not
+    # be able to spread rotations across freshly minted account keys.
+    # 0 = disabled. The default is far above legitimate use — rollover is a
+    # rare operation, not a per-renewal one.
+    rate_limit_key_changes_per_window: int = Field(default=5, ge=0)
 
     # --- Unauthenticated nonce ceiling ---------------------------------------
     # /acme/new-nonce is unauthenticated and each call is a SQLite write, so a

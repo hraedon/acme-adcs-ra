@@ -100,9 +100,9 @@ class that has never been live-proven, so live assurance rides the lab session.
 
 ### 6. Split **WI-014** — parts one to three now shipped
 
-> **Update 2026-08-17: retention is BUILT** (floor, gates, sweep, footprint,
-> JSONL rotation, timestamp index). **14a, the `keyChange` limit, is the only
-> piece still open.** Detail in the two bullets below.
+> **Update 2026-08-17: WI-014 IS CLOSED.** Retention is built (floor, gates,
+> sweep, footprint, JSONL rotation, timestamp index) and 14a, the `keyChange`
+> ceiling, shipped the same day. Detail in the two bullets below.
 
 Parts one and two are **done**: `audit_bounds.py` bounds each row's *size*
 (attacker-chosen `kid` truncated with a SHA-256 of the whole), and
@@ -110,16 +110,23 @@ Parts one and two are **done**: `audit_bounds.py` bounds each row's *size*
 a window, without deleting anything. What is left is two very different jobs
 that should not share one item:
 
-- **14a — STILL OPEN.** Bound *repeatable successful* transitions: Daybreak F1's
-  `keyChange` has no rate, quota or cardinality check, and the coalescer
-  deliberately excludes successes. Mirror `_check_rate_limit`
-  (`routes/orders.py:42`), keyed per **EAB kid** so a leaked EAB cannot spread
-  rotations across fresh accounts, and make it **atomic** rather than
-  count-then-check (the round-6 lifetime per-EAB account quota is the in-repo
-  precedent). Descoped from the retention build deliberately: retention bounds
-  the *storage* consequence, but an unbounded authenticated action is a
-  rate-limiting defect in its own right and wants its own change. Small,
-  Python-only, no lab. **File this as its own item.**
+- **14a — BUILT 2026-08-17.** Bounds *repeatable successful* transitions:
+  Daybreak F1's `keyChange` had no rate, quota or cardinality check, and the
+  coalescer deliberately excludes successes. Shipped as
+  `rate_limit_key_changes_per_window` (default 5, `0` disables), keyed per
+  **EAB kid** so a leaked EAB cannot spread rotations across fresh accounts,
+  and enforced **atomically** inside `update_account_key_with_audit` rather
+  than count-then-check — the round-6 lifetime per-EAB account quota was the
+  precedent followed. The denial (`key-change-rate-limited`) is coalesced so
+  the ceiling does not simply move the growth to the refusal row; the success
+  row stays uncoalesced because it is the counter. Seven tests in
+  `tests/test_key_change_rate_limit.py`, each mutation-proven. See the
+  CHANGELOG and `docs/operations.md` → *Key-rollover ceiling*.
+
+  Nothing needs filing for this. It was descoped from the retention build
+  deliberately, not forgotten: retention bounds the *storage* consequence, but
+  an unbounded authenticated action is a rate-limiting defect in its own right
+  and wanted its own change.
 - **14b — BUILT 2026-08-17.** Retention shipped, and the owner decision it was
   waiting on got made: the floor is `observed certificate validity + 14 days`
   (enforced, startup refused below it), and deletion is gated on

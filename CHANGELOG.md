@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — a ceiling on account-key rollover, WI-014 part 14a (2026-08-17)
+
+`keyChange` (RFC 8555 §7.3.5) was the last authenticated transition with no
+rate, quota or cardinality check of any kind. A valid — or stolen — account key
+could chain rotations indefinitely, and each success wrote a durable
+`account-key-changed` row that the denial coalescer deliberately excludes.
+Retention (part three, below) bounds the *storage* consequence; an unbounded
+authenticated action is a rate-limiting defect in its own right, which is why
+this shipped separately rather than being folded into the retention build.
+
+- **`rate_limit_key_changes_per_window` (default 5, `0` disables)** — a ceiling
+  on successful rollovers per rolling window, sharing
+  `rate_limit_window_seconds` with the order limiter. It ships **enabled**: this
+  is a defect fix, and the default sits far above legitimate use (rollover is a
+  rare operational event, and `max_accounts_per_eab_kid` defaults to 1).
+- **Keyed per EAB kid, not per ACME account** — the same reasoning as WI-016's
+  order limit. A per-account key would let a leaked EAB credential reset its
+  budget by enrolling one more account key, which is precisely the move the
+  limit exists to stop.
+- **Enforced inside the rotation transaction**, not by a route-level check.
+  `update_account_key_with_audit` counts, updates the key and writes the audit
+  row under one `BEGIN IMMEDIATE`, following `create_order_with_authz` and the
+  round-6 lifetime EAB account quota. A count-then-rotate split lets a parallel
+  burst all observe the same below-limit count and all proceed — and here every
+  winner is an irreversible key rotation.
+- **The denial is coalesced** (`key-change-rate-limited` joins
+  `COALESCED_EVENT_TYPES`). A ceiling that wrote one durable row per refused
+  attempt would just move the unbounded growth from the success row to the
+  denial row. The success row stays uncoalesced: it is both the only record
+  naming the new key's thumbprint and the counter this limit reads.
+
 ### Added — audit retention, WI-014 part three (2026-08-17)
 
 Parts one and two bounded audit growth without ever deleting (`audit_bounds`

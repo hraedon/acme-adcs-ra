@@ -11,11 +11,13 @@ from acme_adcs_ra.acme_errors import (
     bad_nonce,
     bad_public_key,
     malformed,
+    rate_limited,
     unauthorized,
 )
 from acme_adcs_ra.app_state import (
     _ACME_PATHS,
     ServerContext,
+    _audit,
     authenticate_account,
     emit_audit_hook,
     get_context,
@@ -27,6 +29,7 @@ from acme_adcs_ra.jws import (
     jwk_thumbprint,
     verify_flattened_jws,
 )
+from acme_adcs_ra.store import KeyChangeRateLimitExceeded
 
 router = APIRouter()
 
@@ -141,18 +144,45 @@ async def key_change(
     # the new key's thumbprint, and it used to be written after the rotation
     # had already committed. The SIEM fan-out runs after the commit via the
     # returned event, matching finalize and newAccount.
-    event = ctx.store.update_account_key_with_audit(
-        account_id,
-        new_jwk,
-        audit={
-            "event_type": "account-key-changed",
-            "outcome": "success",
-            "details": {
-                "eab_kid": account.eab_kid,
-                "new_key_thumbprint": new_key_thumbprint,
+    # 14a: the rollover ceiling is enforced INSIDE that transaction, not by a
+    # check here. keyChange was the last authenticated transition with no rate
+    # limit at all, and a route-level count-then-rotate would let a parallel
+    # burst past the ceiling — with each winner an irreversible key rotation.
+    try:
+        event = ctx.store.update_account_key_with_audit(
+            account_id,
+            new_jwk,
+            audit={
+                "event_type": "account-key-changed",
+                "outcome": "success",
+                "details": {
+                    "eab_kid": account.eab_kid,
+                    "new_key_thumbprint": new_key_thumbprint,
+                },
             },
-        },
-    )
+            rate_limit_window_seconds=ctx.config.rate_limit_window_seconds,
+            rate_limit_per_kid=ctx.config.rate_limit_key_changes_per_window,
+        )
+    except KeyChangeRateLimitExceeded as exc:
+        _audit(
+            ctx,
+            event_type="key-change-rate-limited",
+            account_id=account_id,
+            outcome="denied",
+            details={
+                "reason": "per-account-limit",
+                "limit": exc.limit,
+                "window_seconds": exc.window_seconds,
+                "count": exc.count,
+                "scope": "per-account",
+                "kid": exc.kid,
+            },
+        )
+        raise rate_limited(
+            f"key change rate limit exceeded: {exc.count} rollovers in the "
+            f"last {exc.window_seconds}s (limit: {exc.limit})",
+            retry_after=exc.window_seconds,
+        ) from exc
     emit_audit_hook(ctx, event)
 
     return JSONResponse(content={})

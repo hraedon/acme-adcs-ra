@@ -285,15 +285,23 @@ class TestDenialCoalescing:
         membership is pinned so a future addition is a deliberate, reviewed
         change rather than drift.
 
+        ``key-change-rate-limited`` was added deliberately with 14a: it is a
+        cap-exceeded denial, the same class as ``order-rate-limited`` and
+        unbounded for the same reason. Its SUCCESS counterpart,
+        ``account-key-changed``, deliberately stays out — that row is both the
+        provenance of the new key and the counter the ceiling reads.
+
         Mutation: coalesce every event type.
         """
         assert COALESCED_EVENT_TYPES == {
             "account-creation-denied",
             "account-request-denied",
             "order-rate-limited",
+            "key-change-rate-limited",
             "finalize-csr-mismatch",
             "finalize-policy-denied",
         }
+        assert "account-key-changed" not in COALESCED_EVENT_TYPES
         store = _store(tmp_path)
         coalescer = DenialCoalescer(60, clock=_Clock())
 

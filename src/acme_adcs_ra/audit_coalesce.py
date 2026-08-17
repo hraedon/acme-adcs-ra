@@ -80,19 +80,25 @@ from acme_adcs_ra.store import Store, _now_iso
 #
 # * ``account-request-denied`` -- a deactivated or EAB-evicted account key
 #   still authenticates the JWS; the denial is the point.
-# * ``order-rate-limited`` -- requests rejected *because* they exceed a cap
-#   are unbounded by definition: the limiter does not throttle the audit row.
+# * ``order-rate-limited`` / ``key-change-rate-limited`` -- requests rejected
+#   *because* they exceed a cap are unbounded by definition: the limiter does
+#   not throttle the audit row. (14a: the keyChange ceiling would otherwise
+#   just move the growth from the success row to the denial row.)
 # * ``finalize-csr-mismatch`` / ``finalize-policy-denied`` -- cheap pre-enrollment
 #   validation failures on an order that stays ``ready``, so the identical
 #   failing finalize can be replayed forever.
 #
 # Everything else -- issuance, revocation, admin action, one-time state
-# transitions -- keeps one row per event, unconditionally.
+# transitions -- keeps one row per event, unconditionally. In particular the
+# SUCCESSFUL ``account-key-changed`` row is never coalesced: it is both the
+# only record naming the new key's thumbprint and the counter the 14a limiter
+# reads.
 COALESCED_EVENT_TYPES = frozenset(
     {
         "account-creation-denied",
         "account-request-denied",
         "order-rate-limited",
+        "key-change-rate-limited",
         "finalize-csr-mismatch",
         "finalize-policy-denied",
     }

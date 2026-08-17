@@ -303,6 +303,19 @@ class EabAccountLimitExceeded(Exception):
         self.count = count
 
 
+class KeyChangeRateLimitExceeded(Exception):
+    """Raised when atomic key rollover would exceed the per-kid window ceiling."""
+
+    def __init__(
+        self, *, kid: str, limit: int, count: int, window_seconds: int
+    ) -> None:
+        super().__init__("key change rate limit exceeded")
+        self.kid = kid
+        self.limit = limit
+        self.count = count
+        self.window_seconds = window_seconds
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1140,6 +1153,8 @@ class Store:
         new_jwk: dict[str, Any],
         *,
         audit: Mapping[str, Any],
+        rate_limit_window_seconds: int | None = None,
+        rate_limit_per_kid: int = 0,
     ) -> dict[str, Any]:
         """``update_account_key`` plus its audit row in ONE transaction.
 
@@ -1150,6 +1165,19 @@ class Store:
         thumbprint. Same fix shape as ``record_issuance`` and
         ``create_account_with_audit``: commit together or not at all.
 
+        When ``rate_limit_per_kid`` is positive, rollovers already recorded for
+        this account's EAB kid inside the window are counted and the rotation is
+        refused with :class:`KeyChangeRateLimitExceeded` at the ceiling —
+        14a / daybreak 2026-08-17 F1. The count, the key update and the audit
+        insert share one ``BEGIN IMMEDIATE`` transaction for the reason
+        ``create_order_with_authz`` documents: a count-then-check split lets a
+        parallel burst all observe the same below-limit count and all proceed,
+        and here each winner is a key rotation that cannot be undone. The
+        successful ``account-key-changed`` rows ARE the counter — the denial
+        coalescer excludes successes, and the retention floor (validity + 14
+        days) is far longer than any sane window, so the evidence a rotation
+        happened is still on disk when the next one asks.
+
         Returns the audit event for the caller's ``emit_audit_hook``.
         """
         kwargs = dict(audit)
@@ -1157,6 +1185,40 @@ class Store:
             raise ValueError("audit must not carry account_id; it is set from the row")
         thumbprint = jwk_thumbprint(new_jwk)
         with self._connect() as conn:
+            if rate_limit_per_kid > 0:
+                if rate_limit_window_seconds is None or rate_limit_window_seconds < 1:
+                    raise ValueError(
+                        "rate_limit_window_seconds must be positive when a limit is enabled"
+                    )
+                conn.execute("BEGIN IMMEDIATE")
+                account_row = conn.execute(
+                    "SELECT eab_kid FROM accounts WHERE id = ?", (account_id,)
+                ).fetchone()
+                if account_row is None:
+                    raise ValueError("account does not exist")
+                eab_kid = str(account_row["eab_kid"])
+                cutoff = (
+                    datetime.now(UTC)
+                    - timedelta(seconds=rate_limit_window_seconds)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                # Joined on the account rather than read out of the audit row's
+                # details JSON: the kid on the ACCOUNT is the authoritative one,
+                # and it is what the order limiter keys on too.
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM audit_log al "
+                    "JOIN accounts a ON al.account_id = a.id "
+                    "WHERE a.eab_kid = ? AND al.event_type = 'account-key-changed' "
+                    "AND al.outcome = 'success' AND al.timestamp >= ?",
+                    (eab_kid, cutoff),
+                ).fetchone()
+                count = int(row[0])
+                if count >= rate_limit_per_kid:
+                    raise KeyChangeRateLimitExceeded(
+                        kid=eab_kid,
+                        limit=rate_limit_per_kid,
+                        count=count,
+                        window_seconds=rate_limit_window_seconds,
+                    )
             self._update_account_key_in_conn(conn, account_id, new_jwk, thumbprint)
             return self._record_audit_in_conn(conn, account_id=account_id, **kwargs)
 

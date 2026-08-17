@@ -208,6 +208,35 @@ The in-app limit bounds order creation (the expensive path that reaches
 ADCS); the proxy limit bounds raw request rate (including polls and
 challenge POSTs). Both should be configured.
 
+### Key-rollover ceiling (14a)
+
+Order creation is not the only transition a valid credential can repeat.
+Account-key rollover (`keyChange`, RFC 8555 §7.3.5) had no rate, quota or
+cardinality check at all, so a valid — or stolen — account key could chain
+rotations indefinitely, each writing an audit row that is deliberately never
+coalesced. Retention bounds what that costs on disk; this bounds the action.
+
+| Env var | Default | Description |
+|---|---|---|
+| `ACME_RA_RATE_LIMIT_KEY_CHANGES_PER_WINDOW` | `5` | Max successful key rollovers per EAB kid per window. `0` = disabled. |
+
+It shares `ACME_RA_RATE_LIMIT_WINDOW_SECONDS` with the order limiter and is
+keyed per **EAB kid**, not per ACME account, for the same reason: a leaked EAB
+credential must not be able to reset its budget by enrolling a fresh account
+key. Over the limit the RA returns `429` with `Retry-After` and emits
+`key-change-rate-limited`; repeats inside the coalescing window fold into one
+row carrying an exact `denial_count`.
+
+The check, the key update and its audit row share one transaction, so a
+parallel burst cannot slip several rotations past the ceiling — each one that
+did would be irreversible.
+
+**Raising it.** The default is far above legitimate use: rollover is a rare
+operational event, not a per-renewal one, and `max_accounts_per_eab_kid`
+defaults to `1`. Raise it only if you are deliberately rotating many accounts
+under one kid inside a single window (a bulk key-hygiene pass, say), and lower
+it back afterwards.
+
 ### Nonce ceiling (unauthenticated)
 
 `GET`/`HEAD /acme/new-nonce` is unauthenticated by protocol design, and every
