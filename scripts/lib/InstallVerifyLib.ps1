@@ -1392,7 +1392,21 @@ function Stop-AppPoolAndWait {
     # "[ok] no such app pool yet". Nothing here depends on appcmd's exit code or
     # on the wording of a localizable message.
     if (-not $exists.Trim() -and -not $probeErr.Trim()) { return $false }
-    & $AppcmdExe stop apppool /apppool.name:"$AppPool" 2>$null | Out-Null
+    # Shielded like the probe and the prove loop below: on Windows PowerShell
+    # 5.1 under EAP=Stop, ANY redirected native stderr -- even into $null --
+    # wraps the line in an ErrorRecord and terminates the pipeline, so an
+    # appcmd that complains while being told to stop aborted the install with
+    # appcmd's own error text instead of the designed fall-through to
+    # prove-the-worker-gone. (Found by the pester-windows-powershell CI job:
+    # the stop stand-in writing stderr on every invocation. Whether the stop
+    # SUCCEEDED is not load-bearing here -- the loop below proves the outcome.)
+    $stopEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $AppcmdExe stop apppool /apppool.name:"$AppPool" 2>$null | Out-Null
+    } finally {
+        $ErrorActionPreference = $stopEap
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
         # `list wp` stderr is NOT discarded. A broken appcmd -- stopped WAS, a
