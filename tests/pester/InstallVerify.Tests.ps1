@@ -753,12 +753,24 @@ Describe 'install-windows.ps1 never adopts a namespace' {
     It 'still refuses every link-following privileged operation' {
         $script:lib       | Should -Not -Match 'takeown\.exe'
         $script:installer | Should -Not -Match 'takeown\.exe'
-        $calls = @([regex]::Matches($script:lib, '&\s+\$script:IcaclsExe[^\r\n]*'))
+        # The icacls call sites moved behind Invoke-NativeShielded (round 7.3),
+        # so they are now argument ARRAYS rather than bare command lines. The
+        # link-safety guard has to follow them there -- matching only the old
+        # `& $script:IcaclsExe ...` spelling would have silently counted zero
+        # and passed this test vacuously while checking nothing at all.
+        #
+        # An -Arguments array can wrap, so take the text from the call up to the
+        # closing paren of the array literal.
+        $calls = @([regex]::Matches(
+            $script:lib,
+            'Invoke-NativeShielded\s+-Exe\s+\$script:IcaclsExe\s*`?\s*(?:\r?\n\s*)?-Arguments\s+(?<args>[^\r\n]*(?:\r?\n\s*[^\r\n]*)?)'))
         $calls.Count | Should -BeGreaterOrEqual 5
         foreach ($c in $calls) {
-            $c.Value | Should -Match '\s/L\b'
-            $c.Value | Should -Not -Match '\s/c\b'
+            $c.Groups['args'].Value | Should -Match "'/L'"
+            $c.Groups['args'].Value | Should -Not -Match "'/c'"
         }
+        # And nothing may go back to the unshielded spelling.
+        $script:lib | Should -Not -Match '&\s+\$script:IcaclsExe'
     }
 
     It 'proves both trees with the same function the pre-flight uses' {
@@ -2535,5 +2547,93 @@ Describe 'Get-OfficerRights parser: the descending-slice guard (round 7.3)' {
         [BitConverter]::GetBytes([uint32]0x00010000).CopyTo($sd, 32)
         $sd[36] = 1; $sd[37] = 1; $sd[43] = 5; $sd[44] = 18  # S-1-5-18
         { Parse-OfficerRightsSD $sd } | Should -Throw '*no application data*'
+    }
+}
+
+Describe 'Invoke-NativeShielded survives native stderr under EAP=Stop (round 7.3)' {
+    BeforeAll {
+        $script:nsDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ra-nativeshield-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:nsDir | Out-Null
+
+        # Same platform rule as the Stop-AppPoolAndWait fixtures above: the
+        # stand-in must be a NATIVE process on the engine under test, or the
+        # test measures how an unrunnable command surfaces rather than how a
+        # stderr-writing one does.
+        $iw = Get-Variable -Name IsWindows -ErrorAction SilentlyContinue
+        if ($iw) { $script:nsOnWindows = [bool]$iw.Value }
+        else { $script:nsOnWindows = ($env:OS -eq 'Windows_NT') }
+
+        function script:New-NativeFixture([string]$Name, [string[]]$CmdLines, [string[]]$ShLines) {
+            if ($script:nsOnWindows) {
+                $p = Join-Path $script:nsDir "$Name.cmd"
+                [System.IO.File]::WriteAllText($p, ($CmdLines -join "`r`n") + "`r`n")
+            } else {
+                $p = Join-Path $script:nsDir "$Name.sh"
+                [System.IO.File]::WriteAllText($p, ($ShLines -join "`n") + "`n")
+                chmod +x $p
+            }
+            return $p
+        }
+
+        # Writes to stderr AND exits non-zero: the exact shape of an
+        # `icacls /setowner` that cannot take ownership, which is the failure
+        # the owner-candidate fallback loop is written to handle.
+        $script:nsFailing = New-NativeFixture 'failing' @(
+            '@echo off',
+            'echo No mapping between account names and security IDs was done. 1>&2',
+            'exit /b 1332'
+        ) @(
+            '#!/bin/sh',
+            "echo 'No mapping between account names and security IDs was done.' >&2",
+            'exit 1'
+        )
+    }
+
+    AfterAll {
+        if ($script:nsDir -and (Test-Path $script:nsDir)) {
+            Remove-Item $script:nsDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'returns the stderr text and the exit code instead of terminating' {
+        # The caller's EAP -- this is what every function in the library sets,
+        # and what makes an unshielded 2>&1 terminate on 5.1.
+        $ErrorActionPreference = 'Stop'
+        $run = Invoke-NativeShielded -Exe $script:nsFailing -Arguments @()
+        $run.ExitCode | Should -Not -Be 0
+        (($run.Output | Out-String)) | Should -Match 'No mapping between account names'
+    }
+
+    It 'restores the caller ErrorActionPreference afterwards' {
+        $ErrorActionPreference = 'Stop'
+        $null = Invoke-NativeShielded -Exe $script:nsFailing -Arguments @()
+        $ErrorActionPreference | Should -Be 'Stop'
+    }
+
+    It 'lets a caller loop fall through to a later candidate after a failing one' {
+        # THE regression this primitive exists for. Unshielded, the first
+        # failing candidate terminated the loop, so the name-form fallback in
+        # Get-AdministratorsOwnerCandidates was dead code on Windows
+        # PowerShell 5.1 -- and the hostile-namespace throw that the loop
+        # falls into was replaced by icacls's own raw text.
+        $ErrorActionPreference = 'Stop'
+        $tried = @()
+        foreach ($candidate in @('first', 'second')) {
+            $tried += $candidate
+            $run = Invoke-NativeShielded -Exe $script:nsFailing -Arguments @()
+            if ($run.ExitCode -eq 0) { break }
+        }
+        $tried | Should -Be @('first', 'second')
+    }
+
+    It 'leaves no raw redirected icacls invocation in the shipped library' {
+        # A text guard, deliberately: the point of the primitive is that a new
+        # native call site cannot quietly reintroduce the hazard. Any future
+        # `& $script:IcaclsExe ... 2>&1` fails here rather than escaping to a
+        # live install for the eighth time.
+        $libPath = Join-Path $PSScriptRoot '..\..\scripts\lib\InstallVerifyLib.ps1'
+        $text = Get-Content -LiteralPath $libPath -Raw
+        $offenders = [regex]::Matches($text, '&\s*\$script:IcaclsExe[^\r\n]*2>(&1|\$null)')
+        $offenders.Count | Should -Be 0
     }
 }

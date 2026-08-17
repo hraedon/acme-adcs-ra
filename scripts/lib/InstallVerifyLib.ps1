@@ -232,6 +232,48 @@ function Test-InstallRootAttributesAcceptable {
 # So: `/c` is gone from every call (a single unprocessable object must abort the
 # install, not be skipped), the exit code is authoritative, and the summary text
 # is checked as a second, English-only belt-and-braces.
+# Run a native executable, capture stdout AND stderr, and return both with the
+# exit code -- WITHOUT letting a stderr line become a terminating error.
+#
+# This exists because `& native 2>&1` is not a capture on Windows PowerShell 5.1,
+# which is the ONLY engine this installer runs on. Each stderr line is turned
+# into an ErrorRecord on the output stream, and under $ErrorActionPreference =
+# 'Stop' -- which nearly every function in this library sets -- the FIRST one
+# terminates the pipeline. The assignment never happens, so the careful
+# exit-code-and-output classification on the next line never runs, and the
+# actionable message the failure path was written to produce is never reached.
+# The caller sees the native tool's raw text instead.
+#
+# That family has now escaped SEVEN times in this repository: three in
+# Stop-AppPoolAndWait alone (probe, prove-loop, and the stop call itself, the
+# last found by the 5.1 CI job on 2026-08-17), and the icacls sites converted
+# below, found live on 2026-08-17 by running the real fallback loop on a real
+# 5.1 host. Every one was written as `2>&1` plus a classify-the-output check,
+# and every one silently lost the check.
+#
+# The repetition is the actual defect: the shield is seven lines of save/set/
+# try/finally, so each new native call site had to remember it independently and
+# some did not. One primitive, used everywhere, is what makes forgetting
+# impossible -- a call site either uses this and is shielded, or does not use it
+# and is visible to the test that enumerates native invocations.
+#
+# Mirrors Invoke-ChildScript in lib/SyncLib.ps1, which solved the same problem
+# for the revocation agent's child processes on 2026-08-13.
+function Invoke-NativeShielded {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Exe @Arguments 2>&1
+        return [pscustomobject]@{ Output = @($out); ExitCode = $LASTEXITCODE }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
 function Test-IcaclsOutputClean {
     param(
         [Parameter(Mandatory = $true)][int]$ExitCode,
@@ -299,9 +341,16 @@ function Reset-TreeToInherited {
     $ownerFailures = @()
     $owned = $false
     foreach ($principal in (Get-AdministratorsOwnerCandidates)) {
-        $out = & $script:IcaclsExe $Path /setowner $principal /t /q /L 2>&1
-        if (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out) { $owned = $true; break }
-        $ownerFailures += ("{0} -> exit {1}: {2}" -f $principal, $LASTEXITCODE, (($out | Out-String).Trim()))
+        # Shielded: an unshielded `2>&1` here terminated the loop on the FIRST
+        # candidate that wrote to stderr, so the name-form fallback documented
+        # on Get-AdministratorsOwnerCandidates was unreachable on 5.1 -- and the
+        # hostile-namespace throw below (the message this path exists to print)
+        # was replaced by icacls's raw "Access is denied".
+        $run = Invoke-NativeShielded -Exe $script:IcaclsExe `
+            -Arguments @($Path, '/setowner', $principal, '/t', '/q', '/L')
+        $out = $run.Output
+        if (Test-IcaclsOutputClean -ExitCode $run.ExitCode -Output $out) { $owned = $true; break }
+        $ownerFailures += ("{0} -> exit {1}: {2}" -f $principal, $run.ExitCode, (($out | Out-String).Trim()))
     }
     if (-not $owned) {
         throw ("Reset-TreeToInherited: could not claim ownership of $Path for the Administrators " +
@@ -316,9 +365,10 @@ function Reset-TreeToInherited {
     # protection tree-wide. Descendants become pure inheritors, so the caller's
     # protected root DACL propagates to all of them. We own every object by now,
     # so this cannot be denied.
-    $out = & $script:IcaclsExe $Path /reset /t /q /L 2>&1
-    if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
-        throw ("Reset-TreeToInherited: icacls /reset failed on $Path (exit $LASTEXITCODE): " +
+    $run = Invoke-NativeShielded -Exe $script:IcaclsExe -Arguments @($Path, '/reset', '/t', '/q', '/L')
+    $out = $run.Output
+    if (-not (Test-IcaclsOutputClean -ExitCode $run.ExitCode -Output $out)) {
+        throw ("Reset-TreeToInherited: icacls /reset failed on $Path (exit $($run.ExitCode)): " +
                (($out | Out-String).Trim()) +
                "`nExplicit ACEs may have survived; refusing to continue.")
     }
@@ -370,16 +420,19 @@ function Set-ObjectProtectedDacl {
     )
     $ErrorActionPreference = 'Stop'
     if (-not $SkipReset) {
-        $out = & $script:IcaclsExe $Path /reset /q /L 2>&1
-        if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
-            throw ("Set-ObjectProtectedDacl: icacls /reset failed on $Path (exit $LASTEXITCODE): " +
+        $run = Invoke-NativeShielded -Exe $script:IcaclsExe -Arguments @($Path, '/reset', '/q', '/L')
+        $out = $run.Output
+        if (-not (Test-IcaclsOutputClean -ExitCode $run.ExitCode -Output $out)) {
+            throw ("Set-ObjectProtectedDacl: icacls /reset failed on $Path (exit $($run.ExitCode)): " +
                    (($out | Out-String).Trim()))
         }
     }
-    $out = & $script:IcaclsExe $Path /inheritance:r /grant:r @Grants /L 2>&1
-    if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
+    $run = Invoke-NativeShielded -Exe $script:IcaclsExe `
+        -Arguments (@($Path, '/inheritance:r', '/grant:r') + $Grants + @('/L'))
+    $out = $run.Output
+    if (-not (Test-IcaclsOutputClean -ExitCode $run.ExitCode -Output $out)) {
         throw ("Set-ObjectProtectedDacl: icacls /inheritance:r /grant:r failed on " +
-               "$Path (exit $LASTEXITCODE) with grants: $($Grants -join ' ') : " +
+               "$Path (exit $($run.ExitCode)) with grants: $($Grants -join ' ') : " +
                (($out | Out-String).Trim()))
     }
 }
@@ -471,8 +524,11 @@ function New-AtomicProtectedDirectory {
     $owned = $false
     $ownerFailures = @()
     foreach ($principal in (Get-AdministratorsOwnerCandidates)) {
-        $out = & $script:IcaclsExe $Path /setowner $principal /q /L 2>&1
-        if (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out) {
+        # Shielded for the same reason as Reset-TreeToInherited's loop above.
+        $run = Invoke-NativeShielded -Exe $script:IcaclsExe `
+            -Arguments @($Path, '/setowner', $principal, '/q', '/L')
+        $out = $run.Output
+        if (Test-IcaclsOutputClean -ExitCode $run.ExitCode -Output $out) {
             $owned = $true
             break
         }
@@ -835,9 +891,10 @@ function Get-InstallTreeViolations {
     try {
         # /L: dump the links themselves rather than following them, so the
         # read-back cannot be redirected any more than the writes can.
-        $out = & $script:IcaclsExe $Root /save $tmp /t /q /L 2>&1
-        if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
-            return @("$Root : icacls /save failed (exit $LASTEXITCODE): " +
+        $run = Invoke-NativeShielded -Exe $script:IcaclsExe -Arguments @($Root, '/save', $tmp, '/t', '/q', '/L')
+        $out = $run.Output
+        if (-not (Test-IcaclsOutputClean -ExitCode $run.ExitCode -Output $out)) {
+            return @("$Root : icacls /save failed (exit $($run.ExitCode)): " +
                      (($out | Out-String).Trim()) +
                      " -- the tree ACL could not be read back in full, so it cannot be trusted")
         }
@@ -869,9 +926,10 @@ function Get-InstallTreeViolations {
                                 "that can rewrite its DACL is an issuance-policy hole")
             }
             $tmpEntry = Get-InstallVerifyScratchPath -FileName ("ra-aclcheck-" + [guid]::NewGuid().ToString('N') + ".txt")
-            $out = & $script:IcaclsExe $entryPath /save $tmpEntry /q /L 2>&1
-            if (-not (Test-IcaclsOutputClean -ExitCode $LASTEXITCODE -Output $out)) {
-                $violations += "$entryPath : icacls /save failed (exit $LASTEXITCODE): $(($out | Out-String).Trim())"
+            $run = Invoke-NativeShielded -Exe $script:IcaclsExe -Arguments @($entryPath, '/save', $tmpEntry, '/q', '/L')
+            $out = $run.Output
+            if (-not (Test-IcaclsOutputClean -ExitCode $run.ExitCode -Output $out)) {
+                $violations += "$entryPath : icacls /save failed (exit $($run.ExitCode)): $(($out | Out-String).Trim())"
                 continue
             }
             $violations += Test-AclDumpLocked -DumpText (Get-IcaclsDumpText -Path $tmpEntry) `
