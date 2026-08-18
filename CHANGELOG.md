@@ -92,7 +92,12 @@ making it hard to do by accident.
   `audit_log` is the only evidence there is and nothing is deleted from it, so
   local-only deployments bound growth by capacity and monitoring instead. The
   sweep audits itself; a retention pass that leaves no trace is
-  indistinguishable from an attacker's cleanup.
+  indistinguishable from an attacker's cleanup. **`run_sweep` has no production
+  caller yet** — no admin route, no scheduled task, no lifecycle hook — so a
+  deployment that configures retention today prunes nothing. Wiring it is
+  deliberately deferred until the delivery probe stops accepting an
+  unacknowledged UDP datagram, the `DELETE` and its audit row commit atomically,
+  and the sweep event is exported off-box.
 - **Footprint reporting** at startup (rows, time span, database + JSONL bytes)
   with a warning past `audit_store_warn_mib` (default 1024). This is the half
   every deployment gets, and the whole control for local-only ones.

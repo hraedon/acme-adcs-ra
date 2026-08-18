@@ -108,9 +108,12 @@ class that has never been live-proven, so live assurance rides the lab session.
 
 ### 6. Split **WI-014** — parts one to three now shipped
 
-> **Update 2026-08-17: WI-014 IS CLOSED.** Retention is built (floor, gates,
-> sweep, footprint, JSONL rotation, timestamp index) and 14a, the `keyChange`
-> ceiling, shipped the same day. Detail in the two bullets below.
+> **Update 2026-08-17: 14a is closed; 14b is BUILT BUT NOT WIRED.** Retention
+> exists (floor, gates, sweep, footprint, JSONL rotation, timestamp index) and
+> 14a, the `keyChange` ceiling, shipped the same day — but **nothing calls the
+> sweep** (item 7, found 2026-08-18). An earlier revision of this note said
+> "WI-014 IS CLOSED"; that was wrong on the 14b half. Detail in the two bullets
+> below.
 
 Parts one and two are **done**: `audit_bounds.py` bounds each row's *size*
 (attacker-chosen `kid` truncated with a SHA-256 of the whole), and
@@ -135,13 +138,108 @@ that should not share one item:
   deliberately, not forgotten: retention bounds the *storage* consequence, but
   an unbounded authenticated action is a rate-limiting defect in its own right
   and wanted its own change.
-- **14b — BUILT 2026-08-17.** Retention shipped, and the owner decision it was
-  waiting on got made: the floor is `observed certificate validity + 14 days`
+- **14b — BUILT 2026-08-17, NOT REACHABLE IN PRODUCTION.** The code, the floor,
+  the gates and the self-audit are all real; `run_sweep` simply has no caller
+  outside the tests, so a deployment that configures retention prunes nothing
+  (**item 7**). Three deferred safety gaps must close before it is wired, and
+  **item 8 is a hard prerequisite** — see the sequencing note. Everything below
+  describes what was built, not what runs: the floor is `observed certificate validity + 14 days`
   (enforced, startup refused below it), and deletion is gated on
   `audit_offbox_required` *and* a live delivery probe, so the dangerous
   capability only exists where the local table is a buffer rather than the
   system of record. Local-only stays supported and never prunes. The sweep
   audits itself. See the CHANGELOG and `docs/operations.md`.
+
+### 7. (bug, medium) — NEW. **Audit retention never runs.**
+
+`run_sweep` (`audit_retention.py:190`) has **no caller outside the test suite**.
+Verified 2026-08-18: no admin route, no entry in
+`Register-MaintenanceTasks.ps1` (which registers nonce-cleanup and
+expired-order-sweep, but nothing for retention), no lifecycle hook.
+
+So an operator who follows `docs/operations.md` → *Built-in retention*, sets
+`audit_retention_days` at or above the floor and turns on
+`audit_prune_enabled`, gets a feature that is configured, validated at startup,
+documented — and never executes. Nothing unsafe happens; the harm is the belief
+that audit growth is bounded when it is not, which is the belief that stops
+someone watching the disk.
+
+Shipped by the 14b retention build (WI-014 part three). Options are a scheduled
+task against a new admin route (the shape the other two maintenance jobs
+already use), a lifecycle hook, or documenting it explicitly as library-only.
+
+**Do not wire this before item 8 and the three deferred safety gaps below.**
+See the sequencing note after item 9.
+
+### 8. (bug, medium) — NEW. **A UDP syslog probe satisfies `audit_offbox_required` with nothing listening.**
+
+`SiemExporter`'s startup probe (`siem.py:560-581`) returns `True` for
+`syslog_proto=udp` whenever the socket accepts the datagram, which it always
+does. Reproduced by the scanner against an unused port: `enabled=True`,
+`ok=True`, no collector.
+
+The code is *candid* about it — the returned detail says in as many words that
+"reachability is NOT proven" — but the **boolean** is what gates startup, and
+the boolean says yes. `audit_offbox_required` exists to refuse to start unless
+audit evidence leaves the box; on UDP it refuses nothing.
+
+Mitigating: the shipped `web.config` selects TCP, so no shipped configuration
+reaches this. Fix is small — make the UDP probe return `False` for this gate,
+and require HEC acknowledgment or an explicitly accepted TCP check.
+
+**This is the prerequisite for item 7.** See the sequencing note below.
+
+### 9. (bug, low) — NEW. **TCP syslog connect is not bounded by the configured timeout.**
+
+`_apply_send_timeout` (`siem.py:69-92`) runs *after*
+`SysLogHandler.createSocket()` has already resolved and connected, so
+`siem_syslog_timeout_seconds` bounds **sends only**. DNS resolution and the TCP
+connect fall back to the OS default, so a blackholed collector can stall
+service construction — or the single reconnect worker — well past the deadline
+the operator configured.
+
+The docstring only ever claimed to bound a send, so this is a gap rather than a
+broken promise. Fix: create the socket, set the deadline, then connect, and
+bound resolution plus establishment with one wall-clock deadline.
+
+**Check cert-watch for the same shape** — it shares this handler's lineage and
+is already recorded as having no TCP send timeout at all.
+
+### Sequencing note for items 7, 8 and 9
+
+Items 7 and 8 are individually low-severity and were scored separately. They
+interlock, and the order matters:
+
+> Deletion is gated on `audit_offbox_required` **and** a live delivery probe at
+> sweep time. Item 8 says that probe passes on UDP with no collector. So wiring
+> up the sweep (item 7) while item 8 stands would make the UDP hole
+> **load-bearing for deleting the only surviving copy** of audit rows.
+
+Fix 8 first, then 7. The same review deferred three more must-fix-before-wiring
+gaps on the same theme, all of which are only harmless today *because* nothing
+calls `run_sweep`:
+
+- retention can delete rows that were never delivered to SIEM — the
+  delivery-watermark semantics need to exist before deletion is reachable;
+- the `DELETE` and its `audit-retention-swept` row **commit separately**; they
+  should be atomic, the same rule `record_issuance`, `create_account_with_audit`
+  and `update_account_key_with_audit` already follow;
+- the sweep event is never exported off-box, so a retention pass leaves no
+  off-host trace — which is precisely the property that makes a sweep
+  indistinguishable from an attacker's cleanup.
+
+**Provenance for items 7–9.** Codex security scan of
+`7325cdb`→`47bb9f7` (run `f0da0988`, sealed 2026-08-18T01:00:33Z): 3 findings,
+all low severity and high confidence. Each was independently re-verified by
+hand before being recorded here. The same run found **no issue** in the 14a
+keyChange ceiling ("the prior unlimited-rotation vector is resolved") and **no
+regression** in the `Revoke-Cert.ps1` certutil fix, though it had no live
+PowerShell 5.1 or ADCS to execute against — that half is covered by the
+2026-08-17 lab pass. Report and artifacts kept at
+`samples/codex-scans/20260818-SvRVRx/` (gitignored: they name lab hosts).
+
+Items 2 and 3 of that scan's predecessor run remain open and unchanged as
+items 4 and 3 above.
 
 ---
 
