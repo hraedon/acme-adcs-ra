@@ -1327,9 +1327,13 @@ Describe 'install-windows.ps1: round-5 fixes' {
         $postState | Should -BeGreaterThan $stateCreate
     }
 
-    It 'M: -ConfigureIIS proves a pre-existing site tree (reparse + per-object DACL) or refuses' {
+    It 'M: -ConfigureIIS proves a pre-existing site tree (reparse + DACL + chain) or refuses' {
+        # WI-015 replaced the inline per-object loop with Get-TreeTrustViolations,
+        # which adds the ancestor chain the round-2 follow-up had withheld. The
+        # behaviour of that function is driven directly further down; this only
+        # asserts the installer calls it on the site path.
         $script:installer | Should -Match 'Find-ReparsePoints -Path \$SitePath'
-        $script:installer | Should -Match 'Test-ObjectDaclTrusted -Path \$obj\.FullName'
+        $script:installer | Should -Match 'Get-TreeTrustViolations -Path \$SitePath'
         $script:installer | Should -Not -Match 'AlsoFlagTrustees'
         $script:installer | Should -Match 'is not administrator-only'
     }
@@ -2635,5 +2639,98 @@ Describe 'Invoke-NativeShielded survives native stderr under EAP=Stop (round 7.3
         $text = Get-Content -LiteralPath $libPath -Raw
         $offenders = [regex]::Matches($text, '&\s*\$script:IcaclsExe[^\r\n]*2>(&1|\$null)')
         $offenders.Count | Should -Be 0
+    }
+}
+
+# 2026-08-17 Daybreak F3 / 2026-08-18 unfiled item 3. The privileged script
+# tree -- the directory a scheduled task executes Sync-Revocations.ps1 from as
+# the gMSA, every interval, forever -- was authenticated by nothing but
+# Test-Path. Measured on the lab host 2026-08-17: C:\Temp\ra-scripts carried
+# BUILTIN\Users:(I)(CI)(AD) and (I)(CI)(WD) inherited from C:\Temp, so an
+# unprivileged local user could plant a replacement script there. The control
+# existed and was simply not pointed at this path.
+#
+# Behaviour, not source text: these drive the real function with a shimmed
+# Get-Acl, which is what the round-7.3 block above established after
+# string-matching tests were found to survive a neutered implementation.
+Describe 'Get-TreeTrustViolations: the tree a privileged task runs from' {
+    BeforeAll {
+        $script:tree = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-tree-" + [guid]::NewGuid())
+        $null = New-Item -ItemType Directory -Path (Join-Path $script:tree 'lib') -Force
+        Set-Content -LiteralPath (Join-Path $script:tree 'Sync-Revocations.ps1') -Value '# entry point'
+        Set-Content -LiteralPath (Join-Path $script:tree 'lib/SyncLib.ps1') -Value '# dot-sourced at run time'
+
+        # Path-keyed ACLs: $script:WritablePaths names the objects that carry an
+        # inherited BUILTIN\Users write ACE; everything else is administrator-only.
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            $p = if ($LiteralPath) { $LiteralPath } else { $Path }
+            $rules = @(
+                [pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'S-1-5-32-544' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = 0
+                    PropagationFlags  = 0
+                })
+            if (@($script:WritablePaths) -contains $p) {
+                # The measured C:\Temp shape: Users, container-inheriting,
+                # write-class, and NOT inherit-only -- so it applies here.
+                $rules += [pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'S-1-5-32-545' }
+                    FileSystemRights  = ([System.Security.AccessControl.FileSystemRights]::WriteData -bor
+                                         [System.Security.AccessControl.FileSystemRights]::Delete)
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = ([int][System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                                         [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+                    PropagationFlags  = 0
+                }
+            }
+            [pscustomobject]@{ Owner = 'S-1-5-32-544'; Access = $rules; Sddl = 'O:BAG:BAD:' }
+        }
+    }
+
+    AfterAll {
+        Remove-Item function:global:Get-Acl -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:tree -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'passes an administrator-only tree' {
+        $script:WritablePaths = @()
+        @(Get-TreeTrustViolations -Path $script:tree).Count | Should -Be 0
+    }
+
+    It 'refuses when the tree directory itself is user-writable' {
+        $script:WritablePaths = @($script:tree)
+        $v = @(Get-TreeTrustViolations -Path $script:tree)
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'write-class access'
+    }
+
+    It 'refuses when only a DIRECTORY ABOVE the tree is writable (the C:\Temp case)' {
+        # The violation the lab measured is inherited from the parent; the tree
+        # and its files can look locally fine. A per-file scan alone misses it.
+        $script:WritablePaths = @((Split-Path -Parent $script:tree))
+        @(Get-TreeTrustViolations -Path $script:tree).Count | Should -BeGreaterThan 0
+    }
+
+    It 'refuses when a single dot-sourced file inside a clean tree is writable' {
+        # The chain walk alone misses this one: it never descends. The task
+        # action names Sync-Revocations.ps1, but that script dot-sources
+        # lib\SyncLib.ps1 at run time, so a writable sibling is equally fatal.
+        $script:WritablePaths = @((Join-Path $script:tree 'lib/SyncLib.ps1'))
+        $v = @(Get-TreeTrustViolations -Path $script:tree)
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'SyncLib'
+    }
+
+    It 'refuses a NULL DACL anywhere in the tree' {
+        $script:WritablePaths = @()
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            [pscustomobject]@{ Owner = 'S-1-5-32-544'; Access = @(); Sddl = 'O:BAG:BAD:' }
+        }
+        $v = @(Get-TreeTrustViolations -Path $script:tree)
+        ($v -join ' ') | Should -Match 'no ACEs'
     }
 }

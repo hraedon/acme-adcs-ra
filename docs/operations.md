@@ -928,6 +928,23 @@ functional gap without granting the enrollment gMSA any CA-officer rights.
 > `scripts/lib/*.ps1` at runtime (the shared byte/SD and task-action builders,
 > also exercised by the Pester suite); without `scripts/lib/` alongside them they
 > fail at load with a "cannot find lib/..." error.
+>
+> **Copy it somewhere administrator-only, and not `C:\Temp`.** The installer
+> does not place this tree for you, so wherever you put it is where a scheduled
+> task will execute privileged code from every interval, forever. Any directory
+> a non-administrator can write to — or any writable directory *above* it — lets
+> that user replace `Sync-Revocations.ps1` between runs and have the gMSA run it.
+> Measured on the lab host 2026-08-17: `C:\Temp\ra-scripts` inherited
+> `BUILTIN\Users:(I)(CI)(AD)` and `(I)(CI)(WD)` from `C:\Temp`. A subdirectory of
+> `%ProgramFiles%` is the right shape — it is what the installer uses for the
+> code root, and for the same reason.
+>
+> `Register-MaintenanceTasks.ps1` now **refuses** to register the revocation-sync
+> task from a tree that fails this check, naming the offending object and the
+> principal that can write it. It checks the whole ancestor chain *and* every
+> file beneath the tree, because the action dot-sources `lib\` siblings at run
+> time. `-AllowUntrustedScriptPath` downgrades the refusal to a warning for lab
+> reproduction; do not use it for a pilot or production registration.
 
 The loop:
 

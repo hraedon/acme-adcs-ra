@@ -112,6 +112,16 @@
     ## Dry-run -> execute promotion). Re-register without -DryRun to arm the
     task. Only meaningful with -RegisterRevocationSync.
 
+.PARAMETER AllowUntrustedScriptPath
+    Register the revocation-sync task even when this script tree, or a
+    directory above it, can be written by a non-administrator. The task
+    executes Sync-Revocations.ps1 from this tree as the task identity on
+    every run, so a writable tree means whoever can write it decides what
+    runs privileged. Measured on the lab host 2026-08-17: the staged tree
+    C:\Temp\ra-scripts carried BUILTIN\Users:(I)(CI)(AD) and (I)(CI)(WD)
+    inherited from C:\Temp. Use only to reproduce a known-untrusted staging
+    path, never for a pilot or production registration.
+
 .PARAMETER WhatIf
     Dry run: print the actions that would be taken without registering
     anything.
@@ -171,6 +181,12 @@ param(
     [switch]$DryRun,
     [switch]$PublishCrl,
     [switch]$AllowInsecureUrl,
+    # Accept a privileged script tree that is NOT administrator-only. See the
+    # provenance gate below for what this gives up; it exists because lab and
+    # first-install flows stage the tree under paths like C:\Temp, and a hard
+    # refusal with no override strands them. Registering is the wrong time to
+    # discover you cannot proceed at all.
+    [switch]$AllowUntrustedScriptPath,
     # Where the task reads its credentials AT RUN TIME (2026-08-19 F2). The
     # tokens are never written into the task definition; the action loads
     # them from this file, which the installer ACLs to Administrators/SYSTEM
@@ -223,6 +239,57 @@ if ($registerSync -and -not $ConfirmToken -and -not $AdminToken) {
 if ($registerSync -and [string]::IsNullOrWhiteSpace($CaConfig)) {
     Write-Error "-RegisterRevocationSync/-RevocationSyncOnly requires -CaConfig (the CA configuration string, e.g. 'CA01\WORK-DOMAIN-CA')."
     exit 3
+}
+
+# The privileged script tree must be administrator-only before its path is
+# PERSISTED into a scheduled task (Daybreak 2026-08-17 F3).
+#
+# The nonce/sweep tasks call Invoke-RestMethod inline and execute nothing from
+# disk, so this applies to the revocation-sync task, whose action names
+# Sync-Revocations.ps1 by absolute path and runs it as the task identity every
+# interval, forever. The installer deliberately does not install scripts/ --
+# docs/operations.md tells the operator to copy it somewhere -- so this tree
+# lands wherever a human put it, with whatever DACL that location carries. The
+# lab put it in C:\Temp\ra-scripts, which inherits BUILTIN\Users create/write
+# from C:\Temp: an unprivileged local user could drop a replacement
+# Sync-Revocations.ps1 there and wait fifteen minutes for the gMSA to run it.
+#
+# The control already existed and simply was not pointed here: this is the same
+# Test-PathChainTrusted the installer applies before executing an interpreter,
+# and the same one that refuses a C:\Temp installer source. Each file is checked
+# as well as the chain, because the action dot-sources siblings out of lib\ at
+# run time.
+#
+# Honest about what this is worth: the check is loaded from the very tree it
+# judges, so someone who can already write here can neuter it. That is not the
+# threat it addresses. It addresses the tree being writable in the first place
+# -- an accidental staging path adopted permanently, and a planted file that
+# arrives AFTER registration, which is the measured case. An attacker who can
+# rewrite this tree today already owns the elevated registration itself.
+if ($registerSync) {
+    . "$PSScriptRoot/lib/InstallVerifyLib.ps1"
+    $treeViolations = @(Get-TreeTrustViolations -Path $PSScriptRoot)
+    if ($treeViolations.Count -gt 0) {
+        $detail = ($treeViolations | Select-Object -First 8) -join "`n  "
+        if ($AllowUntrustedScriptPath) {
+            Write-Warning ("The script tree $PSScriptRoot is NOT administrator-only, and " +
+                           "-AllowUntrustedScriptPath was passed:`n  $detail`n" +
+                           "The registered task will execute Sync-Revocations.ps1 from this tree as " +
+                           "$TaskUser on every run, so whoever can write here chooses what runs " +
+                           "privileged. Move the tree under %ProgramFiles% and re-register before pilot.")
+        } else {
+            Write-Error ("Refusing to register a privileged task that executes from $PSScriptRoot : " +
+                         "the tree, or a directory above it, is writable by a non-administrator.`n  $detail`n" +
+                         "The task action runs Sync-Revocations.ps1 from this path as $TaskUser every " +
+                         "$IntervalMinutes minutes, so a writable tree hands that execution to whoever " +
+                         "can write it. Copy scripts\ somewhere administrator-only (a subdirectory of " +
+                         "%ProgramFiles% is the shape the installer uses for the code root) and re-run " +
+                         "from there. To register anyway -- lab only -- pass -AllowUntrustedScriptPath.")
+            exit 3
+        }
+    } else {
+        Write-Output "Script tree proven administrator-only: $PSScriptRoot"
+    }
 }
 
 # M-2: -LocalMode and -DryRun only have an effect with -RegisterRevocationSync.

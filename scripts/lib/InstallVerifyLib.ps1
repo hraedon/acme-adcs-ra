@@ -1806,6 +1806,29 @@ function Test-PathChainTrusted {
     return @($violations | Where-Object { $_ })
 }
 
+# The provenance gate for a whole TREE that privileged code is read or executed
+# from -- as opposed to Test-PathChainTrusted, which authenticates one file and
+# the directories above it. Two callers, the same question:
+#
+#   * the operator script tree, because a scheduled task names one script by
+#     absolute path but that script dot-sources siblings out of lib\ at run time;
+#   * the IIS site tree, because web.config under it is the gMSA launch
+#     configuration.
+#
+# Chain first (catches a writable directory ABOVE the tree -- the measured
+# C:\Temp\ra-scripts case, where the violation is inherited from C:\Temp and
+# every file below looks locally fine), then every object beneath it (catches a
+# single loosened file inside an otherwise clean tree). Either alone passes a
+# tree the other rejects.
+function Get-TreeTrustViolations {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $violations = @(Test-PathChainTrusted -Path $Path)
+    foreach ($obj in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue)) {
+        $violations += Test-ObjectDaclTrusted -Path $obj.FullName
+    }
+    return @($violations | Where-Object { $_ })
+}
+
 # Fail-closed validation of the web.config the gMSA pool will launch from.
 # web.config IS launch configuration: httpPlatform/@processPath names the
 # executable IIS starts as the gMSA. Round 5: this used to be a warning whose

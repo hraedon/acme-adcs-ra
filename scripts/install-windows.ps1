@@ -1286,12 +1286,26 @@ if ($ConfigureIIS) {
                        "launch-configuration tree can redirect what IIS reads as the gMSA launch " +
                        "configuration. Remove or rename the site directory and re-run.")
             }
-            $siteViol = @()
-            foreach ($obj in @(Get-Item -LiteralPath $SitePath -Force; Get-ChildItem -LiteralPath $SitePath -Recurse -Force)) {
-                $siteViol += Test-ObjectDaclTrusted -Path $obj.FullName
-            }
+            # WI-015: the ancestor chain, not only the tree itself. Round 2
+            # deliberately WITHHELD this half pending a live DACL baseline,
+            # because a default IIS install might legitimately have failed it.
+            # Surveyed live on the lab IIS host 2026-08-17: C:\inetpub and
+            # C:\inetpub\acme-adcs-ra are both CLEAN -- Users hold (RX) and
+            # (OI)(CI)(IO)(GR,GE), read and execute, no write-class access
+            # anywhere on the chain. The same survey discriminates rather than
+            # passing everything: C:\ProgramData\acme-adcs-ra reports two
+            # violations on the same function. So the refusal can be added
+            # without breaking a default install, which is the evidence this
+            # was waiting on.
+            #
+            # A writable directory ABOVE the site root is not a lesser problem
+            # than a writable file inside it: it lets a local user rename the
+            # tree aside and substitute their own, web.config included, and
+            # web.config is what names the executable IIS starts as the gMSA.
+            $siteViol = @(Get-TreeTrustViolations -Path $SitePath)
             if (@($siteViol).Count -gt 0) {
-                throw ("The pre-existing site tree $SitePath is not administrator-only:`n  " +
+                throw ("The pre-existing site tree $SitePath is not administrator-only " +
+                       "(the tree itself, its contents, or a directory above it):`n  " +
                        (($siteViol | Select-Object -First 8) -join "`n  ") +
                        "`nweb.config under it is the gMSA launch configuration: a tree a local user " +
                        "can write is a tree that decides what runs as the gMSA. Inspect the site " +
