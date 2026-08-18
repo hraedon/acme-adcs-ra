@@ -55,8 +55,16 @@ unauthenticated script tree) is valid and better founded than the report knows:
 - the lab itself stages CA-officer scripts in `C:\Temp\ra-scripts`.
 
 `Test-ObjectDaclTrusted` already exists; it is simply not applied to the
-privileged script path. Wants the same live Windows session as the outstanding
-revocation proof.
+privileged script path.
+
+**Measured live 2026-08-17.** `C:\Temp\ra-scripts` — the path the registered
+revocation-sync task actually executes as the gMSA — carries
+`BUILTIN\Users:(I)(CI)(AD)` and `BUILTIN\Users:(I)(CI)(WD)`, inherited from
+`C:\Temp`. So an unprivileged local user can create files in the directory tree
+a scheduled task runs privileged code from. That is no longer a design concern
+awaiting evidence; it is a measurement. The same session watched
+`Test-ObjectDaclTrusted` refuse `C:\Temp` as an *installer source* for exactly
+this reason — the control exists and is simply not pointed at this path.
 
 ### 4. (decision) — NEW, low effort
 
@@ -139,15 +147,20 @@ that should not share one item:
 
 ## Standing validation debt (not work items, but do not lose them)
 
-- **Rverify, the sync/queue drain, and the officer-script class D1–D7 have never
-  been executed** at any tip on this branch. Round 7 was blocked by what it
-  diagnosed as a CA DCOM fault; that diagnosis was **retracted 2026-08-17** — it
-  was the SSH logon session holding no Kerberos TGT (runbook §1). The work is
-  unblocked and needs a lab session.
-- **`01417b5`** (98-line Windows PowerShell 5.1 fix to `InstallVerifyLib.ps1`)
-  landed after the round-7 live proof and has never been live-installed. CI's
-  5.1 Pester job is green on it, but the round-6 and round-7 live runs each
-  found installer defects that green Pester missed.
-- Branch `security-review-2026-08-15-daybreak` is **24 commits ahead of `main`
-  with no PR open**. `security-review-2026-08-18` and `-08-19` are fully merged
-  and stale.
+- ~~**Rverify, the sync/queue drain, and the officer-script class D1–D7 have
+  never been executed**~~ — **DONE 2026-08-17** on tip `e7c4254`. All three ran
+  live and passed, after the run found and fixed the defect that made the whole
+  revocation loop inert (`838eeb2`). See the validation log in
+  `docs/pre-pilot-checklist.md`. What remains unproven is **phase L**
+  (`Lqueue`/`Ldrain`, the stale-worker enrollment lease) — not attempted this
+  session, now outstanding after three.
+- ~~**`01417b5`** (98-line Windows PowerShell 5.1 fix to `InstallVerifyLib.ps1`)
+  has never been live-installed~~ — **DONE 2026-08-17**: the installer ran from
+  `e7c4254` on the lab host and exited 0. Note it also *refused* a `C:\Temp`
+  source tree on DACL grounds, which is the hardening working and which every
+  earlier runbook deploy step now trips over.
+- Branch `security-review-2026-08-15-daybreak` is **26 commits ahead of `main`
+  with no PR open** (14a `e7c4254` and the revocation fix `838eeb2` are the two
+  newest). `security-review-2026-08-18` and `-08-19` are fully merged and stale.
+  This branch now carries a full live E2E pass; opening the PR is an owner
+  decision, not a blocked one.

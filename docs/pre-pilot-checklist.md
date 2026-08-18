@@ -163,6 +163,80 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Full live E2E re-proof executed (2026-08-17), tip `e7c4254` (14a), on the
+  lab RA host and issuing CA.** CI green on the proven commit before deploy;
+  local gates green (`ruff`, `mypy`, 876 pytest, 363 Pester on pwsh 7). The run
+  covered the whole canonical pass — §A issuance/EKU/SAN/chain/CA-denial/reason
+  codes (14/14), §A.1 front controls (13/13), CRL freshness, the GET-form
+  default, both transport-orphan branches, the revocation round trip through the
+  registered task as the gMSA, the least-privilege denials, the agent authority
+  split, and the CRL-evidence cycle — plus the new §K for 14a. **It found one
+  defect, fixed and re-proven live in the same session:**
+
+  - **Live-found (fixed in `838eeb2`): the entire CA-side revocation loop was
+    inert.** `Sync-Revocations.ps1` exited 2 with nothing revoked; every
+    `certutil` call in `Revoke-Cert.ps1` reached the process **without its
+    `-config`** and the non-CA RA host answered *"No local Certification
+    Authority; use -config option"*. Cause: `Invoke-CertUtil` splatted its
+    argument array into `Invoke-CertUtilCapture`. Splatting an array into a
+    **native** command (the original `& certutil @CertutilArgs`) gives one
+    argument per element; splatting it into a **PowerShell function** binds only
+    the first element and drops the rest into `$args`, silently. Seven arguments
+    in, one out, on every certutil call in the file — the `-revoke` included.
+    Introduced by `a69859d`, a security-hardening commit. Both helpers are now
+    advanced functions, so the mistake is a binding error rather than silence,
+    and three Pester tests assert the argv certutil actually receives (all three
+    fail against the old code). Re-proven live: 7 pending, 2 revoked, 5
+    already-revoked-at-CA recovered through the confirmation retry, 0 failed,
+    agent exit 0, RA queue drained to empty.
+  - **CI could not have caught it.** The Windows job runs pytest; the Pester
+    suite already stubbed `certutil` but never asserted *which* arguments
+    arrived. 363 green Pester tests coexisted with a revocation path that could
+    not revoke. This is the fifth escaped PowerShell defect across three rounds,
+    and the third whose common factor is that no test executed the real call.
+  - **14a (§K, 12/12) proven live**: the ceiling ships **enabled** (read from
+    the deployment, not assumed), five rollovers accepted and the sixth refused
+    `429 rateLimited` with `Retry-After: 3600`; the refusal is **atomic** — the
+    account key did not rotate, the last allowed key still authenticates and the
+    refused key gets 401; exactly five `account-key-changed` rows and one
+    coalesced `key-change-rate-limited` row naming the kid and limit; and a
+    freshly minted account under the same EAB kid is refused on its **first**
+    rollover, so the per-kid keying holds.
+  - **Least privilege re-proven**: the scoped officer cannot publish a CRL
+    (`0x80070005`), cannot revoke outside its template
+    (`CERTSRV_E_RESTRICTEDOFFICER`), reason 8 is refused before the CA is
+    touched (exit 3), and the gMSA token still carries no `Domain Computers`
+    (the E-1 restricted primary group).
+  - **Agent authority split re-proven**: admin-token-only revokes at the CA but
+    is refused on the confirm endpoint (401 → exit 2, serial stays pending);
+    confirm-token-only, with no admin token on the host at all, recovers it and
+    exits 0. Both runs took their credentials from the ACL'd dotenv, so no token
+    reached an argv or a log.
+  - **CRL evidence fail-closed then verified**: with
+    `require_crl_evidence` on, the confirm is refused 400 with audit
+    `crl-evidence-required-but-absent` (exit 2); after an administrator
+    republishes, the confirm succeeds and the audit records
+    `verification: "crl-verified"`.
+  - **`Set-OfficerRights.ps1` provisioned a CA whose `OfficerRights` was ABSENT**
+    — the round-7 "Buffer cannot be null" defect on the first-provisioning path
+    is fixed and live-proven.
+  - **Reproduced, not a regression**: this CA's CRL validity window
+    (7d 12h 20m) still exceeds the RA's default 7-day evidence ceiling (CRL3),
+    so the ceiling must be set from the CA's real cadence. Unchanged operator
+    finding, deliberately measured against the shipped default.
+  - **Not proven this round**: phase L (`Lqueue`/`Ldrain`, the stale-worker
+    enrollment lease) was not run — still the standing validation debt, now
+    unproven after three sessions. The MSI no-digest/staged-copy refusals remain
+    owed from round 6. The privileged-script-path item gained live evidence
+    rather than a fix: `C:\Temp\ra-scripts`, the path the gMSA sync task
+    executes from, measures `BUILTIN\Users:(CI)(AD)` and `(WD)`.
+  - **Teardown verified**: all 7 certificates this run caused the CA to issue
+    are revoked (including the untracked ReqID-only orphan, ReqID 249) and the
+    CRL republished; `OfficerRights` ABSENT and `CA\Security` back to its
+    pristine 224 bytes / 4 ACEs; `denyUrlSequences` empty; store and dotenv
+    restored with an identical fingerprint (integrity ok, all row counts equal)
+    and the app pool back to `Started`.
+
 - **Round-6 native Windows re-proof executed (2026-08-16), final tip
   `8964eba`, on the lab RA host under Windows PowerShell 5.1.** The run
   covered the full live re-proof (§A, §A.1, CRL/G, both transport-orphan
