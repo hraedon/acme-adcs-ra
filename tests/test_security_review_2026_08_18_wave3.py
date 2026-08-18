@@ -239,8 +239,20 @@ class TestOffboxDeliveryIsProven:
             with contextlib.suppress(OSError):
                 listener.close()
 
-    def test_a_udp_syslog_probe_says_what_it_did_not_prove(self) -> None:
-        """UDP cannot acknowledge. The detail must not imply it did."""
+    def test_a_udp_syslog_probe_fails_rather_than_explaining_itself(self) -> None:
+        """UDP cannot acknowledge, so it cannot pass — SUPERSEDED 2026-08-18.
+
+        This wave's fix made the probe *honest*: it returned True with a detail
+        string saying in as many words that reachability was NOT proven. The
+        2026-08-18 Codex scan (item 8) pointed out that the caller gates startup
+        on the boolean and never reads the detail, so `audit_offbox_required`
+        still refused nothing over UDP. The candour was real and useless. What
+        this wave was reaching for is now expressed where it has effect.
+
+        Kept rather than deleted because it is the regression that matters: a
+        future refactor that restores "True with a caveat" would reopen the
+        hole. Full coverage in `tests/test_codex_scan_2026_08_18.py`.
+        """
         emitter = SiemEmitter(
             SiemConfig(
                 sink="syslog",
@@ -251,8 +263,8 @@ class TestOffboxDeliveryIsProven:
         )
         try:
             ok, detail = emitter.probe_offbox_delivery()
-            assert ok is True
-            assert "NOT proven" in detail
+            assert ok is False
+            assert "fire-and-forget" in detail
             assert "syslog_proto=tcp" in detail
         finally:
             emitter.close()

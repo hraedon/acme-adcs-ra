@@ -507,6 +507,21 @@ class RAConfig(BaseSettings):
                 "itself, so a host compromise takes the audit trail with it. "
                 "Configure the syslog or hec sink."
             )
+        if (
+            self.audit_offbox_required
+            and self.siem_sink == "syslog"
+            and self.siem_syslog_proto == "udp"
+        ):
+            raise ValueError(
+                "audit_offbox_required is set with siem_syslog_proto='udp'. "
+                "UDP is fire-and-forget: the socket accepts every datagram "
+                "whether or not a collector exists, so the startup delivery "
+                "probe cannot distinguish a working collector from none at "
+                "all, and 'required' would mean nothing. Set "
+                "siem_syslog_proto='tcp' (proves a live transport) or use the "
+                "hec sink (proves receipt). The shipped web.config already "
+                "selects tcp."
+            )
         return self
 
     @model_validator(mode="after")

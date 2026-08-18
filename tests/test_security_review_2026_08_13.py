@@ -260,7 +260,15 @@ class TestOffboxAuditGate:
                 "siem_hec_url": "http://hec.example/x",
                 "siem_hec_token": SecretStr("t"),
             },
-            {"siem_sink": "syslog", "siem_syslog_host": ""},
+            # TCP so config validation admits the combination at all: an
+            # `audit_offbox_required` + UDP config is refused outright as of
+            # 2026-08-18 item 8, and this case is about the *emitter* being
+            # disabled by an empty host, which is a later gate.
+            {
+                "siem_sink": "syslog",
+                "siem_syslog_host": "",
+                "siem_syslog_proto": "tcp",
+            },
         ],
     )
     def test_startup_fails_when_the_required_emitter_is_disabled(
