@@ -6,6 +6,111 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — a UDP syslog probe satisfied `audit_offbox_required` with nothing listening (2026-08-18)
+
+Codex scan of `7325cdb`→`47bb9f7`, recorded as unfiled item 8. `audit_offbox_required`
+exists to refuse to start unless audit evidence leaves the box. On UDP it
+refused nothing: `SiemExporter`'s startup probe returned `True` whenever the
+socket accepted the datagram, which a datagram socket always does. Reproduced
+against an unused port — `enabled=True`, `ok=True`, no collector.
+
+The code was already candid about this; the returned *detail* said in as many
+words that reachability was NOT proven. But the **boolean** is what gates
+startup, and the caller never reads the detail. That candour shipped as the
+previous wave's fix (2026-08-18 wave 3 F2), so this is the same finding one
+level deeper.
+
+- **The UDP probe now returns `False`.** Requiring off-box audit and
+  demonstrating it over UDP are mutually exclusive, so the honest answer is a
+  refusal, not a caveat. TCP still passes — it proves a live transport, which is
+  the strongest claim syslog can make — and HEC still proves receipt.
+- **Config refuses the combination outright**, so it fails at startup validation
+  with an actionable message rather than at the probe. The shipped `web.config`
+  already selects TCP, so no shipped configuration reaches this.
+- **This was the prerequisite for wiring the retention sweep** (item 7, still
+  open). Deletion in `audit_retention` is gated on this same probe, so wiring
+  `run_sweep` while UDP passed would have made the hole load-bearing for
+  deleting the only surviving copy of audit rows. A test asserts a real UDP
+  emitter cannot open that gate.
+
+### Fixed — the TCP syslog connect ignored the configured timeout (2026-08-18)
+
+Unfiled item 9. `_apply_send_timeout` ran *after*
+`SysLogHandler.createSocket()` had already resolved and connected, so
+`siem_syslog_timeout_seconds` bounded **sends only**. DNS resolution and the TCP
+handshake fell back to the OS default, so a blackholed collector could stall
+service construction — or the single reconnect worker — well past the deadline
+the operator set. The docstring only ever claimed to bound a send, so this was a
+gap rather than a broken promise.
+
+- **One wall-clock deadline** now covers resolution plus every address the
+  resolver returns, so a multi-homed target cannot multiply the wait by its
+  address count. `getaddrinfo` takes no timeout and blocks in the OS resolver,
+  so it runs in a daemon thread that is abandoned rather than waited on.
+- Datagram and Unix sockets keep the stock path; neither connects.
+- The regression test measures it: against a resolver stub that never answers,
+  the pre-fix code took 30s and then connected happily.
+
+### Security — the privileged script tree was authenticated by nothing but `Test-Path` (2026-08-18)
+
+Daybreak 2026-08-17 F3, recorded as unfiled item 3. The installer does not
+install `scripts/` at all — `docs/operations.md` tells operators to hand-copy it
+— so the tree lands wherever a human put it, and
+`Register-MaintenanceTasks.ps1` then persists that path into a scheduled task
+that executes `Sync-Revocations.ps1` as the gMSA every interval, forever.
+
+Measured live 2026-08-17, so this is not a design concern awaiting evidence:
+`C:\Temp\ra-scripts` — the path the registered task actually ran from — carried
+`BUILTIN\Users:(I)(CI)(AD)` and `BUILTIN\Users:(I)(CI)(WD)`, inherited from
+`C:\Temp`. An unprivileged local user could drop a replacement script there and
+wait fifteen minutes. The same session watched `Test-ObjectDaclTrusted` refuse
+`C:\Temp` as an *installer source* for exactly this reason: the control existed
+and was simply not pointed at this path.
+
+- **`Get-TreeTrustViolations`** applies the installer's provenance rule to
+  a whole tree: the ancestor chain (catches the measured inherited-from-`C:\Temp`
+  case, where every file looks locally fine) **and** every object beneath it
+  (catches one loosened file in an otherwise clean tree). Either half alone
+  passes a tree the other rejects; both are mutation-proven.
+- **`Register-MaintenanceTasks.ps1` refuses** to register the revocation-sync
+  task from a failing tree, naming the object and the principal that can write
+  it. The nonce/sweep tasks are unaffected — they call `Invoke-RestMethod`
+  inline and execute nothing from disk.
+- **`-AllowUntrustedScriptPath`** downgrades the refusal to a loud warning, for
+  lab and first-install staging. Same shape as `-AllowInsecureUrl`.
+- Honest scope: the check is loaded from the tree it judges, so it does not stop
+  an attacker who can already write there — it stops the tree being writable in
+  the first place, and the plant that arrives *after* registration, which is the
+  measured case.
+
+### Security — the IIS site tree is now proven up its ancestor chain, WI-015 (2026-08-18)
+
+The round-2 follow-up deliberately **withheld** the `-SitePath` ancestor-chain
+refusal pending a live DACL baseline, because a default IIS install might
+legitimately have failed it. The installer therefore checked the site tree and
+everything in it, but not the directories above it — and a writable directory
+above the site root lets a local user rename the tree aside and substitute
+their own, `web.config` included, which is what names the executable IIS starts
+as the gMSA.
+
+The baseline was surveyed live on the lab IIS host 2026-08-17 and recorded on
+WI-015: `C:\inetpub` and `C:\inetpub\acme-adcs-ra` are both clean — `BUILTIN\Users`
+hold `(RX)` and `(OI)(CI)(IO)(GR,GE)`, no write-class access anywhere on the
+chain — while `C:\ProgramData\acme-adcs-ra` reports two violations on the same
+function, so the survey discriminates rather than passing everything. That was
+the evidence the fix was waiting on, so the refusal now ships: the site-tree
+proof calls the same `Get-TreeTrustViolations` as the script-tree gate above.
+
+### Documented — the `<ipSecurity>` allowlist posture is now a recorded decision (2026-08-18)
+
+Unfiled item 4. Two independent reviews (2026-08-11, 2026-08-17 Daybreak) raised
+the commented-out allowlist in `deploy/iis/web.config`; the first adjudicated it
+and the second re-found it because that adjudication lived only in a review
+document. `SECURITY.md` gains a **Recorded decisions** section stating the
+disposition, the compensating controls in code, and what would change it — so
+the next reviewer argues with a decision rather than re-filing a finding.
+
+
 ### Fixed — the CA-side revocation loop was inert (2026-08-17, live)
 
 Found by the live re-proof, not by CI: `Sync-Revocations.ps1` exited 2 with

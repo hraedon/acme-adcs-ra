@@ -14,7 +14,34 @@ this project); only `work-item file` / `update` fail. Reproduced against both
 being worked on concurrently, so this was left alone rather than migrated —
 recreating the authoritative store is an owner decision, not a mechanical fix.
 
+**Re-checked 2026-08-18** — still failing, identically, for both
+`work-item update` and `breadcrumb file`. Reads still work. So this file is
+still the only tracker, and it has grown a second job: recording work that is
+*finished* but cannot be marked finished anywhere else.
+
 **Reconcile this file into regista once writes are restored, then delete it.**
+
+---
+
+## Status at a glance (2026-08-18)
+
+| # | What | State |
+|---|---|---|
+| 1 | Syslog sends counted as delivered | closed 2026-08-17, filed here for the record |
+| 2 | WI-014 second vector (`keyChange`) | **needs filing** — shipped as 14a, the tracker does not know |
+| 3 | Privileged script tree unauthenticated | **CLOSED 2026-08-18** (code + tests + docs) |
+| — | WI-015 `-SitePath` ancestor chain | **CLOSED 2026-08-18** — fell out of item 3's helper; **mark done in the store** |
+| 4 | `ipSecurity` posture undocumented | **CLOSED 2026-08-18** (`SECURITY.md` → Recorded decisions) |
+| 5 | WI-053 is stale | **needs closing in the store** — re-verified in code 2026-08-18 |
+| 6 | WI-014 split | **needs filing** — 14a shipped, 14b built and unwired |
+| 7 | Audit retention never runs | **open** — prerequisite (item 8) now cleared; three safety gaps remain |
+| 8 | UDP probe satisfied `audit_offbox_required` | **CLOSED 2026-08-18** |
+| 9 | TCP syslog connect unbounded | **CLOSED 2026-08-18** (acme-adcs-ra); cert-watch half open, see below |
+
+Everything marked CLOSED is in the working tree on
+`security-review-2026-08-15-daybreak`, with tests, and needs no tracker entry
+beyond a note that it happened. Everything marked **needs filing** is a
+tracker-only action with no code left to write.
 
 ---
 
@@ -66,6 +93,34 @@ awaiting evidence; it is a measurement. The same session watched
 `Test-ObjectDaclTrusted` refuse `C:\Temp` as an *installer source* for exactly
 this reason — the control exists and is simply not pointed at this path.
 
+> **CLOSED 2026-08-18.** `Get-TreeTrustViolations` (in `InstallVerifyLib.ps1`,
+> beside `Test-PathChainTrusted`) applies the installer's provenance rule to a
+> whole tree — ancestor chain *and* every object beneath it, because the action
+> dot-sources `lib\` siblings at run time. Either half alone passes a tree the
+> other rejects; both halves are mutation-proven in
+> `tests/pester/InstallVerify.Tests.ps1` (5 new tests, suite 368 green).
+> `Register-MaintenanceTasks.ps1` refuses to register the revocation-sync task
+> from a failing tree, with `-AllowUntrustedScriptPath` as the explicit lab
+> override (same shape as `-AllowInsecureUrl`). `docs/operations.md` now says
+> where to put the tree and why, in the same note that already told operators to
+> copy it.
+>
+> **Residual, deliberately not done:** `Sync-Revocations.ps1` does not re-check
+> the tree at *run* time. Doing so would load `InstallVerifyLib.ps1` — two
+> `Add-Type` C# compiles — on a 15-minute cadence, and with registration now
+> refusing untrusted trees the remaining exposure is a DACL loosened *after*
+> registration, which needs administrator rights. Worth revisiting if the lib is
+> ever split so the DACL primitives can be loaded on their own.
+>
+> **WI-015 is a different path, and it is now closed too.** That item is the
+> `-SitePath` ancestor-chain refusal for the *IIS site* tree — round 2 withheld
+> it pending a live DACL baseline, and the baseline was surveyed on 2026-08-17
+> (`C:\inetpub` chain clean; `C:\ProgramData\acme-adcs-ra` still reports two
+> violations, so the check discriminates). Writing `Get-TreeTrustViolations` for
+> the script tree produced exactly the chain-plus-contents shape WI-015 needed,
+> so the installer's site-tree proof now calls it and the ancestor half ships.
+> **Mark WI-015 done when the store accepts writes.**
+
 ### 4. (decision) — NEW, low effort
 
 **Record the IIS `ipSecurity` posture explicitly in `SECURITY.md`.**
@@ -77,6 +132,14 @@ allowlist documented as required and operator-owned in
 raise it. A short "accepted, and why" note in `SECURITY.md` ends the cycle — or,
 if the posture should actually change, that is a deliberate decision to take
 rather than a finding to keep re-triaging.
+
+> **CLOSED 2026-08-18.** `SECURITY.md` gains a **Recorded decisions** section
+> carrying the disposition, why the installer does not enforce an allowlist (the
+> IPs are per-deployment; `<ipSecurity>` needs a role service a first install may
+> not have), where it *is* documented as required, the compensating controls in
+> code (nonce token bucket, WI-016 order limits), and what would change the
+> trade. The posture did not change — only its visibility. A reviewer who
+> disagrees is now arguing with a decision rather than filing a finding.
 
 ### 5. **WI-053 IS ALREADY FIXED — close it**
 
@@ -99,6 +162,11 @@ into the revocation-sync action. Neither is true any more:
   `-RevocationSyncOnly -ConfirmToken`; `docs/pre-pilot-checklist.md:722`
   *requires* it. So the "documented way to deploy it", which was the item's
   actual complaint, is fixed too.
+
+**Re-verified 2026-08-18** against the working tree: `-AdminToken` is still
+`[switch]`, still gated on `$registerGeneral`, and `Build-SyncActionCommand`
+still has no token parameter. The item is stale, not wrong-once. Attempting the
+close is what proved the store is still refusing writes.
 
 Closed by the 2026-08-15 review (`-AdminToken` made non-mandatory plus the new
 `-RevocationSyncOnly` switch — see `docs/security-review-2026-08-15.md:114`) and
@@ -189,6 +257,22 @@ and require HEC acknowledgment or an explicitly accepted TCP check.
 
 **This is the prerequisite for item 7.** See the sequencing note below.
 
+> **CLOSED 2026-08-18.** The UDP branch returns `False`, and `RAConfig` refuses
+> `audit_offbox_required` with `siem_syslog_proto=udp` outright, so the failure
+> is an actionable startup message rather than a probe result nobody sees. No
+> escape hatch: requiring off-box audit and demonstrating it over UDP are
+> mutually exclusive, which is the whole finding. Covered by
+> `tests/test_codex_scan_2026_08_18.py` — including the case that matters most,
+> that a real UDP emitter is `enabled` (so it clears the earlier gate) and still
+> cannot open `audit_retention.evaluate`'s deletion gate.
+>
+> Three existing tests encoded the old behaviour and were updated rather than
+> deleted; the wave-3 one that asserted "True with an honest caveat" now asserts
+> the refusal, since a refactor restoring the caveat would reopen this.
+>
+> **Item 7's prerequisite is therefore cleared** — but the three deferred safety
+> gaps below are not, so item 7 stays shut.
+
 ### 9. (bug, low) — NEW. **TCP syslog connect is not bounded by the configured timeout.**
 
 `_apply_send_timeout` (`siem.py:69-92`) runs *after*
@@ -205,6 +289,27 @@ bound resolution plus establishment with one wall-clock deadline.
 **Check cert-watch for the same shape** — it shares this handler's lineage and
 is already recorded as having no TCP send timeout at all.
 
+> **CLOSED 2026-08-18 for acme-adcs-ra.** `_RaisingSysLogHandler.createSocket`
+> now resolves and connects under one wall-clock deadline covering every address
+> the resolver returns, so a multi-homed target cannot multiply the wait.
+> `getaddrinfo` takes no timeout and blocks in the OS resolver, so it runs in a
+> daemon thread that is abandoned rather than waited on — documented in place,
+> because leaking a thread is a real cost and the alternative is worse. Datagram
+> and Unix sockets keep the stock path. The regression test measures the defect
+> by wall clock: against a resolver stub that never answers, the pre-fix code
+> took 30s and then connected happily.
+>
+> **cert-watch: CONFIRMED, NOT FIXED.** `src/cert_watch/siem.py:89` constructs a
+> stock `SysLogHandler` with no timeout of any kind — so it has *both* defects,
+> the missing send timeout already on record and this connect one. It also
+> inherits the stock `handleError` swallow. cert-watch has no
+> `audit_offbox_required` gate riding on that, so the consequence is a stall and
+> a silent drop rather than a defeated control. Left alone deliberately: it is a
+> different repo, and it had uncommitted work from a concurrent session at the
+> time. `acme_adcs_ra/siem.py` is the reference fix, `_getaddrinfo_within`
+> included. **A breadcrumb could not be filed — the store refuses those writes
+> too — so this paragraph is the only record. It must reach cert-watch.**
+
 ### Sequencing note for items 7, 8 and 9
 
 Items 7 and 8 are individually low-severity and were scored separately. They
@@ -215,7 +320,8 @@ interlock, and the order matters:
 > up the sweep (item 7) while item 8 stands would make the UDP hole
 > **load-bearing for deleting the only surviving copy** of audit rows.
 
-Fix 8 first, then 7. The same review deferred three more must-fix-before-wiring
+Fix 8 first, then 7. **8 is now fixed (2026-08-18) and 7 is still shut** — the
+three gaps below are what hold it, and they are the substantive half. The same review deferred three more must-fix-before-wiring
 gaps on the same theme, all of which are only harmless today *because* nothing
 calls `run_sweep`:
 
