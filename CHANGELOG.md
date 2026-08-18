@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — the CA-side revocation loop was inert (2026-08-17, live)
+
+Found by the live re-proof, not by CI: `Sync-Revocations.ps1` exited 2 with
+nothing revoked, and every `certutil` call in `Revoke-Cert.ps1` failed with
+*"No local Certification Authority; use -config option"* on the (non-CA) RA
+host.
+
+- **`Invoke-CertUtil` splatted its argument array into a PowerShell function.**
+  `& certutil @CertutilArgs` is correct — a native command takes one argument
+  per element — but `a69859d` refactored the native call into
+  `Invoke-CertUtilCapture @CertutilArgs`, and splatting an array into a
+  *function* binds only the first element to the first positional parameter.
+  The remaining six landed in `$args`, which a non-advanced function accepts
+  without complaint. Seven arguments in, one argument out, no error: every
+  certutil invocation in the file ran as a bare `-view` or `-config` with no
+  operands, including the `-revoke` itself.
+- **Both helpers are now advanced functions** (`[CmdletBinding()]` with a
+  declared `param` block), so surplus positional arguments are a binding error
+  instead of silent `$args` overflow. The same mistake cannot recur quietly.
+- **Three Pester tests assert the argv certutil actually receives** — whole
+  array, order included, on the revoke call as well as the read-only views —
+  and that a splatted array now throws. All three fail against the old code.
+  The suite stubbed certutil before this, but never asserted *which* arguments
+  arrived, which is why 363 green Pester tests and a green Windows CI job said
+  nothing about a completely non-functional revocation path.
+
+Verified live afterwards on the lab CA: 7 pending, 2 revoked, 5
+already-revoked-at-CA recovered through the confirmation-retry path, 0 failed,
+agent exit 0, RA queue drained to empty.
+
 ### Added — a ceiling on account-key rollover, WI-014 part 14a (2026-08-17)
 
 `keyChange` (RFC 8555 §7.3.5) was the last authenticated transition with no

@@ -183,7 +183,21 @@ if ([string]::IsNullOrWhiteSpace($RequesterName)) {
 # file goes through here -- Invoke-CertUtil and the three direct -view calls
 # in Test-SerialRevokedAtCa, which deliberately do NOT Die so they can treat
 # "certutil could not answer" as not-revoked and re-revoke on the next pass.
-function Invoke-CertUtilCapture([string[]]$CertutilArgs) {
+#
+# Both helpers are ADVANCED functions ([CmdletBinding()]) for a reason found
+# live on 2026-08-17: a plain function silently collects surplus positional
+# arguments into $args. `Invoke-CertUtilCapture @CertutilArgs` -- splatting an
+# ARRAY into a PowerShell function rather than into a native command -- bound
+# only the first element and dropped the other six, so every certutil call in
+# this file ran WITHOUT its `-config`, and the agent failed on a non-CA host
+# with "No local Certification Authority; use -config option". The splat was
+# correct in the original `& certutil @CertutilArgs` (native commands do take
+# one argument per element) and was carried unchanged onto a function call in
+# a69859d. With [CmdletBinding()] that mistake is a loud binding error instead
+# of six silently discarded arguments.
+function Invoke-CertUtilCapture {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string[]]$CertutilArgs)
     $prior = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -193,8 +207,11 @@ function Invoke-CertUtilCapture([string[]]$CertutilArgs) {
     }
 }
 
-function Invoke-CertUtil([string[]]$CertutilArgs) {
-    $out = Invoke-CertUtilCapture @CertutilArgs
+function Invoke-CertUtil {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string[]]$CertutilArgs)
+    # Pass the array as ONE argument -- NOT `@CertutilArgs`. See above.
+    $out = Invoke-CertUtilCapture $CertutilArgs
     $code = $LASTEXITCODE
     if ($code -ne 0) {
         Die ("certutil exited {0}: {1}" -f $code, ($out -join "`n")) $code

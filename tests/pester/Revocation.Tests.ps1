@@ -351,3 +351,68 @@ Describe 'Parse-OfficerRightsSD empty-return semantics (round 7.4)' {
         { Parse-OfficerRightsSD $bytes } | Should -Throw '*extends past the*'
     }
 }
+
+# 2026-08-17 live re-proof. The whole CA-side revocation loop was inert on the
+# lab host: every certutil call reached the process WITHOUT its `-config`, so a
+# non-CA host answered "No local Certification Authority; use -config option"
+# and Sync-Revocations exited 2 with nothing revoked.
+#
+# Cause: `Invoke-CertUtil` splatted its array into `Invoke-CertUtilCapture`.
+# Splatting an array into a NATIVE command (the original `& certutil @args`) is
+# correct and gives one argument per element; splatting it into a POWERSHELL
+# FUNCTION binds only the first element to the first positional parameter and
+# drops the rest into $args, which a non-advanced function accepts in silence.
+# Seven arguments in, one argument out, no error anywhere.
+#
+# CI could not see this: the Windows job runs pytest, and the Pester suite
+# stubbed certutil in ways that never asserted WHICH arguments arrived. So the
+# assertion here is exactly that -- the argv the process would receive.
+Describe 'Invoke-CertUtil argument passing (extracted from Revoke-Cert.ps1)' {
+    BeforeAll {
+        $script:src = Join-Path $PSScriptRoot '../../scripts/Revoke-Cert.ps1'
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $script:src).Path, [ref]$null, [ref]$null)
+        foreach ($name in @('Invoke-CertUtilCapture', 'Invoke-CertUtil')) {
+            $fn = $ast.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq $name }, $true) | Select-Object -First 1
+            if ($null -eq $fn) { throw "$name not found in Revoke-Cert.ps1" }
+            Invoke-Expression $fn.Extent.Text
+        }
+        # Stand in for certutil and record the argv it was handed.
+        function certutil {
+            $global:LASTEXITCODE = 0
+            $global:CapturedArgs = @($args)
+            return @('ok')
+        }
+        $script:CertUtilExe = 'certutil'
+    }
+
+    It 'delivers EVERY argument to certutil, -config included' {
+        $global:CapturedArgs = @()
+        $expected = @('-view', '-config', 'CA01\lab-ca', '-restrict',
+                      'SerialNumber=6C000000C0', '-out', 'SerialNumber')
+        Invoke-CertUtil $expected | Out-Null
+
+        # The bug delivered exactly one argument ('-view'). Assert the whole
+        # argv, not just the count: a helper that passed the arguments in the
+        # wrong ORDER would also break certutil while keeping the count right.
+        @($global:CapturedArgs) | Should -Be $expected
+    }
+
+    It 'delivers -config on the revoke call itself, not only on the -view calls' {
+        # Line 432's `-revoke` went through the same helper, so the failure was
+        # not confined to the read-only confirmation steps.
+        $global:CapturedArgs = @()
+        Invoke-CertUtil @('-config', 'CA01\lab-ca', '-revoke', '6C000000C0', '1') | Out-Null
+        @($global:CapturedArgs)[0] | Should -Be '-config'
+        @($global:CapturedArgs).Count | Should -Be 5
+    }
+
+    It 'refuses a splatted array loudly instead of dropping arguments' {
+        # The regression shape itself: with [CmdletBinding()] the surplus
+        # positional arguments are a binding ERROR, not silent $args overflow.
+        $splatted = @('-view', '-config', 'CA01\lab-ca')
+        { Invoke-CertUtilCapture @splatted } | Should -Throw
+    }
+}
