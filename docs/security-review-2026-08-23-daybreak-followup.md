@@ -85,10 +85,62 @@ production caller is added.
 
 ## Verification
 
-- Focused Python security tests: green.
+Local gates on the code commit `0b89af1`:
+
+- Python: 896 passed, 1 skipped.
+- Ruff and mypy: green.
+- Cross-platform Pester: 368 passed, 4 platform skips.
 - Mutation checks: key CAS, numeric socket target, TLS hostname binding, and
   pruning refusal each failed when its control was removed.
-- Ruff and mypy: green.
-- Cross-platform Pester: green (368 passed, 4 skipped).
-- Full Python suite and live Windows/IIS/ADCS proof: recorded after the final
-  committed artifact is deployed.
+- Two independent post-fix adversarial reviews found no exploitable defect in
+  the CAS or transport. Their valid test-gap finding produced the real TLS
+  handshake test; their adapter-version finding produced the `requests>=2.32`
+  floor.
+
+### Live Windows/IIS/ADCS proof
+
+Executed 2026-08-23 on the lab RA and issuing CA against the exact committed
+artifact `0b89af1`. The brokered directory credential completed a StartTLS LDAP
+preflight and found the enrollment gMSA; no credential value reached argv,
+stdout or the transcript. The installer deployed version 1.9.1 and exited 0.
+
+Results:
+
+- issuance/EKU/SAN/chain/CA denial/revocation-reason controls: 14/14;
+- ACME front controls: 13/13;
+- real CRL retrieval through the new pinned transport plus POST-as-GET-only
+  resources: 9 passed, with only the standing CRL-cadence calibration check
+  failing as designed (649200-second validity window versus the 604800-second
+  default replay-age ceiling, WI-052);
+- key-rollover ceiling/state/audit: 12/12;
+- both post-issuance transport-orphan branches: 6/6 each;
+- task-driven CA revocation and queue drain: 3/3 after issuance/revocation;
+- least privilege: gMSA token succeeded, CRL publication denied with access
+  denied, out-of-template revocation denied with restricted-officer, reason 8
+  refused before CA action;
+- authority split: admin-only revoked but could not confirm (exit 2),
+  confirm-only recovered the already-revoked row and drained it (exit 0);
+- `audit_prune_enabled=true`: refused by the deployed config loader;
+- CRL evidence: confirmation first failed closed with
+  `crl-evidence-required-but-absent`; after publication the same registered task
+  exited 0, drained the queue, and audited `verification: crl-verified`.
+
+The first CRL-evidence attempt reported task exit 1 before reaching the RA. This
+was a stale lab wrapper, not product behavior: `sync-crl.ps1` still named the
+retired ProgramData scripts path and contained literal token placeholders. The
+current registered task loads the confirm credential from the ACL-protected
+dotenv and produced the expected fail-closed/publish/retry sequence above. The
+wrapper was not used as evidence.
+
+Teardown was verified rather than assumed. All seven certificates caused by the
+run, including the ReqID-only orphan, were revoked and selected under CA
+disposition 21; the CRL was republished; CA security returned to 224 bytes/four
+ACEs with `OfficerRights` absent; IIS `denyUrlSequences` was empty; the RA store
+returned to its backup fingerprint (`integrity=ok`, every table count equal);
+the throwaway EAB material was absent; and the app pool returned to `Started`.
+The three maintenance tasks existed before the run and were left `Ready`,
+re-registered against the current protected dotenv-loading implementation.
+
+Not exercised in this pass: the optional stale-enrollment `Lqueue`/`Ldrain`
+stress phases and MSI-source replacement. They are separate accumulated live
+proof debt, not paths changed by these three findings.
