@@ -230,11 +230,11 @@ class RAConfig(BaseSettings):
     # probe at sweep time.
     audit_retention_days: int = Field(default=0, ge=0)
 
-    # Arm the retention sweep. Off by default, and deliberately separate from
-    # audit_retention_days so that declaring a policy and destroying evidence
-    # are two decisions rather than one. Ignored unless off-box audit is
-    # required and healthy — with the local audit_log as the only copy, this
-    # RA does not delete from it.
+    # Reserved for a future acknowledged-archive retention path. Production
+    # startup currently refuses True: the library sweep has no production
+    # caller, and a generic SIEM health probe is not proof that each candidate
+    # row reached off-box storage. Leaving the field present makes old configs
+    # fail loudly rather than silently ignoring an operator's pruning policy.
     audit_prune_enabled: bool = False
 
     # Warn when the local audit footprint (database + JSONL mirror) exceeds this
@@ -358,6 +358,17 @@ class RAConfig(BaseSettings):
     # load-bearing. Set this to True ONLY for a lab or CI fixture; production
     # deployments must leave it False.
     allow_weak_credentials: bool = False
+
+    @model_validator(mode="after")
+    def _audit_pruning_is_not_available(self) -> RAConfig:
+        if self.audit_prune_enabled:
+            raise ValueError(
+                "audit_prune_enabled is not available: the current SIEM path has no "
+                "per-row delivery acknowledgement, so deleting local audit rows could "
+                "destroy the only copy. Keep it false; audit_retention_days still "
+                "enforces the retention floor and audit footprint reporting remains active."
+            )
+        return self
 
     @model_validator(mode="after")
     def _base_url_is_a_bare_origin(self) -> RAConfig:

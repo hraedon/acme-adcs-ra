@@ -284,54 +284,20 @@ class TestRedirectPortRule:
 
 
 class TestRedirectAddressPinning:
-    """Hostname text does not bind the address a hop connects to.
+    """Redirect vetting must not perform a second, raceable DNS lookup."""
 
-    Each hop resolves the name again, so an attacker who controls DNS for the
-    configured CDP name can answer the second lookup with anything.
-    """
-
-    def test_a_rebound_host_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def rebound(*_args: Any, **_kwargs: Any) -> list[Any]:
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 80))]
-
-        monkeypatch.setattr(socket, "getaddrinfo", rebound)
-        origin = urlparse("http://crl.example/ca.crl")
-        target, refusal = _vet_redirect(
-            "/latest.crl",
-            "http://crl.example/ca.crl",
-            origin,
-            frozenset({"10.0.0.5"}),
-        )
-        assert target is None
-        assert "resolves outside the addresses seen at the start" in refusal
-
-    def test_a_stable_address_is_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def stable(*_args: Any, **_kwargs: Any) -> list[Any]:
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 80))]
-
-        monkeypatch.setattr(socket, "getaddrinfo", stable)
-        origin = urlparse("http://crl.example/ca.crl")
-        target, refusal = _vet_redirect(
-            "/latest.crl",
-            "http://crl.example/ca.crl",
-            origin,
-            frozenset({"10.0.0.5", "10.0.0.6"}),
-        )
-        assert target == "http://crl.example/latest.crl", refusal
-
-    def test_a_host_that_stops_resolving_is_refused(
+    def test_a_same_origin_redirect_is_vetted_without_dns(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def fails(*_args: Any, **_kwargs: Any) -> list[Any]:
-            raise OSError("NXDOMAIN")
+        def unexpected_lookup(*_args: Any, **_kwargs: Any) -> list[Any]:
+            raise AssertionError("redirect vetting must not re-resolve the host")
 
-        monkeypatch.setattr(socket, "getaddrinfo", fails)
+        monkeypatch.setattr(socket, "getaddrinfo", unexpected_lookup)
         origin = urlparse("http://crl.example/ca.crl")
         target, refusal = _vet_redirect(
-            "/latest.crl", "http://crl.example/ca.crl", origin, frozenset({"10.0.0.5"})
+            "/latest.crl", "http://crl.example/ca.crl", origin
         )
-        assert target is None
-        assert "no longer resolves" in refusal
+        assert target == "http://crl.example/latest.crl", refusal
 
 
 class TestRedirectsAreOffByDefault:

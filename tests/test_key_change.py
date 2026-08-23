@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from acme_adcs_ra.enrollment import FakeEnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
-from acme_adcs_ra.store import Store
+from acme_adcs_ra.store import AccountKeyStale, Store
 
 from .hand_rolled_acme_client import HandRolledAcmeClient, jwk_from_private_key, sign_jws
 
@@ -138,6 +139,68 @@ class TestSuccessfulKeyChange:
 
 
 class TestKeyChangeRejects:
+    def test_rejects_a_rollover_that_loses_the_store_cas(
+        self,
+        acme_client: HandRolledAcmeClient,
+        app_and_store: tuple[Any, Store, ServerContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _, store, _ = app_and_store
+
+        def stale(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AccountKeyStale("lost race")
+
+        monkeypatch.setattr(store, "update_account_key_with_audit", stale)
+        new_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        resp = acme_client.key_change(new_key)
+
+        assert resp.status_code == 401
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:unauthorized"
+        events = store.list_audit_events(event_type="key-change-stale", limit=5)
+        assert len(events) == 1
+        assert events[0]["outcome"] == "denied"
+
+    def test_uniqueness_race_is_a_bad_public_key_not_a_500(
+        self,
+        acme_client: HandRolledAcmeClient,
+        client: TestClient,
+        config: RAConfig,
+        app_and_store: tuple[Any, Store, ServerContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _, store, _ = app_and_store
+        other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        other_acme = HandRolledAcmeClient(client, "http://testserver", other_key)
+        mac_key = config.eab_key_bytes("kid-001")
+        assert mac_key is not None
+        assert other_acme.new_account("kid-001", mac_key).status_code == 201
+        assert other_acme.account_url is not None
+        other_account = store.get_account(other_acme.account_url.rsplit("/", 1)[-1])
+        assert other_account is not None
+
+        proposed_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        proposed_jwk = jwk_from_private_key(proposed_key)
+        original_lookup = store.get_account_by_jwk
+        proposed_lookups = 0
+
+        def raced_lookup(jwk: dict[str, Any]) -> Any:
+            nonlocal proposed_lookups
+            if jwk == proposed_jwk:
+                proposed_lookups += 1
+                return None if proposed_lookups == 1 else other_account
+            return original_lookup(jwk)
+
+        def conflict(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise sqlite3.IntegrityError("UNIQUE constraint failed")
+
+        monkeypatch.setattr(store, "get_account_by_jwk", raced_lookup)
+        monkeypatch.setattr(store, "update_account_key_with_audit", conflict)
+        resp = acme_client.key_change(proposed_key)
+
+        assert resp.status_code == 400
+        assert resp.json()["type"] == "urn:ietf:params:acme:error:badPublicKey"
+        assert proposed_lookups == 2
+
     def test_reject_mismatched_url(
         self,
         acme_client: HandRolledAcmeClient,

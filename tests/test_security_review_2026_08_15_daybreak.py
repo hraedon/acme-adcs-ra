@@ -243,6 +243,7 @@ class TestKeyChangeAtomicWithAudit:
             ctx.store.update_account_key_with_audit(
                 "any",
                 placeholder_rsa_jwk("daybreak-guard-2"),
+                expected_old_thumbprint="old-thumbprint",
                 audit={
                     "event_type": "account-key-changed",
                     "outcome": "success",

@@ -10,7 +10,7 @@ dependencies = [
     "cryptography>=50.0.0",  # CSR parsing, JWS verification; security floor
     "pydantic",
     "pydantic-settings",  # env-var / config-file loading
-    "requests",           # ADCS /certsrv/ HTTP client + the Negotiate auth handler
+    "requests>=2.32",     # CRL pinning overrides get_connection_with_tls_context
     # SPNEGO/Negotiate with channel binding (EPA=Require) as the ambient gMSA.
     # Windows-only (SSPI via sspilib); platform-gated so Linux CI is unaffected.
     "pyspnego; sys_platform == 'win32'",

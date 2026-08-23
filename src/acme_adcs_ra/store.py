@@ -316,6 +316,10 @@ class KeyChangeRateLimitExceeded(Exception):
         self.window_seconds = window_seconds
 
 
+class AccountKeyStale(Exception):
+    """Raised when a rollover was authorized by a key that is no longer current."""
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1152,6 +1156,7 @@ class Store:
         account_id: str,
         new_jwk: dict[str, Any],
         *,
+        expected_old_thumbprint: str,
         audit: Mapping[str, Any],
         rate_limit_window_seconds: int | None = None,
         rate_limit_per_kid: int = 0,
@@ -1185,17 +1190,27 @@ class Store:
             raise ValueError("audit must not carry account_id; it is set from the row")
         thumbprint = jwk_thumbprint(new_jwk)
         with self._connect() as conn:
+            # Serialize the current-key/status check, rate-limit decision,
+            # rotation and success audit. A request authenticated before a
+            # concurrent rollover or deactivation must not remain authorized
+            # after that transition commits.
+            conn.execute("BEGIN IMMEDIATE")
+            account_row = conn.execute(
+                "SELECT eab_kid, jwk_thumbprint, status FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if (
+                account_row is None
+                or str(account_row["jwk_thumbprint"]) != expected_old_thumbprint
+                or str(account_row["status"]) != AccountStatus.VALID
+            ):
+                raise AccountKeyStale("account key or status changed before rollover")
+
             if rate_limit_per_kid > 0:
                 if rate_limit_window_seconds is None or rate_limit_window_seconds < 1:
                     raise ValueError(
                         "rate_limit_window_seconds must be positive when a limit is enabled"
                     )
-                conn.execute("BEGIN IMMEDIATE")
-                account_row = conn.execute(
-                    "SELECT eab_kid FROM accounts WHERE id = ?", (account_id,)
-                ).fetchone()
-                if account_row is None:
-                    raise ValueError("account does not exist")
                 eab_kid = str(account_row["eab_kid"])
                 cutoff = (
                     datetime.now(UTC)
@@ -1219,7 +1234,21 @@ class Store:
                         count=count,
                         window_seconds=rate_limit_window_seconds,
                     )
-            self._update_account_key_in_conn(conn, account_id, new_jwk, thumbprint)
+            cursor = conn.execute(
+                "UPDATE accounts SET jwk_json = ?, jwk_thumbprint = ? "
+                "WHERE id = ? AND jwk_thumbprint = ? AND status = ?",
+                (
+                    _dump_json(new_jwk),
+                    thumbprint,
+                    account_id,
+                    expected_old_thumbprint,
+                    AccountStatus.VALID,
+                ),
+            )
+            if cursor.rowcount != 1:
+                # Defensive even under BEGIN IMMEDIATE: keep the authorization
+                # predicate attached to the write that consumes it.
+                raise AccountKeyStale("account key or status changed before rollover")
             return self._record_audit_in_conn(conn, account_id=account_id, **kwargs)
 
     def _update_account_key_in_conn(

@@ -45,6 +45,17 @@ def _package_version() -> str:
 
 def create_app(context: ServerContext) -> FastAPI:
     """Build a FastAPI app wired to the supplied server context."""
+    # Defense in depth for callers that mutate or construct a config without
+    # normal Pydantic validation. The library sweep is intentionally not wired:
+    # the SIEM exporter has no per-row delivery watermark, so a health probe
+    # cannot prove the rows selected for deletion have an off-box copy.
+    if context.config.audit_prune_enabled:
+        raise RuntimeError(
+            "audit_prune_enabled is not available without acknowledged per-row "
+            "off-box delivery; refusing to start rather than silently ignore the "
+            "setting or delete the only copy of audit evidence"
+        )
+
     # Wire the default SIEM emitter when no test/operator hook is supplied.
     _siem_emitter: SiemEmitter | None = None
     if context.audit_hook is None:

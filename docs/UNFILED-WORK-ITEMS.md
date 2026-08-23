@@ -239,6 +239,15 @@ already use), a lifecycle hook, or documenting it explicitly as library-only.
 **Do not wire this before item 8 and the three deferred safety gaps below.**
 See the sequencing note after item 9.
 
+> **CLOSED 2026-08-23 by refusing the unsupported configuration, not by wiring
+> unsafe deletion.** `RAConfig` now rejects `audit_prune_enabled=true`, and the
+> composition root repeats the refusal for a mutated or validation-bypassed
+> config. This removes the false operational claim while preserving
+> `audit_retention_days` floor validation and footprint reporting. The library
+> sweep remains unreachable until per-row off-box acknowledgement exists,
+> deletion plus self-audit are atomic, and the sweep event is exported off-host.
+> Tests mutation-prove both refusal boundaries.
+
 ### 8. (bug, medium) — NEW. **A UDP syslog probe satisfies `audit_offbox_required` with nothing listening.**
 
 `SiemExporter`'s startup probe (`siem.py:560-581`) returns `True` for

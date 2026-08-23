@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
@@ -29,7 +30,7 @@ from acme_adcs_ra.jws import (
     jwk_thumbprint,
     verify_flattened_jws,
 )
-from acme_adcs_ra.store import KeyChangeRateLimitExceeded
+from acme_adcs_ra.store import AccountKeyStale, KeyChangeRateLimitExceeded
 
 router = APIRouter()
 
@@ -152,6 +153,7 @@ async def key_change(
         event = ctx.store.update_account_key_with_audit(
             account_id,
             new_jwk,
+            expected_old_thumbprint=old_key_thumbprint,
             audit={
                 "event_type": "account-key-changed",
                 "outcome": "success",
@@ -163,6 +165,17 @@ async def key_change(
             rate_limit_window_seconds=ctx.config.rate_limit_window_seconds,
             rate_limit_per_kid=ctx.config.rate_limit_key_changes_per_window,
         )
+    except AccountKeyStale as exc:
+        _audit(
+            ctx,
+            event_type="key-change-stale",
+            account_id=account_id,
+            outcome="denied",
+            details={"reason": "account-key-or-status-changed"},
+        )
+        raise unauthorized(
+            "account key or status changed while the key rollover was in progress"
+        ) from exc
     except KeyChangeRateLimitExceeded as exc:
         _audit(
             ctx,
@@ -183,6 +196,17 @@ async def key_change(
             f"last {exc.window_seconds}s (limit: {exc.limit})",
             retry_after=exc.window_seconds,
         ) from exc
+    except sqlite3.IntegrityError as exc:
+        # The route-level lookup is only an optimization. A different account
+        # can claim the proposed key before this transaction acquires SQLite's
+        # writer lock; the UNIQUE index is authoritative and must map to the
+        # ACME client error rather than an unhandled 500.
+        existing = ctx.store.get_account_by_jwk(new_jwk)
+        if existing is not None and existing.id != account_id:
+            raise bad_public_key(
+                "new account key is already registered to another account"
+            ) from exc
+        raise
     emit_audit_hook(ctx, event)
 
     return JSONResponse(content={})

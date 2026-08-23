@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — stale key-change requests could overwrite a completed rollover (2026-08-23)
+
+- `keyChange` now carries the authenticated old-key thumbprint into one
+  `BEGIN IMMEDIATE` transaction and compares account ID, current thumbprint and
+  `status=valid` on the update itself. A concurrent rollover or deactivation
+  invalidates the stale request; exactly one rollover and its success audit can
+  commit.
+- A database-level new-key uniqueness race now maps to ACME `badPublicKey`
+  instead of escaping as a 500.
+- The regression suite coordinates two real SQLite writers and mutation-proves
+  the old last-writer-wins behavior.
+
+### Security — CRL DNS validation is now bound to the socket (2026-08-23)
+
+- The CRL host is resolved once and each request connects to one of those
+  numeric addresses. Redirect hops reuse the same pin, so no validation-only
+  lookup can race a second hostname resolution inside `requests`.
+- The original hostname remains the HTTP `Host` header and, for HTTPS, the TLS
+  SNI and certificate-verification name. Real HTTP, redirect and TLS-handshake
+  tests cover the connection target, Host, SNI, accepted hostname and rejected
+  hostname; an empty initial resolution fails closed.
+- CRL retrieval is deliberately direct and does not use environment HTTP
+  proxies: a proxy would perform its own destination resolution and defeat the
+  socket pin. Internal/private CRL addresses remain supported. `requests>=2.32`
+  is now explicit because that is the adapter API this control overrides.
+
+### Security — unsupported audit pruning now fails loudly (2026-08-23)
+
+`audit_prune_enabled=true` previously configured a production-inert feature:
+`run_sweep` had no caller. Wiring it unchanged would be unsafe because the SIEM
+path has no per-row delivery acknowledgement, deletion and self-audit are not
+atomic, and the sweep event is not exported off-host. Configuration and app
+construction now refuse the flag rather than silently claiming a cumulative
+storage bound or activating evidence deletion. Operators who set it must remove
+it or set it to false; retention-floor validation, footprint warnings, denial
+coalescing and JSONL rotation remain active.
+
 ### Security — a UDP syslog probe satisfied `audit_offbox_required` with nothing listening (2026-08-18)
 
 Codex scan of `7325cdb`→`47bb9f7`, recorded as unfiled item 8. `audit_offbox_required`
