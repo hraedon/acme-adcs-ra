@@ -10,17 +10,23 @@ certificate-minting primitive at runtime.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import contextlib
 import importlib.resources
 import logging
 import os
 import re
+import socket
 import sys
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -121,6 +127,105 @@ class EnrollmentTransportError(Exception):
         return self.req_id is not None
 
 
+class EnrollmentGateBusy(Exception):
+    """The dedicated enrollment executor is at its admission ceiling."""
+
+
+_T = TypeVar("_T")
+
+
+class EnrollmentGate:
+    """Bound and isolate synchronous ADCS work from framework workers.
+
+    Once admitted, work is cancellation-shielded until it returns.  A client
+    disconnect must not abandon a worker that may issue at the CA and skip the
+    route's certificate/orphan recording step.
+    """
+
+    def __init__(self, max_workers: int = 4, max_pending: int = 32) -> None:
+        self._max_workers = max_workers
+        self._max_pending = max_pending
+        self._executor: ThreadPoolExecutor | None = None
+        self._state_lock = threading.Lock()
+        self._pending = 0
+        self._closed = False
+
+    def set_limits(self, *, max_workers: int, max_pending: int) -> None:
+        with self._state_lock:
+            self._max_pending = max_pending
+            if self._executor is None:
+                self._max_workers = max_workers
+
+    async def run(self, fn: Callable[..., _T], /, *args: Any) -> _T:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("EnrollmentGate is closed")
+            if self._pending >= self._max_pending:
+                raise EnrollmentGateBusy(
+                    f"{self._pending} enrollments already admitted "
+                    f"(limit {self._max_pending})"
+                )
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="ra-adcs-enrollment",
+                )
+            executor = self._executor
+            self._pending += 1
+            try:
+                # Submit before releasing the state lock. Otherwise close()
+                # can shut the captured executor down in the narrow gap after
+                # admission, leaving the order in processing with no worker.
+                future = executor.submit(fn, *args)
+            except BaseException:
+                self._pending -= 1
+                raise
+
+        def _finished(_future: Any) -> None:
+            with self._state_lock:
+                self._pending -= 1
+
+        future.add_done_callback(_finished)
+        wrapped = asyncio.wrap_future(future)
+        while True:
+            try:
+                return cast("_T", await asyncio.shield(wrapped))
+            except asyncio.CancelledError:
+                # ``shield`` makes caller cancellation leave ``wrapped`` live.
+                # A canceled wrapped future is therefore a different condition:
+                # the admitted executor job itself was canceled. Retrying an
+                # await against that permanently-canceled future would spin
+                # forever. The gate never does this itself (close preserves all
+                # admitted work), but fail loudly and finitely if an external
+                # executor/future implementation violates that invariant.
+                if wrapped.cancelled() or future.cancelled():
+                    raise RuntimeError(
+                        "admitted enrollment work was canceled before completion"
+                    ) from None
+                # Suppress request cancellation after the irreversible work was
+                # admitted. The caller must receive the result and durably
+                # complete/quarantine it; abandoning the worker creates a live
+                # CA certificate with no RA row.
+                task = asyncio.current_task()
+                if task is not None:
+                    task.uncancel()
+
+    def close(self) -> None:
+        with self._state_lock:
+            self._closed = True
+            executor = self._executor
+            self._executor = None
+        if executor is not None:
+            # Never cancel queued work: admission happens only after the order
+            # entered processing, so every admitted call must run to its own
+            # bounded Certsrv deadline and return enough information for the
+            # route to complete or quarantine it. ``wait=False`` keeps lifespan
+            # shutdown non-blocking; the deadline bounds the remaining worker
+            # lifetime. ThreadPoolExecutor's non-daemon threads then retire once
+            # the admitted queue drains.
+            executor.shutdown(wait=False, cancel_futures=False)
+
+
 # ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
@@ -211,6 +316,8 @@ class HttpResponse(Protocol):
 
     def raise_for_status(self) -> None: ...
 
+    def close(self) -> None: ...
+
 
 class HttpSession(Protocol):
     """Minimal HTTP session (satisfied by ``requests.Session`` on win32).
@@ -287,7 +394,65 @@ def _reject_redirect(resp: HttpResponse, what: str) -> None:
         )
 
 
-def _read_capped_body(resp: HttpResponse, max_bytes: int, what: str) -> bytes:
+class _LiveEnrollmentTransfer:
+    def __init__(self) -> None:
+        self.response: HttpResponse | None = None
+
+
+def _abort_enrollment_transfer(
+    live: _LiveEnrollmentTransfer, timed_out: threading.Event
+) -> None:
+    """Expire the deadline and wake a body read, including on Windows."""
+    timed_out.set()
+    response = live.response
+    if response is None:
+        return
+    raw = getattr(response, "raw", None)
+    connection = getattr(raw, "_connection", None)
+    sock = getattr(connection, "sock", None)
+    if sock is not None:
+        # Best-effort timer thread: a changed socket wrapper may reject the
+        # CPython socket shutdown signature with TypeError (or raise some other
+        # unexpected exception). Nothing from this callback may escape, and on
+        # Windows a failed shutdown must not skip the closesocket operation that
+        # actually wakes a recv blocked in another thread.
+        with contextlib.suppress(Exception):
+            sock.shutdown(socket.SHUT_RDWR)
+        if sys.platform == "win32":
+            # Winsock shutdown from another thread does not reliably wake recv;
+            # closesocket does. The owning worker closes the response afterward.
+            with contextlib.suppress(Exception):
+                sock.close()
+        return
+    with contextlib.suppress(Exception):
+        response.close()
+
+
+def _deadline_timeout(
+    per_call_timeout: float, deadline: float, timed_out: threading.Event
+) -> float:
+    remaining = deadline - time.monotonic()
+    if timed_out.is_set() or remaining <= 0:
+        raise EnrollmentTransportError("ADCS enrollment total deadline expired")
+    return min(per_call_timeout, remaining)
+
+
+def _close_response(resp: HttpResponse, live: _LiveEnrollmentTransfer) -> None:
+    live.response = None
+    close = getattr(resp, "close", None)
+    if close is not None:
+        with contextlib.suppress(Exception):
+            close()
+
+
+def _read_capped_body(
+    resp: HttpResponse,
+    max_bytes: int,
+    what: str,
+    *,
+    deadline: float | None = None,
+    timed_out: threading.Event | None = None,
+) -> bytes:
     """Read an enrollment response body, refusing to exceed *max_bytes*.
 
     The certificate, disposition, and PKCS#7 bodies were read with no size
@@ -323,7 +488,11 @@ def _read_capped_body(resp: HttpResponse, max_bytes: int, what: str) -> bytes:
     if read1 is None:
         # A transport-only test fake, or a session that does not stream. It has
         # already buffered, so all that is left is to refuse to parse it.
+        if timed_out is not None and timed_out.is_set():
+            raise EnrollmentTransportError("ADCS enrollment total deadline expired")
         body = resp.content
+        if deadline is not None and time.monotonic() >= deadline:
+            raise EnrollmentTransportError("ADCS enrollment total deadline expired")
         if len(body) > max_bytes:
             raise EnrollmentTransportError(
                 f"{what} returned {len(body)} bytes, over the "
@@ -334,11 +503,19 @@ def _read_capped_body(resp: HttpResponse, max_bytes: int, what: str) -> bytes:
     chunks: list[bytes] = []
     received = 0
     while received <= max_bytes:
+        if timed_out is not None and timed_out.is_set():
+            raise EnrollmentTransportError("ADCS enrollment total deadline expired")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise EnrollmentTransportError("ADCS enrollment total deadline expired")
         chunk = read1(65536, decode_content=True)
         if not chunk:
             break
         chunks.append(chunk)
         received += len(chunk)
+    if timed_out is not None and timed_out.is_set():
+        raise EnrollmentTransportError("ADCS enrollment total deadline expired")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise EnrollmentTransportError("ADCS enrollment total deadline expired")
     if received > max_bytes:
         raise EnrollmentTransportError(
             f"{what} returned more than the {max_bytes}-byte limit"
@@ -390,6 +567,7 @@ class CertsrvEnrollmentLeg:
         ca_name: str | None = None,
         ca_bundle: str | None = None,
         timeout: float = 30.0,
+        total_timeout: float = 120.0,
         session_factory: Callable[[], HttpSession] | None = None,
         locale: str = "en",
         max_response_bytes: int = 5 * 1024 * 1024,
@@ -399,6 +577,7 @@ class CertsrvEnrollmentLeg:
         self._ca_name = ca_name
         self._ca_bundle = ca_bundle
         self._timeout = timeout
+        self._total_timeout = total_timeout
         self._session_factory = session_factory
         self._locale = locale
         self._max_response_bytes = max_response_bytes
@@ -459,7 +638,16 @@ class CertsrvEnrollmentLeg:
             else self._build_session()
         )
         base = f"https://{self._host}/certsrv"
-        timeout = self._timeout
+        deadline = time.monotonic() + self._total_timeout
+        timed_out = threading.Event()
+        live = _LiveEnrollmentTransfer()
+        watchdog = threading.Timer(
+            self._total_timeout,
+            _abort_enrollment_transfer,
+            args=(live, timed_out),
+        )
+        watchdog.daemon = True
+        watchdog.start()
 
         # Everything the CA has already committed to, tracked outside the try
         # so the handlers below can hand it to the caller. Once `issued_req_id`
@@ -479,13 +667,28 @@ class CertsrvEnrollmentLeg:
                 "TargetStoreFlags": "0",
                 "SaveCert": "yes",
             }
-            resp = session.post(f"{base}/certfnsh.asp", data=form, timeout=timeout)
-            _reject_redirect(resp, "certfnsh.asp")
-            resp.raise_for_status()
-            body = _read_capped_body(resp, self._max_response_bytes, "certfnsh.asp")
-            disposition, detail = _parse_certfnsh_disposition(
-                _decode_body(body, resp), resp.status_code, locale=self._locale
+            resp = session.post(
+                f"{base}/certfnsh.asp",
+                data=form,
+                timeout=_deadline_timeout(self._timeout, deadline, timed_out),
             )
+            live.response = resp
+            try:
+                _reject_redirect(resp, "certfnsh.asp")
+                resp.raise_for_status()
+                body = _read_capped_body(
+                    resp,
+                    self._max_response_bytes,
+                    "certfnsh.asp",
+                    deadline=deadline,
+                    timed_out=timed_out,
+                )
+                disposition, detail = _parse_certfnsh_disposition(
+                    _decode_body(body, resp), resp.status_code, locale=self._locale
+                )
+                _deadline_timeout(self._timeout, deadline, timed_out)
+            finally:
+                _close_response(resp, live)
             if disposition == "pending":
                 # The ReqID travels as a field, not just inside the message:
                 # the order cannot be safely reopened without it (F4).
@@ -508,27 +711,36 @@ class CertsrvEnrollmentLeg:
             cert_resp = session.get(
                 f"{base}/certnew.cer",
                 params={"ReqID": req_id, "Enc": "b64"},
-                timeout=timeout,
+                timeout=_deadline_timeout(self._timeout, deadline, timed_out),
             )
-            _reject_redirect(cert_resp, "certnew.cer")
-            cert_resp.raise_for_status()
-            cert_body = _read_capped_body(
-                cert_resp, self._max_response_bytes, "certnew.cer"
-            )
-            # ADCS Web Enrollment is inconsistent about the certnew.cer
-            # content-type (observed live: text/html wrapping an Enc=b64 PEM
-            # body). Don't gate on the header — parse the body as a certificate
-            # and fail only if that fails, surfacing a snippet for diagnosis.
+            live.response = cert_resp
             try:
-                cert_pem = _parse_cert_body(cert_body)
-            except Exception as exc:
-                ct = cert_resp.headers.get("Content-Type")
-                snippet = " ".join(_decode_body(cert_body, cert_resp)[:400].split())
-                raise EnrollmentTransportError(
-                    f"certnew.cer did not return a parseable certificate "
-                    f"(content-type {ct!r}): {exc}; body: {snippet}",
-                    req_id=req_id,
-                ) from exc
+                _reject_redirect(cert_resp, "certnew.cer")
+                cert_resp.raise_for_status()
+                cert_body = _read_capped_body(
+                    cert_resp,
+                    self._max_response_bytes,
+                    "certnew.cer",
+                    deadline=deadline,
+                    timed_out=timed_out,
+                )
+                # ADCS Web Enrollment is inconsistent about the certnew.cer
+                # content-type (observed live: text/html wrapping an Enc=b64 PEM
+                # body). Don't gate on the header — parse the body as a certificate
+                # and fail only if that fails, surfacing a snippet for diagnosis.
+                try:
+                    cert_pem = _parse_cert_body(cert_body)
+                except Exception as exc:
+                    ct = cert_resp.headers.get("Content-Type")
+                    snippet = " ".join(_decode_body(cert_body, cert_resp)[:400].split())
+                    raise EnrollmentTransportError(
+                        f"certnew.cer did not return a parseable certificate "
+                        f"(content-type {ct!r}): {exc}; body: {snippet}",
+                        req_id=req_id,
+                    ) from exc
+                _deadline_timeout(self._timeout, deadline, timed_out)
+            finally:
+                _close_response(cert_resp, live)
             # The bytes are in hand: every later failure can now quarantine a
             # fully identified certificate rather than just a ReqID.
             issued_cert_pem = cert_pem
@@ -554,29 +766,51 @@ class CertsrvEnrollmentLeg:
 
             # 3. Fetch the CA chain (PKCS#7).  First scrape nRenewals from
             #    certcarc.asp, then GET certnew.p7b (mirrors spike_mode_a.py).
-            arc_resp = session.get(f"{base}/certcarc.asp", params={}, timeout=timeout)
-            _reject_redirect(arc_resp, "certcarc.asp")
-            arc_resp.raise_for_status()
-            arc_body = _read_capped_body(
-                arc_resp, self._max_response_bytes, "certcarc.asp"
+            arc_resp = session.get(
+                f"{base}/certcarc.asp",
+                params={},
+                timeout=_deadline_timeout(self._timeout, deadline, timed_out),
             )
-            nren = re.search(
-                r"var nRenewals=(\d+);", _decode_body(arc_body, arc_resp)
-            )
+            live.response = arc_resp
+            try:
+                _reject_redirect(arc_resp, "certcarc.asp")
+                arc_resp.raise_for_status()
+                arc_body = _read_capped_body(
+                    arc_resp,
+                    self._max_response_bytes,
+                    "certcarc.asp",
+                    deadline=deadline,
+                    timed_out=timed_out,
+                )
+                nren = re.search(
+                    r"var nRenewals=(\d+);", _decode_body(arc_body, arc_resp)
+                )
+                _deadline_timeout(self._timeout, deadline, timed_out)
+            finally:
+                _close_response(arc_resp, live)
             renewals = nren.group(1) if nren else "0"
             chain_resp = session.get(
                 f"{base}/certnew.p7b",
                 params={"ReqID": "CACert", "Renewal": renewals, "Enc": "b64"},
-                timeout=timeout,
+                timeout=_deadline_timeout(self._timeout, deadline, timed_out),
             )
-            _reject_redirect(chain_resp, "certnew.p7b")
-            chain_resp.raise_for_status()
-            chain_body = _read_capped_body(
-                chain_resp, self._max_response_bytes, "certnew.p7b"
-            )
-            chain_pem = _parse_pkcs7_chain(chain_body)
-            issued_chain_pem = list(chain_pem)
-            _validate_chain_binds_to_leaf(cert_pem, chain_pem)
+            live.response = chain_resp
+            try:
+                _reject_redirect(chain_resp, "certnew.p7b")
+                chain_resp.raise_for_status()
+                chain_body = _read_capped_body(
+                    chain_resp,
+                    self._max_response_bytes,
+                    "certnew.p7b",
+                    deadline=deadline,
+                    timed_out=timed_out,
+                )
+                chain_pem = _parse_pkcs7_chain(chain_body)
+                issued_chain_pem = list(chain_pem)
+                _validate_chain_binds_to_leaf(cert_pem, chain_pem)
+                _deadline_timeout(self._timeout, deadline, timed_out)
+            finally:
+                _close_response(chain_resp, live)
         except EnrollmentDenied:
             raise
         except EnrollmentPending:
@@ -598,12 +832,23 @@ class CertsrvEnrollmentLeg:
             # Preserve the stack for diagnosis — the wrapped message alone loses
             # where in the request/parse flow an unexpected error originated.
             _log.exception("certsrv enrollment failed (unexpected error)")
+            detail = (
+                f"ADCS enrollment exceeded its {self._total_timeout}s total "
+                f"deadline ({exc})"
+                if timed_out.is_set() or time.monotonic() >= deadline
+                else f"ADCS enrollment transport error: {exc}"
+            )
             raise EnrollmentTransportError(
-                f"ADCS enrollment transport error: {exc}",
+                detail,
                 req_id=issued_req_id,
                 cert_pem=issued_cert_pem,
                 chain_pem=issued_chain_pem,
             ) from exc
+        finally:
+            watchdog.cancel()
+            response = live.response
+            if response is not None:
+                _close_response(response, live)
 
         metadata: dict[str, str] = {
             "req_id": req_id,

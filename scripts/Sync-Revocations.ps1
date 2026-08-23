@@ -65,13 +65,25 @@
     pending endpoint is at <RaBaseUrl>/acme/admin/revocations/pending.
 
 .PARAMETER AdminToken
-    The RA admin Bearer token (ACME_RA_ADMIN_TOKEN). Gates the admin
-    endpoints. Treat like an EAB MAC key -- do not commit, do not log.
-    Optional: if omitted, the token is read from the ACME_ADMIN_TOKEN
-    environment variable. The scheduled-task registration
-    (Register-MaintenanceTasks.ps1 -RegisterRevocationSync) uses the
-    environment form so the token never appears on this script's process
-    command line.
+    Declare that this run should hold ADMIN authority, drawn from the
+    ACME_ADMIN_TOKEN environment variable. This is a SWITCH, not a value:
+    since the 2026-08-23 review the script accepts no secret on its command
+    line at all -- the invocation is shell history and a process argument
+    list, which is exactly where a token should never travel. Set the
+    variable first (e.g. `$env:ACME_ADMIN_TOKEN = Read-Host "Admin token"`,
+    or load it from the protected dotenv) and pass the bare flag. Fails
+    loudly when the flag is given but the variable is unset. Only needed by a
+    deployment that has not yet provisioned a confirm token: the RA refuses
+    the admin token on the confirm endpoint, so prefer -ConfirmToken.
+
+.PARAMETER ConfirmToken
+    Declare that this run should use the revocation CONFIRM credential
+    (ACME_CONFIRM_TOKEN), read from that environment variable. A SWITCH, like
+    -AdminToken: the value itself is never accepted here. The confirm token
+    is the least-privilege credential and the only one the confirm endpoint
+    accepts; it alone can power the whole sync workflow. Set the variable
+    first and pass the bare flag; the script fails loudly if the flag is
+    given while the variable is unset.
 
 .PARAMETER CaConfig
     The CA configuration string ("CA01\WORK-DOMAIN-CA" form). Passed through
@@ -119,26 +131,30 @@
     section E and docs/operations.md.
 
 .EXAMPLE
-    # Dry run (default -- report only, no changes):
+    # Dry run (default -- report only, no changes). The credential NEVER
+    # travels on the command line: set it in the environment first (any
+    # protected source -- the RA dotenv, a vault lookup, an interactive
+    # prompt), then run with the bare -ConfirmToken flag:
+    $env:ACME_CONFIRM_TOKEN = Read-Host "Revocation confirm token"
     powershell -File .\scripts\Sync-Revocations.ps1 `
         -RaBaseUrl "https://ra.WORK-DOMAIN.local" `
-        -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
-        -CaConfig 'CA01\WORK-DOMAIN-CA'
+        -CaConfig 'CA01\WORK-DOMAIN-CA' -ConfirmToken
 
 .EXAMPLE
-    # Execute (actually revoke pending serials at the CA):
+    # Execute (actually revoke pending serials at the CA), same
+    # environment-first rule:
+    $env:ACME_CONFIRM_TOKEN = Read-Host "Revocation confirm token"
     powershell -File .\scripts\Sync-Revocations.ps1 `
         -RaBaseUrl "https://ra.WORK-DOMAIN.local" `
-        -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
-        -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute
+        -CaConfig 'CA01\WORK-DOMAIN-CA' -ConfirmToken -Execute
 
 .EXAMPLE
     # Single-identity deployment (agent on the RA host under the enrollment
     # gMSA, which is also the revoker):
+    $env:ACME_CONFIRM_TOKEN = Read-Host "Revocation confirm token"
     powershell -File .\scripts\Sync-Revocations.ps1 `
         -RaBaseUrl "https://ra.WORK-DOMAIN.local" `
-        -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
-        -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute -LocalMode
+        -CaConfig 'CA01\WORK-DOMAIN-CA' -ConfirmToken -Execute -LocalMode
 
 .NOTES
     Schedule as a Windows Scheduled Task running as `gMSA-acme-revoker$` on
@@ -156,8 +172,18 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$RaBaseUrl,
-    [string]$AdminToken = "",
-    [string]$ConfirmToken = "",
+    # 2026-08-23 finding 6: these used to be [string] parameters, so the
+    # documented direct invocation carried the FULL token value through the
+    # shell history and the process argument list -- the last place the
+    # credential still travelled after the scheduled-task side was closed.
+    # They are SWITCHES now (the same pattern as Register-MaintenanceTasks
+    # since the 2026-08-15 review): they declare WHICH environment variable
+    # supplies the value, so a token value can no longer be passed at all --
+    # whatever follows the flag binds positionally to a non-secret parameter
+    # and never reaches an Authorization header -- and a flag whose variable
+    # is unset fails loudly before anything runs.
+    [switch]$AdminToken,
+    [switch]$ConfirmToken,
     [Parameter(Mandatory = $true)][string]$CaConfig,
     [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
     [switch]$DryRun,
@@ -184,15 +210,25 @@ if ($Execute -and $DryRun) {
 }
 $liveMode = [bool]$Execute
 
-# Admin token: prefer the -AdminToken parameter; fall back to the
-# ACME_ADMIN_TOKEN environment variable. The scheduled-task registration
-# passes it via the environment so the token never lands on this script's
-# process command line (visible in a process listing during the run window).
-if ([string]::IsNullOrWhiteSpace($AdminToken)) {
-    $AdminToken = $env:ACME_ADMIN_TOKEN
+# Credentials: the VALUE always comes from the environment. -AdminToken /
+# -ConfirmToken are switches that declare which one this run uses, fail loudly
+# when the declared variable is unset, and never accept the secret itself --
+# the command line is shell history and a process listing (2026-08-23
+# finding 6). The scheduled-task action (Register-MaintenanceTasks.ps1) sets
+# ACME_ADMIN_TOKEN / ACME_CONFIRM_TOKEN and passes no switch, so with no flag
+# given the environment is still the source and direct manual operation works
+# the same way: set the variable(s), then run the script.
+$adminTokenValue = [string]$env:ACME_ADMIN_TOKEN
+$confirmTokenValue = [string]$env:ACME_CONFIRM_TOKEN
+if ($AdminToken -and [string]::IsNullOrWhiteSpace($adminTokenValue)) {
+    Die ("-AdminToken was given but ACME_ADMIN_TOKEN is not set in the environment. " +
+         "Set it first (e.g. `$env:ACME_ADMIN_TOKEN = Read-Host) -- the value is never " +
+         "accepted on the command line.") 3
 }
-if ([string]::IsNullOrWhiteSpace($ConfirmToken)) {
-    $ConfirmToken = $env:ACME_CONFIRM_TOKEN
+if ($ConfirmToken -and [string]::IsNullOrWhiteSpace($confirmTokenValue)) {
+    Die ("-ConfirmToken was given but ACME_CONFIRM_TOKEN is not set in the environment. " +
+         "Set it first (e.g. `$env:ACME_CONFIRM_TOKEN = Read-Host) -- the value is never " +
+         "accepted on the command line.") 3
 }
 # The confirm token is now sufficient authority for this whole script: the RA
 # accepts it for the read-only pending list as well as for confirming. That is
@@ -200,13 +236,15 @@ if ([string]::IsNullOrWhiteSpace($ConfirmToken)) {
 # token can reclaim a processing order and drain the nonce table, powers this
 # agent has no use for. -AdminToken remains accepted for a deployment that has
 # not yet provisioned a confirm token, but it is no longer required.
-if ([string]::IsNullOrWhiteSpace($AdminToken) -and [string]::IsNullOrWhiteSpace($ConfirmToken)) {
-    Die "No credential supplied: pass -ConfirmToken (preferred) or -AdminToken, or set ACME_CONFIRM_TOKEN / ACME_ADMIN_TOKEN." 3
+if ([string]::IsNullOrWhiteSpace($adminTokenValue) -and [string]::IsNullOrWhiteSpace($confirmTokenValue)) {
+    Die ("No credential supplied: set ACME_CONFIRM_TOKEN (preferred) or ACME_ADMIN_TOKEN in the " +
+         "environment first, and declare the choice with the -ConfirmToken / -AdminToken flag. " +
+         "Token values are never accepted as command-line parameters.") 3
 }
-if ([string]::IsNullOrWhiteSpace($ConfirmToken)) {
-    Write-Warning ("No -ConfirmToken supplied; falling back to the admin token to read the pending list. " +
-                   "The RA REFUSES the admin token when confirming, so every confirm below will fail and " +
-                   "serials will stay pending. Provision ACME_RA_REVOCATION_CONFIRM_TOKEN.")
+if ([string]::IsNullOrWhiteSpace($confirmTokenValue)) {
+    Write-Warning ("No confirm token in the environment; falling back to the admin token to read the " +
+                   "pending list. The RA REFUSES the admin token when confirming, so every confirm below " +
+                   "will fail and serials will stay pending. Provision ACME_RA_REVOCATION_CONFIRM_TOKEN.")
 }
 
 # Resolve the Revoke-Cert.ps1 path.
@@ -237,7 +275,7 @@ try {
 }
 # Prefer the confirm token for the read; fall back to the admin token only if
 # no confirm token was provisioned.
-$readToken = if ([string]::IsNullOrWhiteSpace($ConfirmToken)) { $AdminToken } else { $ConfirmToken }
+$readToken = if ([string]::IsNullOrWhiteSpace($confirmTokenValue)) { $adminTokenValue } else { $confirmTokenValue }
 $headers = @{ 'Authorization' = "Bearer $readToken" }
 
 # Confirming a CA-side revocation now requires its own credential -- the RA
@@ -245,8 +283,8 @@ $headers = @{ 'Authorization' = "Bearer $readToken" }
 # monitoring/ops token cannot forge "the CA revoked it". Fall back to the
 # admin token only when no confirm token was supplied, so an operator who has
 # not yet provisioned one gets the RA's explicit 401 rather than a silent skip.
-$confirmTokenValue = if ([string]::IsNullOrWhiteSpace($ConfirmToken)) { $AdminToken } else { $ConfirmToken }
-$confirmHeaders = @{ 'Authorization' = "Bearer $confirmTokenValue" }
+$effectiveConfirmToken = if ([string]::IsNullOrWhiteSpace($confirmTokenValue)) { $adminTokenValue } else { $confirmTokenValue }
+$confirmHeaders = @{ 'Authorization' = "Bearer $effectiveConfirmToken" }
 
 if ($liveMode) {
     if ($LocalMode) {

@@ -33,7 +33,7 @@ async def post_authorization(
     Unlike the plain GET above, this is account-scoped: it closes the
     existence oracle for callers who hold the URL but not the account key.
     """
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/authz/{authz_id}"
     )
     if payload != {}:
@@ -82,7 +82,7 @@ async def post_challenge(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/challenge/{challenge_id}"
     )
     account_id = account.id

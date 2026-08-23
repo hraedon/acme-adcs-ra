@@ -21,6 +21,7 @@ from acme_adcs_ra.app_state import (
     _audit,
     authenticate_account,
     emit_audit_hook,
+    enforce_account_usable,
     get_context,
 )
 from acme_adcs_ra.jws import (
@@ -48,7 +49,7 @@ async def key_change(
     URL and the old key JWK. After validation the account's stored key is
     replaced; the old key is no longer accepted.
     """
-    outer_header, outer_payload, account = await authenticate_account(
+    outer_header, outer_payload, account, authenticated_thumbprint = await authenticate_account(
         ctx, request, _ACME_PATHS["keyChange"]
     )
     account_id = account.id
@@ -150,21 +151,28 @@ async def key_change(
     # limit at all, and a route-level count-then-rotate would let a parallel
     # burst past the ceiling — with each winner an irreversible key rotation.
     try:
-        event = ctx.store.update_account_key_with_audit(
-            account_id,
-            new_jwk,
-            expected_old_thumbprint=old_key_thumbprint,
-            audit={
-                "event_type": "account-key-changed",
-                "outcome": "success",
-                "details": {
-                    "eab_kid": account.eab_kid,
-                    "new_key_thumbprint": new_key_thumbprint,
+        async with ctx.account_issuance_locks.mutating(account_id):
+            current = ctx.store.get_account(account_id)
+            if current is None:
+                raise AccountKeyStale("account disappeared before rollover")
+            enforce_account_usable(ctx, current)
+            if jwk_thumbprint(json.loads(current.jwk_json)) != authenticated_thumbprint:
+                raise AccountKeyStale("account key changed before rollover")
+            event = ctx.store.update_account_key_with_audit(
+                account_id,
+                new_jwk,
+                expected_old_thumbprint=authenticated_thumbprint,
+                audit={
+                    "event_type": "account-key-changed",
+                    "outcome": "success",
+                    "details": {
+                        "eab_kid": account.eab_kid,
+                        "new_key_thumbprint": new_key_thumbprint,
+                    },
                 },
-            },
-            rate_limit_window_seconds=ctx.config.rate_limit_window_seconds,
-            rate_limit_per_kid=ctx.config.rate_limit_key_changes_per_window,
-        )
+                rate_limit_window_seconds=ctx.config.rate_limit_window_seconds,
+                rate_limit_per_kid=ctx.config.rate_limit_key_changes_per_window,
+            )
     except AccountKeyStale as exc:
         _audit(
             ctx,

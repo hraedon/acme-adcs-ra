@@ -59,6 +59,8 @@ def main() -> int:
             template=config.adcs_template,
             ca_name=config.adcs_ca_name,
             ca_bundle=config.adcs_ca_bundle,
+            timeout=config.adcs_enrollment_timeout_seconds,
+            total_timeout=config.adcs_enrollment_total_timeout_seconds,
         )
         if sys.platform == "win32"
         else FakeEnrollmentLeg()

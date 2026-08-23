@@ -25,11 +25,13 @@ from acme_adcs_ra.app_state import (
     _url,
     authenticate_account,
     emit_audit_hook,
+    enforce_account_usable,
     get_context,
 )
 from acme_adcs_ra.jws import (
     JWSValidationError,
     _base64url_decode,
+    jwk_thumbprint,
     verify_eab_jws,
 )
 from acme_adcs_ra.serializers import _account_to_json
@@ -266,7 +268,7 @@ async def account_resource(
     account — including revoking its own live certificates. It is one-way; RFC
     8555 §7.3.6 says the server MUST NOT allow reactivation.
     """
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/acct/{account_id}"
     )
     # The kid already identified the account; a mismatch means the caller is
@@ -281,16 +283,32 @@ async def account_resource(
                 "the only supported account status change is 'deactivated' "
                 "(RFC 8555 §7.3.6)"
             )
-        applied = ctx.store.update_account_status(
-            account.id, AccountStatus.DEACTIVATED
-        )
-        _audit(
-            ctx,
-            event_type="account-deactivated",
-            account_id=account.id,
-            outcome="success",
-            details={"eab_kid": account.eab_kid, "applied": applied},
-        )
+        async with ctx.account_issuance_locks.mutating(account.id):
+            current = ctx.store.get_account(account.id)
+            if current is None:
+                raise unauthorized("account not found")
+            enforce_account_usable(ctx, current)
+            if jwk_thumbprint(json.loads(current.jwk_json)) != authenticated_thumbprint:
+                _audit(
+                    ctx,
+                    event_type="account-deactivation-stale",
+                    account_id=account.id,
+                    outcome="denied",
+                    details={"reason": "account-key-changed"},
+                )
+                raise unauthorized(
+                    "account key changed while deactivation was in progress"
+                )
+            applied = ctx.store.update_account_status(
+                account.id, AccountStatus.DEACTIVATED
+            )
+            _audit(
+                ctx,
+                event_type="account-deactivated",
+                account_id=account.id,
+                outcome="success",
+                details={"eab_kid": account.eab_kid, "applied": applied},
+            )
         refreshed = ctx.store.get_account(account.id)
         if refreshed is None:  # pragma: no cover - defensive
             raise unauthorized("account not found")
@@ -310,7 +328,7 @@ async def account_orders(
     The account object has always advertised this URL; it had no handler, so
     a client that followed the link got a 404.
     """
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/acct/{account_id}/orders"
     )
     if account.id != account_id:

@@ -1829,6 +1829,171 @@ function Get-TreeTrustViolations {
     return @($violations | Where-Object { $_ })
 }
 
+# --- 2026-08-23 finding 3: the interpreter's whole runtime tree ---------------
+#
+# Test-PathChainTrusted authenticates ONE file plus the directories above it.
+# That was the only gate on the elevated interpreter, but python.exe is not the
+# only bytes that run: before the first line of `--version` output, Python has
+# already loaded python3*.dll / vcruntime*.dll from beside the executable and
+# executed Lib\site.py -- which processes every .pth file and imports
+# sitecustomize.py it finds. A single permissively-ACL'd sibling DLL, module,
+# or .pth rode the executable-and-ancestors gate entirely and ran as
+# Administrator. The closure, not just the entry point, is the executed content.
+
+# The directory roots whose closure an interpreter executes from: the prefix
+# directory beside python.exe, plus -- when python.exe is a PEP 405 venv's
+# launcher -- every base the venv reaches through. pyvenv.cfg's `home` is where
+# the real pythonXY.dll and the stdlib live, and `base-executable` names the
+# binary the venv delegates some operations to; both are executed content while
+# the venv's python.exe is. Returns DISTINCT canonical roots; a venv whose
+# `home` points somewhere that does not exist is reported as a violation by the
+# caller-facing Get-InterpreterRuntimeViolations, not silently dropped.
+function Get-InterpreterRuntimeTree {
+    param([Parameter(Mandatory = $true)][string]$InterpreterPath)
+    $roots = @()
+    $queue = New-Object System.Collections.Generic.Queue[string]
+    $queue.Enqueue($InterpreterPath)
+    $seen = @{}
+    $guard = 0
+    while ($queue.Count -gt 0) {
+        $guard++
+        if ($guard -gt 16) { break }
+        $exePath = $queue.Dequeue()
+        if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { continue }
+        $prefix = Split-Path -Parent $exePath
+        $canonical = Get-CanonicalPathString -Path $prefix
+        if (-not $canonical) { continue }
+        $key = $canonical.ToLowerInvariant()
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $roots += $canonical
+        }
+        # A venv's python.exe carries pyvenv.cfg beside the executable OR -- the
+        # conventional Windows layout -- one directory up in the venv root
+        # (python.exe lives in <venv>\Scripts\). In both cases the directory
+        # holding pyvenv.cfg is itself executed content (the venv's own
+        # Lib\site-packages is on sys.path), and the `home`/`base-executable`
+        # entries name the base installation whose DLLs and stdlib the venv
+        # python.exe executes: the closure extends into all of them.
+        $cfgPath = Join-Path $canonical 'pyvenv.cfg'
+        if (-not (Test-Path -LiteralPath $cfgPath -PathType Leaf)) {
+            $parent = Split-Path -Parent $canonical
+            if ($parent) {
+                $candidateCfg = Join-Path $parent 'pyvenv.cfg'
+                if (Test-Path -LiteralPath $candidateCfg -PathType Leaf) {
+                    $cfgPath = $candidateCfg
+                    $parentCanonical = Get-CanonicalPathString -Path $parent
+                    if ($parentCanonical -and -not $seen.ContainsKey($parentCanonical.ToLowerInvariant())) {
+                        $seen[$parentCanonical.ToLowerInvariant()] = $true
+                        $roots += $parentCanonical
+                    }
+                }
+            }
+        }
+        if (Test-Path -LiteralPath $cfgPath -PathType Leaf) {
+            # NB $homePrefix, not $home: $HOME is a read-only automatic
+            # variable and PowerShell variable names are case-insensitive, so
+            # an assignment to $home throws on every platform and the parse
+            # loop below would go on seeing the login shell's home directory
+            # as the venv base.
+            $homePrefix = ''
+            $baseExe = ''
+            # An EXISTING pyvenv.cfg that cannot be read must THROW, not be
+            # skipped: this read used -ErrorAction SilentlyContinue, so an
+            # unreadable file parsed as "no base at all", the closure silently
+            # shrank to the venv directory alone, and the gate proved a tree
+            # that was not the executed closure. Get-InterpreterRuntimeViolations
+            # turns the throw into a refusal.
+            $cfgLines = @()
+            try {
+                $cfgLines = @(Get-Content -LiteralPath $cfgPath -ErrorAction Stop)
+            } catch {
+                throw ("Get-InterpreterRuntimeTree: pyvenv.cfg exists but cannot be read " +
+                       "($cfgPath): $($_.Exception.Message); the venv base installation " +
+                       "cannot be determined, so the runtime closure cannot be proven.")
+            }
+            foreach ($line in $cfgLines) {
+                if ($line -match '^\s*home\s*=\s*(\S.*)$') { $homePrefix = $Matches[1].Trim() }
+                if ($line -match '^\s*base-executable\s*=\s*(\S.*)$') { $baseExe = $Matches[1].Trim() }
+            }
+            # Same rule for a READABLE but undecipherable cfg: a pyvenv.cfg
+            # declaring neither key names no base, which means the closure is
+            # unknown -- and "unknown" is a refusal, not an empty extension.
+            # (A well-formed CPython venv always writes home.)
+            if (-not $homePrefix -and -not $baseExe) {
+                throw ("Get-InterpreterRuntimeTree: pyvenv.cfg at $cfgPath declares neither " +
+                       "'home' nor 'base-executable'; the base installation the venv executes " +
+                       "from cannot be determined, so the runtime closure cannot be proven.")
+            }
+            if ($baseExe -and (Test-Path -LiteralPath $baseExe -PathType Leaf)) { $queue.Enqueue($baseExe) }
+            elseif ($homePrefix) {
+                # home names the base PREFIX (a directory); enqueue a python.exe
+                # inside it when one exists so the prefix is picked up as a root.
+                # String concat, not Join-Path: Join-Path is provider-aware and
+                # throws "Cannot find drive" for a Windows path on a non-Windows
+                # host (the same reason Assert-WebConfigLaunchTrusted avoids it).
+                $homeExe = $homePrefix.TrimEnd('\') + '\python.exe'
+                if (Test-Path -LiteralPath $homeExe -PathType Leaf) {
+                    $queue.Enqueue($homeExe)
+                } else {
+                    $homeCanonical = Get-CanonicalPathString -Path $homePrefix
+                    if ($homeCanonical -and -not $seen.ContainsKey($homeCanonical.ToLowerInvariant())) {
+                        $seen[$homeCanonical.ToLowerInvariant()] = $true
+                        $roots += $homeCanonical
+                    }
+                }
+            }
+        }
+    }
+    return @($roots)
+}
+
+# The full pre-execution gate for an interpreter the elevated installer is
+# about to run: every runtime-tree root must be free of reparse points (a link
+# inside the tree redirects what Python imports, and what a -Recurse copy
+# copies, outside the proven tree) and administrator-only through the same
+# Get-TreeTrustViolations the site tree gets -- ancestor chain plus every
+# object's owner and DACL. EMPTY means trusted. The reparse walk runs FIRST and
+# short-circuits the root: Get-TreeTrustViolations enumerates with
+# Get-ChildItem -Recurse, which follows junctions on Windows PowerShell 5.1, so
+# a link must never be walked past, only reported. A runtime closure that
+# cannot be DETERMINED (an unreadable or undecipherable pyvenv.cfg) is a
+# refusal here, never a partial proof.
+function Get-InterpreterRuntimeViolations {
+    param([Parameter(Mandatory = $true)][string]$InterpreterPath)
+    $violations = @()
+    if (-not (Test-Path -LiteralPath $InterpreterPath)) {
+        return @("$InterpreterPath : interpreter not found; refusing to prove an absent runtime")
+    }
+    $runtimeRoots = @()
+    try {
+        $runtimeRoots = @(Get-InterpreterRuntimeTree -InterpreterPath $InterpreterPath)
+    } catch {
+        return @(("$InterpreterPath : interpreter runtime closure could not be determined " +
+                  "($($_.Exception.Message)) -- a partial closure is not proof"))
+    }
+    foreach ($root in $runtimeRoots) {
+        # A root that does not exist (a dangling pyvenv.cfg home) must be a
+        # refusal: the chain walk skips non-existent paths, so silence here
+        # would otherwise read as proof.
+        if (-not (Test-Path -LiteralPath $root)) {
+            $violations += ("$root : interpreter runtime tree root does not exist " +
+                            "(dangling pyvenv.cfg home?); refusing to treat silence as proof")
+            continue
+        }
+        $links = @(Find-ReparsePoints -Path $root)
+        if (@($links).Count -gt 0) {
+            foreach ($link in $links) {
+                $violations += ("$link : reparse point inside the interpreter runtime tree -- " +
+                                "Python loads (and the installer copies) follow it outside the proven tree")
+            }
+            continue
+        }
+        $violations += @(Get-TreeTrustViolations -Path $root)
+    }
+    return @($violations | Where-Object { $_ })
+}
+
 # Fail-closed validation of the web.config the gMSA pool will launch from.
 # web.config IS launch configuration: httpPlatform/@processPath names the
 # executable IIS starts as the gMSA. Round 5: this used to be a warning whose
@@ -2135,3 +2300,226 @@ function Assert-WebConfigLaunchTrusted {
 # single atomic DACL swap, and the emptiness check catches anything that
 # slipped through it: after the swap Users hold no create right, so nothing
 # new can appear.
+
+# --- 2026-08-23 finding 5: trusted inbox cmdlet resolution --------------------
+#
+# The elevated installer used Get-Command as a truth test and then invoked the
+# same BARE name: "the name resolved" was treated as "a trusted cmdlet is
+# present". PowerShell name resolution happily returns an Application found on
+# PATH (or an ExternalScript, or an Alias), so on a host where the expected
+# module is absent -- a client SKU without ServerManager, a server without
+# RSAT -- a planted executable named Install-WindowsFeature.exe in a writable
+# PATH entry satisfied discovery and ran as Administrator.
+#
+# The fix: expected IIS/ServerManager/ActiveDirectory commands may only be
+# INBOX cmdlets/functions, imported from the canonical system module root by
+# absolute path, with the resolved CommandInfo's CommandType and module
+# provenance validated before anything is invoked.
+
+# The canonical root where inbox Windows PowerShell modules live. Empty off
+# Windows (there is no inbox), which makes every resolution fail closed there.
+#
+# The Windows directory is derived from NON-process sources on purpose. The
+# obvious spelling is $env:windir, but the process environment is inherited
+# from whatever launched the installer and is caller-settable -- the exact
+# input class this library already refuses to trust elsewhere
+# ($script:InstallVerifyIsWindows exists because a gate keyed on $env:OS let a
+# stripped environment silently disable it). Import-TrustedInboxModule loads a
+# MODULE from this root by absolute path, so a redirected windir is not a
+# wrong-path report, it is elevated execution of attacker-chosen bytes.
+# Sources, in order of preference: the MACHINE-scope 'windir' (the HKLM
+# Session Manager Environment value, writable only by Administrators/SYSTEM)
+# and the OS folder API for the System directory. Both candidates must be
+# drive-absolute Windows paths or they are discarded. String operations only:
+# Join-Path/Split-Path are provider-aware and throw for Windows drive paths on
+# the non-Windows hosts the Pester suite runs on.
+function Get-TrustedInboxModuleRoots {
+    $candidates = @()
+    try {
+        $machineWindir = [string][System.Environment]::GetEnvironmentVariable('windir', 'Machine')
+        if ($machineWindir) { $candidates += $machineWindir }
+    } catch { }
+    try {
+        $systemDir = [string][System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)
+        if ($systemDir) {
+            $cut = $systemDir.LastIndexOf('\')
+            if ($cut -gt 0) { $candidates += $systemDir.Substring(0, $cut) }
+        }
+    } catch { }
+    foreach ($dir in @($candidates)) {
+        $trimmed = $dir.Trim()
+        if ($trimmed -notmatch '^[A-Za-z]:\\') { continue }
+        return @($trimmed.TrimEnd('\') + '\System32\WindowsPowerShell\v1.0\Modules')
+    }
+    return @()
+}
+
+# Pure "is $Path inside $Root" over canonicalised strings, for the module
+# provenance check. Get-PathRelation/Test-PathInsideTree refuse non-Windows
+# path shapes outright (Assert-SafeLocalInstallPath), which is right for
+# operator-supplied install roots but would make the provenance decision
+# unrunnable from the Linux Pester job; this variant canonicalises both sides
+# (Get-CanonicalPathString is lexical for drive-absolute paths on any host)
+# and compares case-insensitively, Windows path semantics.
+function Test-PathInsideTrustedRoot {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Root
+    )
+    if (-not $Path -or -not $Root) { return $false }
+    $np = Get-CanonicalPathString -Path $Path
+    $nr = Get-CanonicalPathString -Path $Root
+    if (-not $np -or -not $nr) { return $false }
+    # Normalise separators to '\' on BOTH sides before the segment compare:
+    # the prefix test below appends a '\', and a POSIX-shaped path (the Linux
+    # Pester run drives this with real temp roots) would never match against a
+    # backslash-terminated prefix otherwise.
+    $np = ((@($np -replace '/', '\' -split '\\')) | Where-Object { $_ }) -join '\'
+    $nr = ((@($nr -replace '/', '\' -split '\\')) | Where-Object { $_ }) -join '\'
+    if ($np -eq $nr) { return $true }
+    return $np.StartsWith($nr + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+# Pure decision over a resolved command's provenance fields: does it name a
+# trusted inbox Cmdlet/Function from the expected module, installed under a
+# trusted module root? Takes primitives rather than a CommandInfo so the Linux
+# Pester run can drive it directly.
+#
+#   * CommandType must be Cmdlet or Function -- an Application is a PATH
+#     executable, an ExternalScript is an arbitrary .ps1, an Alias is one hop
+#     away from either; none of them is inbox code.
+#   * The owning module must be the expected one, compared case-insensitively
+#     (module names are case-insensitive in PowerShell).
+#   * The module's own path must sit inside a trusted root: a same-named module
+#     copied into a user-writable PSModulePath location exports a perfectly
+#     normal-looking Cmdlet CommandInfo with a perfectly wrong Module.Path.
+function Test-CommandProvenanceTrusted {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$CommandType,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ModuleName,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ModulePath,
+        [Parameter(Mandatory = $true)][string]$ExpectedModuleName,
+        [AllowEmptyCollection()][string[]]$TrustedModuleRoots
+    )
+    if ($CommandType -ne 'Cmdlet' -and $CommandType -ne 'Function') { return $false }
+    if (-not [string]::Equals($ModuleName, $ExpectedModuleName,
+                              [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not $ModulePath) { return $false }
+    foreach ($root in @($TrustedModuleRoots)) {
+        if (Test-PathInsideTrustedRoot -Path $ModulePath -Root $root) { return $true }
+    }
+    return $false
+}
+
+# Import $ModuleName from a trusted inbox module root by ABSOLUTE path -- never
+# by name, which consults PSModulePath and its user-writable entries. Returns
+# the imported PSModuleInfo, or $null when the module is not installed under a
+# trusted root (callers keep their existing "not available" skip/warn branch;
+# nothing from PATH or a foreign module location is ever loaded).
+function Import-TrustedInboxModule {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModuleName,
+        [AllowEmptyCollection()][string[]]$TrustedModuleRoots = @(Get-TrustedInboxModuleRoots)
+    )
+    foreach ($root in @($TrustedModuleRoots)) {
+        $dir = Join-Path $root $ModuleName
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        # Prefer the conventional <Module>\<Module>.psd1; fall back to the
+        # psm1/dll spellings and then to any manifest in the directory, so an
+        # inbox module with an unconventional file name still imports from its
+        # PROVEN location rather than being skipped.
+        $moduleFile = $null
+        foreach ($candidate in @(
+            (Join-Path $dir ($ModuleName + '.psd1')),
+            (Join-Path $dir ($ModuleName + '.psm1')),
+            (Join-Path $dir ($ModuleName + '.dll'))
+        )) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $moduleFile = $candidate; break }
+        }
+        if (-not $moduleFile) {
+            $anyManifest = @(Get-ChildItem -LiteralPath $dir -Filter '*.psd1' -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1)
+            if ($anyManifest) { $moduleFile = $anyManifest.FullName }
+        }
+        if (-not $moduleFile) { continue }
+        # The LOCATION is the trust anchor, so the location is PROVEN before
+        # anything is imported (2026-08-23 finding 5 follow-up): no reparse
+        # points (a link inside the module tree can redirect both this import
+        # and the ACL walk below), then the same whole-tree gate as every other
+        # privileged read -- the module directory, every object under it, and
+        # the ancestor chain above it must be administrator-only. A redirected
+        # or tampered root therefore fails HERE, on the bytes about to be
+        # loaded, even if its path shape matched the expected layout.
+        $links = @(Find-ReparsePoints -Path $dir)
+        if (@($links).Count -gt 0) {
+            Write-Warning ("Import-TrustedInboxModule: $dir contains reparse points (first: " +
+                           "$($links[0])); refusing to import an unprovable module tree.")
+            return $null
+        }
+        $treeViolations = @(Get-TreeTrustViolations -Path $dir)
+        if (@($treeViolations).Count -gt 0) {
+            $shown = @($treeViolations) | Select-Object -First 4
+            Write-Warning ("Import-TrustedInboxModule: $dir is not administrator-only (its chain " +
+                           "or its contents):`n  " + ($shown -join "`n  ") +
+                           "`nRefusing to import from an unproven location.")
+            return $null
+        }
+        # -Global: this runs from inside installer functions, and a module
+        # imported into a function scope is removed when that scope exits.
+        try {
+            $imported = Import-Module $moduleFile -Global -PassThru -ErrorAction Stop
+            if ($imported) { return $imported }
+        } catch {
+            return $null
+        }
+    }
+    return $null
+}
+
+# Resolve $Name to a trusted inbox command: import the canonical module,
+# resolve the command from THAT MODULE'S OWN export table, validate its
+# provenance, and hand back the CommandInfo for the caller to invoke with the
+# call operator. $null means "not safely available" -- the caller's existing
+# not-available semantics apply, and the untrusted resolution (a PATH
+# Application, a same-named function from the wrong module) is never executed.
+function Get-TrustedInboxCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$ModuleName,
+        [AllowEmptyCollection()][string[]]$TrustedModuleRoots = @(Get-TrustedInboxModuleRoots)
+    )
+    $module = Import-TrustedInboxModule -ModuleName $ModuleName -TrustedModuleRoots $TrustedModuleRoots
+    if (-not $module) { return $null }
+    # Resolve from the imported module's OWN ExportedCommands, never through
+    # global name resolution. Get-Command obeys alias > function > cmdlet >
+    # external-script precedence across the WHOLE session, so a caller-profile
+    # alias, a same-named global function, or another loaded module's export
+    # shadows the trusted one -- and the provenance check then either rejects
+    # the shadow (breaking availability: the trusted cmdlet exists but the
+    # caller is told "not available") or, worse, returns something that merely
+    # LOOKS right. The export table is module-bound by construction: whatever
+    # it hands back was exported by the module whose path was just proven,
+    # however many shadows exist in the session. Keys are compared with -ieq
+    # rather than trusting the table's comparer.
+    $cmd = $null
+    try {
+        if ($module.ExportedCommands) {
+            foreach ($key in @($module.ExportedCommands.Keys)) {
+                if ($key -ieq $Name) { $cmd = $module.ExportedCommands[$key]; break }
+            }
+        }
+    } catch {
+        return $null
+    }
+    if (-not $cmd) { return $null }
+    $modulePath = ''
+    try {
+        if ($cmd.Module -and $cmd.Module.Path) { $modulePath = [string]$cmd.Module.Path }
+    } catch { }
+    if (-not (Test-CommandProvenanceTrusted -CommandType ([string]$cmd.CommandType) `
+            -ModuleName ([string]$cmd.ModuleName) -ModulePath $modulePath `
+            -ExpectedModuleName $ModuleName -TrustedModuleRoots $TrustedModuleRoots)) {
+        return $null
+    }
+    return $cmd
+}

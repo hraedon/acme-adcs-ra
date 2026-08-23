@@ -29,13 +29,20 @@ and the test confirmed to fail. See docs/security-review-2026-08-15-rescan.md.
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 from typing import Any, Self
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
 
+from acme_adcs_ra.acme_errors import AcmeError
 from acme_adcs_ra.enrollment import EnrollmentResult, FakeEnrollmentLeg
+from acme_adcs_ra.jws import jwk_thumbprint
 from acme_adcs_ra.store import OrderStatus, Store
 
 from .test_security_review_2026_08_14 import (
@@ -69,6 +76,31 @@ class _CountingLeg(FakeEnrollmentLeg):
         return super().submit_csr(
             csr_pem, account_id=account_id, requested_sans=requested_sans
         )
+
+
+def _ready_finalize(client: Any) -> tuple[Any, Any, str, bytes]:
+    """Create an authenticated account and ready order for race tests."""
+    from .hand_rolled_acme_client import HandRolledAcmeClient
+    from .test_revocation import _eab_mac_key, _make_csr, _make_test_config
+
+    cfg = _make_test_config(Path("/nonexistent"))
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    acme = HandRolledAcmeClient(client, "http://testserver", key)
+    assert acme.new_account("kid-001", _eab_mac_key(cfg, "kid-001")).status_code == 201
+    order = acme.new_order(["srv01.WORK-DOMAIN.local"]).json()
+    for authz_url in order["authorizations"]:
+        authz = acme.get_authorization(authz_url).json()
+        for challenge in authz["challenges"]:
+            assert acme.validate_challenge(challenge["url"]).status_code == 200
+    return acme, key, order["finalize"], _make_csr(["srv01.WORK-DOMAIN.local"])
+
+
+def _mutation_client(client: Any, key: Any, account_url: str) -> Any:
+    from .hand_rolled_acme_client import HandRolledAcmeClient
+
+    acme = HandRolledAcmeClient(client, "http://testserver", key)
+    acme.account_url = account_url
+    return acme
 
 
 def _only_processing_order_id(store: Store) -> str:
@@ -153,22 +185,19 @@ class TestTheMarkCoversTheWholeInFlightInterval:
         produces. Before the fix the registry was empty here, so this reclaim
         returned 200 and reopened the order; the stale task then submitted to
         ADCS alongside the client's second finalize."""
-        from acme_adcs_ra.routes import orders as orders_module
-
         leg = _CountingLeg()
         store, client = _app_with_leg(tmp_path, leg)
-        real_run_in_threadpool = orders_module.run_in_threadpool
+        gate = client.app.state.context.enrollment_gate
+        real_run = gate.run
         gated = _GatedFinalize(client)
 
-        async def gated_run_in_threadpool(func: Any, *args: Any, **kwargs: Any) -> Any:
-            # Stand in for the wait for a threadpool slot: the task is admitted
-            # and queued, but not yet running.
+        async def gated_run(func: Any, *args: Any, **kwargs: Any) -> Any:
+            # Stand in for the wait for a dedicated enrollment slot: the task
+            # is admitted and queued, but not yet running.
             gated.gate()
-            return await real_run_in_threadpool(func, *args, **kwargs)
+            return await real_run(func, *args, **kwargs)
 
-        monkeypatch.setattr(
-            orders_module, "run_in_threadpool", gated_run_in_threadpool
-        )
+        monkeypatch.setattr(gate, "run", gated_run)
 
         with gated:
             order_id = _only_processing_order_id(store)
@@ -236,6 +265,188 @@ class TestTheMarkCoversTheWholeInFlightInterval:
         assert leg.calls == 1
 
 
+class TestAccountMutationLinearization:
+    @pytest.mark.parametrize("mutation", ["deactivate", "key-change"])
+    def test_mutation_committed_while_finalize_is_queued_blocks_the_ca_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+    ) -> None:
+        leg = _CountingLeg()
+        store, client = _app_with_leg(tmp_path, leg)
+        acme, key, finalize_url, csr = _ready_finalize(client)
+        assert acme.account_url is not None
+        mutator = _mutation_client(client, key, acme.account_url)
+
+        gate = client.app.state.context.enrollment_gate
+        real_run = gate.run
+        queued = threading.Event()
+        release = threading.Event()
+
+        async def queued_run(fn: Any, *args: Any) -> Any:
+            queued.set()
+            assert release.wait(_TIMEOUT)
+            return await real_run(fn, *args)
+
+        monkeypatch.setattr(gate, "run", queued_run)
+        result: dict[str, Any] = {}
+
+        def finalize() -> None:
+            result["response"] = acme.finalize_order(finalize_url, csr)
+
+        thread = threading.Thread(target=finalize, daemon=True)
+        thread.start()
+        assert queued.wait(_TIMEOUT)
+        if mutation == "deactivate":
+            mutation_response = mutator.deactivate_account()
+        else:
+            mutation_response = mutator.key_change(
+                rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            )
+        assert mutation_response.status_code == 200
+        release.set()
+        thread.join(_TIMEOUT)
+        assert not thread.is_alive()
+
+        assert result["response"].status_code == 401
+        assert leg.calls == 0
+        events = store.list_audit_events(event_type="finalize-enrollment-abandoned")
+        assert events[-1]["details"]["reason"] == "account-authorization-changed"
+
+    @pytest.mark.parametrize("mutation", ["deactivate", "key-change"])
+    def test_mutation_waits_when_ca_submission_linearized_first(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        entered_ca = threading.Event()
+        release_ca = threading.Event()
+
+        class _BlockingLeg(_CountingLeg):
+            def submit_csr(
+                self, csr_pem: str, *, account_id: str, requested_sans: Any
+            ) -> EnrollmentResult:
+                entered_ca.set()
+                assert release_ca.wait(_TIMEOUT)
+                return super().submit_csr(
+                    csr_pem, account_id=account_id, requested_sans=requested_sans
+                )
+
+        leg = _BlockingLeg()
+        store, client = _app_with_leg(tmp_path, leg)
+        acme, key, finalize_url, csr = _ready_finalize(client)
+        assert acme.account_url is not None
+        account_id = acme.account_url.rsplit("/", 1)[-1]
+        mutator = _mutation_client(client, key, acme.account_url)
+        results: dict[str, Any] = {}
+
+        finalize_thread = threading.Thread(
+            target=lambda: results.update(
+                finalize=acme.finalize_order(finalize_url, csr)
+            ),
+            daemon=True,
+        )
+        finalize_thread.start()
+        assert entered_ca.wait(_TIMEOUT)
+
+        def mutate() -> None:
+            if mutation == "deactivate":
+                results["mutation"] = mutator.deactivate_account()
+            else:
+                results["mutation"] = mutator.key_change(
+                    rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                )
+
+        mutation_thread = threading.Thread(target=mutate, daemon=True)
+        mutation_thread.start()
+        mutation_thread.join(0.1)
+        assert mutation_thread.is_alive(), "mutation bypassed the account issuance lock"
+        account = store.get_account(account_id)
+        assert account is not None and account.status == "valid"
+
+        release_ca.set()
+        finalize_thread.join(_TIMEOUT)
+        mutation_thread.join(_TIMEOUT)
+        assert not finalize_thread.is_alive() and not mutation_thread.is_alive()
+        assert results["finalize"].status_code == 200
+        assert results["mutation"].status_code == 200
+        assert leg.calls == 1
+
+
+class TestCsrEkuPreEnrollmentBoundary:
+    @pytest.mark.parametrize(
+        "ekus",
+        [
+            [ExtendedKeyUsageOID.CLIENT_AUTH],
+            [ObjectIdentifier("2.5.29.37.0")],
+            [ObjectIdentifier("1.3.6.1.4.1.311.20.2.2")],
+            [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
+        ],
+    )
+    def test_forbidden_standard_eku_never_reaches_enrollment(
+        self, tmp_path: Path, ekus: list[ObjectIdentifier]
+    ) -> None:
+        leg = _CountingLeg()
+        _store, client = _app_with_leg(tmp_path, leg)
+        acme, _account_key, finalize_url, _csr = _ready_finalize(client)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(
+                x509.Name(
+                    [x509.NameAttribute(NameOID.COMMON_NAME, "srv01.WORK-DOMAIN.local")]
+                )
+            )
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [x509.DNSName("srv01.WORK-DOMAIN.local")]
+                ),
+                critical=False,
+            )
+            .add_extension(x509.ExtendedKeyUsage(ekus), critical=False)
+            .sign(key, hashes.SHA256())
+            .public_bytes(serialization.Encoding.DER)
+        )
+
+        response = acme.finalize_order(finalize_url, csr)
+
+        assert response.status_code == 400
+        assert response.json()["type"].endswith(":badCSR")
+        assert leg.calls == 0
+
+    def test_microsoft_application_policies_never_reaches_enrollment(
+        self, tmp_path: Path
+    ) -> None:
+        leg = _CountingLeg()
+        _store, client = _app_with_leg(tmp_path, leg)
+        acme, _account_key, finalize_url, _csr = _ready_finalize(client)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        csr = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(
+                x509.Name(
+                    [x509.NameAttribute(NameOID.COMMON_NAME, "srv01.WORK-DOMAIN.local")]
+                )
+            )
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [x509.DNSName("srv01.WORK-DOMAIN.local")]
+                ),
+                critical=False,
+            )
+            .add_extension(
+                x509.UnrecognizedExtension(
+                    ObjectIdentifier("1.3.6.1.4.1.311.21.10"), b"0\x00"
+                ),
+                critical=False,
+            )
+            .sign(key, hashes.SHA256())
+            .public_bytes(serialization.Encoding.DER)
+        )
+
+        response = acme.finalize_order(finalize_url, csr)
+
+        assert response.status_code == 400
+        assert response.json()["type"].endswith(":badCSR")
+        assert leg.calls == 0
+
+
 class TestTheDurableLeaseStopsAStaleWorker:
     """C — the half that does not depend on process-local memory being right.
 
@@ -249,10 +460,24 @@ class TestTheDurableLeaseStopsAStaleWorker:
     def _ctx_and_order(self, tmp_path: Path, leg: Any) -> tuple[Any, Store, str, str]:
         store, client = _app_with_leg(tmp_path, leg)
         order_id, account_id = _seed_processing_order(store)
-        return client.app.state.context, store, order_id, account_id
+        ctx = client.app.state.context
+        # _seed_processing_order predates the live-EAB recheck and uses kid-1;
+        # make that seed authorized unless a test deliberately evicts it.
+        ctx.config.eab_allowlist = [
+            *ctx.config.eab_allowlist,
+            ctx.config.eab_allowlist[0].model_copy(update={"kid": "kid-1"}),
+        ]
+        return ctx, store, order_id, account_id
 
     def _submit(
-        self, ctx: Any, store: Store, order_id: str, account_id: str, generation: int
+        self,
+        ctx: Any,
+        store: Store,
+        order_id: str,
+        account_id: str,
+        generation: int,
+        *,
+        authenticated_thumbprint: str | None = None,
     ) -> Any:
         from cryptography.x509 import load_der_x509_csr
 
@@ -262,10 +487,15 @@ class TestTheDurableLeaseStopsAStaleWorker:
         from .test_revocation import _make_csr
 
         csr = load_der_x509_csr(_make_csr(["a.example.com"]))
+        account = store.get_account(account_id)
+        assert account is not None
+        if authenticated_thumbprint is None:
+            authenticated_thumbprint = jwk_thumbprint(json.loads(account.jwk_json))
         return _finalize_submit_enrollment(
             ctx,
             order_id,
             account_id,
+            authenticated_thumbprint,
             ["a.example.com"],
             csr,
             "CN=a.example.com",
@@ -275,6 +505,44 @@ class TestTheDurableLeaseStopsAStaleWorker:
             ),
             generation,
         )
+
+    @pytest.mark.parametrize("mutation", ["deactivate", "key-change", "eab-evict"])
+    def test_account_authorization_is_rechecked_under_lock_before_ca_submission(
+        self, tmp_path: Path, mutation: str
+    ) -> None:
+        """Every predicate is independently load-bearing at the CA boundary."""
+        from .hand_rolled_acme_client import jwk_from_private_key
+
+        leg = _CountingLeg()
+        ctx, store, order_id, account_id = self._ctx_and_order(tmp_path, leg)
+        order = store.get_order(order_id)
+        account = store.get_account(account_id)
+        assert order is not None and account is not None
+        authenticated = jwk_thumbprint(json.loads(account.jwk_json))
+
+        if mutation == "deactivate":
+            assert store.update_account_status(account_id, "deactivated")
+        elif mutation == "key-change":
+            new_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            store.update_account_key(account_id, jwk_from_private_key(new_key))
+        else:
+            ctx.config.eab_allowlist = []
+
+        with pytest.raises(AcmeError, match="CA was not called"):
+            self._submit(
+                ctx,
+                store,
+                order_id,
+                account_id,
+                order.processing_generation,
+                authenticated_thumbprint=authenticated,
+            )
+
+        assert leg.calls == 0
+        refreshed = store.get_order(order_id)
+        assert refreshed is not None and refreshed.status == OrderStatus.READY
+        events = store.list_audit_events(event_type="finalize-enrollment-abandoned")
+        assert events[-1]["details"]["reason"] == "account-authorization-changed"
 
     def test_a_task_queued_across_a_reclaim_never_reaches_the_ca(
         self, tmp_path: Path

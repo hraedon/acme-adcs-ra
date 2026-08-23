@@ -403,9 +403,18 @@ function Test-HttpPlatformHandler {
     # HttpPlatformHandler is the IIS module that launches+supervises uvicorn and
     # reverse-proxies to it. It is a separate (third-party) install, NOT a Windows
     # feature. Detect it as a registered IIS global module; fall back to the DLL.
+    #
+    # 2026-08-23 finding 5: this used Get-Command as a truth test and then
+    # invoked the bare name, so when the WebAdministration module is absent a
+    # planted Get-WebGlobalModule.exe in a writable PATH entry satisfied
+    # discovery and ran as Administrator. The cmdlet is resolved through the
+    # trusted inbox-module gate (Get-TrustedInboxCommand) and invoked via its
+    # resolved CommandInfo; when it is not safely available the DLL fallback
+    # below still decides, and nothing name resolution found ever executes.
     try {
-        if (Get-Command Get-WebGlobalModule -ErrorAction SilentlyContinue) {
-            $m = Get-WebGlobalModule -ErrorAction SilentlyContinue | Where-Object { $_.Name -ieq "httpPlatformHandler" }
+        $getWebGlobalModule = Get-TrustedInboxCommand -Name 'Get-WebGlobalModule' -ModuleName 'WebAdministration'
+        if ($getWebGlobalModule) {
+            $m = & $getWebGlobalModule -ErrorAction SilentlyContinue | Where-Object { $_.Name -ieq "httpPlatformHandler" }
             if ($m) { return $true }
         }
     } catch { }
@@ -418,14 +427,23 @@ function Install-Prerequisites {
     Write-Host "Installing prerequisites (-InstallPrereqs) ..."
 
     # 1. IIS role + features (native, idempotent). Server only (Install-WindowsFeature).
-    if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+    #
+    # 2026-08-23 finding 5: the same Get-Command-as-truth-test plus bare-name
+    # invocation as Test-HttpPlatformHandler. Both ServerManager cmdlets are
+    # resolved through the trusted inbox-module gate and invoked via their
+    # resolved CommandInfo; when they do not resolve (a client SKU, a server
+    # without the module) the warn-and-continue branch below runs unchanged,
+    # and a PATH-planted Install-WindowsFeature.exe is never executed.
+    $getWindowsFeature = Get-TrustedInboxCommand -Name 'Get-WindowsFeature' -ModuleName 'ServerManager'
+    $installWindowsFeature = Get-TrustedInboxCommand -Name 'Install-WindowsFeature' -ModuleName 'ServerManager'
+    if ($getWindowsFeature -and $installWindowsFeature) {
         foreach ($f in $RequiredIisFeatures) {
-            $state = Get-WindowsFeature -Name $f -ErrorAction SilentlyContinue
+            $state = & $getWindowsFeature -Name $f -ErrorAction SilentlyContinue
             if ($state -and $state.Installed) {
                 Write-Host "  [ok]   IIS feature $f already installed."
             } else {
                 Write-Host "  [..]   Installing IIS feature $f ..."
-                $res = Install-WindowsFeature -Name $f -IncludeManagementTools -ErrorAction Continue
+                $res = & $installWindowsFeature -Name $f -IncludeManagementTools -ErrorAction Continue
                 if ($res -and $res.Success) { Write-Host "  [ok]   $f installed." }
                 else { Write-Host "  [warn] Install-WindowsFeature $f did not report success; install it manually." }
             }
@@ -731,21 +749,28 @@ if ($InstallPrereqs) { Install-Prerequisites }
 # needs, before we touch anything.
 Write-Host "Prerequisite check:"
 $iisRole = $null
-if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) { $iisRole = Get-WindowsFeature -Name Web-Server -ErrorAction SilentlyContinue }
+# Finding 5 (2026-08-23): resolve through the trusted inbox-module gate, never
+# by bare name -- a report line must not become an elevated execution either.
+$getWindowsFeature = Get-TrustedInboxCommand -Name 'Get-WindowsFeature' -ModuleName 'ServerManager'
+if ($getWindowsFeature) { $iisRole = & $getWindowsFeature -Name Web-Server -ErrorAction SilentlyContinue }
 if ($iisRole) { Write-Host "  IIS Web-Server role .......... $(if ($iisRole.Installed) { 'present' } else { 'MISSING (install IIS or pass -InstallPrereqs)' })" }
 $haveWebAdmin = [bool](Get-Module -ListAvailable WebAdministration -ErrorAction SilentlyContinue)
 Write-Host "  WebAdministration module ..... $(if ($haveWebAdmin) { 'present' } else { 'MISSING (Web-Scripting-Tools)' })"
 Write-Host "  HttpPlatformHandler module .... $(if (Test-HttpPlatformHandler) { 'present' } else { 'MISSING (see -HttpPlatformHandlerMsi / iis.net)' })"
-$haveRsat = [bool](Get-Command Test-ADServiceAccount -ErrorAction SilentlyContinue)
+# Finding 5 (2026-08-23): same trusted resolution for the RSAT cmdlet; a PATH
+# application named Test-ADServiceAccount.exe must not turn the gMSA check
+# into elevated execution of attacker bytes.
+$testAdServiceAccount = Get-TrustedInboxCommand -Name 'Test-ADServiceAccount' -ModuleName 'ActiveDirectory'
+$haveRsat = [bool]$testAdServiceAccount
 Write-Host "  RSAT AD PowerShell ........... $(if ($haveRsat) { 'present' } else { 'absent (gMSA test will be skipped)' })"
 Write-Host ""
 
 # --- Confirm the gMSA is installed here (best-effort; the SID resolved above) -
 # Strip the domain for Test-ADServiceAccount (it wants the SAM without DOMAIN\).
 $gmsaSam = ($GmsaAccount -replace ".*\\", "") -replace '\$$', ""
-if (Get-Command Test-ADServiceAccount -ErrorAction SilentlyContinue) {
+if ($testAdServiceAccount) {
     try {
-        if (Test-ADServiceAccount -Identity $gmsaSam) {
+        if (& $testAdServiceAccount -Identity $gmsaSam) {
             Write-Host "Test-ADServiceAccount: gMSA is installed and usable on this host."
         } else {
             Write-Host "[warn] Test-ADServiceAccount returned False for $gmsaSam. The app pool will fail to start until the gMSA is installed here (Install-ADServiceAccount)."
@@ -757,9 +782,16 @@ if (Get-Command Test-ADServiceAccount -ErrorAction SilentlyContinue) {
     Write-Host "[warn] RSAT AD PowerShell not present; skipping Test-ADServiceAccount. Confirm the gMSA is installed on this host."
 }
 
-# --- Locate a Python 3.12+ launcher (lifted from cert-watch; same VM concerns) -
-# The Windows 'py' launcher can fail through PowerShell's & operator (Store
-# stubs, arg mangling). Probe via cmd /c, then resolve the real python.exe.
+# --- Locate a Python 3.12+ interpreter ----------------------------------------
+# Probing goes through cmd /c because Store stubs and argument mangling make
+# PowerShell's & operator unreliable for version probes.
+#
+# The Windows 'py' launcher is deliberately NOT a candidate (2026-08-23
+# finding 3 follow-up): probing it executes whichever interpreter it selects,
+# and that interpreter's runtime tree could not be proven before the probe
+# ran -- the probe IS execution. Only exact python.exe/python3.exe
+# Application paths whose full runtime closure can be proven BEFORE the first
+# probe are considered.
 function Invoke-PyProbe {
     param([string]$Exe, [string[]]$Arguments)
     # Resolve a BARE name to the absolute path PowerShell discovered on PATH
@@ -789,6 +821,13 @@ function Invoke-PyProbe {
 # anchor for that manifest -- and each mechanism was the next round's finding.
 # The runtime is now built fresh, under %ProgramFiles%, on every run, so there
 # is never a destination interpreter to decide about. That is the whole fix.
+#
+# The 'py' launcher is not here either, for the same reason it is not a
+# candidate anywhere: `py --version` executes the interpreter the launcher
+# selects before any gate can prove that interpreter's runtime tree, and no
+# amount of proving py.exe itself closes that (2026-08-23 finding 3). Machine
+# directories, the per-user Python manager layout, and PATH-discovered
+# python.exe/python3.exe exact paths all CAN be proven pre-probe, so they stay.
 $launchers = @()
 $imRoot = Join-Path $env:LOCALAPPDATA "Python"
 foreach ($pc in (Get-ChildItem $imRoot -Filter "pythoncore-*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
@@ -806,10 +845,10 @@ foreach ($n in @("python3.exe", "python.exe")) {
     $p = Join-Path (Join-Path $imRoot "bin") $n
     if (Test-Path $p) { $launchers += @{ Exe = $p; Args = @() } }
 }
+# Bare python/python3 names resolve to an exact rooted Application path in the
+# Get-Command check below BEFORE anything is proven or probed; anything that is
+# not an exact executable path is skipped there.
 $launchers += @(
-    @{ Exe = "py";      Args = @("-3.14") },
-    @{ Exe = "py";      Args = @("-3.12") },
-    @{ Exe = "py";      Args = @("-3") },
     @{ Exe = "python";  Args = @() },
     @{ Exe = "python3"; Args = @() }
 )
@@ -843,6 +882,24 @@ foreach ($l in $launchers) {
         foreach ($v in @($chainViol | Select-Object -First 4)) { Write-Host "         $v" }
         continue
     }
+    # Finding 3 (2026-08-23): python.exe is not the only bytes that run. The
+    # version probe below IS execution, and before the first line of output
+    # Python has already loaded python3*.dll / vcruntime140.dll from beside the
+    # executable and executed Lib\site.py -- which processes every .pth and
+    # imports sitecustomize.py it finds. Proving the executable and its
+    # ancestors proved almost none of the executed closure: one
+    # permissively-ACL'd sibling DLL, module or .pth rode the whole gate and ran
+    # as Administrator. Prove the WHOLE runtime tree (plus the venv base a
+    # pyvenv.cfg reaches through) BEFORE the first probe executes any of it.
+    # NO EXEMPTIONS: a candidate whose closure cannot be proven without first
+    # executing it (the py launcher) is not a candidate at all -- it is absent
+    # from the list above for exactly this reason.
+    $treeViol = @(Get-InterpreterRuntimeViolations -InterpreterPath $chainProbePath)
+    if (@($treeViol).Count -gt 0) {
+        Write-Host "  [skip] $label -- interpreter runtime tree is not administrator-only:"
+        foreach ($v in @($treeViol | Select-Object -First 4)) { Write-Host "         $v" }
+        continue
+    }
     # Probe the EXACT path whose chain was just proven, not the bare name again.
     # Passing $l.Exe made Invoke-PyProbe re-resolve the name independently, so
     # the object that was checked and the object that was executed were two
@@ -867,14 +924,23 @@ foreach ($l in $launchers) {
                 }
             } catch { }
             if ($resolved) {
-                # The self-resolved interpreter can live elsewhere than the
-                # launcher that produced it (py.exe in C:\Windows, python.exe
-                # wherever it was installed) -- gate it on its own chain too,
-                # before the runtime build adopts it.
+                # The executable the gates proved can still be a redirector
+                # whose sys.executable names a DIFFERENT interpreter binary
+                # (a shim python.exe; the py launcher is no longer a candidate
+                # at all). Gate the self-resolved interpreter on its own chain
+                # AND, finding 3 (2026-08-23), on its whole runtime tree: every
+                # later elevated run (venv creation, the pip closure) executes
+                # from that tree.
                 $resolvedViol = Test-PathChainTrusted -Path $resolved
                 if (@($resolvedViol).Count -gt 0) {
                     Write-Host "  [skip] $label -- resolved interpreter $resolved is not administrator-only:"
                     foreach ($v in @($resolvedViol | Select-Object -First 4)) { Write-Host "         $v" }
+                    continue
+                }
+                $resolvedTreeViol = @(Get-InterpreterRuntimeViolations -InterpreterPath $resolved)
+                if (@($resolvedTreeViol).Count -gt 0) {
+                    Write-Host "  [skip] $label -- resolved interpreter $resolved has an untrusted runtime tree:"
+                    foreach ($v in @($resolvedTreeViol | Select-Object -First 4)) { Write-Host "         $v" }
                     continue
                 }
             }
@@ -883,8 +949,11 @@ foreach ($l in $launchers) {
                 Write-Host "  [ok]   $label -- $ver (resolved: $resolved)"
                 $python = @{ Exe = $resolved; Args = @() }
             } else {
-                Write-Host "  [ok]   $label -- $ver (using launcher directly)"
-                $python = $l
+                # The proven executable itself, never the bare name: adopting
+                # $l would re-resolve "python" through PATH again at venv
+                # creation, a second lookup the gates above never covered.
+                Write-Host "  [ok]   $label -- $ver (using the proven interpreter directly)"
+                $python = @{ Exe = $chainProbePath; Args = $l.Args }
             }
             break
         }
@@ -893,7 +962,12 @@ foreach ($l in $launchers) {
         Write-Host "  [fail] $label -- output not recognised: $ver"
     }
 }
-if (-not $python) { throw "Python 3.12+ not found. Install it (winget install Python.Python.3.14) and re-run." }
+if (-not $python) {
+    throw ("Python 3.12+ not found: no python.exe/python3.exe whose whole runtime tree is " +
+           "administrator-only was discovered (the py launcher is deliberately not probed -- " +
+           "probing it would execute an unproven interpreter). Install a machine-wide Python " +
+           "3.12+ (winget install Python.Python.3.14) and re-run.")
+}
 
 # --- Build the runtime FRESH, in place, under %ProgramFiles% -----------------
 #
@@ -916,12 +990,23 @@ try {
     # A user-profile interpreter is unusable by the app pool -- the gMSA cannot
     # read another account's profile -- so it is copied into the runtime tree.
     # A machine-wide interpreter is left where it is and simply referenced: it
-    # already lives somewhere non-administrators cannot write, and copying it
-    # would add bytes to verify for no gain.
+    # already lives somewhere non-administrators cannot write -- PROVEN now, not
+    # assumed (finding 3): the whole runtime tree passed
+    # Get-InterpreterRuntimeViolations before the first elevated probe ran, and
+    # copying it would add bytes to verify for no gain.
     $runtimePy = Join-Path $runtimeCurrent "python"
     if ($python.Exe -like "*\AppData\*" -or $python.Exe -like "*\WindowsApps\*") {
         Write-Host "  Python is user-scoped ($($python.Exe)); copying it into the runtime ..."
         $pySrc = Split-Path $python.Exe
+        # Finding 3 (2026-08-23): the copy does not launder bytes. Copying a
+        # user runtime into the protected root preserves whatever the source
+        # tree contained, so the trust decision belongs to the source-side tree
+        # gate that already ran -- BEFORE the first probe executed anything
+        # from this tree, and therefore before this copy. What is re-asserted
+        # here is only the no-links half: a reparse point raced in since the
+        # proof would redirect this recursive copy (or a later import) outside
+        # the proven tree.
+        Assert-NoReparsePoints -Path $pySrc -Context 'user-scoped Python copy source'
         if (Test-Path $pySrc) { Copy-Item -LiteralPath $pySrc -Destination $runtimePy -Recurse -Force }
         $runtimePyExe = Join-Path $runtimePy "python.exe"
         if (-not (Test-Path $runtimePyExe)) {
@@ -938,7 +1023,7 @@ try {
         $python = @{ Exe = $runtimePyExe; Args = @() }
         Write-Host "  [ok]   runtime interpreter at $runtimePyExe"
     } else {
-        Write-Host "  Using the machine-wide interpreter $($python.Exe) (not copied; not user-writable)"
+        Write-Host "  Using the machine-wide interpreter $($python.Exe) (not copied; runtime tree proven administrator-only)"
     }
 
     # Clear hidden/system attrs on venv launchers (Python 3.14 marks them) so
@@ -1259,10 +1344,13 @@ $script:iisActuallyConfigured = $false
 if ($ConfigureIIS) {
     Write-Host ""
     Write-Host "Configuring IIS ..."
-    if (-not (Get-Module -ListAvailable WebAdministration -ErrorAction SilentlyContinue)) {
-        Write-Host "  [skip] WebAdministration module not available; skipping IIS config. See deploy\iis\README.md."
+    # Finding 5 (2026-08-23): the IIS:\ provider everything below uses is
+    # imported from the canonical inbox module root by absolute path, never by
+    # name from PSModulePath (whose user-writable entries can carry a
+    # same-named module). Unavailable-or-untrusted keeps the existing skip.
+    if (-not (Import-TrustedInboxModule -ModuleName 'WebAdministration')) {
+        Write-Host "  [skip] WebAdministration module not available from the trusted inbox module root; skipping IIS config. See deploy\iis\README.md."
     } else {
-        Import-Module WebAdministration
 
         # Round 5: SitePath is the third security-relevant tree -- web.config
         # inside it is the gMSA launch configuration. A pre-existing site tree

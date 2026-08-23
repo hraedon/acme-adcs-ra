@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -17,7 +18,7 @@ from acme_adcs_ra.acme_errors import unauthorized
 from acme_adcs_ra.audit_coalesce import DenialCoalescer
 from acme_adcs_ra.config import RAConfig
 from acme_adcs_ra.crl_evidence import CrlEvidenceGate
-from acme_adcs_ra.enrollment import EnrollmentLeg
+from acme_adcs_ra.enrollment import EnrollmentGate, EnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.rate_limit import TokenBucket
 from acme_adcs_ra.revocation import RevocationLeg
@@ -124,6 +125,49 @@ class ActiveEnrollments:
             return self._active.get(order_id, 0) > 0
 
 
+class AccountIssuanceLocks:
+    """Process-local serialization of account mutations and CA submission.
+
+    The supported server has one process.  A submit holds an account lock from
+    the final status/key/EAB read through the complete ADCS call sequence;
+    deactivation and keyChange take the same lock around their durable mutation.
+    This gives those operations a linear order without holding a SQLite write
+    transaction over network I/O.
+
+    Async routes poll a non-blocking ``threading.Lock`` acquisition rather than
+    parking the event loop (or consuming a shared framework worker) while an
+    enrollment is in flight.  The lock table intentionally lives for the
+    process lifetime; account creation is already quota-bounded.
+    """
+
+    def __init__(self) -> None:
+        self._table_lock = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+
+    def _for_account(self, account_id: str) -> threading.Lock:
+        with self._table_lock:
+            return self._locks.setdefault(account_id, threading.Lock())
+
+    @contextmanager
+    def submitting(self, account_id: str) -> Iterator[None]:
+        lock = self._for_account(account_id)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @asynccontextmanager
+    async def mutating(self, account_id: str) -> Any:
+        lock = self._for_account(account_id)
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+        try:
+            yield
+        finally:
+            lock.release()
+
+
 @dataclass
 class ServerContext:
     """Dependencies shared across every request."""
@@ -138,6 +182,10 @@ class ServerContext:
     # enrollment (which would double-issue at the CA). Process-local by
     # design; see ActiveEnrollments.
     active_enrollments: ActiveEnrollments = field(default_factory=ActiveEnrollments)
+    account_issuance_locks: AccountIssuanceLocks = field(
+        default_factory=AccountIssuanceLocks
+    )
+    enrollment_gate: EnrollmentGate = field(default_factory=EnrollmentGate)
     # Dedicated, bounded, single-flight execution for CRL evidence fetches so
     # that a slow CRL host cannot queue behind — or ahead of — enrollment on
     # the shared worker pool. Closed by the app lifespan.
@@ -288,23 +336,25 @@ def enforce_account_usable(ctx: ServerContext, account: AccountRecord) -> None:
 
 async def authenticate_account(
     ctx: ServerContext, request: Request, path: str
-) -> tuple[dict[str, Any], dict[str, Any], AccountRecord]:
-    """Verify an existing-account JWS and return (header, payload, account).
+) -> tuple[dict[str, Any], dict[str, Any], AccountRecord, str]:
+    """Verify a JWS; return header, payload, account, and exact key thumbprint.
 
     The single authenticated entry point for every account-scoped route. It
     binds the JWS to *this* RA's canonical URL for ``path`` (built from the
     configured ``base_url``, never from the inbound request) and enforces that
     the account is still usable before the route does any work.
     """
-    header, payload, account_id = await verify_existing_account_jws(
+    header, payload, account_id, authenticated_thumbprint = (
+        await verify_existing_account_jws(
         request,
         ctx.store,
         expected_url=_url(ctx, path),
         account_url_prefix=_account_url_prefix(ctx),
         max_body_size_bytes=ctx.config.max_jws_body_size_bytes,
+        )
     )
     account = ctx.store.get_account(account_id)
     if account is None:
         raise unauthorized("account not found")
     enforce_account_usable(ctx, account)
-    return header, payload, account
+    return header, payload, account, authenticated_thumbprint

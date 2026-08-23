@@ -2734,3 +2734,655 @@ Describe 'Get-TreeTrustViolations: the tree a privileged task runs from' {
         ($v -join ' ') | Should -Match 'no ACEs'
     }
 }
+
+# --- 2026-08-23 codex scan, finding 3: the interpreter's whole runtime tree ---
+#
+# Test-PathChainTrusted authenticated python.exe and its ancestors, but the
+# version probe executes python3*.dll, vcruntime*.dll, Lib\site.py, every .pth
+# and sitecustomize.py BEFORE the first line of output. One permissively-ACL'd
+# sibling in an otherwise clean tree rode the whole gate and ran elevated.
+
+Describe 'Get-InterpreterRuntimeTree (2026-08-23 finding 3)' {
+    BeforeAll {
+        $script:base = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-itree-" + [guid]::NewGuid())
+        # A machine-wide-layout base install
+        $null = New-Item -ItemType Directory -Path (Join-Path $script:base 'Lib') -Force
+        Set-Content -LiteralPath (Join-Path $script:base 'python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $script:base 'python314.dll') -Value 'MZ'
+        # A conventional PEP 405 venv ON that base: python.exe in Scripts\,
+        # pyvenv.cfg one level UP in the venv root.
+        $script:venv = Join-Path $script:base 'venv'
+        $null = New-Item -ItemType Directory -Path (Join-Path $script:venv 'Scripts') -Force
+        Set-Content -LiteralPath (Join-Path $script:venv 'Scripts\python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $script:venv 'pyvenv.cfg') -Value ("home = {0}`ninclude-system-site-packages = false" -f $script:base)
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:base -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'a plain install yields exactly the prefix beside the executable' {
+        $roots = @(Get-InterpreterRuntimeTree -InterpreterPath (Join-Path $script:base 'python.exe'))
+        $roots.Count | Should -Be 1
+        $roots[0] | Should -BeLike "*ra-itree-*"
+    }
+
+    It 'a venv python.exe extends the tree to the venv root AND the base prefix' {
+        $roots = @(Get-InterpreterRuntimeTree -InterpreterPath (Join-Path $script:venv 'Scripts\python.exe'))
+        # Scripts\ (where the exe lives), the venv root (where pyvenv.cfg and
+        # the venv site-packages live), and the base prefix named by home.
+        $roots.Count | Should -Be 3
+        $joined = (($roots | ForEach-Object { $_ -replace '/', '\' }) -join ';').ToLowerInvariant()
+        $wantVenv = ($script:venv -replace '/', '\').ToLowerInvariant()
+        $wantBase = ($script:base -replace '/', '\').ToLowerInvariant()
+        $joined | Should -Match ([regex]::Escape($wantVenv))
+        $joined | Should -Match ([regex]::Escape($wantBase))
+    }
+
+    It 'a dangling pyvenv.cfg home is reported, not silently dropped' {
+        $dangling = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-dangling-" + [guid]::NewGuid())
+        $null = New-Item -ItemType Directory -Path (Join-Path $dangling 'Scripts') -Force
+        Set-Content -LiteralPath (Join-Path $dangling 'Scripts\python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $dangling 'pyvenv.cfg') -Value 'home = C:\Definitely\Not\Here'
+        try {
+            $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $dangling 'Scripts\python.exe'))
+            ($v -join ' ') | Should -Match 'does not exist'
+        } finally {
+            Remove-Item -LiteralPath $dangling -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'a self-referential home does not loop or duplicate roots' {
+        $loop = Join-Path $script:base 'loopvenv'
+        $null = New-Item -ItemType Directory -Path (Join-Path $loop 'Scripts') -Force
+        Set-Content -LiteralPath (Join-Path $loop 'Scripts\python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $loop 'pyvenv.cfg') -Value ("home = {0}" -f $loop)
+        $roots = @(Get-InterpreterRuntimeTree -InterpreterPath (Join-Path $loop 'Scripts\python.exe'))
+        $unique = @($roots | Select-Object -Unique)
+        $unique.Count | Should -Be $roots.Count
+        $roots.Count | Should -BeLessThan 5
+    }
+}
+
+Describe 'Get-InterpreterRuntimeViolations (2026-08-23 finding 3)' {
+    BeforeAll {
+        $script:py = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-pytree-" + [guid]::NewGuid())
+        $null = New-Item -ItemType Directory -Path (Join-Path $script:py 'Lib\site-packages') -Force
+        Set-Content -LiteralPath (Join-Path $script:py 'python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $script:py 'python314.dll') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $script:py 'vcruntime140.dll') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $script:py 'Lib\site.py') -Value '#'
+        Set-Content -LiteralPath (Join-Path $script:py 'Lib\site-packages\innocent.pth') -Value '#'
+
+        # Path-keyed ACLs, the same fixture pattern as the Get-TreeTrustViolations
+        # suite above: $script:WritablePaths carries a Users write ACE.
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            $p = if ($LiteralPath) { $LiteralPath } else { $Path }
+            $rules = @(
+                [pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'S-1-5-32-544' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = 0
+                    PropagationFlags  = 0
+                })
+            if (@($script:WritablePaths) -contains $p) {
+                $rules += [pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'S-1-5-32-545' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::WriteData
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = 0
+                    PropagationFlags  = 0
+                }
+            }
+            [pscustomobject]@{ Owner = 'S-1-5-32-544'; Access = $rules; Sddl = 'O:BAG:BAD:' }
+        }
+    }
+    AfterAll {
+        Remove-Item function:global:Get-Acl -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:py -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'passes a fully administrator-only runtime tree' {
+        $script:WritablePaths = @()
+        @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $script:py 'python.exe')).Count |
+            Should -Be 0
+    }
+
+    It 'refuses a user-writable sibling DLL beside a protected python.exe' {
+        # The exact finding shape: python.exe and every ancestor pass the chain
+        # gate; only the closure check catches the loadable sibling.
+        $script:WritablePaths = @((Join-Path $script:py 'python314.dll'))
+        $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $script:py 'python.exe'))
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'python314\.dll'
+    }
+
+    It 'refuses a writable .pth deep in site-packages (content site.py executes)' {
+        $script:WritablePaths = @((Join-Path $script:py 'Lib\site-packages\innocent.pth'))
+        $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $script:py 'python.exe'))
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'innocent\.pth'
+    }
+
+    It 'refuses a reparse point inside the tree (a link redirects imports/copies)' {
+        $script:WritablePaths = @()
+        $target = Join-Path $script:py 'Lib\site.py'
+        $link = Join-Path $script:py 'linked.py'
+        try {
+            $null = New-Item -ItemType SymbolicLink -Path $link -Value $target -ErrorAction Stop
+            $created = $true
+        } catch {
+            $created = $false
+        }
+        if (-not $created) {
+            Set-ItResult -Skipped -Because 'symlink creation is not permitted on this host'
+        } else {
+            try {
+                $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $script:py 'python.exe'))
+                $v.Count | Should -BeGreaterThan 0
+                ($v -join ' ') | Should -Match 'reparse point'
+            } finally {
+                # A lingering link would poison every later violations listing
+                # for this shared tree.
+                Remove-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'extends the refusal through a pyvenv.cfg home base' {
+        $script:WritablePaths = @((Join-Path $script:py 'vcruntime140.dll'))
+        $venv = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-pyvenv-" + [guid]::NewGuid())
+        $null = New-Item -ItemType Directory -Path (Join-Path $venv 'Scripts') -Force
+        Set-Content -LiteralPath (Join-Path $venv 'Scripts\python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $venv 'pyvenv.cfg') -Value ("home = {0}" -f $script:py)
+        try {
+            $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $venv 'Scripts\python.exe'))
+            $v.Count | Should -BeGreaterThan 0
+            ($v -join ' ') | Should -Match 'vcruntime140\.dll'
+        } finally {
+            Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'refuses an absent interpreter rather than proving nothing' {
+        $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $script:py 'nope.exe'))
+        $v.Count | Should -Be 1
+        $v[0] | Should -Match 'not found'
+    }
+
+    # Review follow-up on the closure computation itself: the pyvenv.cfg read
+    # used -ErrorAction SilentlyContinue, so an UNREADABLE cfg parsed as "no
+    # base at all" and the closure silently shrank to the venv directory --
+    # the gate then proved a tree that was not the executed closure. Both an
+    # unreadable cfg and a readable-but-undecipherable one must refuse.
+    It 'fails closed when an existing pyvenv.cfg cannot be read' {
+        $script:WritablePaths = @()
+        $venv = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-cfglock-" + [guid]::NewGuid())
+        $null = New-Item -ItemType Directory -Path (Join-Path $venv 'Scripts') -Force
+        Set-Content -LiteralPath (Join-Path $venv 'Scripts\python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $venv 'pyvenv.cfg') -Value ("home = {0}" -f $script:py)
+        $cfgPath = Join-Path $venv 'pyvenv.cfg'
+        try {
+            # ACL-based denial is not portable (root on Linux, admin on the CI
+            # runner), so the read is intercepted with a parameter-filtered
+            # Pester mock. The mock body uses Write-Error, not throw: a real
+            # cmdlet denial is a NON-terminating error, which is exactly what
+            # the old -ErrorAction SilentlyContinue swallowed -- a terminating
+            # throw would be suppressed by nothing and the test would prove
+            # the wrong thing. Only THIS path errors; every other Get-Content
+            # call reaches the real cmdlet; Pester removes the mock when the
+            # It ends.
+            Mock Get-Content { Write-Error 'Access is denied (simulated unreadable pyvenv.cfg)' } `
+                -ParameterFilter { $LiteralPath -and ($LiteralPath -eq $cfgPath) }
+            $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $venv 'Scripts\python.exe'))
+            $v.Count | Should -BeGreaterThan 0
+            ($v -join ' ') | Should -Match 'closure could not be determined'
+            ($v -join ' ') | Should -Match 'pyvenv\.cfg'
+        } finally {
+            Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails closed when pyvenv.cfg declares neither home nor base-executable' {
+        $script:WritablePaths = @()
+        $venv = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-cfgempty-" + [guid]::NewGuid())
+        $null = New-Item -ItemType Directory -Path (Join-Path $venv 'Scripts') -Force
+        Set-Content -LiteralPath (Join-Path $venv 'Scripts\python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $venv 'pyvenv.cfg') -Value 'include-system-site-packages = false'
+        try {
+            $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $venv 'Scripts\python.exe'))
+            $v.Count | Should -BeGreaterThan 0
+            ($v -join ' ') | Should -Match 'closure could not be determined'
+            ($v -join ' ') | Should -Match 'neither'
+        } finally {
+            Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'install-windows.ps1: interpreter runtime tree gate (2026-08-23 finding 3)' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    It 'the whole-tree gate runs BEFORE the first elevated probe executes the candidate' {
+        $gate = $script:installer.IndexOf('Get-InterpreterRuntimeViolations -InterpreterPath $chainProbePath')
+        $probe = $script:installer.IndexOf('Invoke-PyProbe -Exe $chainProbePath -Arguments ($l.Args + @("--version"))')
+        $gate | Should -BeGreaterThan 0
+        $probe | Should -BeGreaterThan $gate
+    }
+
+    It 'the self-resolved interpreter gets chain AND tree gates before adoption' {
+        $selfProbe = $script:installer.IndexOf('import sys; print(sys.executable)')
+        $chainGate = $script:installer.IndexOf('Test-PathChainTrusted -Path $resolved')
+        $treeGate = $script:installer.IndexOf('Get-InterpreterRuntimeViolations -InterpreterPath $resolved')
+        $adopt = $script:installer.IndexOf('$python = @{ Exe = $resolved; Args = @() }')
+        $chainGate | Should -BeGreaterThan $selfProbe
+        $treeGate | Should -BeGreaterThan $chainGate
+        $adopt | Should -BeGreaterThan $treeGate
+    }
+
+    It 'no py-launcher candidate or exemption remains (the probe IS execution)' {
+        # `py --version` executes whichever interpreter the launcher selects,
+        # before ANY gate can prove that interpreter's runtime tree -- so the
+        # launcher cannot be a candidate at all, and no exemption from the
+        # pre-probe tree gate may exist to let one back in. Reintroducing
+        # either the candidate or the exemption reopens finding 3.
+        $script:installer | Should -Not -Match '@\{ Exe = "py"'
+        $script:installer | Should -Not -Match 'Args = @\("-3'
+        $script:installer | Should -Not -Match '\$isPyLauncher'
+        $script:installer | Should -Not -Match 'launcher did not resolve'
+        # the launcher hashtable must never be adopted wholesale again: that
+        # re-resolves the bare name at venv time, outside every gate.
+        $script:installer | Should -Not -Match '\$python = \$l\b'
+    }
+
+    It 'direct adoption uses the PROVEN path, not a re-resolvable bare name' {
+        $script:installer | Should -Match '\$python = @\{ Exe = \$chainProbePath; Args = \$l\.Args \}'
+    }
+
+    It 'the user-scoped copy source is link-checked immediately before the copy' {
+        $assert = $script:installer.IndexOf('Assert-NoReparsePoints -Path $pySrc')
+        $copy = $script:installer.IndexOf('Copy-Item -LiteralPath $pySrc')
+        $assert | Should -BeGreaterThan 0
+        $copy | Should -BeGreaterThan $assert
+    }
+}
+
+# --- 2026-08-23 codex scan, finding 5: trusted inbox cmdlet resolution --------
+#
+# The elevated installer used Get-Command as a truth test and then invoked the
+# bare name, so a planted executable in a writable PATH entry satisfied
+# discovery and ran as Administrator whenever the real module was absent.
+
+Describe 'Test-CommandProvenanceTrusted (2026-08-23 finding 5)' {
+    BeforeAll {
+        $script:roots = @('C:\Windows\System32\WindowsPowerShell\v1.0\Modules')
+    }
+
+    It 'accepts an inbox Cmdlet from the expected module under the trusted root' {
+        Test-CommandProvenanceTrusted -CommandType 'Cmdlet' `
+            -ModuleName 'ServerManager' `
+            -ModulePath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\ServerManager\ServerManager.psd1' `
+            -ExpectedModuleName 'ServerManager' -TrustedModuleRoots $script:roots | Should -BeTrue
+    }
+
+    It 'accepts a Function, with module name and path compared case-insensitively' {
+        Test-CommandProvenanceTrusted -CommandType 'Function' `
+            -ModuleName 'webadministration' `
+            -ModulePath 'C:\WINDOWS\system32\windowspowershell\v1.0\modules\WebAdministration\WebAdministration.psd1' `
+            -ExpectedModuleName 'WebAdministration' -TrustedModuleRoots $script:roots | Should -BeTrue
+    }
+
+    It 'rejects an Application even when every other field looks right (the planted PATH exe)' {
+        Test-CommandProvenanceTrusted -CommandType 'Application' `
+            -ModuleName 'ServerManager' `
+            -ModulePath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\ServerManager\ServerManager.psd1' `
+            -ExpectedModuleName 'ServerManager' -TrustedModuleRoots $script:roots | Should -BeFalse
+    }
+
+    It 'rejects ExternalScript and Alias command types' {
+        foreach ($type in @('ExternalScript', 'Alias', 'Script', 'Workflow', '')) {
+            Test-CommandProvenanceTrusted -CommandType $type `
+                -ModuleName 'ServerManager' `
+                -ModulePath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\ServerManager\ServerManager.psd1' `
+                -ExpectedModuleName 'ServerManager' -TrustedModuleRoots $script:roots | Should -BeFalse
+        }
+    }
+
+    It 'rejects a cmdlet exported by the WRONG module' {
+        Test-CommandProvenanceTrusted -CommandType 'Cmdlet' `
+            -ModuleName 'SomeOtherModule' `
+            -ModulePath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\SomeOtherModule\SomeOtherModule.psd1' `
+            -ExpectedModuleName 'ServerManager' -TrustedModuleRoots $script:roots | Should -BeFalse
+    }
+
+    It 'rejects a same-named module outside every trusted root' {
+        Test-CommandProvenanceTrusted -CommandType 'Cmdlet' `
+            -ModuleName 'ServerManager' `
+            -ModulePath 'C:\Program Files\WindowsPowerShell\Modules\ServerManager\ServerManager.psd1' `
+            -ExpectedModuleName 'ServerManager' -TrustedModuleRoots $script:roots | Should -BeFalse
+    }
+
+    It 'rejects a path that only PREFIX-matches the trusted root' {
+        # ModulesExtra\ must not count as inside Modules\ -- the containment
+        # comparison has to be segment-boundary, not StartsWith.
+        Test-CommandProvenanceTrusted -CommandType 'Cmdlet' `
+            -ModuleName 'ServerManager' `
+            -ModulePath 'C:\Windows\System32\WindowsPowerShell\v1.0\ModulesExtra\ServerManager\ServerManager.psd1' `
+            -ExpectedModuleName 'ServerManager' -TrustedModuleRoots $script:roots | Should -BeFalse
+    }
+
+    It 'rejects an empty module path (session function with no owning module)' {
+        Test-CommandProvenanceTrusted -CommandType 'Function' `
+            -ModuleName 'ServerManager' -ModulePath '' `
+            -ExpectedModuleName 'ServerManager' -TrustedModuleRoots $script:roots | Should -BeFalse
+    }
+
+    It 'treats the trusted root itself as inside (equality, not strict subtree)' {
+        Test-CommandProvenanceTrusted -CommandType 'Cmdlet' `
+            -ModuleName 'ServerManager' `
+            -ModulePath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules' `
+            -ExpectedModuleName 'ServerManager' -TrustedModuleRoots $script:roots | Should -BeTrue
+    }
+
+    It 'no trusted root means nothing is trusted (fail closed off Windows)' {
+        Test-CommandProvenanceTrusted -CommandType 'Cmdlet' `
+            -ModuleName 'ServerManager' `
+            -ModulePath 'C:\Windows\System32\WindowsPowerShell\v1.0\Modules\ServerManager\ServerManager.psd1' `
+            -ExpectedModuleName 'ServerManager' -TrustedModuleRoots @() | Should -BeFalse
+    }
+}
+
+Describe 'Import-TrustedInboxModule / Get-TrustedInboxCommand (2026-08-23 finding 5)' {
+    BeforeAll {
+        # Real importable modules in temp directories acting as trusted roots,
+        # so the resolution path (import by absolute path, validate, invoke)
+        # runs for real on every CI platform.
+        $script:trustedRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-mods-" + [guid]::NewGuid())
+        $script:otherRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-other-" + [guid]::NewGuid())
+        foreach ($pair in @(
+            @{ Root = $script:trustedRoot; Name = 'FakeInbox';   Output = 'trusted-output' },
+            @{ Root = $script:otherRoot;    Name = 'FakeInbox';  Output = 'untrusted-output' },
+            @{ Root = $script:otherRoot;    Name = 'ShadowThing'; Output = 'shadow-output' },
+            # Never imported on the green path: the module the refusal tests
+            # below prove UNTRUSTED. A fresh name matters -- an earlier test
+            # has already imported FakeInbox into the session, and Get-Command
+            # would still resolve its commands after a refused import.
+            @{ Root = $script:trustedRoot; Name = 'FakeGuarded'; Output = 'guarded-output' }
+        )) {
+            $dir = Join-Path $pair.Root $pair.Name
+            $null = New-Item -ItemType Directory -Path $dir -Force
+            Set-Content -LiteralPath (Join-Path $dir ($pair.Name + '.psd1')) -Value (
+                "@{ ModuleVersion = '1.0'; RootModule = '" + $pair.Name + ".psm1'; " +
+                "FunctionsToExport = 'Get-" + $pair.Name + "Thing' }")
+            Set-Content -LiteralPath (Join-Path $dir ($pair.Name + '.psm1')) -Value (
+                "function Get-" + $pair.Name + "Thing { '" + $pair.Output + "' }")
+        }
+
+        # Import-TrustedInboxModule proves the module tree's ACL closure before
+        # importing (the location is the trust anchor). Get-Acl has no Unix
+        # provider implementation and the real Windows temp-dir ACLs are
+        # user-writable by design, so -- exactly like the Get-TreeTrustViolations
+        # suite above -- the ACL read is a path-keyed fake: clean unless the
+        # path is listed in $script:WritablePaths.
+        $script:WritablePaths = @()
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            $p = if ($LiteralPath) { $LiteralPath } else { $Path }
+            $rules = @(
+                [pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'S-1-5-32-544' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = 0
+                    PropagationFlags  = 0
+                })
+            if (@($script:WritablePaths) -contains $p) {
+                $rules += [pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'S-1-5-32-545' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::WriteData
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = 0
+                    PropagationFlags  = 0
+                }
+            }
+            [pscustomobject]@{ Owner = 'S-1-5-32-544'; Access = $rules; Sddl = 'O:BAG:BAD:' }
+        }
+    }
+    AfterAll {
+        Remove-Item function:global:Get-Acl -ErrorAction SilentlyContinue
+        Remove-Module FakeInbox, FakeGuarded, ShadowThing -ErrorAction SilentlyContinue -Force
+        Remove-Item -LiteralPath $script:trustedRoot, $script:otherRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'resolves and invokes a command from a module under the trusted root' {
+        $cmd = Get-TrustedInboxCommand -Name 'Get-FakeInboxThing' -ModuleName 'FakeInbox' `
+            -TrustedModuleRoots @($script:trustedRoot)
+        $cmd | Should -Not -BeNullOrEmpty
+        & $cmd | Should -Be 'trusted-output'
+    }
+
+    It 'never loads a same-named module from outside the trusted roots' {
+        # A shadow FakeInbox outside the trusted root exports the same command
+        # with different bytes. Resolution must keep returning the trusted one
+        # even after the shadow exists on disk.
+        $cmd = Get-TrustedInboxCommand -Name 'Get-FakeInboxThing' -ModuleName 'FakeInbox' `
+            -TrustedModuleRoots @($script:trustedRoot)
+        & $cmd | Should -Be 'trusted-output'
+        (Get-Module -Name FakeInbox).Path | Should -BeLike "*$script:trustedRoot*"
+    }
+
+    It 'returns null for a module that only exists outside the trusted roots' {
+        Get-TrustedInboxCommand -Name 'Get-ShadowThingThing' -ModuleName 'ShadowThing' `
+            -TrustedModuleRoots @($script:trustedRoot) | Should -BeNullOrEmpty
+    }
+
+    It 'returns null for a command the trusted module does not export' {
+        Get-TrustedInboxCommand -Name 'Get-MissingThing' -ModuleName 'FakeInbox' `
+            -TrustedModuleRoots @($script:trustedRoot) | Should -BeNullOrEmpty
+    }
+
+    It 'returns null when the module does not exist at all' {
+        Get-TrustedInboxCommand -Name 'Get-FakeInboxThing' -ModuleName 'DoesNotExist' `
+            -TrustedModuleRoots @($script:trustedRoot) | Should -BeNullOrEmpty
+    }
+
+    It 'Import-TrustedInboxModule returns the module info it imported' {
+        $m = Import-TrustedInboxModule -ModuleName 'FakeInbox' -TrustedModuleRoots @($script:trustedRoot)
+        $m | Should -Not -BeNullOrEmpty
+        $m.Name | Should -Be 'FakeInbox'
+    }
+
+    It 'refuses to import a module whose own file is user-writable' {
+        # The location is the trust anchor: a module file an administrator
+        # has not sole control of is not loaded, however conventional its
+        # path shape.
+        $script:WritablePaths = @((Join-Path $script:trustedRoot 'FakeGuarded\FakeGuarded.psm1'))
+        try {
+            Import-TrustedInboxModule -ModuleName 'FakeGuarded' `
+                -TrustedModuleRoots @($script:trustedRoot) | Should -BeNullOrEmpty
+            Get-TrustedInboxCommand -Name 'Get-FakeGuardedThing' -ModuleName 'FakeGuarded' `
+                -TrustedModuleRoots @($script:trustedRoot) | Should -BeNullOrEmpty
+        } finally {
+            $script:WritablePaths = @()
+        }
+    }
+
+    It 'refuses to import when a directory ABOVE the module is user-writable' {
+        # The chain half of the gate: a writable parent means the module tree
+        # can be swapped out wholesale, whatever its own DACLs say.
+        $script:WritablePaths = @($script:trustedRoot)
+        try {
+            Import-TrustedInboxModule -ModuleName 'FakeGuarded' `
+                -TrustedModuleRoots @($script:trustedRoot) | Should -BeNullOrEmpty
+        } finally {
+            $script:WritablePaths = @()
+        }
+    }
+
+    It 'refuses to import a module tree containing a reparse point' {
+        # A link inside the module directory can redirect both the import and
+        # the ACL walk; the reparse check runs BEFORE the walk so the link is
+        # reported, never followed.
+        $guardedDir = Join-Path $script:trustedRoot 'FakeGuarded'
+        $link = Join-Path $guardedDir 'linked.ps1'
+        try {
+            $null = New-Item -ItemType SymbolicLink -Path $link `
+                -Value (Join-Path $guardedDir 'FakeGuarded.psm1') -ErrorAction Stop
+            $created = $true
+        } catch {
+            $created = $false
+        }
+        if (-not $created) {
+            Set-ItResult -Skipped -Because 'symlink creation is not permitted on this host'
+        } else {
+            try {
+                Import-TrustedInboxModule -ModuleName 'FakeGuarded' `
+                    -TrustedModuleRoots @($script:trustedRoot) | Should -BeNullOrEmpty
+            } finally {
+                Remove-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Review follow-up on command resolution: Get-TrustedInboxCommand used a
+    # global Get-Command after the import, which obeys alias > function >
+    # cmdlet precedence across the WHOLE session -- so a shadow elsewhere in
+    # the session either masked the trusted export (an availability bug) or
+    # put an unproven command in front of the provenance check. Resolution now
+    # comes from the imported module's OWN export table, and these tests plant
+    # every shadow shape that used to win.
+    It 'selects the trusted module export over a globally shadowing function' {
+        function global:Get-FakeInboxThing { 'shadow-function-output' }
+        try {
+            $cmd = Get-TrustedInboxCommand -Name 'Get-FakeInboxThing' -ModuleName 'FakeInbox' `
+                -TrustedModuleRoots @($script:trustedRoot)
+            $cmd | Should -Not -BeNullOrEmpty
+            & $cmd | Should -Be 'trusted-output'
+            [string]$cmd.ModuleName | Should -Be 'FakeInbox'
+        } finally {
+            Remove-Item -Path 'function:global:Get-FakeInboxThing' -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'selects the trusted module export over a shadowing alias' {
+        # Aliases OUTRANK functions in global name resolution, so this is the
+        # shadow that wins first under the old global-lookup implementation.
+        Set-Alias -Name Get-FakeInboxThing -Value Write-Output -Scope Global
+        try {
+            $cmd = Get-TrustedInboxCommand -Name 'Get-FakeInboxThing' -ModuleName 'FakeInbox' `
+                -TrustedModuleRoots @($script:trustedRoot)
+            $cmd | Should -Not -BeNullOrEmpty
+            [string]$cmd.CommandType | Should -Be 'Function'
+            & $cmd | Should -Be 'trusted-output'
+        } finally {
+            # The Alias provider has no scoped paths (unlike function:global:),
+            # but the flat name removes a Global-scope alias from any scope.
+            Remove-Item -Path 'alias:Get-FakeInboxThing' -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'selects the trusted export when a same-named untrusted module is loaded FIRST' {
+        # Reverse-order preload: the untrusted FakeInbox from $script:otherRoot
+        # is imported into the session before the gate runs. The untrusted
+        # module's code is never INVOKED -- only its presence may shadow
+        # resolution -- and the gate must still hand back the trusted export.
+        Remove-Module -Name FakeInbox -Force -ErrorAction SilentlyContinue
+        Import-Module (Join-Path $script:otherRoot 'FakeInbox\FakeInbox.psd1') -Global
+        try {
+            $cmd = Get-TrustedInboxCommand -Name 'Get-FakeInboxThing' -ModuleName 'FakeInbox' `
+                -TrustedModuleRoots @($script:trustedRoot)
+            $cmd | Should -Not -BeNullOrEmpty
+            & $cmd | Should -Be 'trusted-output'
+            [string]$cmd.Module.Path | Should -Match ([regex]::Escape($script:trustedRoot))
+        } finally {
+            Remove-Module -Name FakeInbox -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'Get-TrustedInboxModuleRoots: the trust anchor is not the process environment' {
+    BeforeAll {
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        # Set by the library at dot-source time; overridable/readable so both
+        # platforms get an honest assertion rather than a skip. NB spelled
+        # $libIsWindows, not $isWindows: $IsWindows is a read-only automatic
+        # variable and PowerShell names are case-insensitive.
+        $script:libIsWindows = [bool]$script:InstallVerifyIsWindows
+    }
+
+    It 'never derives a root from the inherited process windir' {
+        # The process environment is caller-settable; a redirected windir here
+        # would point Import-TrustedInboxModule at attacker-chosen bytes.
+        $prev = $env:windir
+        $env:windir = 'Q:\FakeWindir'
+        try {
+            $roots = @(Get-TrustedInboxModuleRoots)
+        } finally {
+            $env:windir = $prev
+        }
+        ($roots -join ';') | Should -Not -Match 'Q:\\FakeWindir'
+    }
+
+    It 'the function body contains no process-environment read' {
+        $start = $script:lib.IndexOf('function Get-TrustedInboxModuleRoots')
+        $start | Should -BeGreaterThan 0
+        $end = $script:lib.IndexOf('function ', $start + 10)
+        $end | Should -BeGreaterThan $start
+        $body = $script:lib.Substring($start, $end - $start)
+        $body | Should -Not -Match '\$env:windir'
+    }
+
+    It 'on Windows derives the real inbox root from the machine store; elsewhere fails closed' {
+        if ($script:libIsWindows) {
+            $roots = @(Get-TrustedInboxModuleRoots)
+            $roots.Count | Should -Be 1
+            $machineWindir = [string][System.Environment]::GetEnvironmentVariable('windir', 'Machine')
+            $machineWindir | Should -Not -BeNullOrEmpty
+            $roots[0] | Should -Be ($machineWindir.TrimEnd('\') + '\System32\WindowsPowerShell\v1.0\Modules')
+        } else {
+            @(Get-TrustedInboxModuleRoots).Count | Should -Be 0
+        }
+    }
+}
+
+Describe 'install-windows.ps1: trusted inbox cmdlet gates (2026-08-23 finding 5)' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    It 'Test-HttpPlatformHandler resolves Get-WebGlobalModule through the trusted gate' {
+        $script:installer | Should -Match "Get-TrustedInboxCommand -Name 'Get-WebGlobalModule' -ModuleName 'WebAdministration'"
+        $script:installer | Should -Match '& \$getWebGlobalModule -ErrorAction SilentlyContinue'
+    }
+
+    It 'Test-HttpPlatformHandler keeps the DLL fallback when the cmdlet is unavailable' {
+        $script:installer | Should -Match 'System32\\inetsrv\\httpPlatformHandler\.dll'
+    }
+
+    It 'the ServerManager feature loop calls the resolved trusted commands' {
+        $script:installer | Should -Match "Get-TrustedInboxCommand -Name 'Get-WindowsFeature' -ModuleName 'ServerManager'"
+        $script:installer | Should -Match "Get-TrustedInboxCommand -Name 'Install-WindowsFeature' -ModuleName 'ServerManager'"
+        $script:installer | Should -Match '& \$getWindowsFeature -Name \$f'
+        $script:installer | Should -Match '& \$installWindowsFeature -Name \$f -IncludeManagementTools'
+        # the existing not-available semantics survive as a warn-and-continue
+        $script:installer | Should -Match 'Install-WindowsFeature not available'
+    }
+
+    It 'Test-ADServiceAccount is resolved through the trusted gate and invoked resolved' {
+        $script:installer | Should -Match "Get-TrustedInboxCommand -Name 'Test-ADServiceAccount' -ModuleName 'ActiveDirectory'"
+        $script:installer | Should -Match '& \$testAdServiceAccount -Identity \$gmsaSam'
+    }
+
+    It 'no Get-Command truth test or bare prerequisite invocation remains' {
+        $script:installer | Should -Not -Match 'Get-Command (Get-WebGlobalModule|Get-WindowsFeature|Install-WindowsFeature|Test-ADServiceAccount)\b'
+        $script:installer | Should -Not -Match '\s(Get-WebGlobalModule|Get-WindowsFeature|Install-WindowsFeature|Test-ADServiceAccount)\s+-'
+    }
+
+    It '-ConfigureIIS imports WebAdministration from the trusted inbox root, not by name' {
+        $script:installer | Should -Match "Import-TrustedInboxModule -ModuleName 'WebAdministration'"
+        $script:installer | Should -Not -Match 'Import-Module WebAdministration\r?\n'
+    }
+}

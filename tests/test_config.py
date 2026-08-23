@@ -61,6 +61,17 @@ class TestRAConfig:
         with pytest.raises(AttributeError):
             _ = RAConfig().audit_emit
 
+    def test_enrollment_total_timeout_cannot_be_below_socket_timeout(self) -> None:
+        with pytest.raises(ValueError, match="total_timeout"):
+            RAConfig(
+                adcs_enrollment_timeout_seconds=30,
+                adcs_enrollment_total_timeout_seconds=29,
+            )
+
+    def test_enrollment_admission_cannot_be_below_worker_count(self) -> None:
+        with pytest.raises(ValueError, match="max_pending"):
+            RAConfig(adcs_enrollment_max_workers=4, adcs_enrollment_max_pending=3)
+
 
 class TestSANScopeValidation:
     """SANScope.dns_patterns must reject invalid wildcard patterns at config time."""

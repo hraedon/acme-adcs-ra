@@ -101,6 +101,16 @@ class RAConfig(BaseSettings):
     # those heuristics and relies on locale-independent signals (ReqID,
     # certnew.cer URL) only — failing loudly if none match.
     adcs_locale: str = "en"
+    # Per socket operation and one monotonic ceiling across the complete
+    # certfnsh/certificate/chain sequence. The latter prevents a peer from
+    # extending four individually-valid responses indefinitely by trickling.
+    adcs_enrollment_timeout_seconds: float = Field(default=30.0, gt=0)
+    adcs_enrollment_total_timeout_seconds: float = Field(default=120.0, gt=0)
+    # Dedicated enrollment executor and admission ceiling. ADCS work must never
+    # consume the framework's shared worker pool, and ThreadPoolExecutor's own
+    # queue is unbounded, so both running and admitted work are bounded.
+    adcs_enrollment_max_workers: int = Field(default=4, ge=1)
+    adcs_enrollment_max_pending: int = Field(default=32, ge=1)
 
     # --- Dev/CI escape hatch -------------------------------------------------
     # Off by default. The entrypoint refuses to start on a non-Windows platform
@@ -561,6 +571,19 @@ class RAConfig(BaseSettings):
         if self.revocation_confirm_crl_total_timeout_seconds <= 0:
             raise ValueError(
                 "revocation_confirm_crl_total_timeout_seconds must be positive"
+            )
+        if (
+            self.adcs_enrollment_total_timeout_seconds
+            < self.adcs_enrollment_timeout_seconds
+        ):
+            raise ValueError(
+                "adcs_enrollment_total_timeout_seconds must be at least "
+                "adcs_enrollment_timeout_seconds"
+            )
+        if self.adcs_enrollment_max_pending < self.adcs_enrollment_max_workers:
+            raise ValueError(
+                "adcs_enrollment_max_pending must be at least "
+                "adcs_enrollment_max_workers"
             )
         if self.revocation_confirm_crl_max_workers < 1:
             raise ValueError("revocation_confirm_crl_max_workers must be at least 1")

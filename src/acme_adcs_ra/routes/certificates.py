@@ -44,7 +44,7 @@ async def post_certificate(
     Account-scoped, so a caller holding only the URL cannot distinguish
     valid (200) from revoked (410) from unknown (401).
     """
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/cert/{cert_id}"
     )
     if payload != {}:

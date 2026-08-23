@@ -106,6 +106,10 @@ def create_app(context: ServerContext) -> FastAPI:
         max_workers=context.config.revocation_confirm_crl_max_workers,
         max_pending=context.config.revocation_confirm_crl_max_pending,
     )
+    context.enrollment_gate.set_limits(
+        max_workers=context.config.adcs_enrollment_max_workers,
+        max_pending=context.config.adcs_enrollment_max_pending,
+    )
 
     # Retention floor, then footprint. The floor is a refusal rather than a
     # warning: retaining for less than a certificate's own lifetime means a
@@ -129,6 +133,7 @@ def create_app(context: ServerContext) -> FastAPI:
         # Same reason: the CRL-evidence pool is the RA's own, so nothing else
         # reclaims its threads at shutdown.
         context.crl_evidence_gate.close()
+        context.enrollment_gate.close()
         if context.denial_coalescer is not None:
             context.denial_coalescer.close()
 
