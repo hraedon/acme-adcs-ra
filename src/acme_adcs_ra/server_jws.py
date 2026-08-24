@@ -22,6 +22,7 @@ from acme_adcs_ra.jws import (
     JWSValidationError,
     _base64url_decode,
     _public_key_from_jwk,
+    jwk_thumbprint,
     verify_flattened_jws,
 )
 from acme_adcs_ra.store import Store
@@ -197,10 +198,12 @@ async def verify_existing_account_jws(
     expected_url: str,
     account_url_prefix: str,
     max_body_size_bytes: int = 65536,
-) -> tuple[dict[str, Any], dict[str, Any], str]:
+) -> tuple[dict[str, Any], dict[str, Any], str, str]:
     """Verify a JWS signed by an existing account (kid lookup).
 
-    Returns (protected_header, payload_dict, account_id).
+    Returns (protected_header, payload_dict, account_id, key_thumbprint).  The
+    thumbprint is computed from the exact stored JWK used to verify this
+    signature; a later account read may already see a concurrently-rotated key.
     """
     header, jws = await _parse_jws_header(
         request,
@@ -222,13 +225,15 @@ async def verify_existing_account_jws(
         raise unauthorized("account not found")
 
     try:
-        public_key = _public_key_from_jwk(json.loads(account.jwk_json))
+        authenticated_jwk = json.loads(account.jwk_json)
+        public_key = _public_key_from_jwk(authenticated_jwk)
+        authenticated_thumbprint = jwk_thumbprint(authenticated_jwk)
     except Exception as exc:
         raise bad_public_key(f"stored account key is invalid: {exc}") from exc
 
     payload_dict = _verify_jws_signature(jws, public_key)
 
-    return header, payload_dict, account_id
+    return header, payload_dict, account_id, authenticated_thumbprint
 
 
 async def verify_new_account_jws(

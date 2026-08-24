@@ -8,7 +8,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
 
 from acme_adcs_ra.acme_errors import AcmeError
 from acme_adcs_ra.csr_validation import (
@@ -28,6 +28,8 @@ def _csr(
     common_name: str,
     san: str,
     ca: bool = False,
+    ekus: list[ObjectIdentifier] | None = None,
+    microsoft_application_policies: bool = False,
 ) -> x509.CertificateSigningRequest:
     builder = (
         x509.CertificateSigningRequestBuilder()
@@ -39,6 +41,15 @@ def _csr(
     if ca:
         builder = builder.add_extension(
             x509.BasicConstraints(ca=True, path_length=0), critical=True
+        )
+    if ekus is not None:
+        builder = builder.add_extension(x509.ExtendedKeyUsage(ekus), critical=False)
+    if microsoft_application_policies:
+        builder = builder.add_extension(
+            x509.UnrecognizedExtension(
+                ObjectIdentifier("1.3.6.1.4.1.311.21.10"), b"0\x00"
+            ),
+            critical=False,
         )
     return builder.sign(key, hashes.SHA256())
 
@@ -83,6 +94,59 @@ def test_ca_capable_csr_is_rejected_before_enrollment() -> None:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     csr = _csr(key, common_name="allowed.example", san="allowed.example", ca=True)
     with pytest.raises(AcmeError, match="CA=true"):
+        _reject_ca_capable_csr_extensions(csr)
+
+
+@pytest.mark.parametrize(
+    "ekus",
+    [
+        [ExtendedKeyUsageOID.CLIENT_AUTH],
+        [ObjectIdentifier("2.5.29.37.0")],
+        [ObjectIdentifier("1.3.6.1.4.1.311.20.2.2")],  # Microsoft PKINIT
+        [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
+    ],
+)
+def test_non_server_auth_csr_eku_is_rejected_before_enrollment(
+    ekus: list[ObjectIdentifier],
+) -> None:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr = _csr(
+        key,
+        common_name="allowed.example",
+        san="allowed.example",
+        ekus=ekus,
+    )
+    with pytest.raises(AcmeError, match="exactly serverAuth"):
+        _reject_ca_capable_csr_extensions(csr)
+
+
+@pytest.mark.parametrize("ekus", [None, [ExtendedKeyUsageOID.SERVER_AUTH]])
+def test_absent_or_exact_server_auth_csr_eku_is_accepted(
+    ekus: list[ObjectIdentifier] | None,
+) -> None:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr = _csr(
+        key,
+        common_name="allowed.example",
+        san="allowed.example",
+        ekus=ekus,
+    )
+    _reject_ca_capable_csr_extensions(csr)
+
+
+def test_microsoft_application_policies_csr_is_rejected_as_unsupported() -> None:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr = _csr(
+        key,
+        common_name="allowed.example",
+        san="allowed.example",
+        microsoft_application_policies=True,
+    )
+    extension = csr.extensions.get_extension_for_oid(
+        ObjectIdentifier("1.3.6.1.4.1.311.21.10")
+    )
+    assert isinstance(extension.value, x509.UnrecognizedExtension)
+    with pytest.raises(AcmeError, match="Microsoft Application Policies"):
         _reject_ca_capable_csr_extensions(csr)
 
 

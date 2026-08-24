@@ -33,7 +33,7 @@ async def post_authorization(
     Unlike the plain GET above, this is account-scoped: it closes the
     existence oracle for callers who hold the URL but not the account key.
     """
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/authz/{authz_id}"
     )
     if payload != {}:
@@ -82,7 +82,7 @@ async def post_challenge(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/challenge/{challenge_id}"
     )
     account_id = account.id
@@ -99,6 +99,15 @@ async def post_challenge(
     # (architecture.md); the payload body is intentionally ignored.
     if payload != {}:
         raise malformed("challenge payload must be an empty object {}")
+
+    # Replay short-circuit (Daybreak round 5): a challenge already ``valid``
+    # is a finished, idempotent operation. Re-running the block below on every
+    # replay rewrote identical state and emitted a fresh audit row per POST --
+    # durable audit growth at the attacker's request rate for an operation
+    # that happened once. Return the current object; the original validation
+    # keeps its row.
+    if challenge.status == "valid":
+        return JSONResponse(content=_challenge_to_json(challenge))
 
     # ------------------------------------------------------------------
     # Enterprise trust decision point.

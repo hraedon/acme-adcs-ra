@@ -16,7 +16,22 @@ class PolicyDecision:
 
     allowed: bool
     template: str | None
+    #: Human-readable prose. MAY embed request data (the offending SAN, the
+    #: offered kid), so it is not safe to key anything on.
     reason: str
+    #: Stable machine identity for this decision, drawn from a fixed vocabulary
+    #: and never containing request data. The audit coalescer keys on this: with
+    #: only ``reason`` available it keyed on a string containing the client's
+    #: own SAN, so varying one identifier per request defeated the durable-growth
+    #: bound the coalescer exists to provide.
+    #:
+    #: REQUIRED, deliberately. Defaulting it meant a future denial branch that
+    #: omitted the keyword -- one argument missing from a four-branch method --
+    #: silently produced ``outcome="denied"`` carrying ``reason_code="allowed"``:
+    #: two genuinely distinct denials folded into one row, the second's prose
+    #: nowhere on disk, and a SIEM rule keying on this field misreading it. A
+    #: default is invisible to mypy; requiring it is not.
+    reason_code: str
 
 
 def _match_dns_pattern(san: str, pattern: str) -> bool:
@@ -144,6 +159,7 @@ class IssuancePolicy:
                 allowed=False,
                 template=None,
                 reason=f"unknown kid: {eab_kid}",
+                reason_code="unknown-kid",
             )
 
         # 2. Server-auth certs must request at least one SAN.
@@ -154,6 +170,7 @@ class IssuancePolicy:
                 allowed=False,
                 template=None,
                 reason="no SANs requested; subject-only issuance is not allowed",
+                reason_code="no-sans-requested",
             )
 
         # 3. Every SAN must match at least one allowed pattern for this account.
@@ -169,6 +186,7 @@ class IssuancePolicy:
                     allowed=False,
                     template=None,
                     reason=f"SAN out of scope for kid {eab_kid}: {san}",
+                    reason_code="san-out-of-scope",
                 )
 
         # 4. All checks pass
@@ -176,4 +194,5 @@ class IssuancePolicy:
             allowed=True,
             template=self._template,
             reason="allowed",
+            reason_code="allowed",
         )

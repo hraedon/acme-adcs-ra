@@ -84,6 +84,10 @@ class RAConfig(BaseSettings):
 
     # --- EAB allowlist -------------------------------------------------------
     eab_allowlist: list[EABEntry] = []
+    # Lifetime cap on durable ACME accounts created under one EAB kid. The
+    # store counts every account row, including deactivated accounts, so a
+    # client cannot recycle durable capacity by deactivating an account.
+    max_accounts_per_eab_kid: int = Field(default=1, ge=1)
 
     # --- ADCS target (placeholders only) -------------------------------------
     adcs_host: str = "CA01.WORK-DOMAIN.local"
@@ -97,6 +101,16 @@ class RAConfig(BaseSettings):
     # those heuristics and relies on locale-independent signals (ReqID,
     # certnew.cer URL) only — failing loudly if none match.
     adcs_locale: str = "en"
+    # Per socket operation and one monotonic ceiling across the complete
+    # certfnsh/certificate/chain sequence. The latter prevents a peer from
+    # extending four individually-valid responses indefinitely by trickling.
+    adcs_enrollment_timeout_seconds: float = Field(default=30.0, gt=0)
+    adcs_enrollment_total_timeout_seconds: float = Field(default=120.0, gt=0)
+    # Dedicated enrollment executor and admission ceiling. ADCS work must never
+    # consume the framework's shared worker pool, and ThreadPoolExecutor's own
+    # queue is unbounded, so both running and admitted work are bounded.
+    adcs_enrollment_max_workers: int = Field(default=4, ge=1)
+    adcs_enrollment_max_pending: int = Field(default=32, ge=1)
 
     # --- Dev/CI escape hatch -------------------------------------------------
     # Off by default. The entrypoint refuses to start on a non-Windows platform
@@ -168,6 +182,17 @@ class RAConfig(BaseSettings):
     # Per-kid overrides: {kid: limit}. If a kid is not listed, the default
     # rate_limit_orders_per_window applies.
     rate_limit_overrides: dict[str, int] = {}
+    # Per-kid ceiling on SUCCESSFUL account-key rollovers per rolling window
+    # (14a / daybreak 2026-08-17 F1). keyChange was the one authenticated
+    # transition with no rate, quota or cardinality check: a valid — or stolen —
+    # account key could chain rotations indefinitely, each one a non-coalesced
+    # audit row. Retention bounds the storage consequence; this bounds the
+    # action. Shares rate_limit_window_seconds with the order limiter, and is
+    # keyed per EAB kid for the same reason: a leaked EAB credential must not
+    # be able to spread rotations across freshly minted account keys.
+    # 0 = disabled. The default is far above legitimate use — rollover is a
+    # rare operation, not a per-renewal one.
+    rate_limit_key_changes_per_window: int = Field(default=5, ge=0)
 
     # --- Unauthenticated nonce ceiling ---------------------------------------
     # /acme/new-nonce is unauthenticated and each call is a SQLite write, so a
@@ -184,6 +209,58 @@ class RAConfig(BaseSettings):
     # audit table and its only mirror together. Set this in production to
     # refuse startup unless audit events leave the box (syslog or HEC).
     audit_offbox_required: bool = False
+
+    # Coalescing window for account-creation denial audit rows, in seconds
+    # (second daybreak rescan F4 / the standing WI-014). A peer that passes the
+    # network allowlist needs no account to make the RA write one durable SQLite
+    # row plus one JSONL line per rejected newAccount, which is unbounded growth
+    # on an issuance host's disk.
+    #
+    # Inside a window, repeats of the same denial reason update the row that is
+    # already on disk — bumping an exact counter — instead of adding new ones,
+    # so durable growth becomes a function of time rather than of the
+    # attacker's request rate. Nothing is deleted and no attempt goes
+    # uncounted; see audit_coalesce for why that distinction is the whole
+    # point. Set to 0 to write one row per denial, as before this existed.
+    audit_denial_coalesce_window_seconds: int = Field(default=60, ge=0)
+
+    # How long audit rows are kept, in days. 0 (the default) keeps everything,
+    # which is the behaviour that existed before retention was configurable.
+    #
+    # When set, it is validated at startup against a floor of "longest
+    # certificate validity this RA has actually issued, plus a fixed grace
+    # period" — retaining for less than a certificate's own lifetime means a
+    # certificate can be valid and servable while the record of how it was
+    # issued has been deleted. Startup is refused below that floor rather than
+    # warned about; see audit_retention.
+    #
+    # Setting this alone does not delete anything: it declares the policy and
+    # makes the footprint report meaningful. Deletion additionally requires
+    # audit_prune_enabled AND audit_offbox_required AND a live off-box delivery
+    # probe at sweep time.
+    audit_retention_days: int = Field(default=0, ge=0)
+
+    # Reserved for a future acknowledged-archive retention path. Production
+    # startup currently refuses True: the library sweep has no production
+    # caller, and a generic SIEM health probe is not proof that each candidate
+    # row reached off-box storage. Leaving the field present makes old configs
+    # fail loudly rather than silently ignoring an operator's pruning policy.
+    audit_prune_enabled: bool = False
+
+    # Warn when the local audit footprint (database + JSONL mirror) exceeds this
+    # many MiB. 0 disables the warning. This is the half that local-only
+    # deployments rely on: they never prune, so measuring is the whole control.
+    # The default is generous against measured growth — a few GiB per 180 days
+    # even under sustained denial flooding — so crossing it means something has
+    # changed rather than that the RA is busy.
+    audit_store_warn_mib: int = Field(default=1024, ge=0)
+
+    # Rotate the JSONL audit mirror at this size, keeping audit_jsonl_keep
+    # files. 0 disables rotation (append forever, as before). The mirror is
+    # local, so rotation is capacity management on a copy — the durable trail is
+    # the SQLite table and, when configured, the off-box sink.
+    audit_jsonl_max_mib: int = Field(default=256, ge=0)
+    audit_jsonl_keep: int = Field(default=4, ge=0)
 
     # --- SIEM / audit emission -----------------------------------------------
     # Auditing every issuance is mandatory (hard rule). There is no toggle.
@@ -291,6 +368,17 @@ class RAConfig(BaseSettings):
     # load-bearing. Set this to True ONLY for a lab or CI fixture; production
     # deployments must leave it False.
     allow_weak_credentials: bool = False
+
+    @model_validator(mode="after")
+    def _audit_pruning_is_not_available(self) -> RAConfig:
+        if self.audit_prune_enabled:
+            raise ValueError(
+                "audit_prune_enabled is not available: the current SIEM path has no "
+                "per-row delivery acknowledgement, so deleting local audit rows could "
+                "destroy the only copy. Keep it false; audit_retention_days still "
+                "enforces the retention floor and audit footprint reporting remains active."
+            )
+        return self
 
     @model_validator(mode="after")
     def _base_url_is_a_bare_origin(self) -> RAConfig:
@@ -440,6 +528,21 @@ class RAConfig(BaseSettings):
                 "itself, so a host compromise takes the audit trail with it. "
                 "Configure the syslog or hec sink."
             )
+        if (
+            self.audit_offbox_required
+            and self.siem_sink == "syslog"
+            and self.siem_syslog_proto == "udp"
+        ):
+            raise ValueError(
+                "audit_offbox_required is set with siem_syslog_proto='udp'. "
+                "UDP is fire-and-forget: the socket accepts every datagram "
+                "whether or not a collector exists, so the startup delivery "
+                "probe cannot distinguish a working collector from none at "
+                "all, and 'required' would mean nothing. Set "
+                "siem_syslog_proto='tcp' (proves a live transport) or use the "
+                "hec sink (proves receipt). The shipped web.config already "
+                "selects tcp."
+            )
         return self
 
     @model_validator(mode="after")
@@ -468,6 +571,19 @@ class RAConfig(BaseSettings):
         if self.revocation_confirm_crl_total_timeout_seconds <= 0:
             raise ValueError(
                 "revocation_confirm_crl_total_timeout_seconds must be positive"
+            )
+        if (
+            self.adcs_enrollment_total_timeout_seconds
+            < self.adcs_enrollment_timeout_seconds
+        ):
+            raise ValueError(
+                "adcs_enrollment_total_timeout_seconds must be at least "
+                "adcs_enrollment_timeout_seconds"
+            )
+        if self.adcs_enrollment_max_pending < self.adcs_enrollment_max_workers:
+            raise ValueError(
+                "adcs_enrollment_max_pending must be at least "
+                "adcs_enrollment_max_workers"
             )
         if self.revocation_confirm_crl_max_workers < 1:
             raise ValueError("revocation_confirm_crl_max_workers must be at least 1")

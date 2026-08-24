@@ -48,7 +48,7 @@ async def revoke_cert(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, _ACME_PATHS["revokeCert"]
     )
     account_id = account.id

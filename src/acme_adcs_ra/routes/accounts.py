@@ -24,16 +24,19 @@ from acme_adcs_ra.app_state import (
     _order_url,
     _url,
     authenticate_account,
+    emit_audit_hook,
+    enforce_account_usable,
     get_context,
 )
 from acme_adcs_ra.jws import (
     JWSValidationError,
     _base64url_decode,
+    jwk_thumbprint,
     verify_eab_jws,
 )
 from acme_adcs_ra.serializers import _account_to_json
 from acme_adcs_ra.server_jws import verify_new_account_jws
-from acme_adcs_ra.store import AccountStatus
+from acme_adcs_ra.store import AccountStatus, EabAccountLimitExceeded
 
 router = APIRouter()
 
@@ -173,17 +176,57 @@ async def new_account(
         raise malformed("contact must be a list")
 
     try:
-        account = ctx.store.create_account(
+        # Account row and its provenance audit commit in ONE transaction
+        # (Daybreak 2026-08-15): an account that exists with no
+        # ``account-created`` row is unauditable, and the window between two
+        # separate commits was exactly that. The SIEM fan-out happens after
+        # the commit via the returned event, as finalize does for issuance.
+        account, event = ctx.store.create_account_with_audit(
             jwk=account_jwk,
             eab_kid=verified_kid,
             status="valid",
             contact=contact,
+            audit={
+                "event_type": "account-created",
+                "outcome": "success",
+                "details": {"eab_kid": verified_kid, "alg": eab_header.get("alg")},
+            },
+            max_accounts_per_eab_kid=ctx.config.max_accounts_per_eab_kid,
         )
+    except EabAccountLimitExceeded as exc:
+        # A concurrent retry for the same JWK may lose the quota transaction
+        # after the other request commits. Preserve newAccount idempotence in
+        # that case; only a genuinely new key is a quota denial.
+        winner = ctx.store.get_account_by_jwk(account_jwk)
+        if winner is not None:
+            return JSONResponse(
+                status_code=200,
+                content=_account_to_json(ctx, winner),
+                headers={"Location": _account_url(ctx, winner.id)},
+            )
+        # Keep the coalescing key fixed. The validated kid and server-side
+        # count are useful audit context, but attacker-chosen JWKs must not
+        # create a distinct durable denial row per request.
+        _audit(
+            ctx,
+            event_type="account-creation-denied",
+            outcome="failed",
+            details={
+                "reason": "eab-account-limit",
+                "kid": exc.kid,
+                "limit": exc.limit,
+                "count": exc.count,
+            },
+        )
+        raise bad_external_account_binding(
+            "the external account binding account limit has been reached"
+        ) from exc
     except sqlite3.IntegrityError:
         # A concurrent newAccount for the same key won the UNIQUE index. That
         # is exactly the case the index exists to stop, and the right answer is
         # the RFC 8555 §7.3 one: return the account that already exists rather
         # than surfacing a 500 for what is a legitimate idempotent retry.
+        # (The audit row rolls back with the account: nothing was created.)
         winner = ctx.store.get_account_by_jwk(account_jwk)
         if winner is None:
             raise
@@ -192,13 +235,7 @@ async def new_account(
             content=_account_to_json(ctx, winner),
             headers={"Location": _account_url(ctx, winner.id)},
         )
-
-    _audit(ctx,
-        event_type="account-created",
-        account_id=account.id,
-        outcome="success",
-        details={"eab_kid": verified_kid, "alg": eab_header.get("alg")},
-    )
+    emit_audit_hook(ctx, event)
 
     body: dict[str, Any] = {
         **_account_to_json(ctx, account),
@@ -231,7 +268,7 @@ async def account_resource(
     account — including revoking its own live certificates. It is one-way; RFC
     8555 §7.3.6 says the server MUST NOT allow reactivation.
     """
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/acct/{account_id}"
     )
     # The kid already identified the account; a mismatch means the caller is
@@ -246,16 +283,32 @@ async def account_resource(
                 "the only supported account status change is 'deactivated' "
                 "(RFC 8555 §7.3.6)"
             )
-        applied = ctx.store.update_account_status(
-            account.id, AccountStatus.DEACTIVATED
-        )
-        _audit(
-            ctx,
-            event_type="account-deactivated",
-            account_id=account.id,
-            outcome="success",
-            details={"eab_kid": account.eab_kid, "applied": applied},
-        )
+        async with ctx.account_issuance_locks.mutating(account.id):
+            current = ctx.store.get_account(account.id)
+            if current is None:
+                raise unauthorized("account not found")
+            enforce_account_usable(ctx, current)
+            if jwk_thumbprint(json.loads(current.jwk_json)) != authenticated_thumbprint:
+                _audit(
+                    ctx,
+                    event_type="account-deactivation-stale",
+                    account_id=account.id,
+                    outcome="denied",
+                    details={"reason": "account-key-changed"},
+                )
+                raise unauthorized(
+                    "account key changed while deactivation was in progress"
+                )
+            applied = ctx.store.update_account_status(
+                account.id, AccountStatus.DEACTIVATED
+            )
+            _audit(
+                ctx,
+                event_type="account-deactivated",
+                account_id=account.id,
+                outcome="success",
+                details={"eab_kid": account.eab_kid, "applied": applied},
+            )
         refreshed = ctx.store.get_account(account.id)
         if refreshed is None:  # pragma: no cover - defensive
             raise unauthorized("account not found")
@@ -275,7 +328,7 @@ async def account_orders(
     The account object has always advertised this URL; it had no handler, so
     a client that followed the link got a 404.
     """
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/acct/{account_id}/orders"
     )
     if account.id != account_id:

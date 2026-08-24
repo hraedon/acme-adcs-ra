@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, NoReturn, cast
 
 from cryptography import x509
@@ -38,10 +39,11 @@ from acme_adcs_ra.enrollment import (
     EnrollmentResult,
     EnrollmentTransportError,
 )
-from acme_adcs_ra.jws import _base64url_decode
+from acme_adcs_ra.jws import _base64url_decode, jwk_thumbprint
 from acme_adcs_ra.policy import PolicyDecision
 from acme_adcs_ra.serializers import _order_to_json
 from acme_adcs_ra.store import (
+    AccountStatus,
     CertificateRecord,
     OrderRecord,
     OrderStatus,
@@ -209,6 +211,14 @@ def _finalize_parse_and_validate_csr(
             outcome="denied",
             details={
                 "reason": "CSR SANs not in order identifiers",
+                # Same reason/reason_code split as the policy-denied call
+                # below: the reason is currently a fixed string, but
+                # out_of_order -- the attacker-chosen SAN list -- sits in this
+                # same dict one refactor away from being interpolated into it,
+                # which would put it straight back into the coalescing key.
+                # The sibling call site was the R2-5 finding; this one is
+                # pinned now rather than after that refactor.
+                "reason_code": "csr-san-mismatch",
                 "out_of_order": out_of_order,
             },
         )
@@ -233,7 +243,15 @@ def _finalize_parse_and_validate_csr(
             order_id=order_id,
             sans=requested_sans,
             outcome="denied",
-            details={"reason": decision.reason},
+            # ``reason`` is prose and contains the offending SAN, which the
+            # client chooses; ``reason_code`` is the stable coalescing identity.
+            # Without the split, varying one identifier per finalize produced one
+            # durable audit row per request on a single order — the bound-defeat
+            # the coalescer excludes attacker-chosen data to prevent.
+            details={
+                "reason": decision.reason,
+                "reason_code": decision.reason_code,
+            },
         )
         if "out of scope" in decision.reason or "no SANs" in decision.reason:
             raise rejected_identifier(decision.reason)
@@ -268,6 +286,7 @@ def _finalize_submit_enrollment(
     ctx: ServerContext,
     order_id: str,
     account_id: str,
+    authenticated_thumbprint: str,
     requested_sans: list[str],
     csr: x509.CertificateSigningRequest,
     csr_subject: str,
@@ -291,14 +310,60 @@ def _finalize_submit_enrollment(
     Raises on unrecoverable error.
     """
     csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("utf-8")
-    stale = _abandon_if_lease_lapsed(
-        ctx, order_id, account_id, requested_sans, decision, generation
-    )
-    if stale is not None:
-        return stale
-    return _submit_enrollment_inner(
-        ctx, order_id, account_id, requested_sans, csr_pem, decision, generation
-    )
+    # The lock is intentionally held across ADCS I/O, but no SQLite transaction
+    # is.  A deactivation/keyChange that commits first makes the checks below
+    # fail; if this call takes the lock first, its submission linearizes before
+    # that later mutation.
+    with ctx.account_issuance_locks.submitting(account_id):
+        account = ctx.store.get_account(account_id)
+        current_thumbprint = (
+            jwk_thumbprint(json.loads(account.jwk_json)) if account is not None else None
+        )
+        eab_allowlisted = (
+            account is not None
+            and account.eab_kid in ctx.config.eab_keys_by_kid()
+        )
+        if (
+            account is None
+            or account.status != AccountStatus.VALID
+            or current_thumbprint != authenticated_thumbprint
+            or not eab_allowlisted
+        ):
+            applied = ctx.store.transition_processing_to_ready(
+                order_id, expected_generation=generation
+            )
+            _audit(
+                ctx,
+                event_type="finalize-enrollment-abandoned",
+                account_id=account_id,
+                order_id=order_id,
+                sans=requested_sans,
+                template=decision.template,
+                outcome="denied",
+                details={
+                    "reason": "account-authorization-changed",
+                    "stage": "before-submit",
+                    "account_status": account.status if account is not None else "missing",
+                    "key_matches_authenticated_request": (
+                        current_thumbprint == authenticated_thumbprint
+                    ),
+                    "eab_kid_allowlisted": eab_allowlisted,
+                    "revert_applied": applied,
+                },
+            )
+            raise unauthorized(
+                "account status, key, or external-account authorization changed "
+                "before certificate submission; the CA was not called"
+            )
+
+        stale = _abandon_if_lease_lapsed(
+            ctx, order_id, account_id, requested_sans, decision, generation
+        )
+        if stale is not None:
+            return stale
+        return _submit_enrollment_inner(
+            ctx, order_id, account_id, requested_sans, csr_pem, decision, generation
+        )
 
 
 def _abandon_if_lease_lapsed(

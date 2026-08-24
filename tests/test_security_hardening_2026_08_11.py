@@ -136,12 +136,18 @@ def test_offbox_audit_required_rejects_the_jsonl_sink(tmp_path: Path) -> None:
 
 
 def test_offbox_audit_required_accepts_syslog(tmp_path: Path) -> None:
+    # Explicitly TCP. This originally relied on the `udp` default, which the
+    # 2026-08-18 Codex scan (item 8) made an invalid posture under this gate:
+    # a datagram socket accepts every send whether or not a collector exists,
+    # so "required" could never be demonstrated. The point of this test is that
+    # syslog is an accepted off-box sink, which it still is.
     cfg = RAConfig(
         base_url="http://testserver",
         db_path=tmp_path / "ra.db",
         audit_offbox_required=True,
         siem_sink="syslog",
         siem_syslog_host="siem.example",
+        siem_syslog_proto="tcp",
     )
     assert cfg.siem_sink == "syslog"
 

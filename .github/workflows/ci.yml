@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # security-review-* gets push CI too: those branches carry the exact
+    # commits external reviews cite by hash, and a review of a commit CI has
+    # never built is a review of unverified bytes (Daybreak 2026-08-15 rescan
+    # noted the branch tip had no check run at all).
+    branches: [main, "security-review-*"]
   pull_request:
     branches: [main]
   schedule:

@@ -72,11 +72,209 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
-**Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
-security reviews.** There is **no 1.9.0 release**: that line shipped only as
-`rc1`/`rc2`, and the re-proof that gates a tag found a red lint gate on the rc2
-tip and a `Set-OfficerRights.ps1` defect on the first-provisioning path, so the
-fixed build ships as 1.9.1. The
+**Daybreak standard pass (review of `7325cdb`, 2026-08-17) found four medium
+issues, no high or critical. One fixed, three triaged and consciously left.**
+Fixed: syslog transport failures were counted as successful off-box audit
+delivery, and the `audit_offbox_required` startup probe passed with the
+collector dead — a stock `SysLogHandler` swallows send errors, and both the
+counters and the probe inferred success from `Logger.info()` returning.
+Confirmed by execution (five sends to a killed collector recorded five
+deliveries and zero failures); rated **high** rather than the reported medium,
+because it is the same defect class as wave-3 F2 which was fixed for HEC only,
+and the shipped `web.config` selects TCP syslog. Fixed with
+`_RaisingSysLogHandler` (re-raises, drops the dead stream so the next event
+reconnects, re-applies the send timeout across a reconnect). Eight tests, each
+mutation-checked — the first version of the timeout test was vacuous and only
+earned its place after a rewrite. Not fixed, with reasons: unlimited `keyChange`
+rotations is a second vector on open WI-014; the commented-out IIS `ipSecurity`
+allowlist is the posture adopted in the 2026-08-11 review (second reviewer to
+re-report it — record the decision in `SECURITY.md`); the unauthenticated
+privileged script tree is valid and converges with WI-015/WI-053. Coverage was
+partial (37 of 167 files) and the reviewer's own follow-ups are
+*live-windows-validation* and *remaining-file-review*. See
+`docs/security-review-2026-08-17-daybreak-standard.md`. Local gates: 840 pytest
++ 1 skipped, ruff, mypy. **Not a live Windows proof.**
+
+**Audit retention landed 2026-08-17 (WI-014 part three).** Deletion is now
+possible, and most of the code exists to make it hard to do by accident.
+`certificates.not_before`/`not_after` are recorded at issuance (and backfilled),
+so the retention floor is `longest observed certificate validity + a fixed 14-day
+grace` — configure `audit_retention_days` below it and **startup is refused**,
+because retaining for less than a certificate's own lifetime means a certificate
+can be valid and servable with no record of how it was issued. Derived from
+observed issuance, not the template, since ADCS can issue shorter than asked.
+The sweep additionally requires `audit_prune_enabled`, `audit_offbox_required`
+and a delivery probe that succeeds **at sweep time**; miss any gate and it
+reports and deletes nothing. **Local-only deployments never prune** — with no
+off-box copy the local table is the only evidence there is — and instead get
+footprint reporting plus JSONL rotation. Their stated cost is availability: the
+`certificate-issued` audit row commits in the same transaction as the
+certificate, so a full disk stops issuance rather than issuing unaudited. The
+`"DELETE FROM audit_log" not in source` tripwire was **narrowed, not removed**;
+it now pins deletion to one statement in one policy-free primitive callable only
+from `audit_retention`. Local gates: 869 pytest + 1 skipped, ruff, mypy.
+**Not a live Windows proof.**
+
+> **The binding constraint is lab time, not review.** Rverify, the sync/queue
+> drain and the officer class D1–D7 have never been executed on this branch, and
+> `01417b5` (a 5.1 installer fix) postdates the last live proof. Round 7 blamed
+> a CA DCOM fault; that was **retracted 2026-08-17** — it was the SSH logon
+> session holding no Kerberos TGT (runbook §1), so nothing is blocked. Work-item
+> writes are also down estate-wide; see `docs/UNFILED-WORK-ITEMS.md`.
+
+**Daybreak round 6 (review of `d1d7c17`) found seven more issues: 4 high,
+3 medium; all are remediated in source, and the full native Windows re-proof
+has now been EXECUTED on the final tip `8964eba` (2026-08-16, lab RA host,
+PowerShell 5.1) — it found and fixed one more defect live: the post-build
+re-assert ran `icacls /reset` on the protected state root, re-inheriting
+ProgramData's Users-create rights for the interval before `/inheritance:r`
+(a looping standard user planted 3 entries through it; caught fail-closed by
+the proof, then 0-for-43,920 after the fix). Roots are never `/reset`
+mid-install now (`Reset-TreeChildrenToInherited` + `-SkipReset`).** The six
+installer findings were treated as one trust-boundary redesign: fresh roots
+are created with their final protected DACL in `CreateDirectoryW` (no
+retained-handle window), executable provenance uses an authorized-writer SID
+allowlist, ambiguous Win32 paths are refused, PATH-selected prerequisite
+execution is gone, repository inputs are proven then built from protected
+staging, and MSI verification/execution occurs only on a protected staged
+copy. The application finding is an atomic lifetime per-EAB account quota
+(default one), live-proven at its default (denial, coalescing 46→2 rows,
+no slot recycling on deactivation). Full app re-proof (A/A1/CRL/G/Q/R/
+least-privilege/authority/CRL-evidence) green on the same tip; teardown
+returned both hosts to their pre-run fingerprints. One native case still
+owed: live MSI-source replacement (Pester- and order-proven; the lab host's
+installed handler short-circuits the path). See
+`docs/security-review-2026-08-16-daybreak-round6.md` (incl. Finding 8) and
+the validation log in `docs/pre-pilot-checklist.md`. Local gates: 807
+pytest + 1 skipped, 268 Pester + 1 skipped, ruff, mypy.
+
+**Status update (2026-08-15, post-validation):** Daybreak's review of `f495092`
+(the E2E-proven tip) found the installer's ACL claim was bypassable —
+`/inheritance:r` removes only *inherited* ACEs, so an attacker's explicit ACEs
+and ownership survived the "claim" — plus registration tokens on the command
+line and two commit-before-audit orderings. All four are fixed on
+`security-review-2026-08-15-daybreak` (takeown+/reset+read-back-proof for the
+tree; switch-only `-AdminToken`/`-ConfirmToken`; account/keyChange audit
+atomicity, fault-injection proven); WI-014 stays deferred. See
+`docs/security-review-2026-08-15-daybreak.md`. **Daybreak's rescan of that fix
+found two more (both fixed, same branch):** the ACL lockdown bounded *writes*
+but not *bytes* — a planted `python\python.exe` was still preferred and
+executed, and a planted venv `.pth` survived `python -m venv` (now: the shared
+interpreter runs only on strict whole-tree manifest verification against a
+gMSA-unwritable manifest, and the venv is deleted and rebuilt every run); and
+child junctions redirected the recursive `takeown`/`icacls /t` outside the
+tree (now: a never-following reparse-point walk refuses any link, `/L` on
+every icacls traversal; takeown's remaining TOCTOU window is detected
+post-hoc, not prevented — documented). See
+`docs/security-review-2026-08-15-daybreak-rescan.md`.
+
+**Daybreak's THIRD pass (of `63529a6`) found four more; all four are fixed on
+the same branch** — see `docs/security-review-2026-08-15-daybreak-rescan-2.md`.
+Briefly: the manifest could not authenticate anything on a first install
+because a local user pre-creates both it and the interpreter it vouches for
+(now: the manifest's own digest is anchored in `HKLM\SOFTWARE\acme-adcs-ra`,
+and an unanchored runtime tree is deleted, never executed); `takeown` has no
+`/L`, so a raced junction still redirected elevated recursive ownership out of
+tree (now: `takeown` is gone entirely, ownership is claimed with
+`icacls /setowner … /L`, and `/c` is gone from every call so a partial run
+aborts); the app pool was stopped ~220 lines *after* the claim, so retained
+gMSA write handles outlived the ACL reset (now: stopped and proven dead via
+`appcmd list wp` before anything is claimed, hashed or run) and only the root's
+owner was verified (now: every descendant's). And **WI-014 is fixed rather than
+deferred a fourth time** — not with a pruner, which the earlier deferrals were
+right to refuse, but by folding repeated pre-auth denials into the row already
+on disk, so growth tracks time instead of request rate and nothing is deleted.
+
+**Then the adoption model itself was retired** — see
+`docs/design-code-state-split.md`. Five of the eight installer findings across
+those four rounds were defects in the previous round's fix, and every mechanism
+involved existed to make it safe to *adopt* a directory a local user might have
+created first. So: executable content moved to `%ProgramFiles%\acme-adcs-ra`
+(new `-RuntimeDir`; `%ProgramData%` grants Users create-folder rights with
+CREATOR OWNER inheritance, `%ProgramFiles%` does not), state stayed in
+`%ProgramData%` with the gMSA on modify and **read+execute only** on code, and
+a pre-existing root is now proven ours or refused with an actionable message.
+That also closed an unreported path: `acme-ra.env` is preserved no-clobber, so
+a planted dotenv in a pre-created state dir used to be preserved and ACL'd —
+and it carries the EAB allowlist and SAN scopes. Deleted with the model: the
+tree manifest, the HKLM anchor, `Test-DestinationInterpreterTrusted`, the whole
+reuse branch. `docs/operator-requirements.md` is the operator contract.
+
+**BREAKING for deployments: an old single-directory install is refused.**
+Migration is manual and deliberate — `docs/operator-requirements.md` §4.
+
+**The installer rework is now EXECUTED and lab-validated (2026-08-15, on
+`54b90db`)** — every item the design doc's "still unproven" list demanded:
+clean install, reinstall over it, refusal runs (the real old-layout tree AND
+a genuine non-admin pre-plant), a rollback run, the §4 migration end to end,
+and the load-bearing **gMSA `RX` launch** (HttpPlatformHandler starts the
+ProgramFiles venv as the gMSA; `/directory` 200). The run found **two escaped
+PowerShell defects, both fixed on the branch and re-proven live**: the ACL
+proof could not read `icacls /save` output (UTF-16LE without BOM vs
+`Get-Content`'s ANSI decode on 5.1 — and pwsh *sniffs* BOM-less UTF-16, which
+is why local Pester never saw it), and a failed build left `acme-ra.env`
+inheriting gMSA Modify — the claim's `/reset` strips the dotenv's protected
+DACL and the re-protect was 150 lines downstream of the abort point — bricking
+the next install's pre-flight. Both fixes carry byte-realistic / source-order
+regression tests. Also closed: the `*S-1-5-32-544` star form **works** for
+`icacls /setowner`. Still not proven: the no-rollback proof-failure path and
+a bare-`-ConfigureIIS` first install. Refusal runs leave the app pool stopped
+(fail-closed) — restart by hand. The lab RA host now runs the two-tree layout
+(old tree preserved as the migration rollback artifact); see the validation
+log in `docs/pre-pilot-checklist.md` and the gitignored
+`samples/lab-run-2026-08-15-installer-validation.md`.
+
+**Daybreak's FIFTH pass (of `f0597a5`) found five more (1 high, 4 medium);
+all five are fixed, the final tip is `88e9c07`, live-proven where
+deterministically possible** — the high was a *file*-plant race into a
+freshly created root (the round-4 collision fix closed the directory race,
+but between `New-Item` and the claim's protect step the fresh root still
+inherited Users-create rights, and a planted dotenv rode the whole claim —
+`Lock-FreshRoot` now protects at creation, proves the directory empty, and
+never runs `/reset` on the fresh path); lexical path comparison missed
+dot-segment/8.3/junction aliases (canonicalisation + kernel final-path
+resolution, all three refused live); PATH-resolved interpreters executed
+elevated unproven (ancestor-chain provenance gate — a fake PATH-first
+python is rejected and never executed, live-proven with a marker file);
+SitePath/web.config were adopted unverified (site-tree provenance +
+throwing launch-config validation, both halves refused live); and
+replayable authenticated requests grew the audit stores unbounded
+(coalescing extended to the replayable denial classes + an
+already-valid-challenge short-circuit; the deployed build held **zero**
+durable rows against a 40-request live denial storm). The live run found
+**two more calibration defects in the new chain rule itself** — the raw
+generic-bit constants (0x80000000 is GenericRead, not GenericAll) and
+SID-vs-name in the owner check — plus InheritOnly handling, each
+live-fixed and pinned by a Pester case. The lab host runs `88e9c07`,
+`/directory` 200, store unchanged.
+
+**Daybreak's FOURTH pass (of `27127af`) found four more; all four are fixed
+on `102a1f4` and live-proven where deterministically possible** — a TOCTOU on
+first-install state-root creation (`New-Item -Force` adopted a raced
+pre-creation and the whole proof chain then normalised and *preserved* the
+planted dotenv — now created without `-Force`, provenance re-verified on
+collision); a clean legacy single-tree layout passing the generic
+trustee/owner/DACL provenance while the preserved web.config kept launching
+the old gMSA-writable venv (now: `venv`/`python`/`scripts` at the state root
+are a pre-icacls refusal, proven against the real `.preSplit` tree; and a
+post-install loud warning when web.config's `processPath` points inside the
+state tree); a CWD-executable hijack on the bare `py`/`python` probes through
+`cmd /c` (now: `NoDefaultCurrentDirectoryInExePath` + absolute-path
+resolution); and overlapping `-RuntimeDir`/`-InstallDir` silently collapsing
+the RX/Modify boundary — both grant sets have the same proof *shape*, so
+nested roots stayed green (now: refused before any host mutation). The
+collision branch of the TOCTOU fix is the one thing not live-proven (it is
+reachable only by a genuinely won race). The lab host now runs `102a1f4`'s
+runtime, `/directory` 200, store unchanged.
+
+**Released: v1.10.0 (2026-08-24).** There is **no 1.9.0 or 1.9.1 release**: the
+1.9 line was written up and `pyproject.toml` declared `1.9.1`, but no tag was
+ever cut — 1.9.0 shipped only as `rc1`/`rc2` (the re-proof that gates a tag
+found a red lint gate on the rc2 tip and a `Set-OfficerRights.ps1` defect on the
+first-provisioning path), and the 2026-08-15 → 2026-08-23 review series kept
+finding work. The tagged history goes v1.8.0 → v1.10.0; the minor bump is
+earned by a breaking change to `Sync-Revocations.ps1` (`-AdminToken` and
+`-ConfirmToken` became switches, so token values can no longer reach argv). The
 2026-08-14 scan of rc1 found seventeen further findings, two blocking: ACME
 **reason 8 (removeFromCRL) was accepted and reached `certutil`**, so a revokeCert
 carrying it recorded a successful revocation while asking the CA to *un-revoke*
@@ -192,4 +390,3 @@ disabled, off-box audit gate, the previously-404 order/account resource
 endpoints, and the PKCS#7 chain now bound to the leaf.
 **Consequence for operators: `ACME_RA_BASE_URL` is now security configuration** —
 wrong value ⇒ everything fail-closes.
-

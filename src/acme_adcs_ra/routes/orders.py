@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from starlette.concurrency import run_in_threadpool
 
 from acme_adcs_ra.acme_errors import (
     malformed,
@@ -24,6 +23,7 @@ from acme_adcs_ra.app_state import (
     authenticate_account,
     get_context,
 )
+from acme_adcs_ra.enrollment import EnrollmentGateBusy
 from acme_adcs_ra.finalize import (
     _finalize_complete,
     _finalize_existing_cert,
@@ -65,6 +65,7 @@ def _check_rate_limit(ctx: ServerContext, account_id: str) -> None:
                     account_id=account_id,
                     outcome="denied",
                     details={
+                        "reason": "per-account-limit",
                         "limit": limit,
                         "window_seconds": window,
                         "count": count,
@@ -87,6 +88,7 @@ def _check_rate_limit(ctx: ServerContext, account_id: str) -> None:
                 account_id=account_id,
                 outcome="denied",
                 details={
+                    "reason": "global-limit",
                     "limit": global_limit,
                     "window_seconds": window,
                     "count": global_count,
@@ -105,7 +107,7 @@ async def new_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, _ACME_PATHS["newOrder"]
     )
     account_id = account.id
@@ -168,6 +170,7 @@ async def new_order(
         )
     except OrderRateLimitExceeded as exc:
         details = {
+            "reason": f"{exc.scope}-limit",
             "limit": exc.limit,
             "window_seconds": exc.window_seconds,
             "count": exc.count,
@@ -219,7 +222,7 @@ async def get_order(
     complete. Account-scoped: another account's order is 404, not 403, so the
     endpoint is not an order-ID oracle.
     """
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/order/{order_id}"
     )
     if payload != {}:
@@ -237,7 +240,7 @@ async def finalize_order(
     request: Request,
     ctx: ServerContext = Depends(get_context),
 ) -> JSONResponse:
-    _header, payload, account = await authenticate_account(
+    _header, payload, account, authenticated_thumbprint = await authenticate_account(
         ctx, request, f"/acme/finalize/{order_id}"
     )
     account_id = account.id
@@ -309,11 +312,36 @@ async def finalize_order(
         # The worker re-checks `generation` against the store immediately before
         # it touches ADCS. That is the durable half of the guarantee: the mark
         # above is process-local memory, the lease is a row.
-        enrollment_result = await run_in_threadpool(
-            _finalize_submit_enrollment,
-            ctx, order_id, account_id, requested_sans,
-            csr, csr_subject, decision, generation,
-        )
+        try:
+            enrollment_result = await ctx.enrollment_gate.run(
+                _finalize_submit_enrollment,
+                ctx,
+                order_id,
+                account_id,
+                authenticated_thumbprint,
+                requested_sans,
+                csr,
+                csr_subject,
+                decision,
+                generation,
+            )
+        except EnrollmentGateBusy as exc:
+            reverted = ctx.store.transition_processing_to_ready(
+                order_id, expected_generation=generation
+            )
+            _audit(
+                ctx,
+                event_type="finalize-enrollment-admission-denied",
+                account_id=account_id,
+                order_id=order_id,
+                sans=requested_sans,
+                template=decision.template,
+                outcome="denied",
+                details={"reason": "enrollment-capacity", "revert_applied": reverted},
+            )
+            raise rate_limited(
+                f"enrollment capacity is full: {exc}", retry_after=3
+            ) from exc
         if isinstance(enrollment_result, JSONResponse):
             return enrollment_result
 

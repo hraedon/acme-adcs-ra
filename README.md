@@ -85,15 +85,26 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **v1.9.1 — current release, live-proven 2026-08-14.** The full lab re-proof
-> ran against `bef2022` and passed: issuance, both transport-orphan branches,
-> the revocation round trip, the confirm-authority split, and CRL evidence
-> verified against a real ADCS CRL. Three residuals are recorded in the
-> [validation log](docs/pre-pilot-checklist.md#validation-log); none blocks the
-> release. **There is no 1.9.0 release** — that line shipped only as `rc1` and
-> `rc2`, and the re-proof that gates a tag found two things wrong with rc2 (a
-> red lint gate, and a `Set-OfficerRights.ps1` defect on the
-> first-provisioning path), so the fixed build ships as 1.9.1.
+> **v1.10.0 — current release.** Closes the 2026-08-15 → 2026-08-23 security
+> review series: finalize is revalidated at the CA boundary, `keyChange` is
+> compare-and-swap guarded, CRL retrieval is pinned to a resolved address, the
+> certsrv leg has a bounded isolated lifetime, CSR application purposes are
+> constrained, and the installer proves its interpreter closure and inbox-module
+> provenance. `Sync-Revocations.ps1` no longer accepts token values on argv —
+> **that is a breaking interface change**, which is why this is 1.10.0 rather
+> than a patch. Live-proven on the lab RA and issuing CA across four runs
+> (2026-08-23 twice, 2026-08-24), with the stale-worker enrollment lease proven
+> end to end for the first time. See the
+> [validation log](docs/pre-pilot-checklist.md#validation-log).
+>
+> **Upgrading from 1.8.0 is strongly recommended**: 1.8.0 predates `838eeb2`,
+> which fixed a defect that left the **entire CA-side revocation loop inert** —
+> every `certutil` call ran without its `-config`.
+>
+> **There is no 1.9.0 or 1.9.1 release.** The 1.9 line was written up and
+> `pyproject.toml` declared `1.9.1`, but no tag was ever cut: 1.9.0 shipped only
+> as `rc1`/`rc2`, and the review series kept finding work. The tagged history
+> goes v1.8.0 → v1.10.0.
 >
 > Feature-complete for its charter and maintained deliberately rather than
 > passively: security reports (see `SECURITY.md`) and bug reports are welcome,
@@ -201,13 +212,37 @@ authenticates to `/certsrv/`. `scripts/install-windows.ps1` does the whole host
 side; the CA side (Web Enrollment + the issuance template) is set up once per CA
 via [`docs/certsrv-setup.md`](docs/certsrv-setup.md).
 
+> **Read [`docs/operator-requirements.md`](docs/operator-requirements.md)
+> first.** It is the contract for everything the installer deliberately does
+> not decide for you, and it lists every condition the installer *refuses* on
+> together with the exact remedy. The installer fails closed in several places
+> by design; knowing which ones in advance saves a confusing first run.
+
+**The install is split across two directories, and the split is a security
+boundary:**
+
+| | Code (`-RuntimeDir`) | State (`-InstallDir`) |
+|---|---|---|
+| Default | `%ProgramFiles%\acme-adcs-ra` | `C:\ProgramData\acme-adcs-ra` |
+| Holds | interpreter + venv, under `current\` | audit DB, logs, `acme-ra.env` |
+| The gMSA gets | **read + execute** | **modify** (dotenv: read) |
+| Lifecycle | rebuilt from scratch every install | survives every install |
+
+`%ProgramData%` grants `Users` create-folder rights by default, so a local user
+can pre-create a predictable path there and own it; `%ProgramFiles%` does not.
+Keeping executable content out of the tree the worker can write to is what
+stops a compromised app pool from rewriting the interpreter it runs as.
+Neither root is ever *adopted*: a pre-existing directory must match what a
+completed install leaves behind, or the installer refuses and tells you what
+to do.
+
 ### Prerequisites
 
 | Prerequisite | How to satisfy it |
 |---|---|
 | **IIS** role + `Web-Mgmt-Console`, `Web-Scripting-Tools`, `Web-IP-Security` | `install-windows.ps1 -InstallPrereqs` (uses `Install-WindowsFeature`) |
 | **HttpPlatformHandler** (IIS module — third-party MSI) | Get the v1.2 amd64 MSI from [iis.net](https://www.iis.net/downloads/microsoft/httpplatformhandler); install by hand or pass `-HttpPlatformHandlerMsi <path>` (see note below) |
-| **Python 3.12+** on the host | `install-windows.ps1 -InstallPrereqs` (uses `winget`), or `winget install Python.Python.3.12` |
+| **Python 3.12+** on the host, machine-wide | Install it **separately, before** running the installer (e.g. `winget install Python.Python.3.12` from your own elevated session). `-InstallPrereqs` deliberately does **not** do this: an elevated bootstrapper running a PATH-selected `py`/`python`/`winget` turns a writable PATH entry into Administrator code execution on the issuance host |
 | **A gMSA installed on this host** | `Install-ADServiceAccount`; `Test-ADServiceAccount` must return `True` |
 | **CA: Web Enrollment + `ACME-ServerAuth` template** (server-auth-only EKU, subject from request, gMSA granted Enroll only) | one-time per CA — see [`docs/certsrv-setup.md`](docs/certsrv-setup.md) |
 
@@ -221,13 +256,14 @@ via [`docs/certsrv-setup.md`](docs/certsrv-setup.md).
 > and it runs as Administrator on the host holding the RA's gMSA context — so it
 > is verified before `msiexec` sees it:
 >
-> - a **local path** must carry a `Valid` Authenticode signature whose publisher
->   matches `-HttpPlatformHandlerPublisher` (default `CN=Microsoft
->   Corporation`); pass `-HttpPlatformHandlerSha256` to pin the bytes as well;
-> - an **`https://` URL** additionally *requires* `-HttpPlatformHandlerSha256`,
->   because TLS authenticates the origin, not the artifact;
+> - **every source**, local or HTTPS, requires an out-of-band
+>   `-HttpPlatformHandlerSha256` and a `Valid` Authenticode signature from the
+>   expected publisher;
 > - **plaintext `http://` is refused outright** — a digest delivered over a
 >   channel an attacker controls proves nothing.
+> - the source is copied/downloaded into fresh administrator-only staging; the
+>   staged bytes are verified and only that protected path reaches System32
+>   `msiexec.exe`.
 >
 > Any failure aborts the install rather than proceeding. See
 > [`docs/security-review-2026-08-17.md`](docs/security-review-2026-08-17.md)
@@ -235,14 +271,17 @@ via [`docs/certsrv-setup.md`](docs/certsrv-setup.md).
 
 ### Install
 
-Run from an **elevated** PowerShell on the RA host, from the repo root:
+Run from an **elevated** PowerShell on the RA host, from an administrator-only
+local release tree. The installer verifies the consumed source tree before it
+dot-sources/builds anything, snapshots it into protected storage, and refuses a
+checkout writable by another user or group.
 
 ```powershell
-# 1. (optional) install the native prereqs first — IIS features + Python.
+# 1. Install Python 3.12+ machine-wide first. Optionally install the native
+#    IIS prerequisites with this script.
 #    HttpPlatformHandler is installed too if you point at its MSI. The MSI's
-#    Authenticode signature and publisher are always checked; -...Sha256 pins
-#    the bytes too, and is REQUIRED if you pass an https:// URL instead of a
-#    local path (Get-FileHash -Algorithm SHA256 gives you the digest).
+#    Authenticode signature, publisher, and SHA-256 are always checked for both
+#    local and HTTPS sources (Get-FileHash -Algorithm SHA256 gives the digest).
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
     -GmsaAccount "WORK-DOMAIN\gMSA-acme-ra$" -InstallPrereqs `
     -HttpPlatformHandlerMsi "C:\path\to\HttpPlatformHandler_amd64.msi" `
@@ -255,7 +294,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
     -TlsCertThumbprint "<thumbprint in LocalMachine\My>"
 ```
 
-Both can be combined in one invocation (`-InstallPrereqs -ConfigureIIS`). The
+Both can be combined in one invocation (`-InstallPrereqs -ConfigureIIS`).
+`-InstallPrereqs` does not run PATH-selected Python or winget; install Python
+separately first. The
 script always prints a **prerequisite check** up front (IIS role, IIS module,
 Python, RSAT) so you see what is missing before it does anything. It is **safe to
 re-run**: the secret env file and an existing `web.config` are never clobbered,
@@ -286,7 +327,7 @@ single-site catch-all binding. Full IIS detail is in
 # ACME directory should return JSON:
 Invoke-WebRequest https://acme-ra.work-domain.local/directory -UseBasicParsing
 # The Negotiate stack imports (run as the venv python):
-& C:\ProgramData\acme-adcs-ra\venv\Scripts\python.exe -c "import spnego; import acme_adcs_ra.negotiate_auth"
+& "C:\Program Files\acme-adcs-ra\current\venv\Scripts\python.exe" -c "import spnego; import acme_adcs_ra.negotiate_auth"
 ```
 
 **Before going live, work through [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).**

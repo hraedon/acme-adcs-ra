@@ -241,3 +241,100 @@ Describe 'Test-ShouldConfirmWithRa' {
         Test-ShouldConfirmWithRa '' | Should -BeFalse
     }
 }
+
+# --- 2026-08-23 codex scan, finding 6: no bearer tokens on the argv ----------
+#
+# Sync-Revocations.ps1 accepted -AdminToken/-ConfirmToken as raw STRING
+# parameters and its examples recommended pasting the secret value onto the
+# command line -- shell history and process argument listings. The switches
+# now only declare which environment variable supplies the credential, the
+# Register-MaintenanceTasks.ps1 pattern since the 2026-08-15 review.
+Describe 'Sync-Revocations credential surface (2026-08-23 finding 6)' {
+    BeforeAll {
+        $script:syncPath = (Resolve-Path "$PSScriptRoot/../../scripts/Sync-Revocations.ps1").Path
+        $script:text = Get-Content -Raw $script:syncPath
+        $script:ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $script:text, [ref]$null, [ref]$null)
+        $script:params = @($script:ast.ParamBlock.Parameters)
+        # The same PowerShell host that runs this suite runs the script under
+        # test: pwsh on Linux CI, Windows PowerShell 5.1 on the Windows job.
+        $script:psExe = (Get-Process -Id $PID).Path
+
+        # The script under test writes its failures to stderr via
+        # [Console]::Error, and under Windows PowerShell 5.1 `& $exe ... 2>&1`
+        # turns each stderr line into an ErrorRecord that is TERMINATING under
+        # EAP=Stop -- the exact trap scripts/lib/SyncLib.ps1 documents and
+        # defends around (observed live on the lab CA, 2026-08-13). Same
+        # save/suppress/restore shape here. Defined in BeforeAll because
+        # Pester 5 runs Describe bodies at discovery, not at It run time.
+        function Invoke-SyncScriptCaptured {
+            param([string[]]$ExtraArgs)
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $out = & $script:psExe -NoProfile -ExecutionPolicy Bypass -File $script:syncPath `
+                    -RaBaseUrl 'https://ra.example.invalid' -CaConfig 'CA01\WORK-DOMAIN-CA' `
+                    @ExtraArgs 2>&1
+                return @{ Output = ($out | Out-String); ExitCode = $LASTEXITCODE }
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+        }
+    }
+
+    It '-AdminToken is a switch -- it cannot carry a value' {
+        $p = $script:params | Where-Object { $_.Name.Extent.Text -eq '$AdminToken' }
+        @($p).Count | Should -Be 1
+        $p[0].StaticType.Name | Should -Be 'SwitchParameter'
+    }
+
+    It '-ConfirmToken is a switch -- it cannot carry a value' {
+        $p = $script:params | Where-Object { $_.Name.Extent.Text -eq '$ConfirmToken' }
+        @($p).Count | Should -Be 1
+        $p[0].StaticType.Name | Should -Be 'SwitchParameter'
+    }
+
+    It 'no value-shaped use of either token remains in the body' {
+        $script:text | Should -Not -Match 'IsNullOrWhiteSpace\(\$(AdminToken|ConfirmToken)\)'
+    }
+
+    It 'no example shows a value-shaped -AdminToken/-ConfirmToken' {
+        $script:text | Should -Not -Match '-(Admin|Confirm)Token "'
+        $script:text | Should -Not -Match 'REPLACE-WITH-HIGH-ENTROPY'
+    }
+
+    It 'the credential values come from the environment' {
+        $script:text | Should -Match '\$env:ACME_ADMIN_TOKEN'
+        $script:text | Should -Match '\$env:ACME_CONFIRM_TOKEN'
+    }
+
+    It 'a value passed to the flag never becomes the credential (fails before the network)' {
+        # Regression shape of the original [string] parameters: the literal on
+        # the command line became the bearer token and reached the RA. Now the
+        # flag only SELECTS the environment variable, and with the variable
+        # unset the script dies (exit 3) before any request is made.
+        $run = Invoke-SyncScriptCaptured -ExtraArgs @('-AdminToken', 'argv-secret')
+        $run.ExitCode | Should -Be 3
+        $run.Output | Should -Match 'ACME_ADMIN_TOKEN is not set'
+    }
+
+    It 'the confirm flag fails loudly when its variable is unset' {
+        $run = Invoke-SyncScriptCaptured -ExtraArgs @('-ConfirmToken')
+        $run.ExitCode | Should -Be 3
+        $run.Output | Should -Match 'ACME_CONFIRM_TOKEN is not set'
+    }
+
+    It 'direct manual operation works by setting the environment first' {
+        # The documented manual path: set the variable, pass the bare flag.
+        # The credential is accepted (no exit 3); the run then proceeds to the
+        # RA fetch and dies unreachable (.invalid never resolves) with exit 1.
+        $env:ACME_CONFIRM_TOKEN = 'env-sourced-value'
+        try {
+            $run = Invoke-SyncScriptCaptured -ExtraArgs @('-ConfirmToken')
+            $run.ExitCode | Should -Be 1
+            $run.Output | Should -Match 'RA unreachable'
+        } finally {
+            Remove-Item env:ACME_CONFIRM_TOKEN -ErrorAction SilentlyContinue
+        }
+    }
+}

@@ -39,9 +39,22 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Elevated native helpers resolve to absolute System32 paths, never to ambient
+# PATH. Round-6 finding 3 removed PATH-selected programs from the installer;
+# these scripts were missed, and they are the higher-value half -- this one
+# runs with CA-officer context. A writable PATH entry would be code execution
+# with that context. The System directory comes from the RUNTIME, not
+# $env:windir -- which is caller-settable process state, the same class as the
+# $env:OS gate the round-3 review moved off the environment.
+
 function Die([string]$Message, [int]$Code) {
     [Console]::Error.WriteLine("ERROR: $Message")
     exit $Code
+}
+
+$script:CertUtilExe = Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)) 'certutil.exe'
+if (-not (Test-Path -LiteralPath $script:CertUtilExe)) {
+    Die "certutil.exe not found at $script:CertUtilExe" 2
 }
 
 # Read the OfficerRights REG_BINARY from the CA. Returns a byte[], or $null
@@ -49,8 +62,18 @@ function Die([string]$Message, [int]$Code) {
 # -getreg first; falls back to the registry provider using the CA name
 # extracted from the config string.
 function Get-OfficerRightsBytes([string]$Config) {
-    # certutil -getreg reads the local CA's registry.
-    $out = & certutil -getreg CA\OfficerRights 2>&1
+    # EAP shield: this script runs under EAP=Stop, and on Windows PowerShell
+    # 5.1 the first line a native command writes to a MERGED stderr terminates
+    # the pipeline before $LASTEXITCODE is read -- a failing certutil would
+    # kill the readback tool outright instead of falling through to the
+    # registry provider below.
+    $getregEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $script:CertUtilExe -getreg CA\OfficerRights 2>&1
+    } finally {
+        $ErrorActionPreference = $getregEap
+    }
     $joined = ($out -join "`n")
     if ($LASTEXITCODE -eq 0) {
         # The hex value lines contain space-separated byte pairs. A line with
@@ -96,9 +119,22 @@ function Parse-SidAt([byte[]]$Data, [int]$Offset) {
 }
 
 # Parse the OfficerRights SD and return a list of ACE hashtables.
+#
+# The early exits return @(), NEVER $null: `@(Parse-OfficerRightsSD $bytes)`
+# at the call site is what makes the count right on every host (the same
+# idiom OfficerRightsLib documents for Get-ExistingAces), and @() emits
+# nothing to the pipeline so the wrapper yields Count 0 -- but a $null return
+# flows through that wrapper as a ONE-element array containing $null
+# (@($null).Count is 1), which skipped the no-ACEs guard and printed
+# "Found 1 OfficerRights ACE(s)" + exit 0 for a corrupt value. The R2-11
+# @() wrapping fixed the single-ACE unwrap and created exactly that hole in
+# the same statement; this is the fourth round this file's count logic has
+# been rewritten. Do not "protect" the return with `,$result` either --
+# see OfficerRightsLib's Get-ExistingAces notes for why that breaks the
+# empty case instead.
 function Parse-OfficerRightsSD([byte[]]$Bytes) {
     if ($null -eq $Bytes -or $Bytes.Length -lt 20) {
-        return $null
+        return @()
     }
     $revision = $Bytes[0]
     $control = [BitConverter]::ToUInt16($Bytes, 2)
@@ -106,7 +142,7 @@ function Parse-OfficerRightsSD([byte[]]$Bytes) {
     $daclOffset = [BitConverter]::ToUInt32($Bytes, 16)
 
     if ($daclOffset -eq 0 -or $daclOffset -ge $Bytes.Length) {
-        return $null
+        return @()
     }
 
     # ACL header: AclRevision(1) Sbz1(1) AclSize(2) AceCount(2) Sbz2(2) = 8 bytes
@@ -116,7 +152,15 @@ function Parse-OfficerRightsSD([byte[]]$Bytes) {
     $aces = @()
     $aceOffset = $daclOffset + 8
     for ($i = 0; $i -lt $aceCount; $i++) {
-        if ($aceOffset + 8 -gt $Bytes.Length) { break }
+        # Truncation and malformation THROW rather than `break`-ing into a
+        # partial list: this is the verify-by-readback tool, and "Found 1
+        # OfficerRights ACE(s)" + exit 0 over a descriptor that stopped walking
+        # after the first of two declared ACEs is the tool affirming a
+        # restriction it did not fully read. A well-formed descriptor always
+        # walks its declared ACEs exactly.
+        if ($aceOffset + 8 -gt $Bytes.Length) {
+            throw "OfficerRights DACL corrupt: ACE $($i + 1) of $aceCount has a header at offset $aceOffset that extends past the $($Bytes.Length)-byte value."
+        }
         $aceType = $Bytes[$aceOffset]
         $aceSize = [BitConverter]::ToUInt16($Bytes, $aceOffset + 2)
         $accessMask = [BitConverter]::ToUInt32($Bytes, $aceOffset + 4)
@@ -124,12 +168,22 @@ function Parse-OfficerRightsSD([byte[]]$Bytes) {
         # Trustee SID starts at aceOffset + 8 (the SidStart field).
         $sidStart = $aceOffset + 8
         $sidInfo = Parse-SidAt $Bytes $sidStart
-        if ($null -eq $sidInfo) { break }
+        if ($null -eq $sidInfo) {
+            throw "OfficerRights DACL corrupt: no parseable trustee SID at offset $sidStart (ACE $($i + 1) of $aceCount)."
+        }
 
         # ApplicationData (opaque callback blob) follows the SID:
         #   [SidCount u32 LE][subject SIDs][template UTF-16LE + null]
         $appDataStart = $sidStart + $sidInfo.Length
         $appDataEnd = $aceOffset + $aceSize
+        # A DESCENDING range is not an empty slice: $b[5..4] reads backwards and
+        # returns 2 reversed bytes, and $b[5..2] returns 4 -- enough to satisfy the
+        # -ge 4 guard below and mis-parse sidCount out of reversed bytes. Reachable
+        # on a malformed or non-callback ACE. OfficerRightsLib's Get-ExistingAces
+        # guards the equivalent line; this copy did not.
+        if ($appDataEnd -le $appDataStart) {
+            throw "OfficerRights DACL corrupt: ACE $($i + 1) of $aceCount at offset $aceOffset declares no application data (size $aceSize, SID $($sidInfo.Length) bytes)."
+        }
         $appDataBytes = $Bytes[$appDataStart..($appDataEnd - 1)]
 
         $subjectSids = @()
@@ -146,8 +200,15 @@ function Parse-OfficerRightsSD([byte[]]$Bytes) {
             # The remaining bytes are the template OID (UTF-16LE + null).
             if ($cursor -lt $appDataBytes.Length) {
                 $templateBytes = $appDataBytes[$cursor..($appDataBytes.Length - 1)]
-                # Strip the trailing null terminator (2 bytes of 0x00).
-                if ($templateBytes.Length -ge 2 -and $templateBytes[-1] -eq 0 -and $templateBytes[-2] -eq 0) {
+                # Strip the trailing null terminator (2 bytes of 0x00). A
+                # descending range is NOT an empty slice in PowerShell --
+                # 0..-1 is the two-element array (0, -1) -- so the Length==2
+                # all-terminator blob must be handled explicitly or the
+                # "stripped" result keeps both bytes. Display-only here, but
+                # the sibling slice above made the same mistake.
+                if ($templateBytes.Length -eq 2 -and $templateBytes[-1] -eq 0 -and $templateBytes[-2] -eq 0) {
+                    $templateBytes = @()
+                } elseif ($templateBytes.Length -ge 3 -and $templateBytes[-1] -eq 0 -and $templateBytes[-2] -eq 0) {
                     $templateBytes = $templateBytes[0..($templateBytes.Length - 3)]
                 }
                 if ($templateBytes.Length -gt 0) {
@@ -183,7 +244,12 @@ if ($null -eq $bytes) {
 }
 
 Write-Output ("OfficerRights: {0} byte(s) of security descriptor." -f $bytes.Length)
-$aces = Parse-OfficerRightsSD $bytes
+# @() forced: a ONE-ACE descriptor -- the normal provisioned state for this
+# RA -- unwraps across the function boundary to a bare PSCustomObject, whose
+# .Count is 1 on pwsh 7 but $null on Windows PowerShell 5.1. The guard below
+# still behaves ($null -eq 0 is false), but the operator's report printed a
+# blank count. Set-OfficerRights.ps1 already wraps both of its call sites.
+$aces = @(Parse-OfficerRightsSD $bytes)
 if ($null -eq $aces -or $aces.Count -eq 0) {
     Write-Output "OfficerRights: present but contains no callback ACEs."
     exit 1

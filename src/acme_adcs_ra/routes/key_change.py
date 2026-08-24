@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
@@ -11,6 +12,7 @@ from acme_adcs_ra.acme_errors import (
     bad_nonce,
     bad_public_key,
     malformed,
+    rate_limited,
     unauthorized,
 )
 from acme_adcs_ra.app_state import (
@@ -18,6 +20,8 @@ from acme_adcs_ra.app_state import (
     ServerContext,
     _audit,
     authenticate_account,
+    emit_audit_hook,
+    enforce_account_usable,
     get_context,
 )
 from acme_adcs_ra.jws import (
@@ -27,6 +31,7 @@ from acme_adcs_ra.jws import (
     jwk_thumbprint,
     verify_flattened_jws,
 )
+from acme_adcs_ra.store import AccountKeyStale, KeyChangeRateLimitExceeded
 
 router = APIRouter()
 
@@ -44,7 +49,7 @@ async def key_change(
     URL and the old key JWK. After validation the account's stored key is
     replaced; the old key is no longer accepted.
     """
-    outer_header, outer_payload, account = await authenticate_account(
+    outer_header, outer_payload, account, authenticated_thumbprint = await authenticate_account(
         ctx, request, _ACME_PATHS["keyChange"]
     )
     account_id = account.id
@@ -136,16 +141,80 @@ async def key_change(
     if existing is not None:
         raise bad_public_key("new account key is already registered to another account")
 
-    ctx.store.update_account_key(account_id, new_jwk)
-
-    _audit(ctx,
-        event_type="account-key-changed",
-        account_id=account_id,
-        outcome="success",
-        details={
-            "eab_kid": account.eab_kid,
-            "new_key_thumbprint": new_key_thumbprint,
-        },
-    )
+    # Key rotation and its audit row commit in ONE transaction (Daybreak
+    # 2026-08-15): the ``account-key-changed`` row is the only record naming
+    # the new key's thumbprint, and it used to be written after the rotation
+    # had already committed. The SIEM fan-out runs after the commit via the
+    # returned event, matching finalize and newAccount.
+    # 14a: the rollover ceiling is enforced INSIDE that transaction, not by a
+    # check here. keyChange was the last authenticated transition with no rate
+    # limit at all, and a route-level count-then-rotate would let a parallel
+    # burst past the ceiling — with each winner an irreversible key rotation.
+    try:
+        async with ctx.account_issuance_locks.mutating(account_id):
+            current = ctx.store.get_account(account_id)
+            if current is None:
+                raise AccountKeyStale("account disappeared before rollover")
+            enforce_account_usable(ctx, current)
+            if jwk_thumbprint(json.loads(current.jwk_json)) != authenticated_thumbprint:
+                raise AccountKeyStale("account key changed before rollover")
+            event = ctx.store.update_account_key_with_audit(
+                account_id,
+                new_jwk,
+                expected_old_thumbprint=authenticated_thumbprint,
+                audit={
+                    "event_type": "account-key-changed",
+                    "outcome": "success",
+                    "details": {
+                        "eab_kid": account.eab_kid,
+                        "new_key_thumbprint": new_key_thumbprint,
+                    },
+                },
+                rate_limit_window_seconds=ctx.config.rate_limit_window_seconds,
+                rate_limit_per_kid=ctx.config.rate_limit_key_changes_per_window,
+            )
+    except AccountKeyStale as exc:
+        _audit(
+            ctx,
+            event_type="key-change-stale",
+            account_id=account_id,
+            outcome="denied",
+            details={"reason": "account-key-or-status-changed"},
+        )
+        raise unauthorized(
+            "account key or status changed while the key rollover was in progress"
+        ) from exc
+    except KeyChangeRateLimitExceeded as exc:
+        _audit(
+            ctx,
+            event_type="key-change-rate-limited",
+            account_id=account_id,
+            outcome="denied",
+            details={
+                "reason": "per-account-limit",
+                "limit": exc.limit,
+                "window_seconds": exc.window_seconds,
+                "count": exc.count,
+                "scope": "per-account",
+                "kid": exc.kid,
+            },
+        )
+        raise rate_limited(
+            f"key change rate limit exceeded: {exc.count} rollovers in the "
+            f"last {exc.window_seconds}s (limit: {exc.limit})",
+            retry_after=exc.window_seconds,
+        ) from exc
+    except sqlite3.IntegrityError as exc:
+        # The route-level lookup is only an optimization. A different account
+        # can claim the proposed key before this transaction acquires SQLite's
+        # writer lock; the UNIQUE index is authoritative and must map to the
+        # ACME client error rather than an unhandled 500.
+        existing = ctx.store.get_account_by_jwk(new_jwk)
+        if existing is not None and existing.id != account_id:
+            raise bad_public_key(
+                "new account key is already registered to another account"
+            ) from exc
+        raise
+    emit_audit_hook(ctx, event)
 
     return JSONResponse(content={})

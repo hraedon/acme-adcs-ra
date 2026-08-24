@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import sys
+import threading
+import time
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,11 +22,15 @@ from cryptography.x509.oid import NameOID
 from acme_adcs_ra.enrollment import (
     CertsrvEnrollmentLeg,
     EnrollmentDenied,
+    EnrollmentGate,
+    EnrollmentGateBusy,
     EnrollmentLeg,
     EnrollmentPending,
     EnrollmentResult,
     EnrollmentTransportError,
     FakeEnrollmentLeg,
+    _abort_enrollment_transfer,
+    _LiveEnrollmentTransfer,
     _parse_certfnsh_disposition,
 )
 
@@ -144,10 +151,14 @@ class _FakeResponse:
         # taking bytes for both (2026-08-18 wave 3 F4). Keep them consistent.
         self.content = content if content else text.encode("utf-8")
         self.headers: Mapping[str, str] = headers if headers is not None else {}
+        self.closed = False
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeSession:
@@ -163,14 +174,17 @@ class _FakeSession:
         self._routes = routes
         self.posts: list[tuple[str, dict[str, str]]] = []
         self.gets: list[tuple[str, dict[str, str]]] = []
+        self.timeouts: list[float] = []
 
     def post(self, url: str, *, data: Mapping[str, str], timeout: float) -> _FakeResponse:
+        self.timeouts.append(timeout)
         self.posts.append((url, dict(data)))
         return self._route(url)
 
     def get(
         self, url: str, *, params: Mapping[str, str], timeout: float
     ) -> _FakeResponse:
+        self.timeouts.append(timeout)
         self.gets.append((url, dict(params)))
         return self._route(url)
 
@@ -275,6 +289,47 @@ class TestCertsrvEnrollmentLeg:
         assert result.template == _TEMPLATE
         assert result.requester  # non-empty
 
+    def test_all_four_requests_clamp_timeout_to_one_decreasing_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _leaf_pem, leaf_der, p7b_b64 = _build_leaf_cert_and_chain()
+        cert_b64 = base64.b64encode(leaf_der).decode("ascii")
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "acme_adcs_ra.enrollment.time.monotonic", lambda: clock["now"]
+        )
+
+        class _AdvancingSession(_FakeSession):
+            def _route(self, url: str) -> _FakeResponse:
+                # Deterministic elapsed time: every completed HTTP exchange
+                # consumes exactly 0.25s of the one deadline. A mutation that
+                # resets the deadline per request records 2.0 four times and
+                # fails the exact timeout assertion below.
+                clock["now"] += 0.25
+                return super()._route(url)
+
+        fake = _AdvancingSession(
+            routes={
+                "certfnsh.asp": _FakeResponse(
+                    text='<a href="certnew.cer?ReqID=42&Enc=b64">cert</a>'
+                ),
+                "certnew.cer": _FakeResponse(content=cert_b64.encode("ascii")),
+                "certcarc.asp": _FakeResponse(text="var nRenewals=0;"),
+                "certnew.p7b": _FakeResponse(content=p7b_b64.encode("ascii")),
+            }
+        )
+        leg = CertsrvEnrollmentLeg(
+            host=_HOST,
+            template=_TEMPLATE,
+            timeout=5.0,
+            total_timeout=2.0,
+            session_factory=lambda: fake,
+        )
+
+        leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
+
+        assert fake.timeouts == pytest.approx([2.0, 1.75, 1.5, 1.25])
+
     def test_pending_raises_enrollment_pending_carrying_the_req_id(self) -> None:
         """Pending is its own type, and the ReqID travels as a field.
 
@@ -328,6 +383,247 @@ class TestCertsrvEnrollmentLeg:
         )
         with pytest.raises(EnrollmentTransportError, match="connection refused"):
             leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
+
+    def test_one_deadline_aborts_stream_and_preserves_issued_req_id(self) -> None:
+        """A trickling post-issuance body cannot outlive the total deadline."""
+
+        class _Socket:
+            def __init__(self) -> None:
+                self.aborted = threading.Event()
+
+            def shutdown(self, _how: int) -> None:
+                self.aborted.set()
+
+            def close(self) -> None:
+                self.aborted.set()
+
+        class _Raw:
+            def __init__(self) -> None:
+                self._connection = type("Connection", (), {"sock": _Socket()})()
+
+            def read1(self, _size: int, *, decode_content: bool) -> bytes:
+                del decode_content
+                assert self._connection.sock.aborted.wait(1.0)
+                raise OSError("socket aborted")
+
+        blocked = _FakeResponse()
+        blocked.raw = _Raw()  # type: ignore[attr-defined]
+        fake = _FakeSession(
+            routes={
+                "certfnsh.asp": _FakeResponse(
+                    text='<a href="certnew.cer?ReqID=42&Enc=b64">cert</a>'
+                ),
+                "certnew.cer": blocked,
+            }
+        )
+        leg = CertsrvEnrollmentLeg(
+            host=_HOST,
+            template=_TEMPLATE,
+            timeout=5.0,
+            total_timeout=0.05,
+            session_factory=lambda: fake,
+        )
+
+        started = time.monotonic()
+        with pytest.raises(EnrollmentTransportError, match="deadline") as caught:
+            leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
+        assert time.monotonic() - started < 0.5
+        assert caught.value.req_id == "42"
+        assert caught.value.ca_issued is True
+        assert blocked.closed is True
+
+    def test_deadline_closes_the_socket_on_windows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Socket:
+            def __init__(self) -> None:
+                self.shutdown_called = False
+                self.close_called = False
+
+            def shutdown(self, _how: int) -> None:
+                self.shutdown_called = True
+
+            def close(self) -> None:
+                self.close_called = True
+
+        sock = _Socket()
+        response = _FakeResponse()
+        response.raw = type(  # type: ignore[attr-defined]
+            "Raw", (), {"_connection": type("Connection", (), {"sock": sock})()}
+        )()
+        live = _LiveEnrollmentTransfer()
+        live.response = response
+        timed_out = threading.Event()
+        monkeypatch.setattr("acme_adcs_ra.enrollment.sys.platform", "win32")
+
+        _abort_enrollment_transfer(live, timed_out)
+
+        assert timed_out.is_set()
+        assert sock.shutdown_called is True
+        assert sock.close_called is True
+
+    def test_windows_close_still_runs_when_socket_shutdown_raises_type_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Socket:
+            def __init__(self) -> None:
+                self.close_called = False
+
+            def shutdown(self, _how: int) -> None:
+                raise TypeError("changed wrapper signature")
+
+            def close(self) -> None:
+                self.close_called = True
+
+        sock = _Socket()
+        response = _FakeResponse()
+        response.raw = type(  # type: ignore[attr-defined]
+            "Raw", (), {"_connection": type("Connection", (), {"sock": sock})()}
+        )()
+        live = _LiveEnrollmentTransfer()
+        live.response = response
+        timed_out = threading.Event()
+        monkeypatch.setattr("acme_adcs_ra.enrollment.sys.platform", "win32")
+
+        # A Timer callback has nowhere useful to propagate an exception. This
+        # must return normally and still execute the Windows closesocket path.
+        _abort_enrollment_transfer(live, timed_out)
+
+        assert timed_out.is_set()
+        assert sock.close_called is True
+
+    def test_dedicated_gate_sheds_instead_of_queueing_without_bound(self) -> None:
+        async def scenario() -> None:
+            gate = EnrollmentGate(max_workers=1, max_pending=1)
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked() -> str:
+                entered.set()
+                assert release.wait(2.0)
+                return threading.current_thread().name
+
+            first = asyncio.create_task(gate.run(blocked))
+            assert await asyncio.to_thread(entered.wait, 1.0)
+            with pytest.raises(EnrollmentGateBusy):
+                await gate.run(blocked)
+            release.set()
+            assert (await first).startswith("ra-adcs-enrollment")
+            gate.close()
+
+        asyncio.run(scenario())
+
+    def test_dedicated_gate_does_not_abandon_admitted_work_on_cancellation(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            gate = EnrollmentGate(max_workers=1, max_pending=1)
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked() -> str:
+                entered.set()
+                assert release.wait(2.0)
+                return "issued-result"
+
+            admitted = asyncio.create_task(gate.run(blocked))
+            assert await asyncio.to_thread(entered.wait, 1.0)
+            admitted.cancel()
+            await asyncio.sleep(0)
+            assert admitted.done() is False
+            release.set()
+            assert await admitted == "issued-result"
+            gate.close()
+
+        asyncio.run(scenario())
+
+    def test_gate_close_drains_running_and_queued_admitted_work(self) -> None:
+        """Shutdown refuses new work but never cancels already-admitted issuance."""
+
+        async def scenario() -> None:
+            gate = EnrollmentGate(max_workers=1, max_pending=2)
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            second_ran = threading.Event()
+
+            def first() -> str:
+                first_entered.set()
+                assert release_first.wait(2.0)
+                return "first-complete"
+
+            def second() -> str:
+                second_ran.set()
+                return "second-complete"
+
+            running = asyncio.create_task(gate.run(first))
+            assert await asyncio.to_thread(first_entered.wait, 1.0)
+            queued = asyncio.create_task(gate.run(second))
+            await asyncio.sleep(0)
+
+            gate.close()
+            with pytest.raises(RuntimeError, match="closed"):
+                await gate.run(lambda: "not-admitted")
+
+            release_first.set()
+            assert await asyncio.wait_for(running, timeout=1.0) == "first-complete"
+            assert await asyncio.wait_for(queued, timeout=1.0) == "second-complete"
+            assert second_ran.is_set()
+
+        asyncio.run(scenario())
+
+    def test_direct_body_deadline_error_keeps_issued_orphan_metadata(self) -> None:
+        """The EnrollmentTransportError branch preserves ReqID, not only catch-all."""
+
+        class _Socket:
+            def __init__(self) -> None:
+                self.aborted = threading.Event()
+
+            def shutdown(self, _how: int) -> None:
+                self.aborted.set()
+
+            def close(self) -> None:
+                self.aborted.set()
+
+        class _Raw:
+            def __init__(self) -> None:
+                self._connection = type("Connection", (), {"sock": _Socket()})()
+
+            def read1(self, _size: int, *, decode_content: bool) -> bytes:
+                del decode_content
+                # Return normally after watchdog abort. _read_capped_body then
+                # sees timed_out itself and raises EnrollmentTransportError
+                # directly, exercising that exception branch.
+                assert self._connection.sock.aborted.wait(1.0)
+                return b"x"
+
+        blocked = _FakeResponse()
+        blocked.raw = _Raw()  # type: ignore[attr-defined]
+        fake = _FakeSession(
+            routes={
+                "certfnsh.asp": _FakeResponse(
+                    text='<a href="certnew.cer?ReqID=73&Enc=b64">cert</a>'
+                ),
+                "certnew.cer": blocked,
+            }
+        )
+        leg = CertsrvEnrollmentLeg(
+            host=_HOST,
+            template=_TEMPLATE,
+            timeout=5.0,
+            total_timeout=0.05,
+            session_factory=lambda: fake,
+        )
+
+        with pytest.raises(
+            EnrollmentTransportError, match="total deadline expired"
+        ) as caught:
+            leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
+
+        assert caught.value.req_id == "73"
+        assert caught.value.cert_pem is None
+        assert caught.value.chain_pem == []
+        assert caught.value.ca_issued is True
+        assert blocked.closed is True
 
     def test_certfnsh_payload_correctness(self) -> None:
         _leaf_pem, leaf_der, p7b_b64 = _build_leaf_cert_and_chain()

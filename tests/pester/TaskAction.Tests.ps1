@@ -111,7 +111,7 @@ Describe 'Build-ActionScriptBlock' {
         $s | Should -Match 'ACME_RA_ADMIN_TOKEN='
         $s.Contains($script:dotenv) | Should -BeTrue
         # The header is built from the runtime variable, not a literal.
-        $s | Should -Match 'Bearer \$tok'
+        $s | Should -Match "Bearer ' \+ \`$tok"
     }
 
     It 'Output contains Invoke-RestMethod -Method Delete' {
@@ -202,5 +202,113 @@ Describe 'Build-SyncActionCommand injection resistance' {
         $cmd | Should -Not -Match "x'; Stop-Service certsvc; ';"
         # Each occurrence must be the escaped form.
         $cmd | Should -Match "x''; Stop-Service certsvc; ''"
+    }
+}
+
+# --- Daybreak 2026-08-15: the registration command line is not a secret channel -
+#
+# -AdminToken/-ConfirmToken used to be [string] parameters, so the one-time
+# registration carried the FULL token values through shell history and the
+# invoking process's argument list -- the last place a secret still traveled
+# after F2 removed them from the task definitions. They are switches now: the
+# script cannot accept a secret value at all. These tests pin that property at
+# the AST level, which Linux CI can do.
+Describe 'Register-MaintenanceTasks credential surface (Daybreak 2026-08-15)' {
+    BeforeAll {
+        $script:text = Get-Content -Raw "$PSScriptRoot/../../scripts/Register-MaintenanceTasks.ps1"
+        $script:ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $script:text, [ref]$null, [ref]$null)
+        $script:params = @($script:ast.ParamBlock.Parameters)
+    }
+
+    It '-AdminToken is a switch -- it cannot accept a value' {
+        $p = $script:params | Where-Object { $_.Name.Extent.Text -eq '$AdminToken' }
+        @($p).Count | Should -Be 1
+        $p[0].StaticType.Name | Should -Be 'SwitchParameter'
+    }
+
+    It '-ConfirmToken is a switch -- it cannot accept a value' {
+        $p = $script:params | Where-Object { $_.Name.Extent.Text -eq '$ConfirmToken' }
+        @($p).Count | Should -Be 1
+        $p[0].StaticType.Name | Should -Be 'SwitchParameter'
+    }
+
+    It 'no value-shaped use of either token remains in the body' {
+        $script:text | Should -Not -Match 'IsNullOrWhiteSpace\(\$(AdminToken|ConfirmToken)\)'
+    }
+
+    It 'no example shows a value-shaped -AdminToken/-ConfirmToken' {
+        $script:text | Should -Not -Match '-(Admin|Confirm)Token "'
+    }
+
+    It 'the sync action is keyed off the switches, not off string presence' {
+        $script:text | Should -Match '-LoadAdminToken \(\[bool\]\$AdminToken\)'
+        $script:text | Should -Match '-LoadConfirmToken \(\[bool\]\$ConfirmToken\)'
+    }
+}
+
+# 2026-08-16 round 7.2. Build-SyncActionCommand carried these two invariants,
+# a comment explaining why, and tests. Build-ActionScriptBlock -- whose output
+# the SAME caller wraps in `-Command "..."` -- carried none of them, and emitted
+# six double quotes across eleven lines. CommandLineToArgvW then re-split the
+# registered action, so `@{ 'Authorization' = "Bearer $tok" }` reached
+# PowerShell as `@{ 'Authorization' = Bearer $tok }` and died with "The term
+# 'Bearer' is not recognized". Registration reported success either way --
+# New-ScheduledTaskAction only stores the string, and the post-register check
+# reads NextRunTime, never LastTaskResult -- so nonce GC and the RFC 8555 7.1.6
+# expired-order sweep would have failed silently on every run.
+Describe 'Build-ActionScriptBlock: the -Command wrapping invariants' {
+    BeforeAll {
+        $script:action = Build-ActionScriptBlock `
+            'https://ra.WORK-DOMAIN.local/acme/admin/nonces' `
+            'C:\ProgramData\acme-adcs-ra\acme-ra.env'
+    }
+
+    It 'contains NO double quote' {
+        $script:action | Should -Not -Match '"'
+    }
+
+    It 'is a single line' {
+        $script:action | Should -Not -Match "`n"
+        $script:action | Should -Not -Match "`r"
+    }
+
+    It 'is still valid PowerShell after all that quoting discipline' {
+        $errs = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseInput(
+            $script:action, [ref]$null, [ref]$errs)
+        @($errs).Count | Should -Be 0
+    }
+
+    It 'survives the -Command wrapping the caller actually applies' {
+        # Rebuild what Register-MaintenanceTasks passes to the task action and
+        # confirm the header expression is still one token after re-splitting.
+        $wrapped = "-NoProfile -ExecutionPolicy Bypass -Command `"$script:action`""
+        $wrapped | Should -Match "Authorization' = \('Bearer ' \+ "
+        # exactly two double quotes: the pair the caller adds, and no others
+        @([regex]::Matches($wrapped, '"')).Count | Should -Be 2
+    }
+
+    It 'still loads the token from the dotenv rather than embedding it' {
+        $script:action | Should -Match 'ACME_RA_ADMIN_TOKEN='
+        $script:action | Should -Match 'Get-Content -LiteralPath'
+    }
+}
+
+# Round 7.4: the no-double-quote invariant of the -Command-wrapped actions was
+# an assumption, not a control -- ConvertTo-PsSingleQuotedLiteral escaped single
+# quotes (F4) but passed a double quote through verbatim, and any input value
+# carrying one would re-tokenise the registered action at run time (the R2-4
+# defect reachable again). A double quote is not representable in that position
+# at all, so the builder refuses it.
+Describe 'ConvertTo-PsSingleQuotedLiteral refuses double quotes (round 7.4)' {
+    It 'throws on a value containing a double quote' {
+        # Mutation: delete the IndexOf('"') guard in ConvertTo-PsSingleQuotedLiteral.
+        { ConvertTo-PsSingleQuotedLiteral 'https://ra.example/?x="y' } | Should -Throw '*double quote*'
+    }
+
+    It 'the emitted action contains no double quote for any quote-free input' {
+        $action = Build-ActionScriptBlock 'https://ra.example/nonce' 'C:\ProgramData\acme-adcs-ra\acme-ra.env'
+        $action | Should -Not -Match '"'
     }
 }

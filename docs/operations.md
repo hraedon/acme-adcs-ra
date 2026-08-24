@@ -18,6 +18,15 @@ EAB key allows rogue account creation within that kid's SAN scope until it is
 rotated, so kids must be high-entropy and the MAC key must be treated like a
 password.
 
+Each EAB kid has a lifetime durable-account quota, configured with
+`ACME_RA_MAX_ACCOUNTS_PER_EAB_KID` (default `1`). Deactivated accounts still
+consume their slot; the quota is not a concurrency hint or a rolling limit.
+The RA enforces it in the store transaction that inserts the account and its
+`account-created` audit row, so concurrent distinct account keys cannot exceed
+the configured value. A rejected creation returns
+`badExternalAccountBinding` and is coalesced with other account-limit denials
+for audit-growth control.
+
 ### Minting a new EAB credential
 
 Use `scripts/eab.py` to mint a high-entropy kid (UUID4, 32 hex chars, 128
@@ -199,6 +208,35 @@ The in-app limit bounds order creation (the expensive path that reaches
 ADCS); the proxy limit bounds raw request rate (including polls and
 challenge POSTs). Both should be configured.
 
+### Key-rollover ceiling (14a)
+
+Order creation is not the only transition a valid credential can repeat.
+Account-key rollover (`keyChange`, RFC 8555 §7.3.5) had no rate, quota or
+cardinality check at all, so a valid — or stolen — account key could chain
+rotations indefinitely, each writing an audit row that is deliberately never
+coalesced. Retention bounds what that costs on disk; this bounds the action.
+
+| Env var | Default | Description |
+|---|---|---|
+| `ACME_RA_RATE_LIMIT_KEY_CHANGES_PER_WINDOW` | `5` | Max successful key rollovers per EAB kid per window. `0` = disabled. |
+
+It shares `ACME_RA_RATE_LIMIT_WINDOW_SECONDS` with the order limiter and is
+keyed per **EAB kid**, not per ACME account, for the same reason: a leaked EAB
+credential must not be able to reset its budget by enrolling a fresh account
+key. Over the limit the RA returns `429` with `Retry-After` and emits
+`key-change-rate-limited`; repeats inside the coalescing window fold into one
+row carrying an exact `denial_count`.
+
+The check, the key update and its audit row share one transaction, so a
+parallel burst cannot slip several rotations past the ceiling — each one that
+did would be irreversible.
+
+**Raising it.** The default is far above legitimate use: rollover is a rare
+operational event, not a per-renewal one, and `max_accounts_per_eab_kid`
+defaults to `1`. Raise it only if you are deliberately rotating many accounts
+under one kid inside a single window (a bulk key-hygiene pass, say), and lower
+it back afterwards.
+
 ### Nonce ceiling (unauthenticated)
 
 `GET`/`HEAD /acme/new-nonce` is unauthenticated by protocol design, and every
@@ -223,6 +261,17 @@ measured a legitimate need.
 **Caveat:** the bucket is per worker *process*. Under IIS/HttpPlatformHandler
 the RA runs as a single uvicorn process, so one bucket sees all traffic; if you
 ever scale to multiple workers the effective ceiling multiplies by worker count.
+
+The nonce bucket bounds the *rate* of the cheapest step. It does not bound what
+a slower, sustained stream of rejected `newAccount` requests writes to disk;
+that is a separate control:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ACME_RA_AUDIT_DENIAL_COALESCE_WINDOW_SECONDS` | `60` | Window in which repeats of the same pre-auth denial reason update one durable audit row instead of adding rows. `0` writes one row per denial. |
+
+See **Retention and archival → audit_log table** below for what the coalesced
+row contains and why nothing is deleted.
 The network allowlist below remains the authoritative outer bound.
 
 ### Network allowlist (`<ipSecurity>`)
@@ -297,27 +346,29 @@ nonce cleanup on `create_nonce` is a safety net only — wire the cron.
 that call these endpoints on a cadence (default 15 minutes):
 
 ```powershell
-# Register both tasks (run as the gMSA so the task can read acme-ra.env if
-# needed; the admin token is passed as a parameter — do NOT commit it):
+# Register both tasks (run as the gMSA so the task can read acme-ra.env).
+# -AdminToken is a FLAG: the task action loads ACME_RA_ADMIN_TOKEN from the
+# dotenv at run time -- the value is never accepted on a command line.
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
+    -AdminToken `
     -IntervalMinutes 15 `
     -TaskUser "WORK-DOMAIN\gMSA-acme-ra$"
 
 # Dry run (does not register anything):
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -AdminToken "REPLACE-WITH-HIGH-ENTROPY-ADMIN-TOKEN" `
+    -AdminToken `
     -WhatIf
 ```
 
 **Task-user choice.** Run the tasks as the gMSA (the same identity the RA app
-pool uses) so the task can read the env file if the token is sourced there,
-and so the task has no more privilege than the RA itself. Alternatively, run
-as `NT AUTHORITY\SYSTEM` if the gMSA is not desired for scheduled tasks;
-either way the admin token is passed in the task action's headers, not stored
-in a file the task reads.
+pool uses) so the task can read the env file, and so the task has no more
+privilege than the RA itself. Alternatively, run as `NT AUTHORITY\SYSTEM` if
+the gMSA is not desired for scheduled tasks; either way the task action reads
+its credentials from the dotenv at run time (2026-08-19 F2) — no token value
+is stored in the task definition or accepted by the registration script
+(Daybreak 2026-08-15).
 
 After registering, verify:
 
@@ -356,14 +407,14 @@ re-enroll — so the token is a high-value secret, treated like an EAB MAC key.
 1. Generate a new high-entropy token.
 2. Update `ACME_RA_ADMIN_TOKEN` in `acme-ra.env`.
 3. Restart the RA app pool.
-4. Re-register the scheduled tasks with the new token
-   (`Register-MaintenanceTasks.ps1 -AdminToken <new>`).
+4. Nothing else: the scheduled tasks read the token from the dotenv at run
+   time, so there is nothing to re-register.
 5. Confirm the old token is rejected (`GET /acme/admin/orders` with the old
    token → 401).
 
 ### Minimum strength (enforced at startup)
 
-Since v1.9.1 the RA **refuses to start** on a weak credential: EAB MAC keys
+Since v1.10.0 (the 1.9 line was never released) the RA **refuses to start** on a weak credential: EAB MAC keys
 must decode to at least 32 bytes and `ACME_RA_ADMIN_TOKEN` /
 `ACME_RA_REVOCATION_CONFIRM_TOKEN` must be at least 32 characters. Everything
 `python scripts/eab.py new` generates clears this. `allow_weak_credentials=true`
@@ -400,14 +451,17 @@ token) are not registered there, and omit `-AdminToken` entirely:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -RevocationSyncOnly -ConfirmToken "REPLACE-WITH-CONFIRM-TOKEN" `
+    -RevocationSyncOnly -ConfirmToken `
     -CaConfig 'CA01\WORK-DOMAIN-CA' -RequesterName "WORK-DOMAIN\gMSA-acme-ra$"
 ```
 
 The generated task action then carries zero admin-token bytes, so a compromise
-of the revocation host cannot reach order reclaim or nonce cleanup. Passing
-`-AdminToken` remains supported for a single-host deployment that has not split
-the credentials, and for the general tasks on the RA host.
+of the revocation host cannot reach order reclaim or nonce cleanup. The
+`-ConfirmToken` FLAG declares which key the action loads from the dotenv at
+run time; put `ACME_RA_REVOCATION_CONFIRM_TOKEN=<value>` in the host's
+`acme-ra.env` (`-DotEnvPath`, ACL'd like the RA's own). Adding `-AdminToken`
+(flag) is for a single-host deployment that has not split the credentials, and
+for the general tasks on the RA host.
 
 ### Optional: independent CRL evidence for confirmations
 
@@ -419,6 +473,9 @@ it verifiable, point the RA at the CA's published CRL:
 ACME_RA_REVOCATION_CONFIRM_CRL_URL=http://pki.WORK-DOMAIN.local/crl/WORK-DOMAIN-CA.crl
 # Fail closed: refuse to confirm unless the CRL proves the serial is revoked.
 ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true
+# For this CA: CRLPeriod=604800s; measured nextUpdate-thisUpdate=649200s.
+# The lower bound must be measured at scheduled replacement/publication time.
+ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=<measured age < value < 649200>
 ```
 
 The CRL is signed by the CA and readable without privilege, so this is the one
@@ -427,13 +484,55 @@ The RA verifies the CRL's signature against the issuing CA certificate from the
 certificate's **own stored chain**, and refuses an expired CRL as evidence.
 Confirmations then record `verification: "crl-verified"` with the CRL number.
 
+These are three separate time bounds:
+
+- **Publication cadence:** `CRLPeriod` is the expected interval between CRLs.
+- **Overlap / validity:** `nextUpdate - thisUpdate` is the CRL's validity window;
+  `nextUpdate` is a hard expiry, not a delay budget that can be extended here.
+- **Replay-age ceiling:** `revocation_confirm_crl_max_age_seconds` independently
+  limits how old a signed CRL the RA will accept, so it must remain binding below
+  the hard expiry.
+
+For this CA, the committed evidence measures `CRLPeriod` as 604800 seconds (1
+week) and the `thisUpdate` → `nextUpdate` window as 649200 seconds (7d 12h
+20m). `CRLPeriod` is only the expected publication cadence; it is **not** the
+lower bound for the age ceiling.
+
+Before setting `revocation_confirm_crl_max_age_seconds` (the
+`ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` environment variable), measure
+`A_sched_max`: the maximum age observed, using the RA's clock, for a still-current
+CRL at its scheduled replacement/publication time. Measure representative
+scheduled cycles and include ADCS `thisUpdate` backdating plus the worst observed
+CA/RA clock skew. Then require:
+`A_sched_max < max_age_seconds < V_next_min`, where `V_next_min` is the minimum
+measured `nextUpdate - thisUpdate` validity window across representative CRLs.
+The evidence currently recorded here contains one 649200-second window; use the
+minimum from the deployment's measurements if later windows are shorter. The
+repository does **not** record `A_sched_max`, so it does not justify a numeric
+lower bound or a copy-paste production value. The prior 691200-second (8-day)
+plumbing test is not safe for this CA because it exceeds the measured validity
+window and makes the independent age ceiling non-binding before `nextUpdate`.
+
+Any operational margin belongs between the measured `A_sched_max` and the hard
+`nextUpdate` bound. If that gap is insufficient, change the CA's publication
+schedule/validity policy or accept fail-closed confirmations; do not widen the
+age ceiling past `nextUpdate`.
+
+If publication misses `nextUpdate`, the CRL must fail closed; no extra
+`max_age_seconds` margin can make an expired CRL acceptable. Fix the CA's
+publication path or accept the pending confirmation rather than widening this
+ceiling beyond the measured validity window.
+
 Note the timing trade-off before setting `REQUIRE_CRL_EVIDENCE`: a serial is not
 on the CRL until the CA next publishes one. On the default least-privilege path
 the agent does not force a republish (it has no Manage-CA right), so a
 confirmation can legitimately fail until the scheduled CRL publication catches
 up. The serial simply stays pending and the next sync cycle confirms it.
-**This path has not yet been exercised against a real ADCS CRL** — see
-`docs/security-review-2026-08-13.md`.
+The CRL-evidence path was exercised against a real ADCS CRL in the 2026-08-14
+live re-proof: required evidence refused a serial before publication and
+accepted it as `crl-verified` after publication. See
+`docs/security-review-2026-08-13.md` and the validation log in
+`docs/pre-pilot-checklist.md`.
 
 The retrieval is bounded on both axes, because the CRL host is an
 operator-configured third party on a path a scoped confirmation credential can
@@ -457,6 +556,18 @@ ACME_RA_REVOCATION_CONFIRM_CRL_MAX_WORKERS=2
 # Must be >= MAX_WORKERS (validated at config load).
 ACME_RA_REVOCATION_CONFIRM_CRL_MAX_PENDING=32
 ```
+
+**If the CRL URL is `https://`, the CRL host's own chain must be RFC 5280 clean.**
+CRL retrieval verifies that TLS chain against the system trust store, and the
+OpenSSL shipped with Python 3.13+ (the lab host runs 3.14) enforces checks the
+3.12 build did not: an issuing CA whose certificate omits a Subject Key
+Identifier or a `keyCertSign` Key Usage is refused with
+`CERTIFICATE_VERIFY_FAILED`. A public CA meets this; a hand-rolled internal
+one may not. The failure is a fetch error, so evidence is recorded as absent
+and the confirmation fails closed rather than passing on an unverified CRL —
+correct, but it looks like an unreachable CRL host. Prefer a plain `http://`
+CDP: the CRL is signed by the CA and its signature is verified independently,
+so TLS adds no evidentiary value here.
 
 Concurrent confirmations for the **same certificate** share a single retrieval,
 so a retry loop or a burst on the revocation host costs one CRL fetch rather
@@ -612,7 +723,23 @@ someone attempting to use credentials they should not have.
 ### audit_log table
 
 The `audit_log` table is the authoritative local audit (the SIEM JSONL is a
-secondary emission). It grows unbounded by default. Retention guidance:
+secondary emission).
+
+**Attacker-driven growth is bounded; ordinary growth is not.** Since the
+2026-08-15 audit work,
+repeated *pre-authentication denials* — the one audit path an unauthenticated
+peer can drive, by failing EAB validation on `newAccount` over and over — no
+longer write a row each. Within
+`ACME_RA_AUDIT_DENIAL_COALESCE_WINDOW_SECONDS` (default 60), repeats of the
+same denial reason update the row that is already on disk, bumping an exact
+`denial_count` and recording how many distinct `kid` values were offered. Set
+the window to 0 to go back to one row per denial.
+
+Nothing is pruned, and no attempt goes uncounted: the counter is written to a
+committed row on every increment, so even a crash mid-window keeps the tally.
+What this bounds is *rows per unit time* (at most one per reason per window),
+not the total, so the retention guidance below still applies to normal
+operation:
 
 - **Keep hot** for the incident-review window (e.g. 90 days) for fast query.
 - **Archive cold** after the hot window: export rows older than N days to a
@@ -624,9 +751,48 @@ secondary emission). It grows unbounded by default. Retention guidance:
   (the audit is the matching half of the revocation trail; see the
   revocation runbook below).
 
-A retention script is operator-owned (not shipped) — the schema is stable
-(`SELECT * FROM audit_log WHERE timestamp < ?`), so a simple cron/export
-suffices.
+#### Built-in retention (`audit_retention_days`)
+
+The RA can now enforce that window itself, but only in the one deployment shape
+where deleting a local row is not destroying evidence.
+
+**The floor.** `audit_retention_days` is validated at startup against the
+longest certificate validity this RA has *actually issued* (recorded per row in
+`certificates.not_before` / `not_after`) plus a fixed 14-day grace. Configure it
+below that and **startup is refused**, not warned: retaining for less than a
+certificate's own lifetime means a certificate can be valid and servable while
+the record of how it was issued has been deleted. The floor is derived from
+observed issuance rather than from the template, because ADCS can issue shorter
+than the template asks — the template is a request, the certificate is the fact.
+The grace term is a constant rather than a setting, so it cannot be tuned to
+zero, and so it does not collapse as certificate lifetimes shrink.
+
+**The gates.** Deletion requires *all* of:
+
+| Gate | Why |
+|---|---|
+| `audit_retention_days` ≥ floor | see above |
+| `audit_prune_enabled` | declaring a policy and destroying evidence are two decisions |
+| `audit_offbox_required` | with no off-box copy the local table is the only evidence, so nothing is deleted from it |
+| A delivery probe that succeeds **at sweep time** | a sink that worked at startup and has since died is the exact state where deleting is unrecoverable |
+
+Miss any one and the sweep reports what it would have done and deletes nothing.
+That is the expected outcome for most deployments, and for **every** local-only
+one — see the local-only note in `operator-requirements.md` for the trade.
+
+The sweep audits itself (`audit-retention-swept`, carrying the cutoff, the row
+count and the floor). A retention pass that leaves no trace is indistinguishable
+from an attacker's cleanup.
+
+Deleting is still the last resort rather than the first tool: `audit_bounds`
+caps each row's size, `audit_coalesce` caps rows-per-window for replayable
+denials, and the footprint report tells you whether any of it matters. Measured
+growth is a few GiB per 180 days even under sustained flooding.
+
+Attacker-supplied fields inside `details` (notably the offered EAB `kid`) are
+truncated to 256 characters with a SHA-256 of the full value appended, and the
+whole `details` blob is capped at ~4 KB. Two rows for the same oversized value
+still compare equal, so a row can still be matched against a captured request.
 
 ### certificates table
 
@@ -646,9 +812,21 @@ needed for revocation lookups (serial → cert) and audit. Retention guidance:
 
 - The JSONL sink (`<db>.siem.jsonl`, next to the DB) is the secondary
   emission. Back it up with the DB (see Backup and restore below).
-- Rotate / compress old JSONL on a schedule (operator-owned) so it does not
-  grow unbounded. The SIEM ingest should be the authoritative copy; the
-  local JSONL is the fail-open buffer.
+- **The RA rotates it.** `audit_jsonl_max_mib` (default 256) rolls the mirror to
+  `<name>.1`, `.2`, … and `audit_jsonl_keep` (default 4) bounds how many are
+  retained; set the size to 0 for the previous append-forever behaviour. This is
+  independent of `audit_retention_days` on purpose — the table's retention is
+  gated on off-box audit, whereas a file that grows without limit is a capacity
+  fault on *every* deployment, and the mirror is the larger half of a default
+  install's local footprint. The SIEM ingest should be the authoritative copy;
+  the local JSONL is the fail-open buffer.
+- Rotated files count toward the startup footprint report, so the measured
+  number does not drop simply because the mirror rolled.
+- Coalesced denials reach this sink once per window, not once per request:
+  the SIEM sees the window's opening event, and the *next* window's event
+  carries the closed one's final tally in `previous_window`. For an exact
+  live count of an in-progress flood, read `denial_count` on the `audit_log`
+  row — SQLite is authoritative there, and is updated on every attempt.
 
 ## Revocation runbook
 
@@ -807,6 +985,23 @@ functional gap without granting the enrollment gMSA any CA-officer rights.
 > `scripts/lib/*.ps1` at runtime (the shared byte/SD and task-action builders,
 > also exercised by the Pester suite); without `scripts/lib/` alongside them they
 > fail at load with a "cannot find lib/..." error.
+>
+> **Copy it somewhere administrator-only, and not `C:\Temp`.** The installer
+> does not place this tree for you, so wherever you put it is where a scheduled
+> task will execute privileged code from every interval, forever. Any directory
+> a non-administrator can write to — or any writable directory *above* it — lets
+> that user replace `Sync-Revocations.ps1` between runs and have the gMSA run it.
+> Measured on the lab host 2026-08-17: `C:\Temp\ra-scripts` inherited
+> `BUILTIN\Users:(I)(CI)(AD)` and `(I)(CI)(WD)` from `C:\Temp`. A subdirectory of
+> `%ProgramFiles%` is the right shape — it is what the installer uses for the
+> code root, and for the same reason.
+>
+> `Register-MaintenanceTasks.ps1` now **refuses** to register the revocation-sync
+> task from a tree that fails this check, naming the offending object and the
+> principal that can write it. It checks the whole ancestor chain *and* every
+> file beneath the tree, because the action dot-sources `lib\` siblings at run
+> time. `-AllowUntrustedScriptPath` downgrades the refusal to a warning for lab
+> reproduction; do not use it for a pilot or production registration.
 
 The loop:
 
@@ -887,33 +1082,38 @@ byte-level ACE the GUI produces (proven in Plan 004).
 #### Scheduling the agent
 
 Register `Sync-Revocations.ps1` as a Windows Scheduled Task on the utility
-host, running as `gMSA-acme-revoker$`:
+host, running as `gMSA-acme-revoker$`. Use the registration script, whose
+task action loads the confirm token from an ACL'd dotenv at run time — no
+credential ever lands in the task definition or on a command line:
 
 ```powershell
-$action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\acme-adcs-ra\scripts\Sync-Revocations.ps1 -RaBaseUrl 'https://ra.WORK-DOMAIN.local' -AdminToken '<admin-token>' -ConfirmToken '<confirm-token>' -CaConfig 'CA01\WORK-DOMAIN-CA' -Execute"
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5)
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
-    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2)
-Register-ScheduledTask -TaskName "acme-adcs-ra-sync-revocations" `
-    -Action $action -Trigger $trigger -Settings $settings `
-    -User "WORK-DOMAIN\gMSA-acme-revoker$" -Force
+# 1. On the utility host, write the confirm token to a dotenv (this host needs
+#    ONLY this key -- do not copy the RA's whole env file):
+#    C:\ProgramData\acme-adcs-ra\acme-ra.env containing
+#        ACME_RA_REVOCATION_CONFIRM_TOKEN=<confirm-token>
+#    then ACL it: icacls <file> /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" "WORK-DOMAIN\gMSA-acme-revoker$:R"
+# 2. Register only the sync task, confirm-token only:
+powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
+    -BaseUrl "https://ra.WORK-DOMAIN.local" `
+    -RevocationSyncOnly -ConfirmToken `
+    -DotEnvPath "C:\ProgramData\acme-adcs-ra\acme-ra.env" `
+    -CaConfig 'CA01\WORK-DOMAIN-CA' `
+    -TaskUser "WORK-DOMAIN\gMSA-acme-revoker$" `
+    -IntervalMinutes 5 -Execute
 ```
 
-The admin token is embedded in the task action's arguments (not written to
-a file the task reads); rotate it by re-registering (see the admin-token
-runbook). Tune the interval to your latency requirement (default 5 minutes
-shown; the RA audit records `ca_crl_updated` lag so you can measure the
-actual cadence).
+Rotate the token by editing the dotenv — the action re-reads it on every run,
+so there is nothing to re-register. Tune the interval to your latency
+requirement (default 5 minutes shown; the RA audit records `ca_crl_updated`
+lag so you can measure the actual cadence).
 
-`-ConfirmToken` is the separate revocation-confirmation credential (see above);
-without it every confirm returns 401 and serials never leave the pending list.
-`Register-MaintenanceTasks.ps1` passes both tokens via the environment
-(`ACME_ADMIN_TOKEN`, `ACME_CONFIRM_TOKEN`) so neither lands on the script's
-process command line, and warns if `-ConfirmToken` is omitted.
+`-ConfirmToken` (as a flag) declares which credential the action loads from
+the dotenv; without it every confirm returns 401 and serials never leave the
+pending list, and the registration warns. The load happens into
+`ACME_CONFIRM_TOKEN` inside the task, so the value never appears on the
+script's process command line.
 
-**`-RaBaseUrl` must be https.** Since v1.9.1 both `Sync-Revocations.ps1` and
+**`-RaBaseUrl` must be https.** Since v1.10.0 both `Sync-Revocations.ps1` and
 `Register-MaintenanceTasks.ps1` validate it before attaching any token — https
 only, no embedded credentials, no query, fragment, or path. A scheduled task
 bakes the URL in, so a cleartext typo would have disclosed the maintenance
@@ -1034,7 +1234,7 @@ first (report-only), then re-register without `-DryRun` to arm it:
 # Step 1: register in dry-run mode (report-only — no revocations applied):
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -AdminToken "<admin-token>" `
+    -AdminToken -ConfirmToken `
     -IntervalMinutes 5 `
     -TaskUser "WORK-DOMAIN\gMSA-acme-ra$" `
     -RegisterRevocationSync `
@@ -1045,7 +1245,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1
 # Step 2: after dry-run review, re-register without -DryRun to arm the task:
 powershell -ExecutionPolicy Bypass -File .\scripts\Register-MaintenanceTasks.ps1 `
     -BaseUrl "https://acme-ra.WORK-DOMAIN.local" `
-    -AdminToken "<admin-token>" `
+    -AdminToken -ConfirmToken `
     -IntervalMinutes 5 `
     -TaskUser "WORK-DOMAIN\gMSA-acme-ra$" `
     -RegisterRevocationSync `

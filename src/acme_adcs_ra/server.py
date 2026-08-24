@@ -24,6 +24,8 @@ from acme_adcs_ra.app_state import (
     _default_siem_emitter,
     logger,
 )
+from acme_adcs_ra.audit_coalesce import DenialCoalescer
+from acme_adcs_ra.audit_retention import assert_retention_above_floor, log_footprint
 from acme_adcs_ra.routes.acme import router as acme_router
 from acme_adcs_ra.routes.admin import router as admin_router
 from acme_adcs_ra.siem import SiemEmitter
@@ -43,6 +45,17 @@ def _package_version() -> str:
 
 def create_app(context: ServerContext) -> FastAPI:
     """Build a FastAPI app wired to the supplied server context."""
+    # Defense in depth for callers that mutate or construct a config without
+    # normal Pydantic validation. The library sweep is intentionally not wired:
+    # the SIEM exporter has no per-row delivery watermark, so a health probe
+    # cannot prove the rows selected for deletion have an off-box copy.
+    if context.config.audit_prune_enabled:
+        raise RuntimeError(
+            "audit_prune_enabled is not available without acknowledged per-row "
+            "off-box delivery; refusing to start rather than silently ignore the "
+            "setting or delete the only copy of audit evidence"
+        )
+
     # Wire the default SIEM emitter when no test/operator hook is supplied.
     _siem_emitter: SiemEmitter | None = None
     if context.audit_hook is None:
@@ -85,9 +98,30 @@ def create_app(context: ServerContext) -> FastAPI:
         context.audit_hook = _siem_emitter.export
     if context.nonce_bucket is None:
         context.nonce_bucket = _default_nonce_bucket(context.config)
+    if context.denial_coalescer is None:
+        context.denial_coalescer = DenialCoalescer(
+            context.config.audit_denial_coalesce_window_seconds
+        )
     context.crl_evidence_gate.set_limits(
         max_workers=context.config.revocation_confirm_crl_max_workers,
         max_pending=context.config.revocation_confirm_crl_max_pending,
+    )
+    context.enrollment_gate.set_limits(
+        max_workers=context.config.adcs_enrollment_max_workers,
+        max_pending=context.config.adcs_enrollment_max_pending,
+    )
+
+    # Retention floor, then footprint. The floor is a refusal rather than a
+    # warning: retaining for less than a certificate's own lifetime means a
+    # certificate can be valid and servable while the record of how it was
+    # issued has been deleted, which is an evidence hole rather than a tuning
+    # choice. The footprint report is the half every deployment gets, including
+    # the local-only ones that will never delete a row.
+    assert_retention_above_floor(context.config, context.store)
+    log_footprint(
+        context.config,
+        context.store,
+        _siem_emitter.jsonl_bytes() if _siem_emitter is not None else 0,
     )
 
     # H-3: shut down the SIEM emitter pool on app shutdown via lifespan.
@@ -99,6 +133,9 @@ def create_app(context: ServerContext) -> FastAPI:
         # Same reason: the CRL-evidence pool is the RA's own, so nothing else
         # reclaims its threads at shutdown.
         context.crl_evidence_gate.close()
+        context.enrollment_gate.close()
+        if context.denial_coalescer is not None:
+            context.denial_coalescer.close()
 
     app = FastAPI(
         title="acme-adcs-ra",

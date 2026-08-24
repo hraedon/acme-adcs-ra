@@ -37,7 +37,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -47,6 +47,8 @@ from urllib.parse import ParseResult, urljoin, urlparse
 import requests
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
+from requests.adapters import HTTPAdapter
+from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
 
 logger = logging.getLogger("acme_adcs_ra.crl_evidence")
 
@@ -186,20 +188,103 @@ def _effective_port(parsed: ParseResult) -> int | None:
     return _DEFAULT_PORTS.get(parsed.scheme)
 
 
-def _resolve_addresses(host: str, port: int | None) -> frozenset[str]:
-    """The set of IP addresses *host* currently resolves to, or empty on failure."""
+def _resolve_addresses(host: str, port: int | None) -> tuple[str, ...]:
+    """IP addresses for *host* in resolver order, or empty on failure."""
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError:
-        return frozenset()
-    return frozenset(str(info[4][0]) for info in infos)
+        return ()
+    return tuple(dict.fromkeys(str(info[4][0]) for info in infos))
+
+
+class _PinnedAddressAdapter(HTTPAdapter):
+    """Connect to a numeric address while authenticating the URL hostname."""
+
+    def __init__(self, address: str, hostname: str) -> None:
+        self._address = address
+        self._hostname = hostname
+        super().__init__()
+
+    def get_connection_with_tls_context(
+        self,
+        request: requests.PreparedRequest,
+        verify: Any,
+        proxies: Any = None,
+        cert: Any = None,
+    ) -> HTTPConnectionPool:
+        if not isinstance(request.url, str):  # pragma: no cover - requests prepares str URLs
+            raise requests.exceptions.InvalidURL("prepared URL is not text")
+        parsed = urlparse(request.url)
+        port = _effective_port(parsed)
+        if port is None:  # pragma: no cover - caller accepts only http(s)
+            raise requests.exceptions.InvalidURL(f"URL has no effective port: {request.url}")
+        if parsed.scheme == "https":
+            # `host` is the TCP destination. `server_hostname` controls SNI and
+            # `assert_hostname` keeps certificate verification bound to the
+            # configured hostname rather than to the numeric address.
+            return HTTPSConnectionPool(
+                self._address,
+                port,
+                assert_hostname=self._hostname,
+                server_hostname=self._hostname,
+            )
+        return HTTPConnectionPool(self._address, port)
+
+
+@contextlib.contextmanager
+def _open_pinned_response(
+    url: str,
+    addresses: tuple[str, ...],
+    *,
+    timeout_seconds: float,
+    deadline: float,
+    timed_out: threading.Event,
+) -> Iterator[requests.Response]:
+    """Open *url* against one pre-resolved address, trying each in order."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if hostname is None:  # pragma: no cover - caller validates this
+        raise requests.exceptions.InvalidURL(f"URL has no hostname: {url}")
+
+    last_error: requests.RequestException | None = None
+    for address in addresses:
+        remaining = deadline - time.monotonic()
+        if timed_out.is_set() or remaining <= 0:
+            raise requests.exceptions.Timeout("CRL retrieval deadline expired")
+        adapter = _PinnedAddressAdapter(address, hostname)
+        # PreparedRequest does not add Host itself; urllib3 would derive it from
+        # the pool's numeric address unless it is explicit here.
+        host_header = f"[{hostname}]" if ":" in hostname else hostname
+        if parsed.port is not None:
+            host_header = f"{host_header}:{parsed.port}"
+        request = requests.Request("GET", url, headers={"Host": host_header}).prepare()
+        try:
+            response = adapter.send(
+                request,
+                timeout=min(timeout_seconds, remaining),
+                stream=True,
+                proxies={},
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            adapter.close()
+            continue
+        try:
+            yield response
+        finally:
+            response.close()
+            adapter.close()
+        return
+
+    if last_error is not None:
+        raise last_error
+    raise requests.exceptions.ConnectionError("CRL host resolved to no addresses")
 
 
 def _vet_redirect(
     location: str,
     current_url: str,
     origin: ParseResult,
-    pinned_addresses: frozenset[str] = frozenset(),
 ) -> tuple[str | None, str]:
     """Resolve a ``Location`` and decide whether it may be followed.
 
@@ -222,12 +307,10 @@ def _vet_redirect(
       ``https://host:8443`` to ``https://host:443``. Same host, different port,
       different service — exactly what the check claimed to forbid. The upgrade
       is now spelled out as precisely that one transition.
-    * **The name.** Comparing hostname text does not bind the address the hop
-      actually connects to, and each hop resolves the name again. An attacker
-      controlling DNS for the configured CDP name can answer the second lookup
-      with any address. *pinned_addresses* is what the host resolved to at the
-      start of the retrieval; a hop whose resolution has moved outside that set
-      is refused.
+    Address binding is enforced by the transport, which connects every hop to
+    the numeric addresses resolved once at the start of the retrieval. This
+    function therefore decides URL authority only and performs no second DNS
+    lookup that could race the actual connection.
     """
     target = urljoin(current_url, location)
     parsed = urlparse(target)
@@ -259,17 +342,6 @@ def _vet_redirect(
             "different service"
         )
 
-    if pinned_addresses:
-        now = _resolve_addresses(parsed.hostname, port)
-        if not now:
-            return None, f"target host {parsed.hostname!r} no longer resolves"
-        if not now <= pinned_addresses:
-            # DNS moved under us between the first request and this hop.
-            return None, (
-                f"target host {parsed.hostname!r} now resolves outside the "
-                f"addresses seen at the start of this retrieval "
-                f"({sorted(now - pinned_addresses)} not in {sorted(pinned_addresses)})"
-            )
     return target, ""
 
 
@@ -380,14 +452,17 @@ def fetch_crl_evidence(
         return CrlEvidence(revoked=False, checked=False, detail=detail)
 
     origin = parsed
-    # Resolved once, before the first request, and only when a redirect could
-    # actually use it — this is what a later hop's resolution is held against so
-    # DNS cannot move the destination mid-chain. An empty set (resolution failed
-    # here) means the check below is skipped rather than blocking the fetch: the
-    # request itself is about to fail on the same lookup and will say so.
-    pinned_addresses: frozenset[str] = frozenset()
-    if follow_redirects:
-        pinned_addresses = _resolve_addresses(parsed.hostname, _effective_port(parsed))
+    # Resolve once and use those numeric addresses as the actual TCP targets for
+    # the initial request and every redirect. A validation-only lookup followed
+    # by a hostname request is still DNS-rebindable; an empty pin must fail
+    # closed rather than disabling the control.
+    pinned_addresses = _resolve_addresses(parsed.hostname, _effective_port(parsed))
+    if not pinned_addresses:
+        return CrlEvidence(
+            revoked=False,
+            checked=False,
+            detail=f"CRL host {parsed.hostname!r} did not resolve to any address",
+        )
     deadline = time.monotonic() + total_timeout_seconds
     # Set by the watchdog below, and the reason a torn-down transfer is
     # reported as a deadline rather than as a fetch failure.
@@ -423,21 +498,20 @@ def fetch_crl_evidence(
             # each redirect's body and issues each subsequent request itself,
             # so neither the destination check below nor the byte budget nor
             # the deadline ever saw any of it.
-            response = requests.get(
+            response_context = _open_pinned_response(
                 url,
-                # Clamp to what is left, so no single hop can be granted more
-                # socket patience than the whole retrieval has remaining.
-                timeout=min(timeout_seconds, remaining),
-                stream=True,
-                allow_redirects=False,
+                pinned_addresses,
+                timeout_seconds=timeout_seconds,
+                deadline=deadline,
+                timed_out=timed_out,
             )
-            live.response = response
             # Closed on every exit path, including the deadline and size
             # bail-outs: with stream=True the transfer is only actually torn
             # down when the response is closed, so an early `return` that
             # leaked it would keep the socket — and the trickle — alive. It is
             # also what discards a redirect's body unread.
-            with contextlib.closing(response):
+            with response_context as response:
+                live.response = response
                 if timed_out.is_set():
                     return deadline_evidence(len(body))
 
@@ -465,9 +539,7 @@ def fetch_crl_evidence(
                                 "with no Location header"
                             ),
                         )
-                    target, refusal = _vet_redirect(
-                        location, url, origin, pinned_addresses
-                    )
+                    target, refusal = _vet_redirect(location, url, origin)
                     if target is None:
                         return CrlEvidence(
                             revoked=False,

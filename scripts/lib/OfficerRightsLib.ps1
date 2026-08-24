@@ -177,7 +177,17 @@ function Get-ExistingAces([byte[]]$Bytes) {
     $aceCount = [BitConverter]::ToUInt16($Bytes, $daclOffset + 4)
     $aceOffset = $daclOffset + 8
     for ($i = 0; $i -lt $aceCount; $i++) {
-        if ($aceOffset + 8 -gt $Bytes.Length) { break }
+        if ($aceOffset + 8 -gt $Bytes.Length) {
+            # THROW, do not `break`: this function feeds the add-replace path,
+            # which preserves every ACE it returns VERBATIM in the descriptor it
+            # writes back. A silent partial walk here means existing officers'
+            # ACEs beyond the truncation point are silently STRIPPED from the
+            # rewritten OfficerRights value -- removing officers' rights by
+            # accident instead of by decision. A well-formed descriptor always
+            # walks its declared ACEs exactly; anything else is corruption and
+            # must abort before anything is written.
+            throw "Corrupt ACL at offset ${aceOffset}: header for ACE $($i + 1) of $aceCount extends past the buffer ($($Bytes.Length) bytes)"
+        }
         $aceSize = [BitConverter]::ToUInt16($Bytes, $aceOffset + 2)
         if ($aceSize -lt 8) {
             throw "Corrupt ACE at offset ${aceOffset}: size $aceSize is less than minimum 8 bytes"

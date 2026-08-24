@@ -153,6 +153,20 @@ honest: check a box only when the thing is actually true, not when it's planned.
       `docs/operations.md` ## Revocation runbook. **Reason 7 is rejected** by
       both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil` rejects
       it) so an accepted reason can never silently break the out-of-band loop.
+- [ ] **CRL evidence freshness is configured from the actual CA cadence.** Before
+      enabling `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, measure the
+      maximum age of a current CRL at scheduled replacement/publication time,
+      including ADCS `thisUpdate` backdating and worst observed CA/RA clock skew.
+      Set `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` so
+      `A_sched_max < max_age_seconds < V_next_min`. Repo evidence records
+      one `nextUpdate - thisUpdate` window of `649200s` (7d 12h 20m) for this
+      CA; use the minimum from deployment measurements if later windows are
+      shorter. It does not record `A_sched_max`, so do not substitute the 604800s
+      `CRLPeriod` as the lower bound. After `nextUpdate` the CRL fails closed,
+      regardless of this setting.
+      See
+      `docs/operations.md` under **Optional: independent CRL evidence for
+      confirmations**.
 
 ---
 
@@ -162,6 +176,702 @@ engineered to. Until then it has not — regardless of a green local test run.
 ---
 
 ## Validation log
+
+- **Phase L (the stale-worker enrollment lease) PROVEN END TO END for the first
+  time — 2026-08-24, tip `f6badc9`, on the lab RA host and issuing CA.**
+  22/22: §L 9/9, §Lqueue 8/8, §Ldrain 5/5. CI green on all six jobs for the
+  proven commit before deploy; installer exited 0 against the host's real
+  Python 3.14, IIS, ServerManager and ActiveDirectory.
+
+  **`Ldrain` is the half that had never run in three sessions**, and it is the
+  one that matters: the stale worker reached the CA boundary still holding
+  generation 1, found generation 2, and abandoned **before submit** —
+  `{"reason": "processing-lease-lapsed", "stage": "before-submit",
+  "held_generation": 1, "current_generation": 2}`. Exactly one certificate
+  exists for the contested order, and no order anywhere has two. That is the
+  double-issuance defence working against a real CA rather than a test double.
+
+  **Why it had never run, finally diagnosed.** Not neglect — the phase was
+  unrunnable, for three separate reasons that each had to be fixed:
+
+  1. **No driver called it.** `final-pass.sh` runs §A through the CRL cycle and
+     never invokes `L`, `Lqueue` or `Ldrain`. The phases existed in
+     `raproof.py`; nothing executed them. Added `lab-harness/lease-pass.sh`.
+  2. **Neither blackhole mechanism could support queue-then-drain.** The
+     outbound firewall rule **does not block on this host** — measured at 14ms
+     to connect with the rule present, enabled and carrying the CA's correct
+     address. It had also hardcoded the CA's address, and the CA had since moved;
+     its own CONNECT-PROBE dialled the same stale constant, hung, and reported
+     the inert rule as *working*. (Addresses stay in the gitignored harness.) The config-mode blackhole
+     (`ACME_RA_ADCS_HOST`) does saturate, but lifting it needs an app-pool
+     recycle that **kills the queued enrollments**, leaving nothing to drain —
+     measured as 47 orders wedged in `processing`, zero abandon rows, unchanged
+     across a full 420s wait. Added `lab-harness/bh-route.ps1`: a host route via
+     a verified-unreachable next hop, which drops silently *and* lifts without
+     touching the app pool.
+  3. **`L5` aborted the phase on an expected client timeout.** The re-finalize
+     is admitted and then waits for an enrollment worker; with the 2026-08-23
+     bounded executor no worker frees until an in-flight enrollment burns its
+     120s ceiling, so the wait exceeds any sane client timeout **by design**.
+     The exception escaped before `save_state`, which is why `Ldrain` then had
+     no target and `Ld2`–`Ld4` never executed at all. It now reads the committed
+     result from the store.
+
+  **Two harness checks were measuring the wrong thing and are fixed:**
+
+  - **`L4a` hardcoded `ca_sockets >= 40`**, encoding the old architecture where
+    enrollment ran on Starlette's shared ~40-thread pool. The 2026-08-23
+    final-scan fix gave enrollment its own bounded executor
+    (`adcs_enrollment_max_workers`, **default 4**) precisely so a stalled CA
+    cannot consume the whole server — so the check reported the security fix
+    working as a FAIL. It now reads the ceiling from the deployment, the same
+    rule §K already follows.
+  - **`L1c` read its "pre-existing orders" baseline from the newest backup**,
+    which is only a pre-migration snapshot on the single run where the migration
+    landed. Every run since backs up a store that already has the column and
+    already holds legitimately-leased orders, so "must still be 0" failed on
+    correct behaviour. It now branches on the backup's schema: upgrade
+    assertion when the backup is genuinely pre-migration, generation *stability*
+    otherwise. Measured this run: 38 pre-existing orders, **zero** changed.
+
+  **One self-inflicted failure worth recording**, because the harness reported
+  it misleadingly: lifting the config blackhole with `setenv -Remove` does not
+  restore the real CA. An absent `ACME_RA_ADCS_HOST` falls back to the shipped
+  documentation placeholder `ca01.work-domain.local`, which does not resolve —
+  every enrollment then died with `NameResolutionError` and finalize answered
+  **503**, which reads exactly like a product fault. `show-floor.ps1` printed
+  `ADCS_HOST=ABSENT (real CA)`, actively asserting the wrong thing. Both fixed;
+  absent is not a synonym for correct.
+
+  **Operational property measured, not previously recorded.** With the bounded
+  executor's defaults (`max_workers=4`, `max_pending=32`,
+  `total_timeout=120s`), an *admitted* enrollment behind a stalled CA can wait
+  roughly `(32/4) x 120s` — about 16 minutes — before it starts. Requests past
+  the ceiling are shed promptly; admitted ones are not cancelled, deliberately,
+  because abandoning a worker after CA issuance would skip the durable
+  completion or quarantine step. Clients see a long hang rather than a fast
+  failure, and should be given timeouts and retry accordingly.
+
+  **Teardown verified, not assumed.** The session caused the CA to issue **47**
+  certificates (the drained queue issued far more than the harness's own state
+  file tracked, which is why the ledger is generated by diffing the backup's
+  serials against the live store rather than hardcoded). All 47 revoked at the
+  CA, 0 failed, CRL republished, and first/middle/last spot-checked as
+  disposition 21. The four `finalize-enrollment-transport-orphan` rows were
+  confirmed to **predate** this session (audit ids 114-171 against a backup
+  maximum of 656) and belong to an earlier round's ledger. Store restored with
+  `integrity=ok` and all eight table counts identical to the pre-run
+  fingerprint; app pool `Started`; `/directory` 200; no residual firewall rule,
+  route, or scheduled task; `ACME_RA_ADCS_HOST` back to the real CA and the
+  reclaim floor back to its shipped default.
+
+- **Full live E2E re-proof executed (2026-08-17), tip `e7c4254` (14a), on the
+  lab RA host and issuing CA.** CI green on the proven commit before deploy;
+  local gates green (`ruff`, `mypy`, 876 pytest, 363 Pester on pwsh 7). The run
+  covered the whole canonical pass — §A issuance/EKU/SAN/chain/CA-denial/reason
+  codes (14/14), §A.1 front controls (13/13), CRL freshness, the GET-form
+  default, both transport-orphan branches, the revocation round trip through the
+  registered task as the gMSA, the least-privilege denials, the agent authority
+  split, and the CRL-evidence cycle — plus the new §K for 14a. **It found one
+  defect, fixed and re-proven live in the same session:**
+
+  - **Live-found (fixed in `838eeb2`): the entire CA-side revocation loop was
+    inert.** `Sync-Revocations.ps1` exited 2 with nothing revoked; every
+    `certutil` call in `Revoke-Cert.ps1` reached the process **without its
+    `-config`** and the non-CA RA host answered *"No local Certification
+    Authority; use -config option"*. Cause: `Invoke-CertUtil` splatted its
+    argument array into `Invoke-CertUtilCapture`. Splatting an array into a
+    **native** command (the original `& certutil @CertutilArgs`) gives one
+    argument per element; splatting it into a **PowerShell function** binds only
+    the first element and drops the rest into `$args`, silently. Seven arguments
+    in, one out, on every certutil call in the file — the `-revoke` included.
+    Introduced by `a69859d`, a security-hardening commit. Both helpers are now
+    advanced functions, so the mistake is a binding error rather than silence,
+    and three Pester tests assert the argv certutil actually receives (all three
+    fail against the old code). Re-proven live: 7 pending, 2 revoked, 5
+    already-revoked-at-CA recovered through the confirmation retry, 0 failed,
+    agent exit 0, RA queue drained to empty.
+  - **CI could not have caught it.** The Windows job runs pytest; the Pester
+    suite already stubbed `certutil` but never asserted *which* arguments
+    arrived. 363 green Pester tests coexisted with a revocation path that could
+    not revoke. This is the fifth escaped PowerShell defect across three rounds,
+    and the third whose common factor is that no test executed the real call.
+  - **14a (§K, 12/12) proven live**: the ceiling ships **enabled** (read from
+    the deployment, not assumed), five rollovers accepted and the sixth refused
+    `429 rateLimited` with `Retry-After: 3600`; the refusal is **atomic** — the
+    account key did not rotate, the last allowed key still authenticates and the
+    refused key gets 401; exactly five `account-key-changed` rows and one
+    coalesced `key-change-rate-limited` row naming the kid and limit; and a
+    freshly minted account under the same EAB kid is refused on its **first**
+    rollover, so the per-kid keying holds.
+  - **Least privilege re-proven**: the scoped officer cannot publish a CRL
+    (`0x80070005`), cannot revoke outside its template
+    (`CERTSRV_E_RESTRICTEDOFFICER`), reason 8 is refused before the CA is
+    touched (exit 3), and the gMSA token still carries no `Domain Computers`
+    (the E-1 restricted primary group).
+  - **Agent authority split re-proven**: admin-token-only revokes at the CA but
+    is refused on the confirm endpoint (401 → exit 2, serial stays pending);
+    confirm-token-only, with no admin token on the host at all, recovers it and
+    exits 0. Both runs took their credentials from the ACL'd dotenv, so no token
+    reached an argv or a log.
+  - **CRL evidence fail-closed then verified**: with
+    `require_crl_evidence` on, the confirm is refused 400 with audit
+    `crl-evidence-required-but-absent` (exit 2); after an administrator
+    republishes, the confirm succeeds and the audit records
+    `verification: "crl-verified"`.
+  - **`Set-OfficerRights.ps1` provisioned a CA whose `OfficerRights` was ABSENT**
+    — the round-7 "Buffer cannot be null" defect on the first-provisioning path
+    is fixed and live-proven.
+  - **Reproduced, not a regression**: this CA's CRL validity window
+    (7d 12h 20m) still exceeds the RA's default 7-day evidence ceiling (CRL3),
+    so the ceiling must be set from the measured maximum CRL age at scheduled
+    replacement, including `thisUpdate` backdating and clock skew, not from
+    `CRLPeriod` alone. Unchanged operator finding, deliberately measured against
+    the shipped default.
+  - **Not proven this round**: phase L (`Lqueue`/`Ldrain`, the stale-worker
+    enrollment lease) was not run. **CLEARED 2026-08-24** — proven end to end,
+    22/22, on tip `f6badc9`; see the newest validation-log entry above for why
+    it had been unrunnable rather than merely skipped. The MSI
+    no-digest/staged-copy refusals remain owed from round 6. The privileged-script-path item gained live evidence
+    rather than a fix: `C:\Temp\ra-scripts`, the path the gMSA sync task
+    executes from, measures `BUILTIN\Users:(CI)(AD)` and `(WD)`.
+  - **Teardown verified**: all 7 certificates this run caused the CA to issue
+    are revoked (including the untracked ReqID-only orphan, ReqID 249) and the
+    CRL republished; `OfficerRights` ABSENT and `CA\Security` back to its
+    pristine 224 bytes / 4 ACEs; `denyUrlSequences` empty; store and dotenv
+    restored with an identical fingerprint (integrity ok, all row counts equal)
+    and the app pool back to `Started`.
+
+- **Round-6 native Windows re-proof executed (2026-08-16), final tip
+  `8964eba`, on the lab RA host under Windows PowerShell 5.1.** The run
+  covered the full live re-proof (§A, §A.1, CRL/G, both transport-orphan
+  branches, revocation round-trip through the registered task as the gMSA,
+  least-privilege denials, agent authority split, CRL evidence) **and** the
+  native items the round-6 review demanded — and it found one more defect,
+  fixed and re-proven live in the same session:
+
+  - **Live-found (and fixed on `8964eba`): the mid-install state re-assert
+    ran `icacls /reset` on the protected state root**, re-inheriting
+    `%ProgramData%`'s `Users (CI)(WD,AD,WEA,WA)` until `/inheritance:r`
+    restored — a create-capable window the atomic `CreateDirectoryW` birth
+    DACL does not cover. A looping standard-user process planted 3 entries
+    into the installer-created state root through it (3 successes in 43,701
+    attempts); the post-claim proof caught the plants and aborted (fail-closed
+    held; nothing was adopted), and a deterministic `/reset`-window probe
+    confirmed the cause. Fix: roots are never `/reset` mid-install —
+    `Reset-TreeChildrenToInherited` resets descendants only and
+    `Set-ObjectProtectedDacl -SkipReset` re-asserts the protected shape with
+    no unprotected interval (claim, runtime re-assert, state re-assert).
+    Re-proven live: the same race loop then achieved **0 successes in 43,920
+    attempts** with the install exiting 0.
+  - retained-handle/race item: see above — 0 plants post-fix; the loop's
+    pre-creation of a ProgramData root was separately proven to hit the
+    collision refusal (user-owned tree, never adopted);
+  - named user (`M`/`W`) and named group (`F`) write ACEs on the source tree
+    are refused by the bootstrap before the helper loads (no scratch created);
+    a `C:\Temp`-staged checkout (Users create rights) is likewise refused;
+  - post-snapshot mutation of the checkout cannot reach the build: a syntax
+    bomb written into `src/` after the snapshot appeared left the install
+    green and the built runtime importable;
+  - path spellings refused before any host mutation (pool untouched):
+    trailing dot, trailing space, ADS component, reserved device name, UNC,
+    forward slashes, dot segments, nested roots, equal roots;
+  - PATH-first `py`/`python`/`winget` marker executables were never executed
+    (`-InstallPrereqs`); trusted discovery accepted only the chain-proven
+    interpreter;
+  - MSI: the no-digest and staged-copy refusals are Pester-proven and
+    source-ordered, but **not live-executed this round** — the handler is
+    installed on the lab host and its DLL fallback short-circuits the MSI
+    path; forcing it would have meant hiding a production DLL. Recorded as
+    the one native case still owed;
+  - clean install (also under the live race), reinstall ("recognised as a
+    previous install"), rollback (corrupted pinned hash → previous runtime
+    restored byte-identically, dotenv re-protected, no leftovers), and the
+    §4 migration refusal against the real `.preSplit` tree all passed;
+  - the EAB quota (finding 7) was proven live at its default: a second
+    distinct-key account is denied `badExternalAccountBinding`, 46 replayed
+    denials coalesced into 2 durable rows with exact tallies, and a
+    deactivated account's slot was not recycled;
+  - the standing WI-052 was re-observed unchanged (CRL3: the lab CA's 7d12h
+    window vs the 7d default ceiling) — operator-owned, not a regression.
+
+  Teardown returned both hosts to their pre-run state (store fingerprint
+  byte-identical: 21/87/22/5/22/42/22/1; CA `Security` 224 bytes,
+  `OfficerRights` absent; `SeBatchLogonRight` restored exactly and verified
+  by re-export; every issued cert revoked and the CRL republished; zero
+  scratch/retired/task leftovers). The lab host now runs `8964eba`,
+  `/directory` 200.
+
+- **Daybreak round-6 review remediated in source (2026-08-16); native Windows
+  re-proof is still required before pilot.** Seven findings at `d1d7c17` (four
+  high, three medium) were independently reproduced and addressed as one
+  boundary redesign rather than seven local predicates:
+
+  - fresh runtime/state/site/scratch roots now receive their final protected
+    DACL in the `CreateDirectoryW` call itself. The old create-then-lock design
+    could not revoke a create-capable directory handle opened in its window;
+  - executable/site ACL provenance is an authorized-writer SID allowlist.
+    Arbitrary named users/groups with write rights fail closed;
+  - install paths are restricted to unambiguous local DOS paths, and runtime is
+    kernel-re-resolved before any state Modify grant is applied;
+  - `-InstallPrereqs` no longer executes PATH-selected Python or winget;
+  - consumed repository inputs and ancestors are proven before the helper is
+    dot-sourced, copied into administrator-only staging, and PEP 517 builds only
+    the snapshot;
+  - local/remote MSI inputs both require a digest, are staged under the same
+    protected namespace, verified there, and opened only by the absolute
+    System32 `msiexec.exe` path;
+  - account creation has an atomic lifetime per-EAB-kid quota (default one),
+    counting deactivated accounts and committing the count/insert/audit under
+    `BEGIN IMMEDIATE`.
+
+  Local gates: **807 pytest + 1 skipped, 264 Pester + 1 skipped, ruff, mypy**.
+  The native tests still owed are explicit: retained low-privilege directory
+  handles, named-user/group ACE refusals, trailing-dot/space paths, PATH marker
+  executables, mutable source refusal/snapshot build, MSI replacement attempts,
+  clean install/reinstall/rollback, and gMSA launch. Source-only success is not
+  pilot evidence for this installer.
+
+- **Round-7 validation on tip `45643f8` (2026-08-17) — the accumulated
+  follow-up rounds executed on Windows for the first time.** The five rounds
+  landed since the last live proof (`8964eba`) had only ever been
+  source-verified; the round-6-followup doc said so explicitly. This run
+  executed them. Full record: `samples/lab-run-2026-08-17-round7-validation.md`
+  (gitignored).
+
+  **Proven live on the tip's own bytes** (staging hash-verified equal to
+  `git archive HEAD`):
+
+  - **Install at tip**: reinstall over the two-tree layout, exit 0; both roots
+    recognised as a previous install and re-proven; `web.config` launch
+    configuration verified; **zero** `.retired-*` leftovers; **zero** installer
+    scratch left under `%ProgramFiles%`; **zero** `icacls /save` dumps in
+    `%TEMP%` or `C:\Windows\Temp` (the evidence stays in the protected
+    scratch); pool Started, `/directory` 200; store fingerprint **unchanged**.
+  - **web.config gate — 31/31**, driving the shipped
+    `Assert-WebConfigLaunchTrusted` against real files on real 5.1. The
+    deployed `web.config` is accepted unchanged (control); all 25 refusal
+    shapes owed by rounds 2/3/5/6 refuse (arguments, PYTHON* vars, issuance
+    policy vars, redirected AND absent `ACME_RA_DOTENV`, processPath mismatch,
+    `<location>`-scoped `httpPlatform`, nested `__` env names, `<add>`-shaped
+    entries, `scriptProcessor` and managed `type=` handlers, the SIEM token,
+    the per-kid quota, both CRL strength knobs, and the five control-removing
+    settings); and all 5 **false-refusal guards accept** (`"1"` for a pinned
+    bool, a trailing space in the dotenv path, forward-slash paths, a
+    namespaced `<configuration>`, `REQUIRE_CRL_EVIDENCE="true"`).
+  - **appcmd family — 5/5.** A genuinely broken appcmd aborts with the
+    worker-still-live message rather than "[ok] no such app pool yet"; the
+    tip's own shielded stop no longer aborts the install when appcmd writes to
+    stderr, falling through to the prove loop (**and the control proves it is
+    not vacuous**: the same fixture through the unshielded path *does* abort).
+  - **Bootstrap ACE refusals — 5/5, full installer runs.** A `WDAC`/`WO`-only
+    ACE — the two rights the dead `::WriteDacl`/`::WriteOwner` spellings
+    dropped from the mask — is refused for a **named user** and a **custom
+    group**, on the release root, on `scripts\lib\` (so
+    `Get-BootstrapInteriorDirectories` works), and on `src\`; a plain write ACE
+    on `scripts\` alone is refused. Every case exits non-zero, names the path,
+    and refuses **before any build step**.
+  - **App re-proof**: A 14/14, A1 14/14, G 5/5, Q both branches 6/6 each
+    (chain → quarantined row + ReqID; leaf → **no row written**, by design),
+    R 5/5. CRL 4/5 — the failure is **WI-052 re-observed unchanged** (CA CRL
+    window 649200s vs the 604800s default ceiling, short by 12.3h). The
+    validation did not measure the lower-bound `A_sched_max`; do not infer it
+    from either this validity window or `CRLPeriod` alone.
+
+  **Defect found live and fixed** (`01417b5`): the `icacls` owner-candidate
+  **fallback loops could not fall back** on Windows PowerShell 5.1.
+  `Reset-TreeToInherited` and `New-ProtectedDirectory` ran
+  `& $script:IcaclsExe … 2>&1` under an explicit `EAP=Stop`, so the first
+  candidate that wrote to stderr terminated the loop — the documented
+  name-form fallback was dead code, and the actionable hostile-namespace throw
+  was unreachable on the very path it was written for. Still fail-closed (the
+  install refuses either way), so it is a defeated fallback plus lost
+  diagnostics, not a bypass. Fixed with one primitive,
+  `Invoke-NativeShielded`, replacing the seven-line shield at all seven icacls
+  sites — the repetition being the actual defect, this family having now
+  escaped **seven** times. Tests mutation-verified, with the honest caveat that
+  the three behavioural ones **only fail on 5.1** and pass on pwsh 7: they are
+  meaningful solely on the `pester-windows-powershell` job.
+
+  **Still owed — blocked on lab infrastructure, not on the code.** The lab CA's
+  remote DCOM/RPC path is broken: `certutil -ping` succeeds locally on the CA
+  and fails from the RA host with `RPC_S_SERVER_UNAVAILABLE` **as a plain
+  administrator, outside the product**, with every relevant port open, the
+  firewall rules correct, certsvc running and the DCOM class registered. It
+  broke at 05:02Z on 2026-08-17, mid-way through the previous session, and a
+  reboot did not clear it. Because enrollment rides HTTP `/certsrv/` while
+  revocation rides DCOM, issuance kept working and hid it. **Unproven as a
+  result**: `Rverify`/the queue drain, and the whole officer-script class —
+  `Revoke-Cert.ps1 -ReqID`, malformed and truncated `OfficerRights`, the
+  spoofed-`$env:windir` regression proof, the `net stop`/`net start` fallback,
+  the 5.1 `certutil 2>&1` exit-code contract, and
+  `Reconcile-Revocation.ps1`. These carry over intact.
+
+- **Round-6 follow-up review remediated in source (2026-08-16); native Windows
+  re-proof required before pilot.** An internal review of the round-6 fixes
+  themselves found four defects — three of them in code round 6 added — and two
+  were PowerShell evaluating to something other than what it reads as. See
+  `docs/security-review-2026-08-16-round6-followup.md`.
+
+  - **H** the bootstrap's dangerous-rights mask named `FileSystemRights::WriteDacl`
+    and `::WriteOwner`, **which are not members of that enum** (they are
+    `ChangePermissions` and `TakeOwnership`): both terms resolved to `$null`,
+    contributed 0 to the `-bor` chain, and the gate covered neither WRITE_DAC nor
+    WRITE_OWNER. An ACE granting a named non-administrator only those two rights
+    over the helper or the build inputs passed;
+  - **H** the bootstrap's ancestor walk runs *upward* from the release root and
+    its input list names the helper *file*, so `scripts\` and `scripts\lib\` were
+    never inspected — and delete-child on a parent replaces the child whatever the
+    child's own DACL says;
+  - **M** the `-ConfigureIIS` catch-all TLS branch invoked an unassigned variable
+    (round 6 assigned the `netsh` path only function-locally and inside the
+    `-SharePort443` branch), killing the install after the certificate was bound
+    and before the pool was started. Reachable **only** without `-SharePort443`,
+    which is why no live re-proof of any round could have found it;
+  - **M** the audit coalescer's open-window index had no bound (the round-5 keys
+    carry `order_id`, and the app pool is configured never to recycle).
+
+  Adjacent: the `icacls /save` dump — the evidence for every provenance verdict —
+  moved out of ambient `%TEMP%` into the protected installer scratch, which is now
+  created before the first root claim.
+
+  Local gates: **816 pytest + 1 skipped, 285 Pester + 1 skipped, ruff, mypy**;
+  every new test mutation-verified (8 PowerShell, 4 Python), and one test that did
+  not survive its own mutation was deleted rather than shipped.
+
+  **Native cases owed on top of round 6's list**: a `WDAC`/`WO`-only ACE (named
+  user and custom group) on the release tree, on `scripts\lib\`, and on `src\` is
+  refused before the helper loads, with a clean control; a write ACE on `scripts\`
+  alone is refused; `-ConfigureIIS -HostName <name> -TlsCertThumbprint <t>`
+  **without** `-SharePort443` completes and starts the pool; the `/save` dumps
+  appear under `%ProgramFiles%\.acme-adcs-ra-installer-*` and nowhere else, on
+  both the success and failure paths; and round 6's standard-user race loop
+  re-run unchanged.
+
+- **Round-6 follow-up, ROUND 2 remediated in source (2026-08-16); native Windows
+  re-proof required before pilot.** Three independent hazard-scoped reviews of
+  the fixes above found twelve more defects, **two of them in those fixes**. One
+  high: `Get-SerialFromReqId` returned its own diagnostics, so
+  `Revoke-Cert.ps1 -ReqID` could never revoke — the same success-stream defect the
+  wave-3 round fixed 130 lines above it in the same file. Medium: the
+  launch-configuration gate validated one attribute of four and never compared
+  `$ExpectedProcessPath` to anything (an `<environmentVariables>` entry in
+  `web.config` overrides the protected dotenv — verified against the running
+  code); an ACE-less DACL read as administrator-only; the nonce-cleanup and
+  expired-order-sweep task actions re-tokenised at run time and could never have
+  run; the coalescing key absorbed an attacker-chosen SAN; `Stop-AppPoolAndWait`
+  read an appcmd failure as "no such pool"; and `distinct_kids` was unbounded
+  within a window. Six low. Full detail in
+  `docs/security-review-2026-08-16-round6-followup.md`.
+
+  Local gates: **826 pytest + 1 skipped, 319 Pester + 3 skipped, ruff, mypy**;
+  10 PowerShell and 12 Python mutations run, all detected.
+
+  **Operator-breaking:** a preserved `web.config` carrying `arguments` other than
+  `-m acme_adcs_ra`, `PYTHONPATH`/`PYTHONHOME`/`PYTHONSTARTUP`, an issuance-policy `ACME_RA_*`
+  variable, a redirected `ACME_RA_DOTENV`, a `<location>`-scoped `httpPlatform`,
+  or a `processPath` that is not exactly the built interpreter now **fails the
+  install** instead of being adopted.
+
+  **Native cases owed, adding to the two lists above:**
+  - `Revoke-Cert.ps1 -ReqID <n>` resolves a serial and revokes it at the CA;
+  - the nonce-cleanup task runs once and reports `LastTaskResult 0`;
+  - the deployed `web.config` is accepted unchanged, and each refused shape above
+    is refused;
+  - `Reconcile-Revocation.ps1` still reconciles after the interpreter change;
+  - **under real Windows PowerShell 5.1**: the whole Pester suite, plus the
+    `& certutil … 2>&1` behaviour in `Revoke-Cert.ps1` under `EAP=Stop` — pwsh 7
+    cannot demonstrate it either way, and `SyncLib` documents that on 5.1 the
+    first stderr line terminates, which would break the documented exit-code
+    contract. **Open and unresolved.**
+  - **`C:\inetpub` chain survey** — `-SitePath` has no ancestor-chain provenance
+    and the fix was deliberately withheld pending a live DACL baseline. If the
+    chain passes `Test-PathChainTrusted` on the lab host, add the refusal.
+
+- **Round-6 follow-up, ROUND 6 remediated in source (2026-08-17); native Windows
+  re-proof required before pilot.** Four cross-lineage reviewers over the whole
+  uncommitted follow-up (installer, Python leg, officer scripts, claims-vs-code
+  audit). One high: the stop-and-prove loop's `appcmd list wp 2>$null`
+  discarded stderr, so a *broken* appcmd yielded an empty worker list — which
+  the classifier reads as "no workers", an all-clear — and the installer went
+  on to claim trees a live gMSA worker might still hold write handles into
+  (rescan-2 F3 again; the suite's `noisy` fixture had modelled the shape and
+  was never asserted). Also: both OfficerRights parsers `break`-ed malformed
+  descriptors into partial success (the readback tool affirming half a
+  restriction; the Set-OfficerRights preservation path would silently strip
+  officers from the rewritten value); the eviction marker stamped one row
+  late; certutil/net "absolute" paths built from caller-settable
+  `$env:windir` with bare-name PATH fallbacks; ten control-removing settings
+  (WI-014 coalescing bound, nonce bucket, order limits, body caps, M-2
+  reclaim age) still settable from `web.config`; and three low findings
+  (empty `reason_code` falling back to prose keying; padded `" true "`
+  accepted where pydantic rejects it; the "repository-wide" dead-spelling
+  test checking two hard-coded files).
+
+  Local gates: **832 pytest + 1 skipped, 356 Pester + 4 skipped, ruff,
+  mypy**; nine mutations run against the new tests, all detected.
+
+  **Native cases owed (16–18 in the follow-up doc's list):**
+  - `appcmd list wp` against a genuinely broken appcmd (stop WAS by hand):
+    the installer aborts on the timeout throw, never "[ok] no such app pool";
+  - `Get-OfficerRights.ps1` against a malformed OfficerRights value throws
+    and exits non-zero — never "Found N ACE(s)" over a partial walk;
+  - with `$env:windir` spoofed, the officer scripts still resolve the real
+    System32 certutil and never execute the spoofed one.
+
+- **Round-6 follow-up, ROUND 5 remediated in source (2026-08-17); native Windows
+  re-proof required before pilot.** An inline review of the `web.config` gate,
+  the surface round 4 left unexamined. Six findings, **two of them false
+  refusals** — a pinned setting demanded the literal string `true` (so an
+  operator writing `1`, which pydantic reads as true, had the install refused),
+  and a trailing space in the `ACME_RA_DOTENV` value was refused as an ambiguous
+  path component. Four bypasses: `ACME_RA_SIEM_HEC_TOKEN` (a secret whose home
+  is the dotenv), `ACME_RA_MAX_ACCOUNTS_PER_EAB_KID` (retires the round-6
+  finding-7 quota in one line), the CRL proof's `MAX_AGE`/`FOLLOW_REDIRECTS`
+  strength knobs (a pinned `REQUIRE_CRL_EVIDENCE` means nothing if the freshness
+  bound can be widened beside it), and a managed handler declared with `type=`
+  rather than `scriptProcessor` — the .NET half of the primitive round 3 closed
+  for native executables.
+
+  Local gates: **830 pytest + 1 skipped, 351 Pester + 4 skipped, ruff, mypy**;
+  five mutations run, all detected.
+
+  **Native cases owed:**
+  - the deployed `web.config` is accepted unchanged (the control), and each of
+    the four refused shapes above is refused on the real host;
+  - a `web.config` written with `ACME_RA_AUDIT_OFFBOX_REQUIRED="1"` installs
+    cleanly — this is the false refusal that would have aborted an upgrade.
+
+- **Round-6 follow-up, ROUND 3 remediated in source (2026-08-16); native Windows
+  re-proof required before pilot.** Three more hazard-scoped reviews, of the
+  round-2 fixes. Sixteen findings, **all but two in those fixes**. One high:
+  `Stop-AppPoolAndWait` would have aborted every FIRST install (it threw on the
+  stderr `appcmd list apppool <absent>` legitimately produces, and the pool does
+  not exist until ~800 lines later) — the netsh defect's shape again, invisible
+  to a lab whose host already has the pool. Medium: the forbidden-env-name list
+  was defeated by `env_nested_delimiter="__"` (verified live against the running
+  config); `<handlers>`/`<modules>`/`<isapiFilters>` unchecked while the
+  installer itself unlocks the handlers section; `<add>`-shaped env entries
+  unread; `ACME_RA_AUDIT_OFFBOX_REQUIRED=false` and
+  `ACME_RA_ALLOW_WEAK_CREDENTIALS=true` accepted; three platform gates reading
+  `$env:OS`; `PolicyDecision.reason_code` defaulting to `"allowed"`; and the
+  privileged CA-officer scripts still on bare-PATH `certutil` while the
+  read-only one had been hardened. Full detail in
+  `docs/security-review-2026-08-16-round6-followup.md`.
+
+  Local gates: **827 pytest + 1 skipped, 337 Pester + 4 skipped, ruff, mypy.**
+
+  **Additionally operator-breaking:** a preserved `web.config` that does not set
+  `ACME_RA_DOTENV` at all now fails the install (absent, the worker reads `.env`
+  from its own working directory rather than the protected file).
+
+  **Native cases owed, adding to the lists above:**
+  - `appcmd list apppool "<absent>"` on a real host — record the exit code and
+    stderr. The design is deliberately independent of both, but this is the
+    command that settles it;
+  - a FIRST install (no pre-existing app pool) completes end to end;
+  - a `web.config` with a nested `ACME_RA_SAN_SCOPES__<kid>__DNS_PATTERNS`, an
+    `<add>`-shaped env entry, a `scriptProcessor` handler, or no
+    `ACME_RA_DOTENV` is refused; forward-slash paths and a namespaced
+    `<configuration>` are handled without a false refusal;
+  - `Reconcile-Revocation.ps1` and the officer scripts still run after the
+    absolute-path change;
+  - whether IIS honours a `<location>`-scoped `httpPlatform`, and whether
+    `IsapiModule`/`CgiModule` are registered by the installer's feature set —
+    these set the severity of a refusal already in place, not the fix.
+
+- **Round-6 follow-up, ROUND 4 remediated in source (2026-08-16); native
+  Windows re-proof required before pilot.** Three hazard-scoped reviews of the
+  three rounds above, run before lab validation. Seven findings: the R2-11
+  `@()` wrapping inverted the readback tool's verdict (`@($null).Count` is 1,
+  so a corrupt OfficerRights value printed "Found 1 ACE(s)" and exited 0);
+  `ACME_RA_ALLOW_FAKE_ADCS_BACKENDS` and
+  `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE` were still settable from
+  web.config (the latter now pinned-when-present — the lab sets it to true
+  there, which passes); `finalize-csr-mismatch` still lacked a `reason_code`;
+  the 5.1 `2>&1`-under-`Stop` exit-code hazard was unshielded in every
+  CA-officer script including the `net stop`/`net start` fallback that runs
+  inside a catch; plus marker-forgery, sample-cap-at-open, whitespace and
+  descending-range edges. The mutation-blind
+  `test_a_live_window_survives_below_the_cap` was rewritten a third time, now
+  asserting what the mutation actually changes. Full detail:
+  `docs/security-review-2026-08-16-round6-followup.md` (Round 4).
+
+  Local gates: **830 pytest + 1 skipped, 345 Pester + 4 skipped, ruff, mypy**;
+  9 mutations run against the new tests, all detected.
+
+  **Native cases owed, adding to the lists above:** Get-OfficerRights against a
+  truncated/no-DACL value exits 1 (never "Found 1 ACE(s)"); the
+  net stop/net start fallback completes on 5.1; a failing `certutil -revoke`
+  relays the exit code on 5.1 (item 12 becomes a confirmation).
+
+- **Daybreak round-5 findings validated and fixed (2026-08-15), final tip
+  `88e9c07`, live-proven on the lab RA host.** Five findings on the round-4
+  fixes (1 high, 4 medium), all closed; the live run itself found and fixed
+  **two calibration defects in the new chain-trust rule** (both classes CI
+  could not see: the raw generic-bit constants — `0x80000000` is
+  Generic*Read*, not GenericAll — and SID-vs-name comparison in the owner
+  check), plus a third (honouring `PropagationFlags.InheritOnly`, live-probed
+  both directions on the host) — each now pinned by a Pester case.
+
+  - **H — file-plant race into a freshly created root**: between `New-Item`
+    and the claim's protect step, the fresh root still *inherited* the
+    parent's Users-create rights; a dotenv planted there rode the whole claim
+    (the claim proof verifies shape, and an inherited-DACL dotenv has exactly
+    the descendant shape) and shipped via the no-clobber branch.
+    Fix: `Lock-FreshRoot` — protect the DACL in one atomic swap at creation,
+    prove the directory **empty** (anything present was raced through the only
+    remaining window), normalise the root owner without `/reset`, and skip
+    the reset on the fresh path entirely. **Live-proven on the absent path**
+    (both roots "protected at creation and verified empty", full install
+    exit 0); the raced-plant branch itself needs a genuinely won race and is
+    source-asserted + reviewed instead, like round-4's collision branch.
+  - **M — lexical path comparison missed aliases**: `Get-PathRelation` now
+    canonicalises (dot segments, slashes, case, UNC lexically everywhere;
+    junctions/symlinks/8.3 through kernel final-path resolution of the
+    deepest existing ancestor on Windows). **Live-proven**: dot-segment,
+    `C:\PROGRA~1` and a real junction alias each refused with the relation
+    named, pool untouched, nothing created.
+  - **M — PATH-resolved interpreter executed elevated unproven**: every
+    candidate (launcher resolution *and* the `sys.executable` self-resolution)
+    is chain-gated before first execution. **Live-proven both directions**:
+    a fake `python.exe` first on PATH in a Users-writable dir is rejected
+    with its chain reasons and **never executed** (marker-file proof), while
+    the legitimate ProgramFiles/profile candidates pass and the install
+    completes.
+  - **M — SitePath/web.config adopted unverified**: SitePath joins the
+    disjointness check against both managed roots; a pre-existing site tree
+    must prove itself (no reparse points, admin-only owners, no write-class
+    ACE for any broad trustee — the gMSA included) or the install refuses; a
+    fresh one is locked at birth. The web.config check became
+    `Assert-WebConfigLaunchTrusted` (throwing): unparseable XML, a
+    processPath inside the state tree, or outside the runtime tree, each
+    refuse. **Live-proven**: a Users-writable site tree with a planted
+    web.config is refused naming the ACEs (no IIS mutation, live sites
+    untouched); a hostile processPath is refused; and a mismatched-runtime
+    processPath on a *passing* tree also refuses — found while testing on
+    throwaway roots, exactly the fail-closed behaviour intended.
+  - **M — replayable authenticated requests grew the durable audit stores**:
+    coalescing now covers `account-request-denied`, `order-rate-limited`,
+    `finalize-csr-mismatch`, `finalize-policy-denied` (keyed additionally by
+    account/order so folded tallies stay attributable), and the challenge
+    route short-circuits an already-valid challenge (no state write, no audit
+    row) instead of re-auditing per POST. App-level pytest coverage; the
+    deployed build **live-proven** end-to-end with a 40-request denial storm:
+    40/40 rejected, **zero** durable rows (store counts unchanged at
+    22/5/21/87).
+
+  Local gates on `88e9c07`: 801 pytest / 259 Pester / ruff / mypy; CI green
+  on every tip in the chain (`b4cb6c6`, `fca6458`, `88e9c07`). The lab host
+  now runs `88e9c07`'s runtime; the CA host was never touched.
+
+- **Daybreak round-4 findings validated and fixed (2026-08-15) on `102a1f4`,
+  live-proven on the lab RA host.** Four findings on the installer rework
+  (2 medium, 2 low), all closed on the same branch with 14 new Pester cases
+  (235 total, plus 795 pytest / ruff / mypy green):
+
+  - **M1 TOCTOU on first-install state-root creation** — between the
+    provenance check and `New-Item -Force`, a local attacker could pre-create
+    the predictable ProgramData path; the claim then worked *for* them
+    (`setowner /t` normalised their files' owners, the proof passed, the
+    re-protect protected their planted dotenv, and no-clobber preserved it —
+    the adoption finding reopened by race). Fix: creation without `-Force`
+    (throws on an existing path) plus a provenance re-verdict on collision; a
+    non-admin cannot manufacture an "ours"-shaped tree (owner Administrators
+    is unreachable for them), so the retry can only land in the foreign
+    refusal. **Not live-proven** — the branch is reachable only by a genuinely
+    won race; it is source-asserted and reviewed instead.
+  - **M2 legacy single-tree layout passing the generic provenance check** —
+    a clean pre-split tree has the same trustee/owner/DACL shape as ours, so
+    it verified as "ours" while the preserved web.config kept launching the
+    old gMSA-writable ProgramData venv. Fix, both halves **live-proven**:
+    the state tree now refuses `venv`/`python`/`scripts` at its root
+    (decided before the icacls walk) — proven against the **real preserved
+    `.preSplit` tree**: refusal names the venv as executable content, tree
+    untouched; and a post-install check warns loudly when the site's
+    web.config `processPath` points inside the state tree — proven with a
+    simulated half-done migration (warning printed, then a clean install over
+    the healthy tree still exits 0 and `/directory` answers 200, so the new
+    rule does not trip on our own layout).
+  - **L1 CWD executable hijack on bare `py`/`python` probes through
+    `cmd /c`** — an elevated shell in a user-writable directory would execute
+    a planted interpreter during the probe. Fix:
+    `NoDefaultCurrentDirectoryInExePath` process-wide (set before any
+    `cmd /c`) plus absolute-path resolution in `Invoke-PyProbe`. Source-
+    asserted; deliberately not "proven" live by executing planted bytes as
+    admin.
+  - **L2 overlapping `-RuntimeDir`/`-InstallDir` silently collapsing the
+    RX/Modify boundary** — both grant sets have the same proof shape, so
+    nested or equal roots stayed green while the gMSA gained Modify over
+    executable content. Fix: `Get-PathRelation` refusal before any host
+    mutation. **Live-proven**: equal roots and nested roots both refused
+    (relation named), app pool never touched (still Started), nothing
+    created.
+
+- **Installer rework validation — the two-tree layout EXECUTED for the first
+  time (2026-08-15) on `54b90db`, the tip after two live-found defects were
+  fixed and re-proven on the host.** Everything the code/state split's "what is
+  still unproven" list demanded, on the exact commit, from CI-green preflight
+  through teardown. See `samples/lab-run-2026-08-15-installer-validation.md`
+  (gitignored) for the full transcript map.
+
+  **Proven live, all on `54b90db`'s own bytes:** clean install from absent
+  roots (exit 0, both trees claimed, built, and read-back-proven); reinstall
+  over the result (both roots recognised as ours, runtime retired → rebuilt →
+  retired copy deleted, dotenv preserved no-clobber); **refusal of the real
+  old-layout tree** (the §4 BREAKING behaviour, actionable message naming the
+  violations and the rescue list); **refusal of a genuine non-admin pre-plant**
+  (a throwaway local user pre-created a ProgramData state root with a hostile
+  `acme-ra.env` — refused, tree untouched, refusal precedes any dotenv read;
+  and its attempt to pre-create under `%ProgramFiles%` is access-denied, so
+  the code root cannot be pre-planted at all); **rollback** (deliberately
+  corrupted pinned hash → build fails after retirement → previous runtime
+  restored byte-identically, zero `.retired-*` leftovers, and after the
+  by-hand pool restart the old runtime still serves `/directory` 200);
+  **the gMSA `RX` grant launches uvicorn** — HttpPlatformHandler starts the
+  ProgramFiles venv as the domain gMSA and `/directory` answers 200 with the
+  app running as the gMSA identity; **the §4 migration walked end to end**
+  (backup → rescue → read-the-dotenv → rename → fresh install → restore db/env
+  byte-identical → re-run installer → web.config processPath → verify: §5
+  shape, owners Administrators, spnego imports, db integrity + counts
+  unchanged).
+
+  **Two escaped defects found and fixed on the branch (both the WI-050
+  class — PowerShell semantics invisible to Linux CI):**
+  1. `icacls /save` writes UTF-16LE **without BOM**; `Get-Content -Raw`
+     decoded it as ANSI on Windows PowerShell 5.1 (this pwsh *sniffs* BOM-less
+     UTF-16, which is why local Pester was green) — the ACL proof failed
+     closed on a healthy tree and blocked every install. Fixed in `b816352`
+     (`Get-IcaclsDumpText`, byte-sniffed decode, ordinal `StartsWith`).
+  2. The state-root claim's `icacls /reset /t` strips the dotenv's protected
+     DACL, and it was only re-applied ~150 lines later — a build failure in
+     between (the rollback path) left `acme-ra.env` inheriting gMSA **Modify**
+     (EAB allowlist + SAN scopes worker-writable), and the *next* pre-flight
+     then correctly refused the tree, bricking the install. Fixed in
+     `54b90db` (re-protect immediately after the claim; the rollback catch now
+     re-protects and re-proves the state tree too). Both fixes re-proven live
+     on the host: the failed-build rerun prints "state tree re-protected and
+     re-proven" and the dotenv survives the failure protected.
+
+  **Also closed:** the `*S-1-5-32-544` star form **works** for
+  `icacls /setowner` on this host (previously "unverified for that verb").
+
+  **Not proven:** the no-rollback proof-failure path (a runtime that builds
+     but fails its proof — the honest "app pool left stopped deliberately"
+     message); a `-ConfigureIIS` first install from bare IIS (the lab host
+     already had the site); the user-scoped-Python copy path was exercised,
+     the machine-wide reference path was not (the host's 3.13 lost the
+     launcher preference to the profile 3.14).
+
+  **Host end-state (deliberate, not restored):** the lab RA now runs the
+  two-tree layout on `54b90db`'s runtime with the same store (counts
+  22/5/21/87, unchanged), same dotenv, same siem trail; the old tree is
+  preserved at `C:\ProgramData\acme-adcs-ra.preSplit` as the migration
+  rollback artifact; `web.config` processPath points at the ProgramFiles
+  venv. The CA host was never touched (no issuance, no revocation, no
+  ca-provision this run). Refusal runs leave the app pool stopped
+  (fail-closed; restart by hand) — observed behaviour worth knowing
+  operationally, not a defect.
 
 - **Full E2E lab validation — PASSED (2026-08-15) on `2d6ac20`, the tip after the
   two fixes the `b028b96` pass produced plus the three CI/test/PowerShell commits
@@ -208,8 +918,10 @@ engineered to. Until then it has not — regardless of a green local test run.
   non-defect: 86 orders wedge in `processing` for operator reconciliation.
 
   **The CRL cadence finding stands unchanged** (CRL3 FAIL by design of the
-  check): 7d 12h20m window vs the 604800s default ceiling — the WI-052 operator
-  item, configuration not code.
+  check): 7d 12h20m validity window vs the 604800s default ceiling — the WI-052
+  operator item, configuration not code. The lower bound still requires a
+  measured maximum CRL age at scheduled replacement, including `thisUpdate`
+  backdating and clock skew.
 
   **Two harness defects found (not product).** (1) Lqueue's saturation counter
   reads `ca-ip.txt`, which held the *real* CA address, but the §9-approved
@@ -312,7 +1024,12 @@ engineered to. Until then it has not — regardless of a green local test run.
   **The CRL cadence finding stands unchanged.** This CA's 7d 12h 20m validity
   window still exceeds the 7-day default ceiling. The override is plumbed and
   works (`ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=691200` reads back as
-  691200 against a 604800 default), so this is configuration, not a code gap.
+  691200 against a 604800 default), proving the setting is configurable. That
+  8-day test value is **not** a safe production value for this CA: it exceeds
+  the 649200-second `nextUpdate` window and would leave the independent age
+  ceiling non-binding. Production must measure `A_sched_max` and choose
+  `A_sched_max < max_age_seconds < 649200`; the repository does not supply the
+  numeric lower bound.
 
   **Teardown verified, not assumed.** CA back to 224 bytes / 4 ACEs /
   `OfficerRights: ABSENT`, `denyUrlSequences` empty (checked via the full
@@ -505,15 +1222,15 @@ engineered to. Until then it has not — regardless of a green local test run.
         verified: with the default (`false`) the same serial confirmed as
         `agent-asserted` and drained. Needs a decision on which trust source may
         verify a CRL for a chain-less row.
-  - [ ] **The default CRL freshness ceiling is narrower than this CA's
-        cadence.** `CRLPeriod = 1 Week`, and the published CRL's validity window
-        is **7d 12h 20m** against a default `revocation_confirm_crl_max_age_seconds`
-        of 7 days. In steady state the age of the current CRL reaches the
-        ceiling exactly as the next one is published — zero margin — so any
-        delayed publication starts failing evidence checks. The ceiling should
-        be set from the CA's real cadence (≥ `CRLPeriod` + overlap), not left at
-        the default; the freshness gate itself was confirmed live (a 1-second
-        ceiling refuses the real CRL).
+  - [ ] **WI-052 remains an operator setting, not a code gap.** `CRLPeriod = 1
+        Week` (604800s), and the published CRL's validity window is **7d 12h
+        20m** (649200s) against a default `revocation_confirm_crl_max_age_seconds`
+        of 7 days. The runbook now requires measuring `A_sched_max`, the maximum
+        CRL age at scheduled replacement including `thisUpdate` backdating and
+        clock skew, then using `A_sched_max < max_age_seconds < 649200`. The
+        repository does not record `A_sched_max`; a value beyond 649200 would
+        make the independent replay-age ceiling non-binding. The freshness gate
+        itself was confirmed live (a 1-second ceiling refuses the real CRL).
   - [x] **`Register-MaintenanceTasks.ps1` re-introduces the admin token on the
         revocation host.** `-AdminToken` was mandatory and always written into
         the revocation-sync task action as `$env:ACME_ADMIN_TOKEN`, even when a
@@ -669,14 +1386,16 @@ engineered to. Until then it has not — regardless of a green local test run.
         lock file was exported on Linux for Python 3.13 — a platform-specific
         wheel gap surfaces only here.
   - [x] **CRL freshness against the real publication cadence — measured
-        2026-08-14, and the default does not fit.** The lab CA publishes weekly
-        (`CRLPeriod = 1 Week`) and its CRL declares a **7d 12h 20m** validity
-        window against a 7-day default ceiling, so the current CRL's age reaches
-        the ceiling exactly as the next one is published: zero margin, and any
-        delayed publication fails evidence checks. Set
-        `revocation_confirm_crl_max_age_seconds` from the CA's real cadence
-        (≥ `CRLPeriod` + overlap). The gate itself is live — a 1-second ceiling
-        refuses the real CRL, and the default accepts it.
+        2026-08-14, and the default has zero delay margin.** The lab CA publishes
+        weekly (`CRLPeriod = 1 Week` = 604800s) and its CRL declares a **7d 12h
+        20m** validity window (= 649200s). The lower bound must instead be the
+        measured `A_sched_max` at scheduled replacement, including `thisUpdate`
+        backdating and clock skew; the repository does not record that value.
+        Configure `A_sched_max < revocation_confirm_crl_max_age_seconds < 649200`.
+        Do not widen it past `nextUpdate`: after that hard expiry the CRL must
+        fail closed, and the independent age ceiling must remain binding. The
+        gate itself is live — a 1-second ceiling refuses the real CRL, and the
+        default accepts it.
   - [x] **The unauthenticated GET forms are removed (finding 4, 2026-08-15).**
         Closed entirely on RFC 8555 conformance grounds: `GET /acme/cert/{id}`
         and `GET /acme/authz/{id}` and the `allow_unauthenticated_resource_get`

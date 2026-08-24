@@ -8,7 +8,7 @@ resolution-markers = [
 
 [[package]]
 name = "acme-adcs-ra"
-version = "1.9.1"
+version = "1.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -39,7 +39,7 @@ requires-dist = [
     { name = "pydantic-settings" },
     { name = "pyspnego", marker = "sys_platform == 'win32'" },
     { name = "pytest", marker = "extra == 'dev'" },
-    { name = "requests" },
+    { name = "requests", specifier = ">=2.32" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16,<1" },
     { name = "types-requests", marker = "extra == 'dev'" },
     { name = "uvicorn", extras = ["standard"] },

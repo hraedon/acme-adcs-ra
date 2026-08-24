@@ -14,9 +14,11 @@ Config lives on ``RAConfig`` so it is env/file-driven like the rest of the RA.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +33,204 @@ from urllib.request import Request, urlopen
 from acme_adcs_ra.config import RAConfig
 
 logger = logging.getLogger("acme_adcs_ra.siem")
+
+
+def _getaddrinfo_within(
+    host: str, port: int, socktype: int, deadline: float
+) -> list[Any]:
+    """Resolve ``host`` with a wall-clock deadline.
+
+    ``socket.getaddrinfo`` blocks in the OS resolver and takes no timeout, so
+    the only way to bound it is to stop waiting on it. The worker is a daemon
+    thread and is abandoned, not cancelled, when the deadline passes — the
+    resolver call cannot be interrupted, so the choice is between leaking a
+    thread that will finish on its own and blocking the caller for the OS
+    default. A syslog target that cannot be resolved inside the deadline is a
+    misconfiguration the operator needs to see quickly.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"resolving syslog host {host!r} exceeded its deadline")
+
+    results: list[list[Any]] = []
+    errors: list[BaseException] = []
+
+    def resolve() -> None:
+        try:
+            results.append(socket.getaddrinfo(host, port, 0, socktype))
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller below
+            errors.append(exc)
+
+    worker = threading.Thread(
+        target=resolve, name="ra-siem-syslog-resolve", daemon=True
+    )
+    worker.start()
+    worker.join(remaining)
+    if worker.is_alive():
+        raise TimeoutError(
+            f"resolving syslog host {host!r} did not complete within "
+            f"{remaining:.3f}s; the RA is not waiting on the OS resolver default"
+        )
+    if errors:
+        raise errors[0]
+    if not results or not results[0]:
+        raise OSError("getaddrinfo returns an empty list")
+    return results[0]
+
+
+class _RaisingSysLogHandler(SysLogHandler):
+    """A ``SysLogHandler`` whose transport failures reach the caller.
+
+    The stock handler funnels every :meth:`emit` exception into
+    ``logging.Handler.handleError``, which reports to stderr and **returns**.
+    ``Logger.info()`` therefore returns normally after a send that never left
+    the host, so any delivery accounting that infers success from that return
+    counts a dead collector as delivered — which is exactly what
+    :meth:`SiemEmitter.probe_offbox_delivery` and
+    :meth:`SiemEmitter._syslog_send` do.
+
+    Measured against a killed TCP collector, the stock handler swallowed a
+    ``ConnectionResetError`` followed by four ``BrokenPipeError``s while the
+    emitter recorded five successful deliveries and the ``audit_offbox_required``
+    startup probe still answered "syslog accepted the probe over TCP". The
+    off-box trail is the control meant to survive a compromise of this host, so
+    it must fail loudly. Found by the 2026-08-17 Daybreak review (F4); it is the
+    same defect class as wave-3 F2, which was fixed for the HEC sink only.
+
+    Two behaviours the stock handler does not give us:
+
+    * ``handleError`` re-raises, so a failed send propagates out of
+      ``Logger.info()`` to the caller's ``try/except``.
+    * A failed TCP send drops the dead socket. ``emit`` calls ``createSocket``
+      whenever ``self.socket`` is falsy, so the next event reconnects instead of
+      wedging the sink until the process restarts. ``createSocket`` re-applies
+      the send timeout, which the stock implementation does not carry across a
+      reconnect (and never applied at all when the *initial* connect failed and
+      the socket was created lazily on first emit).
+    """
+
+    def __init__(self, *args: Any, send_timeout: float | None = None, **kwargs: Any) -> None:
+        self._send_timeout = send_timeout
+        super().__init__(*args, **kwargs)
+        self._apply_send_timeout()
+
+    def _apply_send_timeout(self) -> None:
+        """Bound a TCP send so a collector that stops reading cannot park us.
+
+        A TCP syslog socket with no timeout blocks indefinitely once the
+        receiver stops draining: ``SysLogHandler`` does a plain ``sendall`` and
+        a full send buffer parks the caller. UDP cannot block this way, so the
+        timeout is only meaningful — though harmless — for streams. ``socket``
+        exists at runtime for both socket types but is not declared in typeshed,
+        hence the getattr.
+        """
+        if self._send_timeout is None or self.socktype != socket.SOCK_STREAM:
+            return
+        sock: socket.socket | None = getattr(self, "socket", None)
+        if sock is not None:
+            sock.settimeout(self._send_timeout)
+
+    def createSocket(self) -> None:
+        """Build the socket with resolution and connect inside the deadline.
+
+        The stock implementation resolves and connects with **no** timeout, so
+        ``_apply_send_timeout`` — which can only run once a connected socket
+        exists — bounded sends and nothing else. DNS and the TCP handshake fell
+        back to the OS defaults, which on a blackholed collector is minutes: a
+        stall in ``SiemEmitter.__init__`` parks service construction, and a
+        stall on reconnect parks the single syslog worker, both well past the
+        deadline the operator configured. The docstring only ever promised to
+        bound a send, so this was a gap rather than a broken promise, but the
+        knob is named ``siem_syslog_timeout_seconds`` and an operator reasonably
+        reads it as the deadline for talking to the collector.
+
+        One wall-clock deadline now covers resolution plus every address the
+        resolver returns, so a multi-homed host cannot multiply the wait by its
+        address count. Datagram and Unix sockets keep the stock path: neither
+        connects, so there is nothing to bound.
+        """
+        if (
+            self._send_timeout is None
+            or self.socktype != socket.SOCK_STREAM
+            or isinstance(self.address, str)
+        ):
+            super().createSocket()
+            self._apply_send_timeout()
+            return
+        self._create_stream_socket_within(self._send_timeout)
+
+    def _create_stream_socket_within(self, timeout: float) -> None:
+        """Resolve and connect a TCP syslog socket within one deadline.
+
+        Mirrors ``SysLogHandler.createSocket``'s stream path — same address
+        iteration, same "raise the last error" contract, so a refused connect
+        still surfaces as the ``OSError`` the caller already handles — with the
+        remaining budget applied to each attempt.
+        """
+        deadline = time.monotonic() + timeout
+        address = self.address
+        if isinstance(address, str):  # pragma: no cover - caller excludes these
+            raise TypeError("a Unix socket address has nothing to resolve or connect")
+        host, port = address
+        infos = _getaddrinfo_within(host, port, socket.SOCK_STREAM, deadline)
+
+        err: OSError | None = None
+        sock: socket.socket | None = None
+        for af, socktype, proto, _canonname, sa in infos:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                err = TimeoutError(
+                    f"connecting to syslog at {host}:{port} exceeded the "
+                    f"{timeout}s deadline before an address could be tried"
+                )
+                break
+            candidate: socket.socket | None = None
+            try:
+                candidate = socket.socket(af, socktype, proto)
+                # Bounds this connect; _apply_send_timeout resets the socket to
+                # the send deadline once it is established.
+                candidate.settimeout(remaining)
+                candidate.connect(sa)
+                sock = candidate
+                break
+            except OSError as exc:
+                err = exc
+                if candidate is not None:
+                    candidate.close()
+
+        if sock is None:
+            raise err if err is not None else OSError(
+                f"no address for syslog at {host}:{port} could be connected"
+            )
+
+        self.unixsocket = False
+        # Annotated because typeshed does not declare `socket` on SysLogHandler,
+        # so mypy infers the attribute from this class's first assignment to it.
+        # It is genuinely optional: handleError drops a dead stream by setting
+        # None, which is what makes the next emit reconnect.
+        self.socket: socket.socket | None = sock
+        self.socktype = socket.SOCK_STREAM
+        self._apply_send_timeout()
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        exc = sys.exc_info()[1]
+        # Drop the dead stream so the next emit reconnects via createSocket().
+        # Datagram sockets are connectionless, so there is nothing to rebuild.
+        if self.socktype == socket.SOCK_STREAM and not self.unixsocket:
+            sock: socket.socket | None = getattr(self, "socket", None)
+            if sock is not None:
+                # Best-effort: this socket is already broken, and the caller is
+                # about to get the real transport error re-raised below. A
+                # failure to close it must not mask that.
+                with contextlib.suppress(Exception):
+                    sock.close()
+            self.socket = None
+        if exc is None:
+            # handleError is only reached from an active except block, so this
+            # is defensive; still raise, because returning would silently
+            # restore the "failure counts as delivery" bug.
+            raise OSError("syslog emit failed with no exception in flight")
+        raise exc
 
 
 def _instance_id() -> str:
@@ -58,6 +258,10 @@ class SiemConfig:
     # Seconds a TCP syslog send may block before it is abandoned. Without a
     # deadline a stalled receiver parks the sender indefinitely.
     syslog_timeout_seconds: float = 5.0
+    # Size at which the local JSONL mirror rolls, and how many rolled files are
+    # retained. 0 max_mib keeps the previous append-forever behaviour.
+    jsonl_max_mib: int = 256
+    jsonl_keep: int = 4
     # Maximum audit events held in memory awaiting OFF-BOX delivery (syslog
     # or HEC). See SiemEmitter._submit_bounded for why an unbounded queue
     # was a liability.
@@ -197,19 +401,16 @@ class SiemEmitter:
             socktype = (
                 socket.SOCK_STREAM if self._config.syslog_proto == "tcp" else socket.SOCK_DGRAM
             )
-            handler = SysLogHandler(
+            # _RaisingSysLogHandler, not the stock SysLogHandler: the stock one
+            # swallows transport errors, which made every failed send count as
+            # a delivery and let the audit_offbox_required probe pass with the
+            # collector dead. It also owns the send timeout, so a reconnect
+            # cannot silently come back unbounded.
+            handler = _RaisingSysLogHandler(
                 address=(self._config.syslog_host, self._config.syslog_port),
                 socktype=socktype,
+                send_timeout=self._config.syslog_timeout_seconds,
             )
-            # A TCP syslog socket with no timeout blocks indefinitely once the
-            # receiver stops reading: `SysLogHandler` does a plain `sendall`,
-            # and a full send buffer parks the caller until the peer drains it.
-            # UDP cannot block this way, but the timeout is harmless there.
-            # `SysLogHandler.socket` exists at runtime for both socket types but
-            # is not declared in typeshed, hence getattr.
-            sock: socket.socket | None = getattr(handler, "socket", None)
-            if socktype == socket.SOCK_STREAM and sock is not None:
-                sock.settimeout(self._config.syslog_timeout_seconds)
             handler.setFormatter(logging.Formatter("acme-adcs-ra: %(message)s"))
             lg = logging.getLogger("acme_adcs_ra.siem.syslog")
             lg.setLevel(logging.INFO)
@@ -253,6 +454,72 @@ class SiemEmitter:
         line = json.dumps(event, default=str, sort_keys=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+        self._rotate_jsonl_if_needed(path)
+
+    def jsonl_bytes(self) -> int:
+        """Total on-disk size of the JSONL mirror including rotated files.
+
+        Reported to the footprint check because the mirror is the larger half of
+        the local audit footprint on a default install, and it was previously
+        append-forever with no story at all.
+        """
+        path = self._jsonl_path
+        if path is None:
+            return 0
+        total = 0
+        for candidate in [path, *self._rotated_paths(path)]:
+            if candidate.exists():
+                total += candidate.stat().st_size
+        return total
+
+    def _rotated_paths(self, path: Path) -> list[Path]:
+        keep = max(self._config.jsonl_keep, 0)
+        return [path.with_name(f"{path.name}.{i}") for i in range(1, keep + 1)]
+
+    def _rotate_jsonl_if_needed(self, path: Path) -> None:
+        """Roll the mirror at the configured size, keeping N previous files.
+
+        Size-based rather than time-based because the thing being bounded is
+        disk, and the mirror's growth rate is driven by request volume rather
+        than by the clock.
+
+        Rotation *does* discard the oldest file, which for a local-only
+        deployment is the only copy of those events. That is why this is bounded
+        by count rather than deleting outright, why the SQLite ``audit_log``
+        (not the mirror) is the durable local record, and why the mirror's own
+        retention is deliberately independent of ``audit_retention_days``: the
+        table's retention is gated on off-box audit, whereas a file that grows
+        without limit is a capacity fault on every deployment. Set
+        ``audit_jsonl_max_mib`` to 0 to keep the previous append-forever
+        behaviour.
+
+        Best-effort: a failed rotation must never propagate into the caller,
+        which is the audit emission path. The local SQLite row is already
+        durable by this point.
+        """
+        max_bytes = self._config.jsonl_max_mib * 1024 * 1024
+        if max_bytes <= 0:
+            return
+        try:
+            if path.stat().st_size < max_bytes:
+                return
+            keep = max(self._config.jsonl_keep, 0)
+            if keep == 0:
+                # Rotation on with nothing retained: truncate rather than grow.
+                path.write_text("", encoding="utf-8")
+                return
+            # No explicit unlink of the oldest file: the shift below ends with
+            # `.{keep-1}`.replace(`.{keep}`), and Path.replace overwrites its
+            # destination unconditionally on both POSIX and Windows. An unlink
+            # here was dead code (proven by mutation -- removing it changed no
+            # behaviour and failed no test).
+            for i in range(keep - 1, 0, -1):
+                src = path.with_name(f"{path.name}.{i}")
+                if src.exists():
+                    src.replace(path.with_name(f"{path.name}.{i + 1}"))
+            path.replace(path.with_name(f"{path.name}.1"))
+        except OSError:
+            logger.warning("JSONL audit mirror rotation failed", exc_info=True)
 
     def _to_syslog(self, event: dict[str, Any]) -> None:
         """Hand the event to the bounded worker, or drop it under backpressure.
@@ -392,9 +659,10 @@ class SiemEmitter:
         optional path deliberately does not block startup on the network.
 
         Returns ``(ok, detail)``. ``detail`` explains a failure, or describes what
-        was and was not proven on success — which matters for syslog, where the
-        common UDP transport cannot acknowledge anything and the honest answer is
-        "the socket accepted it".
+        was and was not proven on success — which matters for syslog, which has
+        no acknowledgment even over TCP, so the strongest claim available there
+        is "a live transport", not "the collector has it". UDP cannot make even
+        that claim and therefore fails this probe outright.
         """
         cfg = self._config
         if not self._enabled:
@@ -423,15 +691,33 @@ class SiemEmitter:
             except Exception as exc:  # noqa: BLE001
                 return False, f"syslog refused the startup probe: {exc}"
             if cfg.syslog_proto.lower() == "udp":
-                # Worth stating rather than implying: UDP cannot acknowledge, so
-                # this proves the socket accepted the datagram and nothing about
-                # whether a collector received it. Use TCP to get more than that.
-                return True, (
-                    "syslog accepted the probe over UDP, which cannot "
-                    "acknowledge delivery; reachability of the collector is "
-                    "NOT proven. Use syslog_proto=tcp for an acknowledged path."
+                # UDP cannot pass this gate. The send above always "succeeds" —
+                # a datagram socket accepts bytes with nothing listening on the
+                # far side — so a True here would mean "the local kernel took
+                # the packet", which is not evidence that audit leaves the host.
+                # Until 2026-08-18 this returned True with an honest detail
+                # string saying reachability was NOT proven; but the *boolean*
+                # is what gates startup, so `audit_offbox_required` refused
+                # nothing on UDP. Reproduced against an unused port: enabled and
+                # ok, no collector. The detail is not the control; the boolean
+                # is. Requiring off-box audit and demonstrating it over UDP are
+                # mutually exclusive, so the honest answer is a refusal.
+                return False, (
+                    "syslog is configured over UDP, which is fire-and-forget: "
+                    "the socket accepts every datagram whether or not a "
+                    "collector exists, so delivery can never be demonstrated. "
+                    "Use syslog_proto=tcp to at least prove a live transport, "
+                    "or the HEC sink to prove receipt."
                 )
-            return True, "syslog accepted the probe over TCP"
+            # Precise about what this proves: the TCP connection was
+            # established and the send completed without error. That is a live
+            # transport, NOT an application-level acknowledgment — syslog has no
+            # such thing, so a collector that accepts bytes and drops them still
+            # passes. HEC is the sink that can prove receipt.
+            return True, (
+                "syslog TCP send completed with no transport error; the "
+                "collector is reachable but syslog cannot acknowledge receipt"
+            )
         return False, f"sink {cfg.sink!r} is not an off-box sink"
 
     def _hec_post(self, event: dict[str, Any]) -> None:
@@ -508,6 +794,8 @@ def build_siem_config(config: RAConfig) -> SiemConfig:
         syslog_port=config.siem_syslog_port,
         syslog_proto=config.siem_syslog_proto,
         syslog_timeout_seconds=config.siem_syslog_timeout_seconds,
+        jsonl_max_mib=config.audit_jsonl_max_mib,
+        jsonl_keep=config.audit_jsonl_keep,
         hec_url=config.siem_hec_url,
         hec_token=hec_token,
         hec_index=config.siem_hec_index,

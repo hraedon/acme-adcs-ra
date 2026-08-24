@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from cryptography.x509.oid import ExtensionOID, NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, ExtensionOID, NameOID, ObjectIdentifier
 
 from acme_adcs_ra.acme_errors import bad_csr
 from acme_adcs_ra.policy import validate_dns_name
@@ -110,7 +110,18 @@ def _reject_unrequested_common_names(
 
 
 def _reject_ca_capable_csr_extensions(csr: x509.CertificateSigningRequest) -> None:
-    """Reject CSR requests that ask the issuing template for CA capability."""
+    """Reject CSR extensions outside the server-authentication boundary.
+
+    A missing EKU is accepted because the locked-down ADCS template supplies
+    serverAuth.  If a CSR carries the standard EKU extension, however, its set
+    must be exactly ``serverAuth`` before the unchanged CSR can reach ADCS.
+
+    Microsoft Application Policies (1.3.6.1.4.1.311.21.10) is an alternate
+    application-purpose request understood by ADCS.  ``cryptography`` exposes
+    it only as an unrecognized extension rather than decoding its policy OIDs,
+    so the safe supported boundary is to reject the extension whenever present,
+    not to pretend its contents were inspected.
+    """
     try:
         basic_constraints = csr.extensions.get_extension_for_oid(
             ExtensionOID.BASIC_CONSTRAINTS
@@ -124,8 +135,33 @@ def _reject_ca_capable_csr_extensions(csr: x509.CertificateSigningRequest) -> No
     try:
         key_usage = csr.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
     except x509.ExtensionNotFound:
-        return
-    if isinstance(key_usage, x509.KeyUsage) and (
-        key_usage.key_cert_sign or key_usage.crl_sign
-    ):
-        raise bad_csr("CSR requests certificate/CRL signing key usage")
+        pass
+    else:
+        if isinstance(key_usage, x509.KeyUsage) and (
+            key_usage.key_cert_sign or key_usage.crl_sign
+        ):
+            raise bad_csr("CSR requests certificate/CRL signing key usage")
+
+    try:
+        eku = csr.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE).value
+    except x509.ExtensionNotFound:
+        pass
+    else:
+        if not isinstance(eku, x509.ExtendedKeyUsage) or list(eku) != [
+            ExtendedKeyUsageOID.SERVER_AUTH
+        ]:
+            raise bad_csr(
+                "CSR ExtendedKeyUsage must contain exactly serverAuth "
+                "(1.3.6.1.5.5.7.3.1)"
+            )
+
+    microsoft_application_policies = ObjectIdentifier("1.3.6.1.4.1.311.21.10")
+    try:
+        csr.extensions.get_extension_for_oid(microsoft_application_policies)
+    except x509.ExtensionNotFound:
+        pass
+    else:
+        raise bad_csr(
+            "CSR Microsoft Application Policies extension is unsupported; use "
+            "the standard ExtendedKeyUsage extension with exactly serverAuth"
+        )
