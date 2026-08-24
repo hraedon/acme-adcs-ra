@@ -338,3 +338,21 @@ Describe 'Sync-Revocations credential surface (2026-08-23 finding 6)' {
         }
     }
 }
+
+# 2026-08-24 live-found defect (third hop of the override chain): the sync's
+# own gate honoured -AllowUntrustedScriptPath, but the Revoke-Cert.ps1 CHILD
+# it spawns carries the same gate and was never told -- so an explicitly
+# allowed untrusted tree could list, examine, and then never revoke anything.
+Describe 'Sync-Revocations propagates the untrusted-tree override to its child (2026-08-24)' {
+    BeforeAll {
+        $script:syncText = Get-Content -Raw (Resolve-Path "$PSScriptRoot/../../scripts/Sync-Revocations.ps1")
+    }
+
+    It 'revokeArgs includes -AllowUntrustedScriptPath when the sync was allowed' {
+        $arr = $script:syncText.IndexOf('$revokeArgs = @(')
+        $prop = $script:syncText.IndexOf("if (`$AllowUntrustedScriptPath) { `$revokeArgs += '-AllowUntrustedScriptPath' }")
+        $arr | Should -BeGreaterThan 0 -Because 'the child argv build site must be findable'
+        $prop | Should -BeGreaterThan $arr -Because 'the override must reach the child argv'
+        ($prop - $arr) | Should -BeLessThan 900 -Because 'it belongs to the same argv build block, not somewhere unrelated'
+    }
+}

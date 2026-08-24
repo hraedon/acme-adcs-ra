@@ -414,6 +414,14 @@ foreach ($entry in $pending) {
         '-RequesterName', $RequesterName
     )
     if (-not $PublishCrl) { $revokeArgs += '-SkipPublishCrl' }
+    # 2026-08-24 live-found: the override must reach the CHILD too. Revoke-Cert.ps1
+    # carries the same tree gate as this script, so without this line an
+    # untrusted tree that was explicitly allowed at the task level could still
+    # never revoke anything -- every child invocation refused at its own gate
+    # and was classified 'failed'. The override exists for this flow; breaking
+    # it one hop below the task action is the same defect the review's own
+    # propagation fix was written to close.
+    if ($AllowUntrustedScriptPath) { $revokeArgs += '-AllowUntrustedScriptPath' }
     $revokeRun = Invoke-ChildScript $pwshExe $revokeArgs
     $revokeOutput = $revokeRun.Output
     $revokeExit = $revokeRun.ExitCode
