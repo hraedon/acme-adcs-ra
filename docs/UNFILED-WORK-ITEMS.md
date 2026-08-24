@@ -19,6 +19,23 @@ recreating the authoritative store is an owner decision, not a mechanical fix.
 still the only tracker, and it has grown a second job: recording work that is
 *finished* but cannot be marked finished anywhere else.
 
+**Re-checked 2026-08-24** — still blocked, but the *error has changed*, so this
+is no longer the same failure:
+
+```
+[MIGRATION_REQUIRED] Migrations pending: schema 'acme_adcs_ra' has applied
+[1..44], missing [45, 46, 47, 48, 49, 50]. Run regista migrations before starting.
+```
+
+Reads still work — `agent-notes work-item find --project acme-adcs-ra` returns
+all 24 items. The v6-genesis message is gone; what remains is six unapplied
+migrations. That is a *mechanically* fixable state, unlike the genesis reset,
+but the store is shared estate-wide and migrating it is an owner decision with
+blast radius past this repo, so it was left alone again. Note the project
+schema is `acme_adcs_ra` (underscores) — `--project acme-adcs-ra` is rejected
+by the name validator, which is worth knowing before concluding the store is
+down.
+
 **Reconcile this file into regista once writes are restored, then delete it.**
 
 ---
@@ -37,6 +54,10 @@ still the only tracker, and it has grown a second job: recording work that is
 | 7 | Audit retention never runs | **open** — prerequisite (item 8) now cleared; three safety gaps remain |
 | 8 | UDP probe satisfied `audit_offbox_required` | **CLOSED 2026-08-18** |
 | 9 | TCP syslog connect unbounded | **CLOSED 2026-08-18** (acme-adcs-ra); cert-watch half open, see below |
+| 10 | Sibling dot-source precedes the provenance gate | **DECLARED 2026-08-24** — in progress, see below |
+| 11 | No ancestor check on the state/runtime roots | **DECLARED 2026-08-24** — in progress, see below |
+| 12 | HEC token forwarded across redirects | **DECLARED 2026-08-24** — in progress, see below |
+| 13 | `$env:windir` selects elevated executables | **DECLARED 2026-08-24** — in progress, see below |
 
 Everything marked CLOSED is in the working tree on
 `security-review-2026-08-15-daybreak`, with tests, and needs no tracker entry
@@ -384,3 +405,218 @@ items 4 and 3 above.
   newest). `security-review-2026-08-18` and `-08-19` are fully merged and stale.
   This branch now carries a full live E2E pass; opening the PR is an owner
   decision, not a blocked one.
+
+---
+
+## Round 2026-08-24 (daybreak standard review at `0a47955`) — DECLARED BEFORE MUTATION
+
+Four findings, reviewed and re-rated before any code was written. This section
+is the pre-action declaration the steward path requires; the store cannot take
+it (see the header). Severities below are **this repo's** rating, not the
+reporting reviewer's, and two of them differ — the reasoning is recorded so the
+disagreement is arguable rather than silent.
+
+**Actor / lineage.** Implementation by Claude Opus 5 (`claude-opus-5`). The
+findings came from a daybreak standard review — a different actor and lineage.
+Independent review of the *fix* is still owed; see the closing note.
+
+**Declared working set.** Nothing outside these paths:
+
+- `scripts/lib/InstallVerifyLib.ps1`
+- `scripts/install-windows.ps1`
+- `scripts/Register-MaintenanceTasks.ps1`, `scripts/Sync-Revocations.ps1`,
+  `scripts/Revoke-Cert.ps1`, `scripts/Set-OfficerRights.ps1`,
+  `scripts/Reconcile-Revocation.ps1`
+- `scripts/lib/BootstrapTrustLib.ps1` (new)
+- `src/acme_adcs_ra/siem.py`
+- `tests/pester/*.Tests.ps1`, `tests/test_siem*.py`
+- `CHANGELOG.md`, `docs/security-review-2026-08-24-daybreak-standard.md`, this file
+
+**Declared acceptance checks.** Each must have a fresh result *after the last
+edit*, not before it:
+
+1. `pytest -q`
+2. `ruff check . && ruff format --check .`
+3. `mypy src/`
+4. `pwsh -Command "Invoke-Pester tests/pester -CI"`
+5. Mutation proof for every new test: revert the fix, show the test fails,
+   restore. A test that cannot fail is not evidence.
+6. For finding 12, a **live probe**: a local redirect server proving the
+   `Authorization` header no longer reaches the redirect target.
+
+**Known risks going in.**
+
+- Findings 10, 11 and 13 are Windows-side. Linux Pester covers the pure decision
+  functions; it **cannot** cover the live ACL and process behaviour (WI-050).
+  Live assurance rides the outstanding lab session, same as the D1–D7 class.
+- Finding 11 changes a **refusal** on the default install path. A wrong refusal
+  aborts the upgrade of a live issuance host — the round-5 lesson. The predicate
+  must pass `C:\ProgramData` and `%ProgramFiles%` or it is worse than the bug.
+- Finding 13 touches assertions that currently *pin* the `$env:windir` spelling,
+  so the tests move with the code. That is the change most likely to look green
+  while covering nothing.
+
+### 10. (bug, high) — sibling code is loaded before the provenance gate
+
+**Rated high; the report also said high.** The one I would fix first.
+
+`Register-MaintenanceTasks.ps1:199-200` dot-sources `lib/TaskActionLib.ps1` and
+`lib/SyncLib.ps1` immediately after param binding. The script-tree provenance
+gate is at `:269`. Two libraries have already executed as Administrator by the
+time the gate is consulted.
+
+The gate carries an honest caveat — *"the check is loaded from the very tree it
+judges, so someone who can already write here can neuter it"* — and that caveat
+is **not** what this is. Neutering the check requires rewriting
+`InstallVerifyLib.ps1`; this requires only `SyncLib.ps1`, and the gate never
+runs at all. Ordering, not self-reference.
+
+Two further holes the report did not name:
+
+- The gate is inside `if ($registerSync)`. Registering only the nonce/sweep
+  tasks skips it entirely, while `:199-200` still load two siblings elevated.
+  The justification — *"the nonce/sweep tasks execute nothing from disk"* — is
+  true of the **tasks** and false of the **registration script**.
+- **The worst instance is in a different file.** `Sync-Revocations.ps1:199`
+  dot-sources `SyncLib.ps1` with no gate at all, and *that* is the script the
+  scheduled task runs as the gMSA every interval, forever.
+  `Revoke-Cert.ps1:130` (CA-officer context), `Set-OfficerRights.ps1:105` and
+  `Reconcile-Revocation.ps1:97` are the same shape.
+
+**Correction — the run-time gap was a decision, not an oversight.** Item 3's
+closing note (above) records it explicitly: *"Residual, deliberately not done:
+`Sync-Revocations.ps1` does not re-check the tree at run time"*, on two grounds
+— loading `InstallVerifyLib.ps1` means **two `Add-Type` C# compiles** on a
+15-minute cadence (verified: `:444` `ACMERA.AtomicDirectory`, `:1519`
+`ACMERA.FinalPath`), and the residual exposure after registration refuses
+untrusted trees is a DACL loosened later, which needs admin rights. An earlier
+draft of this entry called it an oversight; that was wrong and is withdrawn.
+
+The decision was sound on its own premises. What this round adds is that **one
+premise does not hold**, and that the note's own escape hatch is now cheap:
+
+- *The premise.* "Registration now refuses untrusted trees" is true only on the
+  `$registerSync` path, and only *after* `:199-200` have already loaded two
+  siblings elevated. On the nonce/sweep path the gate never runs. So the
+  run-time check was traded away against a registration-time check that has a
+  hole in front of it. Fix the ordering and the trade becomes defensible again
+  — which is why the ordering fix is the one that matters most.
+- *The escape hatch.* The note ends: *"Worth revisiting **if the lib is ever
+  split so the DACL primitives can be loaded on their own**."* That is exactly
+  what this change does. `Test-ObjectDaclTrusted`, `Test-PathChainTrusted`,
+  `Get-TreeTrustViolations` and their dependencies touch neither compiled type
+  (only `New-AtomicProtectedDirectory:513` and `Get-CanonicalPathString:1586`
+  do), so they move to a new `lib/BootstrapTrustLib.ps1` that dot-sources with
+  no `Add-Type` at all. `InstallVerifyLib.ps1` dot-sources it too, so there is
+  exactly **one** definition of each predicate.
+
+That last point is the reason for moving rather than copying. `:1680-1682`
+records what a second copy cost last time — the installer's inline bootstrap
+copy listed only the dead half of a rights mask and *"looked correct while
+covering neither right"*. A duplicated predicate is how this file already got
+burned once.
+
+- *`-AllowUntrustedScriptPath` outlives its warning.* An operator who takes the
+  documented lab override registers a task against a writable tree and gets a
+  warning saying "re-register before pilot" — after which nothing ever checks
+  again. A run-time gate is what makes that override self-correcting.
+
+So: a legitimate re-find of the remainder of item 3 (one entry point of five,
+with the fix placed after the load), plus the split that retires its stated
+blocker.
+
+### 11. (bug, medium) — no ancestor check on the state and runtime roots
+
+**Report said high; rated medium here, and the framing is wrong at defaults.**
+
+Confirmed: `Get-RootProvenance` inspects the root and its contents, never above
+it, so `Initialize-SecuredRoot` claims `$InstallDir`/`$RuntimeDir` with no
+ancestor check. `install-windows.ps1:1393` applies `Get-TreeTrustViolations` to
+`$SitePath` with a comment making exactly the reviewer's argument.
+
+But *"protected roots remain replaceable"* does not hold on the defaults.
+Substituting an existing child needs `Delete` on the child or
+`DeleteSubdirectoriesAndFiles` on the parent. `C:\ProgramData`'s Users ACE is
+create-class only (`WD,AD,WEA,WA` — no `DE`, no `DC`) and `%ProgramFiles%` is
+Users RX, so the attack does not work there. It works on a **non-default**
+`-InstallDir`/`-RuntimeDir` under a parent that grants delete — which is not
+hypothetical, because admin-created top-level folders inherit
+`Authenticated Users:(OI)(CI)(M)` from `C:\`, and the lab is documented as
+staging under `C:\Temp`.
+
+**Why this stalled, and what unblocks it.** `install-windows.ps1:1385-1387`
+records that the `$SitePath` refusal shipped once `C:\inetpub` was *measured
+clean* — "the evidence this was waiting on". That evidence can never arrive for
+`C:\ProgramData`, because `InstallVerifyLib.ps1:1790` records that it **FAILS**
+`Test-PathChainTrusted`.
+
+It fails on `WriteData`. On a directory that bit means *create a new entry*, not
+*modify an existing child* — a false positive for this question.
+`Test-AceEndangersBytes` is correctly named and is the right predicate for a
+file about to be executed; it is the wrong predicate for an ancestor of a
+protected root, where the dangerous bits are `Delete`,
+`DeleteSubdirectoriesAndFiles`, `ChangePermissions`, `TakeOwnership`,
+`GenericAll` and `GenericWrite` — and **not** bare `WriteData`/`AppendData`.
+
+So the fix is a sibling predicate with the narrower mask, which passes
+`C:\ProgramData` and still fails `C:\Temp`. Default-safe by construction, which
+is the property the round-5 lesson demands.
+
+### 12. (bug, low→medium) — the HEC token is forwarded across redirects
+
+**Report said low; kept at low-to-medium.** Confirmed **by execution**, not by
+reading: a local redirect server received `Authorization: Splunk <token>`
+verbatim after a 302.
+
+`urlopen` (`siem.py:757`) uses the default `HTTPRedirectHandler`, whose
+`redirect_request` strips exactly `("content-length", "content-type")` and
+copies every other header onto the new request — `Authorization` included,
+cross-host. `http_error_302` permits redirect targets with scheme `http`,
+`https` **or** `ftp`, so the https-only gate at `siem.py:335-340` is defeated
+one hop deep and the token can leave in cleartext.
+
+Two precisions the report did not have:
+
+- **Only the token leaks, not the audit events.** `redirect_request` builds the
+  new request without `data=`, and 301/302/303 downgrade POST to GET. Measured:
+  method `GET`, empty body. Even 307/308 drop the body, and POST+307 raises
+  rather than following. This is credential disclosure, not audit disclosure.
+- Adjacent dead code: `if not (200 <= resp.status < 300)` at `:758` cannot fire.
+  Non-2xx raises `HTTPError` and 3xx is followed automatically — which is
+  precisely why a redirect leaves no trace in the logs.
+
+Nudged above the reported severity for one reason: an HEC token lets an attacker
+**forge audit into the SIEM**, and for this product the audit trail is the
+thing being sold.
+
+### 13. (bug, medium) — `$env:windir` selects executables that run elevated
+
+**Report said high; rated medium here.** Real, and inconsistent with this
+repo's own stated doctrine — but the precondition is controlling the
+environment block of a process about to elevate, which generally means already
+holding the launching context.
+
+`InstallVerifyLib.ps1:17` derives `icacls.exe` from `$env:windir`, while
+`Revoke-Cert.ps1`, `Set-OfficerRights.ps1` and `Reconcile-Revocation.ps1`
+resolve System32 from the runtime, and `Get-TrustedInboxModuleRoots:2336` goes
+further still (machine-scope registry plus the folder API) with a comment
+spelling out why the process environment cannot be trusted. Line 17 is simply
+on the old pattern.
+
+The report named the weaker half. Two additions:
+
+- **The bare-name fallback is the sharper bug.** `else { 'icacls.exe' }` is PATH
+  resolution — exactly what round-6 finding 3 removed elsewhere. Test `:1607`
+  asserts the *installer* never invokes icacls by bare name; the *library* still
+  can, whenever `windir` is **unset** rather than redirected. Unsetting is a
+  lower bar than redirecting.
+- **Double impact.** icacls output is not merely executed, it is the evidence
+  `Get-RootProvenance` and `Assert-InstallTreeLocked` read. A substituted icacls
+  forges the lockdown proof as well as running code.
+
+**Decision: fix it completely rather than at line 17.** `install-windows.ps1`
+has eight more `$env:windir` sites (msiexec, secedit, cmd, netsh, attrib,
+appcmd, the handler DLL probe), and tests at `:1379` and `:1605-1607` *pin* that
+spelling. Half-fixing the library while leaving the installer on the old pattern
+is how this class keeps returning: the doctrine ends up split across two files
+and the next reviewer finds whichever half they open first.
