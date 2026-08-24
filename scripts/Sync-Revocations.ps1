@@ -191,10 +191,40 @@ param(
     [string]$ScriptDir = "",
     [switch]$LocalMode,
     [switch]$PublishCrl,
-    [switch]$AllowInsecureUrl
+    [switch]$AllowInsecureUrl,
+    # Accept a script tree that is not administrator-only. Registered into the
+    # task action by Register-MaintenanceTasks.ps1 only when the registrar was
+    # itself given the override, so a lab deployment keeps working and a
+    # production one cannot silently acquire this.
+    [switch]$AllowUntrustedScriptPath
 )
 
 $ErrorActionPreference = "Stop"
+
+# PROVENANCE FIRST, THEN SIBLINGS (2026-08-24 F10).
+#
+# This is the script the revocation-sync scheduled task executes as the gMSA
+# every interval, forever, from whatever path an operator copied scripts\ to.
+# It dot-sourced SyncLib.ps1 with no check of any kind.
+#
+# The 2026-08-18 round considered a run-time check here and declined it, for a
+# reason that was true at the time: loading InstallVerifyLib.ps1 cost two
+# Add-Type C# compiles on a 15-minute cadence. It closed with the condition for
+# revisiting -- "worth revisiting if the lib is ever split so the DACL
+# primitives can be loaded on their own". Those compiles are now on demand and
+# neither is on this path, so the load is 1298ms -> 321ms (pwsh 7.6/Linux) and
+# the objection is retired rather than overruled.
+#
+# The other half of that reasoning was that registration already refuses
+# untrusted trees, leaving only a DACL loosened afterwards. That held only for
+# the revocation-sync path, and only after the registrar had already loaded two
+# siblings unchecked -- and it never covered -AllowUntrustedScriptPath, which
+# registers against a writable tree by design and then warns into the void.
+# Checking here is what makes that override self-correcting.
+. "$PSScriptRoot/lib/InstallVerifyLib.ps1"
+Assert-PrivilegedScriptTreeTrusted -Root $PSScriptRoot `
+    -Purpose 'the revocation-sync task' `
+    -AllowUntrusted:$AllowUntrustedScriptPath -RunTime
 
 . "$PSScriptRoot/lib/SyncLib.ps1"
 

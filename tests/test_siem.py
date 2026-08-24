@@ -676,10 +676,10 @@ class TestHecRedirectDoesNotLeakTheToken:
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         class _H(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # noqa: N802
+            def do_POST(self) -> None:
                 handler_fn(self)
 
-            def do_GET(self) -> None:  # noqa: N802
+            def do_GET(self) -> None:
                 handler_fn(self)
 
             def log_message(self, *a: Any) -> None:

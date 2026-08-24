@@ -196,6 +196,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# PROVENANCE FIRST, THEN SIBLINGS (2026-08-24 F10).
+#
+# These two dot-sources used to sit here, ~70 lines above the script-tree gate,
+# so both libraries executed as Administrator before anything checked whether
+# the tree was administrator-only. Writing SyncLib.ps1 alone was enough; the
+# gate below never got to run. The gate was also scoped to the revocation-sync
+# path, which left the nonce/sweep path loading two siblings with no check at
+# all.
+#
+# InstallVerifyLib.ps1 is loaded first because it IS the check. That it is read
+# from the tree it judges is the known, documented residual -- but it narrows
+# the attack from "any sibling" to "this specific file".
+. "$PSScriptRoot/lib/InstallVerifyLib.ps1"
+Assert-PrivilegedScriptTreeTrusted -Root $PSScriptRoot `
+    -Purpose 'the maintenance-task registrar' `
+    -AllowUntrusted:$AllowUntrustedScriptPath
+
 . "$PSScriptRoot/lib/TaskActionLib.ps1"
 . "$PSScriptRoot/lib/SyncLib.ps1"
 
@@ -266,29 +283,24 @@ if ($registerSync -and [string]::IsNullOrWhiteSpace($CaConfig)) {
 # -- an accidental staging path adopted permanently, and a planted file that
 # arrives AFTER registration, which is the measured case. An attacker who can
 # rewrite this tree today already owns the elevated registration itself.
-if ($registerSync) {
-    . "$PSScriptRoot/lib/InstallVerifyLib.ps1"
-    $treeViolations = @(Get-TreeTrustViolations -Path $PSScriptRoot)
-    if ($treeViolations.Count -gt 0) {
-        $detail = ($treeViolations | Select-Object -First 8) -join "`n  "
-        if ($AllowUntrustedScriptPath) {
-            Write-Warning ("The script tree $PSScriptRoot is NOT administrator-only, and " +
-                           "-AllowUntrustedScriptPath was passed:`n  $detail`n" +
-                           "The registered task will execute Sync-Revocations.ps1 from this tree as " +
-                           "$TaskUser on every run, so whoever can write here chooses what runs " +
-                           "privileged. Move the tree under %ProgramFiles% and re-register before pilot.")
-        } else {
-            Write-Error ("Refusing to register a privileged task that executes from $PSScriptRoot : " +
-                         "the tree, or a directory above it, is writable by a non-administrator.`n  $detail`n" +
-                         "The task action runs Sync-Revocations.ps1 from this path as $TaskUser every " +
-                         "$IntervalMinutes minutes, so a writable tree hands that execution to whoever " +
-                         "can write it. Copy scripts\ somewhere administrator-only (a subdirectory of " +
-                         "%ProgramFiles% is the shape the installer uses for the code root) and re-run " +
-                         "from there. To register anyway -- lab only -- pass -AllowUntrustedScriptPath.")
-            exit 3
-        }
-    } else {
+# The tree was proven at the top of this script, before any sibling loaded, so
+# there is nothing left to check here. What remains is the operator-facing
+# consequence of that verdict, which is specific to registration: the path is
+# about to be PERSISTED into a task that executes it as $TaskUser forever.
+if ($registerSync -and $script:InstallVerifyIsWindows) {
+    if (@(Get-TreeTrustViolations -Path $PSScriptRoot).Count -eq 0) {
         Write-Output "Script tree proven administrator-only: $PSScriptRoot"
+    } else {
+        # Reachable only under -AllowUntrustedScriptPath; the gate at the top
+        # throws otherwise. Registration deserves the louder warning because the
+        # decision outlives the process.
+        Write-Warning ("Registering a task that will execute Sync-Revocations.ps1 from the " +
+                       "NON-administrator-only tree $PSScriptRoot as $TaskUser every " +
+                       "$IntervalMinutes minutes, forever. Whoever can write there chooses what " +
+                       "runs privileged. Sync-Revocations.ps1 re-checks the tree on every run and " +
+                       "will REFUSE unless it is also given the override, so this task is expected " +
+                       "to start failing -- that is the control working. Move the tree under " +
+                       "%ProgramFiles% and re-register before pilot.")
     }
 }
 
@@ -411,7 +423,8 @@ function Register-RevocationSyncTask {
         -Local $LocalMode -DryRunMode $DryRun -ScriptPath $syncScriptPath `
         -Requester $RequesterName -PublishCrlMode $PublishCrl -DotEnvPath $DotEnvPath `
         -LoadAdminToken ([bool]$AdminToken) `
-        -LoadConfirmToken ([bool]$ConfirmToken)
+        -LoadConfirmToken ([bool]$ConfirmToken) `
+        -AllowUntrustedScriptPath ([bool]$AllowUntrustedScriptPath)
 
     if (-not $ConfirmToken) {
         Write-Warning ("-ConfirmToken not set. The RA refuses the general admin token on the " +

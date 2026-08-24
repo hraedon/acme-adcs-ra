@@ -6,7 +6,99 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Security — 2026-08-24 daybreak standard scan (four findings, all fixed)
+
+A cross-lineage standard review at `0a47955`. Two findings were re-rated here
+and one required overturning a documented earlier decision. Full write-up in
+`docs/security-review-2026-08-24-daybreak-standard.md`; the pre-action
+declaration is in `docs/UNFILED-WORK-ITEMS.md`.
+
+Every one of the four is the same shape, which is the part worth keeping: **the
+correct primitive already existed, with the correct reasoning written beside
+it, and was not pointed at every call site.** Several of the new tests are
+therefore coverage assertions rather than behaviour assertions.
+
+- **A privileged script tree was judged AFTER its siblings had already run
+  (high).** `Register-MaintenanceTasks.ps1` dot-sourced `TaskActionLib.ps1` and
+  `SyncLib.ps1` ~70 lines above the provenance gate, so both executed as
+  Administrator before anything checked the tree — and the gate was scoped to
+  the revocation-sync path, so registering only the nonce/sweep tasks skipped it
+  entirely. Writing `SyncLib.ps1` alone was enough; neutering the checker was
+  never necessary. `Sync-Revocations.ps1` (run by the scheduled task as the gMSA
+  every interval, forever), `Revoke-Cert.ps1`, `Set-OfficerRights.ps1` and
+  `Reconcile-Revocation.ps1` had no gate at all.
+
+  One `Assert-PrivilegedScriptTreeTrusted` now runs in all five, **before** any
+  sibling loads. `-AllowUntrustedScriptPath` propagates into the registered task
+  action, so the documented lab flow does not register a task that always
+  refuses.
+
+  This overturns the 2026-08-18 decision to skip the run-time re-check, and the
+  reasons matter. That decision rested on two `Add-Type` C# compiles per load on
+  a 15-minute cadence, and closed with its own condition for revisiting: *"worth
+  revisiting if the lib is ever split so the DACL primitives can be loaded on
+  their own."* Both compiles are now on demand
+  (`Initialize-AtomicDirectoryType`, `Initialize-FinalPathType`) and neither is
+  on the trust path — dot-source cost **1298 ms → 321 ms** (pwsh 7.6/Linux). The
+  objection is retired rather than overruled. The primitives were deliberately
+  *not* split into a second file: `InstallVerifyLib.ps1:1680` records what a
+  duplicated predicate cost last time.
+
+- **Nothing checked whether a parent could replace a protected root (medium;
+  reported as high).** `Get-RootProvenance` inspects the root and its contents,
+  never above it, so everything the installer proves about `$InstallDir` /
+  `$RuntimeDir` could describe a tree an attacker substituted. The installer
+  already makes this argument for the IIS site tree and applies the check there.
+
+  Rated medium because the reported impact does not reproduce on the defaults:
+  swapping a child needs `Delete`/`DeleteSubdirectoriesAndFiles`, and
+  `C:\ProgramData` grants Users create-class rights only. It bites a
+  non-default root under a delete-granting parent — the documented `C:\Temp`
+  staging habit.
+
+  The reason it had never shipped is that `Test-PathChainTrusted` **fails**
+  `C:\ProgramData`, on `WriteData` — which on a directory means *create a new
+  entry*, not *replace an existing child*. So the broad predicate would have
+  refused the default install. `Test-AceEndangersChildContainer` asks the narrow
+  question (`Delete`, `DeleteSubdirectoriesAndFiles`, `ChangePermissions`,
+  `TakeOwnership`, `GenericAll`, `GenericWrite` — and *not* `WriteData`), which
+  passes `C:\ProgramData` and `%ProgramFiles%` and still fails `C:\Temp`.
+  Default-safe by construction; the test asserting `C:\ProgramData` passes is
+  load-bearing, because a wrong refusal aborts the upgrade of a live issuance
+  host.
+
+- **A redirect handed the HEC collector token to another origin (low→medium).**
+  `urllib`'s redirect handler strips only content-length/content-type and
+  copies `Authorization` onto the new request, and permits `http`/`ftp`
+  targets — so the https-only check the sink is gated on was worth one hop.
+  Confirmed by execution against a local redirect pair. The event body does not
+  leak (the new request carries no `data=`, and 301/302/303 downgrade POST to
+  GET), so this is credential disclosure — but an HEC token forges audit *into*
+  the SIEM. The sink now refuses redirects outright.
+
+- **`$env:windir` selected executables that run elevated (medium; reported as
+  high).** `InstallVerifyLib.ps1` derived `icacls.exe` from the inherited
+  process environment with a bare-name PATH fallback, while three sibling
+  scripts and `Get-TrustedInboxModuleRoots` already refused to trust exactly
+  that input. The fallback was the sharper half — reached by *unsetting* windir
+  rather than redirecting it — and icacls is not only executed here, it
+  produces the evidence every provenance verdict is read from.
+
+  `Get-TrustedSystem32Path` resolves from machine-scope `windir` then the folder
+  API, and **throws** on Windows rather than falling back. Applied to all nine
+  installer sites as well as the library; the three test assertions that pinned
+  the old `$env:windir` spelling now pin the new one. Fixing only the library
+  would have split the doctrine across two files, which is how this class keeps
+  returning.
+
+Pester **452 passed / 0 failed** (baseline 424); pytest, ruff and mypy clean.
+Every fix mutation-proven — reverted in place, suite re-run, failure recorded.
+One vacuous test was caught and fixed in the process: rights constants declared
+in a Pester `Describe` body are `$null` inside `It` blocks, so every mask
+assertion would have passed against `[int]$null = 0`.
+
+**Not done:** no live Windows validation (Linux Pester cannot exercise real
+ACLs — WI-050), and the fix has not been independently reviewed.
 
 ## [1.11.0] — 2026-08-24
 

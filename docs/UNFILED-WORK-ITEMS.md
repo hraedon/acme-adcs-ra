@@ -54,10 +54,10 @@ down.
 | 7 | Audit retention never runs | **open** — prerequisite (item 8) now cleared; three safety gaps remain |
 | 8 | UDP probe satisfied `audit_offbox_required` | **CLOSED 2026-08-18** |
 | 9 | TCP syslog connect unbounded | **CLOSED 2026-08-18** (acme-adcs-ra); cert-watch half open, see below |
-| 10 | Sibling dot-source precedes the provenance gate | **DECLARED 2026-08-24** — in progress, see below |
-| 11 | No ancestor check on the state/runtime roots | **DECLARED 2026-08-24** — in progress, see below |
-| 12 | HEC token forwarded across redirects | **DECLARED 2026-08-24** — in progress, see below |
-| 13 | `$env:windir` selects elevated executables | **DECLARED 2026-08-24** — in progress, see below |
+| 10 | Sibling dot-source precedes the provenance gate | **CLOSED 2026-08-24** (code + tests + docs); needs filing in the store |
+| 11 | No ancestor check on the state/runtime roots | **CLOSED 2026-08-24** (code + tests + docs); needs filing in the store |
+| 12 | HEC token forwarded across redirects | **CLOSED 2026-08-24** (code + tests + docs); needs filing in the store |
+| 13 | `$env:windir` selects elevated executables | **CLOSED 2026-08-24** (code + tests + docs); needs filing in the store |
 
 Everything marked CLOSED is in the working tree on
 `security-review-2026-08-15-daybreak`, with tests, and needs no tracker entry
@@ -132,6 +132,14 @@ this reason — the control exists and is simply not pointed at this path.
 > refusing untrusted trees the remaining exposure is a DACL loosened *after*
 > registration, which needs administrator rights. Worth revisiting if the lib is
 > ever split so the DACL primitives can be loaded on their own.
+>
+> **REVISITED AND TAKEN, 2026-08-24 — see item 10.** The stated condition was
+> met: both `Add-Type` compiles are now on demand, so the library dot-sources in
+> 321 ms rather than 1298 ms and neither compile is on the trust path. The
+> second premise — "registration now refuses untrusted trees" — turned out to
+> hold only on the `$registerSync` path and only *after* two siblings had
+> already loaded, and never covered `-AllowUntrustedScriptPath` at all.
+> `Sync-Revocations.ps1` now re-checks on every run.
 >
 > **WI-015 is a different path, and it is now closed too.** That item is the
 > `-SitePath` ancestor-chain refusal for the *IIS site* tree — round 2 withheld
@@ -427,7 +435,22 @@ Independent review of the *fix* is still owed; see the closing note.
 - `scripts/Register-MaintenanceTasks.ps1`, `scripts/Sync-Revocations.ps1`,
   `scripts/Revoke-Cert.ps1`, `scripts/Set-OfficerRights.ps1`,
   `scripts/Reconcile-Revocation.ps1`
-- `scripts/lib/BootstrapTrustLib.ps1` (new)
+- ~~`scripts/lib/BootstrapTrustLib.ps1` (new)~~ — **not created.** Lazy type
+  compilation achieved the same goal (a library cheap enough to dot-source at
+  run time) with a far smaller diff, and a second file invites a second copy of
+  a predicate — see `InstallVerifyLib.ps1:1680` for what that cost last time.
+  Recorded here because the declared working set is the contract.
+
+**Two paths were touched that the declaration did not list**, both recorded
+here for the same reason:
+
+- `scripts/lib/TaskActionLib.ps1` — `Build-SyncActionCommand` had to carry
+  `-AllowUntrustedScriptPath` into the registered action. Not foreseeable until
+  the run-time gate existed: without it, the documented lab flow registers a
+  task that refuses on every run, so this is part of finding 10's fix rather
+  than scope creep.
+- `.gitignore` — `Invoke-Pester -CI` writes `testResults.xml` into the
+  invocation directory, which showed up as untracked noise on every status.
 - `src/acme_adcs_ra/siem.py`
 - `tests/pester/*.Tests.ps1`, `tests/test_siem*.py`
 - `CHANGELOG.md`, `docs/security-review-2026-08-24-daybreak-standard.md`, this file

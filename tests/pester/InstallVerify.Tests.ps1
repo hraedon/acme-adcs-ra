@@ -1376,7 +1376,7 @@ Describe 'install-windows.ps1: round-5 fixes' {
         $stage | Should -BeGreaterThan 0
         $hash | Should -BeGreaterThan $stage
         $exec | Should -BeGreaterThan $hash
-        $script:installer | Should -Match "Join-Path \`$env:windir 'System32\\msiexec\.exe'"
+        $script:installer | Should -Match "Get-TrustedSystem32Path -FileName 'msiexec\.exe'"
         $script:installer | Should -Not -Match 'Start-Process msiexec\.exe'
     }
 }
@@ -1587,7 +1587,7 @@ Describe 'install-windows.ps1: elevated native tools resolve once, at script sco
     # without -SharePort443; the lab always exercises the SNI path, so no live
     # re-proof could have found it.
     It 'netsh is one script-scope absolute path, assigned before every use' {
-        $def = $script:installer.IndexOf('$netshExe = Join-Path $env:windir')
+        $def = $script:installer.IndexOf("`$netshExe = Get-TrustedSystem32Path")
         $def | Should -BeGreaterThan 0
         @([regex]::Matches($script:installer, '\$netshExe\s*=')).Count | Should -Be 1
         $uses = @([regex]::Matches($script:installer, '&\s+\$netshExe\b'))
@@ -1602,9 +1602,13 @@ Describe 'install-windows.ps1: elevated native tools resolve once, at script sco
     }
 
     It 'the other elevated natives are still absolute System32 paths' {
-        $script:installer.IndexOf('$msiexec = Join-Path $env:windir ') | Should -BeGreaterThan 0
-        $script:installer.IndexOf('$secedit = Join-Path $env:windir ') | Should -BeGreaterThan 0
-        $script:installer.IndexOf('$cmdExe = Join-Path $env:windir ') | Should -BeGreaterThan 0
+        $script:installer.IndexOf("`$msiexec = Get-TrustedSystem32Path ") | Should -BeGreaterThan 0
+        $script:installer.IndexOf("`$secedit = Get-TrustedSystem32Path ") | Should -BeGreaterThan 0
+        $script:installer.IndexOf("`$cmdExe = Get-TrustedSystem32Path ") | Should -BeGreaterThan 0
+        # 2026-08-24 F13: and NOTHING elevated resolves through the inherited
+        # process environment any more. This is the assertion that used to pin
+        # the opposite spelling.
+        $script:installer | Should -Not -Match '\$env:windir'
         # nothing elevated is invoked by bare name
         $script:installer | Should -Not -Match '&\s+(msiexec|secedit|netsh|icacls|attrib)\b'
     }
@@ -3359,7 +3363,13 @@ Describe 'install-windows.ps1: trusted inbox cmdlet gates (2026-08-23 finding 5)
     }
 
     It 'Test-HttpPlatformHandler keeps the DLL fallback when the cmdlet is unavailable' {
-        $script:installer | Should -Match 'System32\\inetsrv\\httpPlatformHandler\.dll'
+        # The 'System32\' prefix moved INTO Get-TrustedSystem32Path (2026-08-24
+        # F13), so the literal no longer appears here. Assert the resolved
+        # spelling rather than relaxing the match: the point of this test is
+        # that the fallback still probes a fixed absolute path and not a
+        # relative or PATH-resolved one, and the trusted resolver is a stronger
+        # version of that property, not a weaker one.
+        $script:installer | Should -Match "Get-TrustedSystem32Path -FileName 'inetsrv\\httpPlatformHandler\.dll'"
     }
 
     It 'the ServerManager feature loop calls the resolved trusted commands' {
@@ -3384,5 +3394,418 @@ Describe 'install-windows.ps1: trusted inbox cmdlet gates (2026-08-23 finding 5)
     It '-ConfigureIIS imports WebAdministration from the trusted inbox root, not by name' {
         $script:installer | Should -Match "Import-TrustedInboxModule -ModuleName 'WebAdministration'"
         $script:installer | Should -Not -Match 'Import-Module WebAdministration\r?\n'
+    }
+}
+
+# --- 2026-08-24 F13: elevated programs do not resolve through the process env -
+Describe 'Get-TrustedSystem32Path: the process environment is not the trust anchor' {
+    BeforeAll {
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+        $script:libIsWindows = [bool]$script:InstallVerifyIsWindows
+    }
+
+    It 'never derives a System32 path from the inherited process windir' {
+        # The whole finding. A redirected windir used to select the icacls that
+        # both RUNS elevated and PRODUCES the evidence every provenance verdict
+        # is read from.
+        $prev = $env:windir
+        $env:windir = 'Q:\FakeWindir'
+        try {
+            if ($script:libIsWindows) {
+                (Get-TrustedSystem32Path -FileName 'icacls.exe') | Should -Not -Match 'Q:\\FakeWindir'
+            } else {
+                # Off Windows there is no System32; the bare name is returned and
+                # is unrunnable. What matters is that windir did not reach it.
+                (Get-TrustedSystem32Path -FileName 'icacls.exe') | Should -Be 'icacls.exe'
+            }
+        } finally {
+            $env:windir = $prev
+        }
+    }
+
+    It 'the function body contains no process-environment read' {
+        $start = $script:lib.IndexOf('function Get-TrustedSystem32Path')
+        $start | Should -BeGreaterThan 0
+        $end = $script:lib.IndexOf("`nfunction ", $start + 10)
+        $end | Should -BeGreaterThan $start
+        $body = $script:lib.Substring($start, $end - $start)
+        $body | Should -Not -Match '\$env:windir'
+        $body | Should -Not -Match '\$env:SystemRoot'
+    }
+
+    It 'has no bare-name fallback on Windows -- it throws instead' {
+        # The sharper half of the finding, and the one the report did not name:
+        # the old code fell back to 'icacls.exe' whenever windir was UNSET,
+        # which is PATH resolution reached by a lower bar than redirection.
+        $start = $script:lib.IndexOf('function Get-TrustedSystem32Path')
+        $end = $script:lib.IndexOf("`nfunction ", $start + 10)
+        $body = $script:lib.Substring($start, $end - $start)
+        $body | Should -Match 'throw'
+        # The only bare return is the explicit non-Windows one.
+        @([regex]::Matches($body, 'return \$FileName')).Count | Should -Be 1
+    }
+
+    It 'on Windows resolves to an absolute path under the machine-scope windir' {
+        if ($script:libIsWindows) {
+            $resolved = Get-TrustedSystem32Path -FileName 'icacls.exe'
+            $resolved | Should -Match '^[A-Za-z]:\\'
+            $resolved | Should -Match 'System32\\icacls\.exe$'
+        } else {
+            (Get-TrustedSystem32Path -FileName 'icacls.exe') | Should -Be 'icacls.exe'
+        }
+    }
+
+    It 'the shipped library no longer reads windir in executable code' {
+        # Comment prose still NAMES $env:windir -- three separate comments
+        # explain why it is not trusted, and deleting that reasoning to satisfy
+        # a regex would be the wrong trade. Strip comments, then assert.
+        $code = ($script:lib -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        $code | Should -Not -Match '\$env:windir'
+    }
+}
+
+# --- 2026-08-24 F11: an ancestor that can substitute the root ------------------
+Describe 'Test-AceEndangersChildContainer (F11: replace-the-child, not rewrite-the-bytes)' {
+    # Rights values as .NET reports them, so the test speaks the same language
+    # as Get-Acl rather than icacls shorthand.
+    #
+    # BeforeAll, not the Describe body: Pester 5 runs the body during DISCOVERY
+    # and the It blocks during RUN, in different scopes, so a body-scoped $FR is
+    # $null by the time an It reads it -- [int]$null is 0, every mask test
+    # passes vacuously, and the suite goes green while asserting nothing. Caught
+    # here only because these tests were written to fail first.
+    BeforeAll {
+        $script:FR = [System.Security.AccessControl.FileSystemRights]
+        $script:CI = [int][System.Security.AccessControl.InheritanceFlags]::ContainerInherit
+        $script:OI = [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $script:IO = [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
+    }
+
+    It 'PASSES the C:\ProgramData shape -- create-only rights cannot swap a child' {
+        # This single case is why the broad predicate could not be used here and
+        # why the SitePath refusal never reached the state root. Users on
+        # C:\ProgramData hold (CI)(WD,AD,WEA,WA): create a new entry, touch
+        # nothing that exists. If this test ever goes red the default install
+        # starts refusing itself.
+        $rights = [int]($FR::WriteData -bor $FR::AppendData -bor
+                        $FR::WriteExtendedAttributes -bor $FR::WriteAttributes)
+        Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights $rights `
+            -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0 | Should -BeFalse
+    }
+
+    It 'PASSES the %ProgramFiles% shape (read + execute)' {
+        $rights = [int]($FR::ReadAndExecute)
+        Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights $rights `
+            -AceType 'Allow' -InheritanceFlags ($CI -bor $OI) -PropagationFlags 0 | Should -BeFalse
+    }
+
+    It 'FAILS the C:\Temp shape -- Modify carries Delete' {
+        # An admin-created top-level folder inherits Authenticated Users
+        # (OI)(CI) Modify from C:\, so any authenticated user can rename its
+        # children aside. This is the documented lab staging path.
+        $rights = [int]$FR::Modify
+        Test-AceEndangersChildContainer -Identity 'NT AUTHORITY\Authenticated Users' `
+            -Rights $rights -AceType 'Allow' -InheritanceFlags ($CI -bor $OI) `
+            -PropagationFlags 0 | Should -BeTrue
+    }
+
+    It 'FAILS DeleteSubdirectoriesAndFiles on its own' {
+        Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' `
+            -Rights ([int]$FR::DeleteSubdirectoriesAndFiles) -AceType 'Allow' `
+            -InheritanceFlags $CI -PropagationFlags 0 | Should -BeTrue
+    }
+
+    It 'FAILS TakeOwnership and ChangePermissions -- both reach every other right' {
+        foreach ($r in @($FR::TakeOwnership, $FR::ChangePermissions)) {
+            Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights ([int]$r) `
+                -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0 | Should -BeTrue
+        }
+    }
+
+    It 'ignores INHERIT_ONLY ACEs -- they do not apply to this object' {
+        Test-AceEndangersChildContainer -Identity 'NT AUTHORITY\Authenticated Users' `
+            -Rights ([int]$FR::Modify) -AceType 'Allow' `
+            -InheritanceFlags ($CI -bor $OI) -PropagationFlags $IO | Should -BeFalse
+    }
+
+    It 'ignores Deny ACEs' {
+        Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights ([int]$FR::Delete) `
+            -AceType 'Deny' -InheritanceFlags $CI -PropagationFlags 0 | Should -BeFalse
+    }
+
+    It 'allows the administrator trustees' {
+        foreach ($sid in @('S-1-5-32-544', 'S-1-5-18')) {
+            Test-AceEndangersChildContainer -Identity $sid -Rights ([int]$FR::Delete) `
+                -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0 `
+                -AllowedWriterSids @('S-1-5-32-544', 'S-1-5-18') | Should -BeFalse
+        }
+    }
+
+    It 'fails closed on an identity that cannot be resolved to a SID' {
+        Test-AceEndangersChildContainer -Identity 'NO-SUCH-DOMAIN\ghost' `
+            -Rights ([int]$FR::Delete) -AceType 'Allow' -InheritanceFlags $CI `
+            -PropagationFlags 0 | Should -BeTrue
+    }
+
+    It 'is strictly narrower than the byte predicate on the create-only shape' {
+        # The two predicates must DISAGREE here, or the new one is pointless:
+        # this is exactly the ACE that blocked the refusal from shipping.
+        $rights = [int]($FR::WriteData -bor $FR::AppendData)
+        $bytes = Test-AceEndangersBytes -Identity 'BUILTIN\Users' -Rights $rights `
+            -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0 -IsDirectory $true
+        $container = Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights $rights `
+            -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0
+        $bytes | Should -BeTrue
+        $container | Should -BeFalse
+    }
+}
+
+Describe 'install-windows.ps1: the root claim checks what is ABOVE the root (F11)' {
+    BeforeAll {
+        $script:installer = Get-Content -Raw "$PSScriptRoot/../../scripts/install-windows.ps1"
+    }
+
+    It 'refuses before Get-RootProvenance, so a substitutable parent is the only violation' {
+        $check = $script:installer.IndexOf('Get-AncestorSubstitutionViolations -Path $Path')
+        $prov = $script:installer.IndexOf('$prov = Get-RootProvenance -Path $Path')
+        $check | Should -BeGreaterThan 0
+        $prov | Should -BeGreaterThan $check
+    }
+
+    It 'applies to BOTH the runtime and the state root, not just the site tree' {
+        # One call inside Initialize-SecuredRoot covers both, because both roots
+        # are claimed through it. Assert the claim sites still route that way.
+        $script:installer | Should -Match 'Initialize-SecuredRoot -Path \$RuntimeDir'
+        $script:installer | Should -Match 'Initialize-SecuredRoot -Path \$InstallDir'
+        @([regex]::Matches($script:installer, 'Get-AncestorSubstitutionViolations')).Count |
+            Should -BeGreaterOrEqual 1
+    }
+}
+
+# --- 2026-08-24 F10: provenance before siblings -------------------------------
+Describe 'Privileged entry points prove the tree BEFORE loading siblings (F10)' {
+    BeforeAll {
+        $script:scriptsDir = "$PSScriptRoot/../../scripts"
+    }
+
+    # Every privileged entry point, and for each the sibling it used to load
+    # unguarded. install-windows.ps1 is excluded on purpose: it has its own
+    # inline bootstrap that predates and exceeds this gate.
+    $cases = @(
+        @{ Script = 'Register-MaintenanceTasks.ps1'; Sibling = 'lib/TaskActionLib.ps1' }
+        @{ Script = 'Register-MaintenanceTasks.ps1'; Sibling = 'lib/SyncLib.ps1' }
+        @{ Script = 'Sync-Revocations.ps1';          Sibling = 'lib/SyncLib.ps1' }
+        @{ Script = 'Revoke-Cert.ps1';               Sibling = 'lib/RevocationLib.ps1' }
+        @{ Script = 'Set-OfficerRights.ps1';         Sibling = 'lib/OfficerRightsLib.ps1' }
+    )
+
+    It '<Script> gates before dot-sourcing <Sibling>' -ForEach $cases {
+        $text = Get-Content -Raw "$PSScriptRoot/../../scripts/$Script"
+        $gate = $text.IndexOf('Assert-PrivilegedScriptTreeTrusted')
+        $load = $text.IndexOf(". `"`$PSScriptRoot/$Sibling`"")
+        $gate | Should -BeGreaterThan 0 -Because "$Script must gate its tree"
+        $load | Should -BeGreaterThan 0 -Because "the $Sibling load site must be findable"
+        $gate | Should -BeLessThan $load -Because "the gate is worthless after the load"
+    }
+
+    It 'Reconcile-Revocation.ps1 gates its own tree, not only the interpreter' {
+        $text = Get-Content -Raw "$PSScriptRoot/../../scripts/Reconcile-Revocation.ps1"
+        $text | Should -Match 'Assert-PrivilegedScriptTreeTrusted'
+    }
+
+    It 'the registrar gate is NOT scoped to the revocation-sync path' {
+        # It used to live inside `if ($registerSync)`, so registering only the
+        # nonce/sweep tasks skipped it entirely while still loading two siblings.
+        $text = Get-Content -Raw "$PSScriptRoot/../../scripts/Register-MaintenanceTasks.ps1"
+        $gate = $text.IndexOf('Assert-PrivilegedScriptTreeTrusted')
+        $scoped = $text.IndexOf('if ($registerSync')
+        $gate | Should -BeGreaterThan 0
+        $scoped | Should -BeGreaterThan $gate -Because 'the gate must precede any registerSync scoping'
+    }
+
+    It 'the lab override reaches the registered action, or the task cannot run' {
+        # Sync-Revocations now refuses an untrusted tree at RUN time. A task
+        # registered with -AllowUntrustedScriptPath must carry the flag into the
+        # action, or the documented lab flow registers a task that always fails.
+        $lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/TaskActionLib.ps1"
+        $lib | Should -Match '\$untrustedFlag'
+        $reg = Get-Content -Raw "$PSScriptRoot/../../scripts/Register-MaintenanceTasks.ps1"
+        $reg | Should -Match '-AllowUntrustedScriptPath \(\[bool\]\$AllowUntrustedScriptPath\)'
+    }
+}
+
+Describe 'The trust library is cheap to dot-source (F10 precondition)' {
+    BeforeAll {
+        $script:lib = Get-Content -Raw "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1"
+    }
+
+    # The 2026-08-18 round declined a run-time tree check because loading this
+    # library cost two Add-Type C# compiles on a 15-minute cadence, and named
+    # the split as the condition for revisiting. These tests are what keep that
+    # condition true: a top-level Add-Type reintroduced here silently restores
+    # the cost that justified leaving the gMSA path ungated.
+    It 'compiles no types at dot-source time' {
+        $probe = pwsh -NoProfile -Command @"
+. '$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1'
+Write-Output ([bool]('ACMERA.AtomicDirectory' -as [type]))
+Write-Output ([bool]('ACMERA.FinalPath' -as [type]))
+"@
+        @($probe)[0].Trim() | Should -Be 'False'
+        @($probe)[1].Trim() | Should -Be 'False'
+    }
+
+    It 'has no Add-Type outside an Initialize-*Type function' {
+        # Both compiles must stay behind an explicit initialiser.
+        foreach ($m in [regex]::Matches($script:lib, '(?m)^\s*Add-Type')) {
+            $before = $script:lib.Substring(0, $m.Index)
+            $lastFunc = $before.LastIndexOf("`nfunction ")
+            $lastFunc | Should -BeGreaterThan 0
+            $name = $script:lib.Substring($lastFunc + 10, 40)
+            $name | Should -Match '^Initialize-\w+Type'
+        }
+    }
+
+    It 'both initialisers are called by the functions that need the types' {
+        $script:lib | Should -Match 'Initialize-AtomicDirectoryType'
+        $script:lib | Should -Match 'Initialize-FinalPathType'
+        # and each is idempotent -- a guard clause, not a recompile per call
+        $script:lib | Should -Match "if \('ACMERA\.AtomicDirectory' -as \[type\]\) \{ return \}"
+        $script:lib | Should -Match "if \('ACMERA\.FinalPath' -as \[type\]\) \{ return \}"
+    }
+}
+
+Describe 'Assert-PrivilegedScriptTreeTrusted actually refuses (F10, behavioural)' {
+    # The ordering tests above are TEXTUAL -- they prove the gate is CALLED
+    # before the sibling loads, not that calling it does anything. A gate that
+    # returned unconditionally would pass every one of them.
+    #
+    # Two traps were hit writing this, both worth the comment:
+    #
+    #  1. Driving the platform by assigning $script:InstallVerifyIsWindows from
+    #     an It block does not work -- Pester writes a different scope from the
+    #     one the function resolves, so the Windows branch silently never ran
+    #     and the test reported "no exception thrown" against a working gate.
+    #     Hence the -IsWindowsHost parameter, which matches this library's
+    #     stated design of decision logic taking plain values.
+    #  2. This file installs `function global:Get-Acl` stubs in several
+    #     Describes and at least one outlives its block, so a later Describe
+    #     inherits whatever the last stub returned. Relying on Get-Acl being
+    #     ABSENT off Windows is therefore not reliable here. Each case installs
+    #     its own, which is better anyway: the refusal is driven by a specific
+    #     bad ACL rather than by a missing cmdlet, so these exercise the VERDICT
+    #     and not just the error path.
+    BeforeAll {
+        $script:probeRoot = "$PSScriptRoot/../../scripts"
+    }
+    AfterAll {
+        Remove-Item function:global:Get-Acl -ErrorAction SilentlyContinue
+    }
+
+    It 'returns without refusing off Windows, where there are no such ACLs' {
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            [pscustomobject]@{
+                Owner  = 'BUILTIN\Users'
+                Access = @([pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'BUILTIN\Users' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = [System.Security.AccessControl.InheritanceFlags]::None
+                    PropagationFlags  = [System.Security.AccessControl.PropagationFlags]::None
+                })
+            }
+        }
+        # Same hostile ACL as the refusal case; only the platform differs.
+        { Assert-PrivilegedScriptTreeTrusted -Root $script:probeRoot `
+                -Purpose 'probe' -IsWindowsHost $false } | Should -Not -Throw
+    }
+
+    It 'THROWS on a tree a non-administrator can rewrite' {
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            [pscustomobject]@{
+                Owner  = 'BUILTIN\Users'
+                Access = @([pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'BUILTIN\Users' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = [System.Security.AccessControl.InheritanceFlags]::None
+                    PropagationFlags  = [System.Security.AccessControl.PropagationFlags]::None
+                })
+            }
+        }
+        { Assert-PrivilegedScriptTreeTrusted -Root $script:probeRoot `
+                -Purpose 'probe' -IsWindowsHost $true } | Should -Throw
+    }
+
+    It 'PASSES a tree only administrators can write -- the gate is not always-refuse' {
+        # The other half of "not inert": a gate that always threw would satisfy
+        # the test above and be unusable in production.
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            [pscustomobject]@{
+                Owner  = 'S-1-5-32-544'
+                Access = @([pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'S-1-5-32-544' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = [System.Security.AccessControl.InheritanceFlags]::None
+                    PropagationFlags  = [System.Security.AccessControl.PropagationFlags]::None
+                })
+            }
+        }
+        { Assert-PrivilegedScriptTreeTrusted -Root $script:probeRoot `
+                -Purpose 'probe' -IsWindowsHost $true } | Should -Not -Throw
+    }
+
+    It 'downgrades to a warning under the override, so the lab flow survives' {
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            [pscustomobject]@{
+                Owner  = 'BUILTIN\Users'
+                Access = @([pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'BUILTIN\Users' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = [System.Security.AccessControl.InheritanceFlags]::None
+                    PropagationFlags  = [System.Security.AccessControl.PropagationFlags]::None
+                })
+            }
+        }
+        { Assert-PrivilegedScriptTreeTrusted -Root $script:probeRoot `
+                -Purpose 'probe' -IsWindowsHost $true -AllowUntrusted `
+                -WarningAction SilentlyContinue } | Should -Not -Throw
+    }
+
+    It 'gives run-time advice with -RunTime and registration advice without it' {
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            [pscustomobject]@{
+                Owner  = 'BUILTIN\Users'
+                Access = @([pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = 'BUILTIN\Users' }
+                    FileSystemRights  = [System.Security.AccessControl.FileSystemRights]::FullControl
+                    AccessControlType = 'Allow'
+                    InheritanceFlags  = [System.Security.AccessControl.InheritanceFlags]::None
+                    PropagationFlags  = [System.Security.AccessControl.PropagationFlags]::None
+                })
+            }
+        }
+        $runTimeMsg = ''
+        try {
+            Assert-PrivilegedScriptTreeTrusted -Root $script:probeRoot `
+                -Purpose 'the revocation-sync task' -IsWindowsHost $true -RunTime
+        } catch { $runTimeMsg = "$_" }
+        $runTimeMsg | Should -Match 'the revocation-sync task'
+        $runTimeMsg | Should -Match 're-register the task'
+        $runTimeMsg | Should -Not -Match 'Copy scripts'
+
+        $registerMsg = ''
+        try {
+            Assert-PrivilegedScriptTreeTrusted -Root $script:probeRoot `
+                -Purpose 'the maintenance-task registrar' -IsWindowsHost $true
+        } catch { $registerMsg = "$_" }
+        $registerMsg | Should -Match 'Copy scripts'
+        $registerMsg | Should -Not -Match 're-register the task'
     }
 }
