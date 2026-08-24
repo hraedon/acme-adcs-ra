@@ -11,38 +11,71 @@ honest: check a box only when the thing is actually true, not when it's planned.
 
 ## A. Code / artifact integrity (engineering)
 
+> **Engineering status at v1.10.0 (2026-08-24).** The three boxes below are
+> satisfied for the released artifact; they stay unticked because they are
+> *per-deployment* gates — whoever deploys the pilot re-checks them against the
+> commit they actually ship. Read the caveat on the third one.
+
 - [ ] **Working tree committed.** Never deploy issuance infra from an uncommitted
       tree — it breaks the provenance story the tool exists to provide.
+      *(v1.10.0: `main` clean and tagged at `229574d`.)*
 - [ ] **CI green on the deployed commit.** Linux gates (ruff, mypy --strict,
       pytest, pip-audit) pass on the exact commit being deployed, on a remote
       runner — not just locally. See `.github/workflows/ci.yml`.
+      *(v1.10.0: all six jobs green on `59fba73` — the 3.12/3.13/3.14 matrix,
+      both Pester engines including Windows PowerShell 5.1, pip-audit and the
+      identifier gate — on both the push and `pull_request` runs. This gate
+      earned its place on the first push of the series: a test that passed on
+      the 3.12 dev venv failed on 3.13/3.14, the versions the lab host and the
+      shipped deployment actually run.)*
 - [ ] **Live re-issue against current `main`.** The post-WI-001..005 finalize
       decomposition and CAS-guarded transitions landed *after* the 2026-06-20
       live proof and are validated by unit tests only. Re-run a real end-to-end
       issue on the lab against the current commit before pilot. **The proven
       artifact and the shipped artifact must be the same commit.**
+      *(v1.10.0 caveat, stated rather than glossed: the live proof ran on
+      `f6badc9`; the tag is `59fba73`. The delta is the version string plus
+      documentation — no `src/` or `scripts/` change — so it is not the same
+      commit and this box is not claimed. A pilot deployer who wants the
+      literal guarantee should re-run §A issuance against the tag.)*
 - [ ] **Live-only checks accumulated by the scan series.** Each of these is
       unit-tested as far as it can be on a Linux dev host and genuinely unproven
       against a real CA/host. They are cheap to fold into the next live
       re-proof, and two of them decide whether a *revocation* proceeds:
-  - [ ] **`Test-SerialRevokedAtCa` (2026-08-17 F4).** `certutil -view -restrict
+  - [x] **`Test-SerialRevokedAtCa` (2026-08-17 F4) — PROVEN LIVE 2026-08-17.**
+        A disposition-21/reason-8 row was correctly detected and the
+        both-20-and-21 self-check did not fire. Original text follows.
+        **`Test-SerialRevokedAtCa` (2026-08-17 F4).** `certutil -view -restrict
         "SerialNumber=<s>,Disposition=21"` is assumed to select only revoked
         rows. Confirm against the lab CA that a revoked serial matches and an
         issued one does not — and that the self-check (serial appearing under
         both 20 and 21) does not fire. Fails safe either way, so a mismatch
         means "no worse than before", not "broken".
-  - [ ] **End-to-end confirmation retry (2026-08-17 F4).** Revoke at the CA,
+  - [x] **End-to-end confirmation retry (2026-08-17 F4) — PROVEN LIVE, twice
+        on 2026-08-23.** Admin-token-only revoked at the CA but was refused on
+        the confirm endpoint (exit 2); confirm-token-only then recovered the
+        already-revoked row and drained the queue (exit 0). Original text
+        follows.
+        **End-to-end confirmation retry (2026-08-17 F4).** Revoke at the CA,
         make the RA callback fail (block it / stop the pool), then re-run
         `Sync-Revocations.ps1 -Execute` and confirm it reports
         `already-revoked-at-CA`, reaches the confirm POST, and drains the
         pending set. This is the whole point of exit 6, and only a live run
         exercises the wiring.
-  - [ ] **Installer MSI verification (2026-08-17 F1).** With a real
+  - [ ] **Installer MSI verification (2026-08-17 F1) — STILL OWED.** Pester-proven
+        and source-ordered, never live-executed: the lab host has the handler
+        installed and its DLL fallback short-circuits the MSI path, so forcing
+        it would mean hiding a production DLL. The one native case still owed
+        after five live rounds. With a real
         HttpPlatformHandler MSI: correct `-HttpPlatformHandlerSha256` installs;
         a wrong digest aborts before `msiexec`; an `http://` URL is refused.
         The decision functions are unit-tested, the `Get-FileHash` /
         `Get-AuthenticodeSignature` calls around them are not.
-  - [ ] **POST-as-GET-only RA (2026-08-15 F4).** Plain `GET /acme/cert/{id}`
+  - [x] **POST-as-GET-only RA (2026-08-15 F4) — 405s PROVEN LIVE 2026-08-23**
+        (§G 5/5, and again in the 9-check CRL/POST-as-GET pass). **The Certify
+        the Web renewal half is still owed** — that is a client-compatibility
+        check no lab phase covers. Original text follows.
+        **POST-as-GET-only RA (2026-08-15 F4).** Plain `GET /acme/cert/{id}`
         and `/acme/authz/{id}` now return 405. Prove Certify the Web renews
         against it; any breakage is a CtW bug to file, not a reason to restore
         the forms.
