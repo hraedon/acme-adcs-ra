@@ -267,11 +267,14 @@ collision branch of the TOCTOU fix is the one thing not live-proven (it is
 reachable only by a genuinely won race). The lab host now runs `102a1f4`'s
 runtime, `/directory` 200, store unchanged.
 
-**Released: v1.9.1 (2026-08-14), live-proven on `bef2022` — two external
-security reviews.** There is **no 1.9.0 release**: that line shipped only as
-`rc1`/`rc2`, and the re-proof that gates a tag found a red lint gate on the rc2
-tip and a `Set-OfficerRights.ps1` defect on the first-provisioning path, so the
-fixed build ships as 1.9.1. The
+**Released: v1.10.0 (2026-08-24).** There is **no 1.9.0 or 1.9.1 release**: the
+1.9 line was written up and `pyproject.toml` declared `1.9.1`, but no tag was
+ever cut — 1.9.0 shipped only as `rc1`/`rc2` (the re-proof that gates a tag
+found a red lint gate on the rc2 tip and a `Set-OfficerRights.ps1` defect on the
+first-provisioning path), and the 2026-08-15 → 2026-08-23 review series kept
+finding work. The tagged history goes v1.8.0 → v1.10.0; the minor bump is
+earned by a breaking change to `Sync-Revocations.ps1` (`-AdminToken` and
+`-ConfirmToken` became switches, so token values can no longer reach argv). The
 2026-08-14 scan of rc1 found seventeen further findings, two blocking: ACME
 **reason 8 (removeFromCRL) was accepted and reached `certutil`**, so a revokeCert
 carrying it recorded a successful revocation while asking the CA to *un-revoke*

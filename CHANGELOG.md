@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.10.0] — 2026-08-24
+
+Closes the 2026-08-15 → 2026-08-23 security review series (three external review
+rounds, 40 commits) plus the phase-L lease proof. **Breaking:**
+`Sync-Revocations.ps1` `-AdminToken` and `-ConfirmToken` are now switches —
+token values are read only from `ACME_ADMIN_TOKEN` / `ACME_CONFIRM_TOKEN` and
+can no longer be passed on argv. That is the minor bump.
+
+**There is no 1.9.0 or 1.9.1 release.** `pyproject.toml` declared `1.9.1` and
+the section below was written, but no tag was ever cut; the tagged history goes
+v1.8.0 → v1.10.0. Anyone still on **v1.8.0 should upgrade**: it predates
+`838eeb2`, which fixed a defect that left the entire CA-side revocation loop
+inert.
+
+**Known limitation, deliberate:** `audit_prune_enabled=true` is refused, so
+cumulative local `audit_log` growth is **not** bounded. Disk monitoring and
+archival are operator duties. See the audit-pruning entry below and
+`docs/operations.md`.
+
+### Validated — the stale-worker enrollment lease, proven live (2026-08-24)
+
+Phase L ran end to end for the first time on tip `f6badc9`: §L 9/9, §Lqueue 8/8,
+§Ldrain 5/5. The stale worker reached the CA boundary holding a lapsed
+generation and abandoned **before submit**, leaving exactly one certificate for
+the contested order. It had been unrunnable rather than skipped — no driver
+invoked it, neither blackhole mechanism supported queue-then-drain, and the
+phase aborted on a client timeout the bounded enrollment executor makes
+inevitable. Detail in `docs/pre-pilot-checklist.md`.
+
 ### Fixed — the CRL hostname-verification test was inert on 3.13 and 3.14 (2026-08-24)
 
 `test_https_pin_preserves_sni_and_real_hostname_verification` built its test CA
@@ -1159,6 +1190,10 @@ including the one finding whose stated DoS impact did not survive measurement.
 
 ## [1.9.1] — 2026-08-14
 
+> **NEVER TAGGED — superseded by 1.10.0 (recorded 2026-08-24).** This section
+> describes work that shipped, but under the `v1.10.0` tag; no `v1.9.1` tag
+> exists or will be created. Original note follows.
+>
 > **NOT YET TAGGED (recorded 2026-08-19).** `pyproject.toml` declares `1.9.1`
 > and this section is written, but no `v1.9.1` (or `v1.9.0`) tag or GitHub
 > release exists: the newest release is **v1.8.0**, with `v1.9.0-rc1` and

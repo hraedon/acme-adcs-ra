@@ -364,9 +364,16 @@ items 4 and 3 above.
   never been executed**~~ — **DONE 2026-08-17** on tip `e7c4254`. All three ran
   live and passed, after the run found and fixed the defect that made the whole
   revocation loop inert (`838eeb2`). See the validation log in
-  `docs/pre-pilot-checklist.md`. What remains unproven is **phase L**
-  (`Lqueue`/`Ldrain`, the stale-worker enrollment lease) — not attempted this
-  session, now outstanding after three.
+  `docs/pre-pilot-checklist.md`.
+- ~~**Phase L** (`Lqueue`/`Ldrain`, the stale-worker enrollment lease)~~ —
+  **DONE 2026-08-24** on tip `f6badc9`, 22/22. It had not been skipped: no
+  driver invoked it, neither blackhole mechanism could support queue-then-drain
+  (the firewall rule does not block on this host and hardcoded a CA address that
+  had moved; config mode needs a recycle that kills the queue), and `L5` aborted
+  the phase on a client timeout that the bounded enrollment executor makes
+  inevitable. All three fixed; `Ldrain` proved the stale worker abandons
+  `before-submit` on a lapsed generation with exactly one certificate for the
+  contested order.
 - ~~**`01417b5`** (98-line Windows PowerShell 5.1 fix to `InstallVerifyLib.ps1`)
   has never been live-installed~~ — **DONE 2026-08-17**: the installer ran from
   `e7c4254` on the lab host and exited 0. Note it also *refused* a `C:\Temp`

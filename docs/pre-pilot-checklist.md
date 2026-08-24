@@ -177,6 +177,94 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **Phase L (the stale-worker enrollment lease) PROVEN END TO END for the first
+  time — 2026-08-24, tip `f6badc9`, on the lab RA host and issuing CA.**
+  22/22: §L 9/9, §Lqueue 8/8, §Ldrain 5/5. CI green on all six jobs for the
+  proven commit before deploy; installer exited 0 against the host's real
+  Python 3.14, IIS, ServerManager and ActiveDirectory.
+
+  **`Ldrain` is the half that had never run in three sessions**, and it is the
+  one that matters: the stale worker reached the CA boundary still holding
+  generation 1, found generation 2, and abandoned **before submit** —
+  `{"reason": "processing-lease-lapsed", "stage": "before-submit",
+  "held_generation": 1, "current_generation": 2}`. Exactly one certificate
+  exists for the contested order, and no order anywhere has two. That is the
+  double-issuance defence working against a real CA rather than a test double.
+
+  **Why it had never run, finally diagnosed.** Not neglect — the phase was
+  unrunnable, for three separate reasons that each had to be fixed:
+
+  1. **No driver called it.** `final-pass.sh` runs §A through the CRL cycle and
+     never invokes `L`, `Lqueue` or `Ldrain`. The phases existed in
+     `raproof.py`; nothing executed them. Added `lab-harness/lease-pass.sh`.
+  2. **Neither blackhole mechanism could support queue-then-drain.** The
+     outbound firewall rule **does not block on this host** — measured at 14ms
+     to connect with the rule present, enabled and carrying the CA's correct
+     address. It had also hardcoded the CA's address, and the CA had since moved;
+     its own CONNECT-PROBE dialled the same stale constant, hung, and reported
+     the inert rule as *working*. (Addresses stay in the gitignored harness.) The config-mode blackhole
+     (`ACME_RA_ADCS_HOST`) does saturate, but lifting it needs an app-pool
+     recycle that **kills the queued enrollments**, leaving nothing to drain —
+     measured as 47 orders wedged in `processing`, zero abandon rows, unchanged
+     across a full 420s wait. Added `lab-harness/bh-route.ps1`: a host route via
+     a verified-unreachable next hop, which drops silently *and* lifts without
+     touching the app pool.
+  3. **`L5` aborted the phase on an expected client timeout.** The re-finalize
+     is admitted and then waits for an enrollment worker; with the 2026-08-23
+     bounded executor no worker frees until an in-flight enrollment burns its
+     120s ceiling, so the wait exceeds any sane client timeout **by design**.
+     The exception escaped before `save_state`, which is why `Ldrain` then had
+     no target and `Ld2`–`Ld4` never executed at all. It now reads the committed
+     result from the store.
+
+  **Two harness checks were measuring the wrong thing and are fixed:**
+
+  - **`L4a` hardcoded `ca_sockets >= 40`**, encoding the old architecture where
+    enrollment ran on Starlette's shared ~40-thread pool. The 2026-08-23
+    final-scan fix gave enrollment its own bounded executor
+    (`adcs_enrollment_max_workers`, **default 4**) precisely so a stalled CA
+    cannot consume the whole server — so the check reported the security fix
+    working as a FAIL. It now reads the ceiling from the deployment, the same
+    rule §K already follows.
+  - **`L1c` read its "pre-existing orders" baseline from the newest backup**,
+    which is only a pre-migration snapshot on the single run where the migration
+    landed. Every run since backs up a store that already has the column and
+    already holds legitimately-leased orders, so "must still be 0" failed on
+    correct behaviour. It now branches on the backup's schema: upgrade
+    assertion when the backup is genuinely pre-migration, generation *stability*
+    otherwise. Measured this run: 38 pre-existing orders, **zero** changed.
+
+  **One self-inflicted failure worth recording**, because the harness reported
+  it misleadingly: lifting the config blackhole with `setenv -Remove` does not
+  restore the real CA. An absent `ACME_RA_ADCS_HOST` falls back to the shipped
+  documentation placeholder `ca01.work-domain.local`, which does not resolve —
+  every enrollment then died with `NameResolutionError` and finalize answered
+  **503**, which reads exactly like a product fault. `show-floor.ps1` printed
+  `ADCS_HOST=ABSENT (real CA)`, actively asserting the wrong thing. Both fixed;
+  absent is not a synonym for correct.
+
+  **Operational property measured, not previously recorded.** With the bounded
+  executor's defaults (`max_workers=4`, `max_pending=32`,
+  `total_timeout=120s`), an *admitted* enrollment behind a stalled CA can wait
+  roughly `(32/4) x 120s` — about 16 minutes — before it starts. Requests past
+  the ceiling are shed promptly; admitted ones are not cancelled, deliberately,
+  because abandoning a worker after CA issuance would skip the durable
+  completion or quarantine step. Clients see a long hang rather than a fast
+  failure, and should be given timeouts and retry accordingly.
+
+  **Teardown verified, not assumed.** The session caused the CA to issue **47**
+  certificates (the drained queue issued far more than the harness's own state
+  file tracked, which is why the ledger is generated by diffing the backup's
+  serials against the live store rather than hardcoded). All 47 revoked at the
+  CA, 0 failed, CRL republished, and first/middle/last spot-checked as
+  disposition 21. The four `finalize-enrollment-transport-orphan` rows were
+  confirmed to **predate** this session (audit ids 114-171 against a backup
+  maximum of 656) and belong to an earlier round's ledger. Store restored with
+  `integrity=ok` and all eight table counts identical to the pre-run
+  fingerprint; app pool `Started`; `/directory` 200; no residual firewall rule,
+  route, or scheduled task; `ACME_RA_ADCS_HOST` back to the real CA and the
+  reclaim floor back to its shipped default.
+
 - **Full live E2E re-proof executed (2026-08-17), tip `e7c4254` (14a), on the
   lab RA host and issuing CA.** CI green on the proven commit before deploy;
   local gates green (`ruff`, `mypy`, 876 pytest, 363 Pester on pwsh 7). The run
@@ -241,9 +329,10 @@ engineered to. Until then it has not — regardless of a green local test run.
     `CRLPeriod` alone. Unchanged operator finding, deliberately measured against
     the shipped default.
   - **Not proven this round**: phase L (`Lqueue`/`Ldrain`, the stale-worker
-    enrollment lease) was not run — still the standing validation debt, now
-    unproven after three sessions. The MSI no-digest/staged-copy refusals remain
-    owed from round 6. The privileged-script-path item gained live evidence
+    enrollment lease) was not run. **CLEARED 2026-08-24** — proven end to end,
+    22/22, on tip `f6badc9`; see the newest validation-log entry above for why
+    it had been unrunnable rather than merely skipped. The MSI
+    no-digest/staged-copy refusals remain owed from round 6. The privileged-script-path item gained live evidence
     rather than a fix: `C:\Temp\ra-scripts`, the path the gMSA sync task
     executes from, measures `BUILTIN\Users:(CI)(AD)` and `(WD)`.
   - **Teardown verified**: all 7 certificates this run caused the CA to issue

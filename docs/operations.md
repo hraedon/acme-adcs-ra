@@ -414,7 +414,7 @@ re-enroll — so the token is a high-value secret, treated like an EAB MAC key.
 
 ### Minimum strength (enforced at startup)
 
-Since v1.9.1 the RA **refuses to start** on a weak credential: EAB MAC keys
+Since v1.10.0 (the 1.9 line was never released) the RA **refuses to start** on a weak credential: EAB MAC keys
 must decode to at least 32 bytes and `ACME_RA_ADMIN_TOKEN` /
 `ACME_RA_REVOCATION_CONFIRM_TOKEN` must be at least 32 characters. Everything
 `python scripts/eab.py new` generates clears this. `allow_weak_credentials=true`
@@ -1113,7 +1113,7 @@ pending list, and the registration warns. The load happens into
 `ACME_CONFIRM_TOKEN` inside the task, so the value never appears on the
 script's process command line.
 
-**`-RaBaseUrl` must be https.** Since v1.9.1 both `Sync-Revocations.ps1` and
+**`-RaBaseUrl` must be https.** Since v1.10.0 both `Sync-Revocations.ps1` and
 `Register-MaintenanceTasks.ps1` validate it before attaching any token — https
 only, no embedded credentials, no query, fragment, or path. A scheduled task
 bakes the URL in, so a cleartext typo would have disclosed the maintenance

@@ -85,15 +85,26 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **v1.9.1 — current release, live-proven 2026-08-14.** The full lab re-proof
-> ran against `bef2022` and passed: issuance, both transport-orphan branches,
-> the revocation round trip, the confirm-authority split, and CRL evidence
-> verified against a real ADCS CRL. Three residuals are recorded in the
-> [validation log](docs/pre-pilot-checklist.md#validation-log); none blocks the
-> release. **There is no 1.9.0 release** — that line shipped only as `rc1` and
-> `rc2`, and the re-proof that gates a tag found two things wrong with rc2 (a
-> red lint gate, and a `Set-OfficerRights.ps1` defect on the
-> first-provisioning path), so the fixed build ships as 1.9.1.
+> **v1.10.0 — current release.** Closes the 2026-08-15 → 2026-08-23 security
+> review series: finalize is revalidated at the CA boundary, `keyChange` is
+> compare-and-swap guarded, CRL retrieval is pinned to a resolved address, the
+> certsrv leg has a bounded isolated lifetime, CSR application purposes are
+> constrained, and the installer proves its interpreter closure and inbox-module
+> provenance. `Sync-Revocations.ps1` no longer accepts token values on argv —
+> **that is a breaking interface change**, which is why this is 1.10.0 rather
+> than a patch. Live-proven on the lab RA and issuing CA across four runs
+> (2026-08-23 twice, 2026-08-24), with the stale-worker enrollment lease proven
+> end to end for the first time. See the
+> [validation log](docs/pre-pilot-checklist.md#validation-log).
+>
+> **Upgrading from 1.8.0 is strongly recommended**: 1.8.0 predates `838eeb2`,
+> which fixed a defect that left the **entire CA-side revocation loop inert** —
+> every `certutil` call ran without its `-config`.
+>
+> **There is no 1.9.0 or 1.9.1 release.** The 1.9 line was written up and
+> `pyproject.toml` declared `1.9.1`, but no tag was ever cut: 1.9.0 shipped only
+> as `rc1`/`rc2`, and the review series kept finding work. The tagged history
+> goes v1.8.0 → v1.10.0.
 >
 > Feature-complete for its charter and maintained deliberately rather than
 > passively: security reports (see `SECURITY.md`) and bug reports are welcome,
