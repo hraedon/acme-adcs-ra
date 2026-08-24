@@ -643,3 +643,21 @@ appcmd, the handler DLL probe), and tests at `:1379` and `:1605-1607` *pin* that
 spelling. Half-fixing the library while leaving the installer on the old pattern
 is how this class keeps returning: the doctrine ends up split across two files
 and the next reviewer finds whichever half they open first.
+
+### 8. (observation, medium) — The lab CA's C:\ carries an APPLICABLE Authenticated Users Modify ACE
+
+*Found live 2026-08-24 during the daybreak-branch validation (F10 gates).*
+`MVMCA01`'s `C:\` DACL includes `NT AUTHORITY\Authenticated Users:(M)` with
+no inheritance flags (applicable to the root itself), alongside the normal
+`(OI)(CI)(IO)(M)` twin. Every tree on that host has `C:\` in its ancestor
+chain, so **no path on the CA passes the privileged-script tree gate** — the
+officer scripts (`Set-OfficerRights.ps1`, `Revoke-Cert.ps1`,
+`Reconcile-Revocation.ps1`) need `-AllowUntrustedScriptPath` on that host,
+which is correct-but-loud (the refusal message says exactly what to do). The
+RA host's `C:\` carries only Users create-class and needs no override.
+
+Operator decision: either fix the CA's `C:\` DACL to the inherit-only default
+shape (remove the applicable ACE), or accept that every CA-side privileged
+script run carries the override. Not a product defect — the gate measured a
+real escalation surface — but it should be a conscious choice, and the next
+CA-host deploy should state it in `docs/operator-requirements.md`.

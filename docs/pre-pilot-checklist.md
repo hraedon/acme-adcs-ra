@@ -249,6 +249,61 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **2026-08-24 daybreak review — live validation EXECUTED on the branch, final
+  tip `b8d3343`.** Scope: the four findings of
+  `docs/security-review-2026-08-24-daybreak-standard.md` (F10 provenance gates,
+  F11 ancestor substitution check, F12 HEC redirect, F13 System32 resolution),
+  which had shipped with local gates only. Preflight: local gates reproduced
+  (pytest 931+1, Pester 457+4 at `ade72a8`; 467+4 at the final tip), plus an
+  independent third-lineage adversarial review (F10/F12/F13 SOUND; F11
+  ship-blocking on proof grounds — confirmed prescient by what follows).
+
+  **The live run found three defects.** Two in the fixes themselves, both
+  fixed in-session and live-re-proven:
+
+  1. **`29ad5da` — the F11 root-self check refused the DESIGNED gMSA state
+     grant.** Measured before deploy against the real root: the gMSA's
+     Modify (⇒ Delete) on `C:\ProgramData\acme-adcs-ra` is a violation under
+     `Get-AllowedExecutableOwners`, which can never admit a service identity.
+     First install: `INSTALLER_EXIT=1` — fresh installs passed, **every
+     upgrade of an existing deployment bricked** (the round-5 refusal class).
+     Fix: `-AllowedRootWriterSids` for the root-self check only (state root
+     passes its design writers; runtime root passes none; ancestors never).
+     Live re-proven: upgrade install exit 0, `/directory` 200, twice.
+  2. **`b8d3343` — the untrusted-tree override did not reach the
+     `Revoke-Cert.ps1` child.** The chain ran registrar→task action→the sync's
+     own gate, then stopped: the child carries the same gate and refused
+     (exit 1 → 'failed'), so an allowed tree could list but never revoke —
+     measured live as a genuinely stuck orphan. Fix: propagate the flag into
+     the child argv; live re-proven by draining that orphan (task exit 0).
+  3. **Environment, operator-owned:** the CA host's `C:\` carries an
+     *applicable* `Authenticated Users:(M)` ACE, so no tree on that host
+     passes the gate and the officer scripts need `-AllowUntrustedScriptPath`
+     everywhere there. The refusal is correct (measured, not assumed), the
+     override is loud, the RA host (Users create-class `C:\`) needs none.
+     Filed in `docs/UNFILED-WORK-ITEMS.md`.
+
+  Also closed from the adversarial review: the generic-bit branches
+  (`0x10000000`/`0x40000000`) were live-proven 10/10 against the deployed
+  library, then pinned with four Pester cases (+ the four designed-root-writer
+  regressions, + the child-propagation regression — all mutation-checked;
+  Pester 457→467).
+
+  **Application re-proof on `b8d3343`:** §A 14/14, §A1 13/13, CRL+§G 9/10
+  (CRL3 = standing WI-052), §K 12/12 (same-hour second run refused at the
+  durable per-kid ceiling — the control working), both transport-orphan
+  branches 6/6, §R+Rverify through four cycles with R2b (empty §7.6 body +
+  out-of-band header) each, least privilege, authority split (exit 2 → 0),
+  CRL evidence (`crl-evidence-required-but-absent` → publish →
+  `crl-verified`). F10 additionally proven live in both directions (refuse
+  without override as the gMSA; override present in the registered task's
+  action, read back after registration). Teardown verified: 14 store-diffed
+  serials + both ReqID-only orphans revoked (0 failed, template drained),
+  CRL republished, CA pristine (224/4/absent), store restored to the
+  session-start fingerprint, pool Started, `/directory` 200, hardened CA
+  staging tree removed. Not run: phase L (no enrollment-leg change on this
+  branch; owed on a v1.11.x tag per the standing lab-network item).
+
 - **Phase L (the stale-worker enrollment lease) PROVEN END TO END for the first
   time — 2026-08-24, tip `f6badc9`, on the lab RA host and issuing CA.**
   22/22: §L 9/9, §Lqueue 8/8, §Ldrain 5/5. CI green on all six jobs for the

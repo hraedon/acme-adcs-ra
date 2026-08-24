@@ -316,3 +316,126 @@ test and be unusable in production.
 - **The regista store still cannot record any of this.** Six migrations are
   pending on the shared schema; migrating it has estate-wide blast radius and is
   an owner decision.
+
+---
+
+## Live validation addendum (2026-08-24, later the same day)
+
+The outstanding gate steps — live Windows validation and an independent
+review — were executed. **The live run found three defects in the fixes; two
+were fixed and live-re-proven in-session (`29ad5da`, `b8d3343`), one is an
+environment finding recorded for the operator.** Local gates on the final tip:
+pytest 931 + 1 skip, Pester **467** + 4 skips (baseline 457; +10 = the four
+generic-bit cases, four designed-root-writer regressions, one installer-shape
+assertion, one child-propagation regression), ruff and mypy clean. Every new
+test mutation-checked (lib side, installer side, and child-propagation).
+
+### Independent adversarial review (third lineage)
+
+F10, F12 and F13 were reviewed SOUND with cited evidence (ordering verified at
+all five entry points; the no-redirect opener refuses every redirect class and
+no other urlopen remains; all nine installer sites moved, remaining
+`$env:windir` hits are comments). F11 was rated **ship-blocking on proof
+grounds**: the generic-bit branches had no test case, and the ancestor walk
+had never met a real `C:\ProgramData`. Both proved prescient.
+
+### Live finding 1 (fixed in `29ad5da`) — the root-self check refused the DESIGNED state grant
+
+Measured on the lab RA host before any deploy:
+`Get-AncestorSubstitutionViolations` against the real
+`C:\ProgramData\acme-adcs-ra` returned one violation — **the enrollment gMSA
+holds Modify on the root itself, and Modify carries Delete**. That is the
+designed posture (the app pool writes its database); `Get-AllowedExecutableOwners`
+can never admit a service identity, so the check refused the root it exists to
+protect. First installer run: `INSTALLER_EXIT=1`, exactly the round-5 disaster
+class — **fresh installs passed (no root ACL yet) while every upgrade of an
+existing deployment bricked.**
+
+Fix: `Initialize-SecuredRoot` gains `-AllowedRootWriterSids`, forwarded to the
+root-self check only; the state root passes `$stateOwnerSids` (its design
+writers), the runtime root passes none (gMSA RX is the design there —
+delete-class drift on a runtime root still refuses), and **ancestors are never
+judged by the design list**. After the fix: upgrade install `INSTALLER_EXIT=0`,
+`/directory` 200, re-run again clean.
+
+Also live-measured and pinned after the fact: the generic-bit branches
+(`0x10000000`/`0x40000000` flag; `0x80000000`/`0x20000000` do not) — 10/10
+against the deployed library on the real OS, then four Pester cases added (the
+adversarial review correctly predicted a mutation deleting those bits shipped
+green).
+
+The real ACLs, for the record: `C:\ProgramData` = `Users:(CI)(WD,AD,WEA,WA)`
+create-class → PASSES; `%ProgramFiles%` = `Users:(RX)` → PASSES; the RA
+host's `C:\Temp` = create-class → PASSES (the docs' "C:\Temp FAILS" example
+describes the AU-Modify shape, which the CA host really has — see finding 3).
+
+### Live finding 2 (fixed in `b8d3343`) — the override did not reach the Revoke-Cert child
+
+The override chain was built registrar → task action (verified live in the
+registered action's arguments) → the sync's own gate — and stopped there.
+`Sync-Revocations.ps1` spawned `Revoke-Cert.ps1` without the flag; the child
+carries the same tree gate; every child invocation refused at its own gate,
+exit 1, classified `failed`. Measured live: `SYNC COMPLETE: 1 pending, 0
+revoked, 0 already-revoked-at-CA, 1 failed` with the pending serial stuck —
+**an explicitly-allowed untrusted tree could list but never revoke.** After
+the fix the same task drained a genuinely stuck orphan (`exit 0`, pending set
+emptied).
+
+### Live finding 3 (environment, operator) — the CA host's C:\ carries an applicable AU Modify
+
+`MVMCA01`'s `C:\` DACL includes `Authenticated Users:(M)` **applicable**
+(alongside the inherit-only twin). The ancestor chain of every tree on that
+host terminates at `C:\`, so **no path on the CA passes the tree gate** — the
+officer scripts (`Set-OfficerRights.ps1` first observed refusing organically
+during provisioning) require `-AllowUntrustedScriptPath` everywhere on that
+host. The refusal is correct per the gate's own doctrine (an applicable AU
+Modify on the system-drive root is real escalation surface — it was measured,
+not assumed), the override is loud by design, and the scripts' own message
+tells the operator what to do. Recorded as a deployment-guidance caveat: the
+RA host's `C:\` (Users create-class only) needs no override anywhere.
+
+### F10/F12/F13 live results on the final tip
+
+- **F10**: registration from an untrusted tree with the override succeeds and
+  the action carries the flag (read back from the registered task); the
+  nonce/sweep-only registration path is gated (source-order pinned by Pester,
+  unconditional in the deployed registrar); run-time gate refuses without the
+  override (live, as the gMSA: exit 1 naming the tree and the writable ACEs);
+  with the override the whole revocation loop completes (R cycles + authority
+  split + CRL evidence, below).
+- **F11**: default roots pass against real ACLs; the upgrade-path defect is
+  fixed and live-proven; generic bits pinned; runtime-drift and
+  ancestor-never-allowlisted semantics pinned by the four new regression
+  tests.
+- **F12**: the suite's redirect-pair tests (real sockets) plus the adversarial
+  review's mutation analysis; no live SIEM collector was in scope, and the
+  startup-probe fail-loud path is exercised by `audit_offbox_required`'s own
+  tests.
+- **F13**: the installer ran live through the resolved-System32 paths (twice,
+  exit 0, plus one deliberate refusal run before the state-root fix).
+
+### Application re-proof on the final tip `b8d3343`
+
+Full canonical pass: §A 14/14, §A1 13/13, CRL+§G 9/10 (the one FAIL is CRL3,
+the standing WI-052 calibration check), §K 12/12 (from the same-hour run under
+the same kid — the durable per-kid ceiling refusing a second full pass inside
+the hour is itself the control working), both transport-orphan branches 6/6,
+§R+Rverify through four revocation cycles with R2b (empty §7.6 body +
+out-of-band header) on every cycle, least privilege (gMSA token, CRL publish
+`0x80070005`, out-of-template `CERTSRV_E_RESTRICTEDOFFICER`, reason 8 exit 3
+before CA action), authority split (exit 2 → exit 0), and the CRL-evidence
+cycle (`crl-evidence-required-but-absent` → publish → `crl-verified`).
+
+**Teardown verified:** 14 serials (store-diffed) plus both ReqID-only orphans
+resolved at the CA by ReqID — 14/14 revoked, 0 failed, template fully drained,
+CRL republished; `CA\Security` 224 bytes / 4 ACEs, `OfficerRights` absent;
+the RA store restored to the session-start fingerprint (`integrity=ok`, all
+counts equal), app pool `Started`, `/directory` 200; the hardened CA staging
+tree removed; no leftover tasks.
+
+One validation-session process note, recorded because it is a trap for the
+next session: a driver that deploys "HEAD of the main repo" silently replaced
+the branch build with `0a47955` mid-session — the version string is identical
+and only symbol-level checks catch it (`verify-installed.ps1` has said exactly
+this since 2026-08-24 morning). Always `git archive` the exact worktree
+commit.

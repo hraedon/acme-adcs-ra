@@ -72,6 +72,30 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**2026-08-24 daybreak review: four findings, fixed at `ade72a8`, then LIVE
+VALIDATED the same day on the branch — the validation found and fixed two
+defects in the fixes themselves (final tip `b8d3343`).** (1) The F11
+root-self substitution check judged the DESIGNED gMSA Modify on the state
+root by the executable-owners list — first install refused (`INSTALLER_EXIT=1`)
+and every upgrade of an existing deployment would brick; fixed with
+`-AllowedRootWriterSids` (state root passes its design writers, runtime root
+none, ancestors never) and live-re-proven. (2) The untrusted-tree override
+propagated registrar→task action→sync but not into the `Revoke-Cert.ps1`
+child, so an allowed tree could list pending revocations and never revoke
+one; fixed and live-re-proven by draining a genuinely stuck orphan. (3) The
+CA host's `C:\` carries an applicable `Authenticated Users:(M)` ACE — no
+tree on that host passes the gate; officer scripts there need
+`-AllowUntrustedScriptPath` (correct refusal, loud override, operator item).
+Generic-bit branches of the new predicate live-proven 10/10 then pinned;
+Pester 457→467, all new tests mutation-checked; third-lineage adversarial
+review rated F10/F12/F13 SOUND. Full canonical app re-proof on `b8d3343`:
+§A 14/14, §A1 13/13, CRL+§G 9/10 (CRL3 = WI-052), §K 12/12, orphans 6/6×2,
+§R+Rverify ×4 with R2b, least privilege, authority split, CRL evidence.
+Teardown verified both hosts. Phase L not run (no enrollment-leg change
+here; owed on a v1.11.x tag per the standing lab-network item). See
+`docs/security-review-2026-08-24-daybreak-standard.md` (live addendum) and
+the validation log.
+
 **Daybreak standard pass (review of `7325cdb`, 2026-08-17) found four medium
 issues, no high or critical. One fixed, three triaged and consciously left.**
 Fixed: syslog transport failures were counted as successful off-box audit
