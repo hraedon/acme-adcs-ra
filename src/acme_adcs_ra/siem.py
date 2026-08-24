@@ -28,11 +28,74 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 from acme_adcs_ra.config import RAConfig
 
 logger = logging.getLogger("acme_adcs_ra.siem")
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    """Refuse every HTTP redirect instead of following it.
+
+    The HEC sink sends ``Authorization: Splunk <token>`` on every request, and
+    the sink is only enabled for an ``https`` URL with no embedded credentials
+    (see ``SiemEmitter.__init__``). Both guarantees end at the first redirect.
+
+    ``urllib``'s default ``HTTPRedirectHandler.redirect_request`` copies the
+    original headers onto the new request, stripping exactly
+    ``("content-length", "content-type")`` — so ``Authorization`` rides along,
+    to whatever host the ``Location`` names. ``http_error_302`` accepts a
+    target whose scheme is ``http``, ``https`` *or* ``ftp``, so the "must be
+    https" check is worth one hop: a collector that answers ``302`` hands the
+    collector token to an arbitrary origin in cleartext.
+
+    Confirmed by execution 2026-08-24 against a local redirect pair — the
+    second server received the token verbatim. What does *not* leak is the
+    event: ``redirect_request`` builds the new request without ``data=``, and
+    301/302/303 downgrade POST to GET, so the body is dropped (307/308 drop it
+    too, and POST+307 raises rather than following). This is credential
+    disclosure, not audit disclosure — but an HEC token is enough to forge
+    audit *into* the SIEM, which is the record this system exists to produce.
+
+    Refusing rather than re-validating the target: a redirecting HEC endpoint
+    is a misconfiguration, and there is no benign case worth carrying the
+    header-forwarding machinery for. The refusal surfaces as an ordinary
+    ``HTTPError``, which the caller already records through
+    ``_record_offbox_result`` — so ``audit_offbox_required``'s startup probe
+    fails loudly instead of the RA starting on a leaked token.
+    """
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        raise HTTPError(
+            req.full_url,
+            code,
+            (
+                f"HEC endpoint redirected to {newurl!r}; refusing to follow. "
+                "urllib forwards the Authorization header across redirects, "
+                "including to a different host and to plain http, so following "
+                "one would disclose the collector token. Point siem_hec_url at "
+                "the collector's final https URL."
+            ),
+            headers,
+            fp,
+        )
+
+
+# Built once: an opener that carries no redirect handling at all.
+_HEC_OPENER = build_opener(_NoRedirects)
 
 
 def _getaddrinfo_within(
@@ -755,7 +818,17 @@ class SiemEmitter:
                     "Content-Type": "application/json",
                 },
             )
-            with urlopen(req, timeout=10) as resp:
+            # _HEC_OPENER, not urlopen: the module opener follows redirects and
+            # forwards the Authorization header when it does. See _NoRedirects.
+            #
+            # The status branch below is deliberately kept rather than trimmed
+            # as dead code. urllib raises HTTPError for anything non-2xx and a
+            # 3xx now raises too, so nothing should reach it — but "should" is
+            # doing the work, and a handler change upstream that made a 3xx
+            # returnable would otherwise be recorded as a successful off-box
+            # delivery. It fails closed for the same reason the syslog probe
+            # returns False on UDP: the boolean is the control.
+            with _HEC_OPENER.open(req, timeout=10) as resp:
                 if not (200 <= resp.status < 300):
                     logger.warning("HEC export non-2xx: %s", resp.status)
                     self._record_offbox_result(f"HTTP {resp.status}")

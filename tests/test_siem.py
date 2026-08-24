@@ -10,7 +10,10 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
+from urllib.request import Request
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -21,7 +24,13 @@ from acme_adcs_ra.enrollment import FakeEnrollmentLeg
 from acme_adcs_ra.policy import IssuancePolicy
 from acme_adcs_ra.revocation import FakeRevocationLeg
 from acme_adcs_ra.server import ServerContext, create_app
-from acme_adcs_ra.siem import SiemConfig, SiemEmitter, build_siem_config, default_jsonl_path
+from acme_adcs_ra.siem import (
+    SiemConfig,
+    SiemEmitter,
+    _NoRedirects,
+    build_siem_config,
+    default_jsonl_path,
+)
 from acme_adcs_ra.store import Store
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
@@ -648,3 +657,117 @@ class TestJsonlRotation:
             assert "after-broken-rotation" in (tmp_path / "audit.jsonl").read_text()
         finally:
             emitter.close()
+
+
+class TestHecRedirectDoesNotLeakTheToken:
+    """2026-08-24 daybreak F12 — a redirect used to carry the collector token.
+
+    ``urllib``'s default redirect handler copies every header except
+    content-length/content-type onto the new request, so ``Authorization``
+    followed the ``Location`` — to any host, and to plain http, defeating the
+    https-only check the sink is gated on. These tests drive real sockets
+    rather than mocking ``urlopen``, because the defect lived entirely in
+    urllib's handler chain: a mock would have asserted our own assumptions and
+    passed against the vulnerable code.
+    """
+
+    @staticmethod
+    def _serve(handler_fn: Any) -> Any:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _H(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                handler_fn(self)
+
+            def do_GET(self) -> None:  # noqa: N802
+                handler_fn(self)
+
+            def log_message(self, *a: Any) -> None:
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def test_token_never_reaches_a_redirect_target(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def attacker(h: Any) -> None:
+            seen["authorization"] = h.headers.get("Authorization")
+            h.send_response(200)
+            h.end_headers()
+            h.wfile.write(b'{"text":"Success","code":0}')
+
+        sink = self._serve(attacker)
+
+        def collector(h: Any) -> None:
+            h.send_response(302)
+            h.send_header("Location", f"http://127.0.0.1:{sink.server_port}/x")
+            h.end_headers()
+
+        front = self._serve(collector)
+        try:
+            emitter = SiemEmitter(
+                SiemConfig(
+                    sink="hec",
+                    hec_url=f"http://127.0.0.1:{front.server_port}/services/collector",
+                    hec_token="SUPER-SECRET-HEC-TOKEN",
+                )
+            )
+            try:
+                emitter._hec_post_inner({"event_type": "probe"})
+            finally:
+                emitter.close()
+
+            # The whole finding, in one assertion.
+            assert seen.get("authorization") is None, (
+                "the collector token was forwarded to the redirect target"
+            )
+            # And the refusal is recorded as a delivery FAILURE, not swallowed
+            # as a success -- audit_offbox_required is a boolean gate, so a
+            # redirect that silently counted as delivered would be the
+            # 2026-08-18 UDP defect in a new place.
+            assert emitter.offbox_delivered == 0
+            assert emitter.offbox_failures == 1
+            assert "302" in (emitter.offbox_last_error or "")
+        finally:
+            front.shutdown()
+            sink.shutdown()
+
+    def test_the_startup_probe_fails_rather_than_starting_on_a_leak(self) -> None:
+        """raise_on_error is the path audit_offbox_required gates startup on."""
+
+        def collector(h: Any) -> None:
+            h.send_response(301)
+            h.send_header("Location", "http://evil.invalid/collector")
+            h.end_headers()
+
+        front = self._serve(collector)
+        try:
+            emitter = SiemEmitter(
+                SiemConfig(
+                    sink="hec",
+                    hec_url=f"http://127.0.0.1:{front.server_port}/services/collector",
+                    hec_token="SUPER-SECRET-HEC-TOKEN",
+                )
+            )
+            try:
+                with pytest.raises(HTTPError) as caught:
+                    emitter._hec_post_inner({"event_type": "probe"}, raise_on_error=True)
+            finally:
+                emitter.close()
+            assert caught.value.code == 301
+            assert "refusing to follow" in str(caught.value.reason)
+        finally:
+            front.shutdown()
+
+    def test_redirect_handler_refuses_every_code_urllib_would_follow(self) -> None:
+        """301/302/303/307/308 all reach redirect_request; none may be followed."""
+        handler = _NoRedirects()
+        req = Request("https://splunk.example/services/collector", method="POST")
+        for code in (301, 302, 303, 307, 308):
+            with pytest.raises(HTTPError) as caught:
+                handler.redirect_request(
+                    req, None, code, "Found", {}, "http://evil.invalid/x"
+                )
+            assert caught.value.code == code
