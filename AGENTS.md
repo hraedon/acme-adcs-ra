@@ -267,7 +267,16 @@ collision branch of the TOCTOU fix is the one thing not live-proven (it is
 reachable only by a genuinely won race). The lab host now runs `102a1f4`'s
 runtime, `/directory` 200, store unchanged.
 
-**Released: v1.10.0 (2026-08-24).** There is **no 1.9.0 or 1.9.1 release**: the
+**Released: v1.11.0 (2026-08-24).** 1.11.0 fixes two revocation defects found by
+pointing a real ACME client at the RA: `revokeCert` read `cert` where RFC 8555
+§7.6 says `certificate` (so no conformant client could revoke at all), and the
+JSON success body made a real client report succeeded revocations as failed.
+The response is now an empty body plus an `X-Acme-Ra-Out-Of-Band-Revocation`
+header — **breaking** for anything that read the body. Neither bug was
+catchable in-repo: the harness and the test client both spoke the same
+non-standard dialect as the server.
+
+**v1.10.0 (2026-08-24).** There is **no 1.9.0 or 1.9.1 release**: the
 1.9 line was written up and `pyproject.toml` declared `1.9.1`, but no tag was
 ever cut — 1.9.0 shipped only as `rc1`/`rc2` (the re-proof that gates a tag
 found a red lint gate on the rc2 tip and a `Set-OfficerRights.ps1` defect on the

@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.11.0] — 2026-08-24
+
+Two defects that made ACME revocation unusable for real clients, both found by
+pointing **Certify the Web** at the RA for the first time.
+
+**Breaking:** the `revokeCert` response shape — success is now 200 with an
+**empty body**, and the non-normative out-of-band hint moved to the
+`X-Acme-Ra-Out-Of-Band-Revocation` header. Anything that parsed the body must
+read the header instead. That is the minor bump, following the same convention
+as 1.10.0, whose breaking `Sync-Revocations.ps1` change was also a minor.
+
+**Upgrade if anything other than this project's own tooling revokes
+certificates** — before this release, nothing else could.
+
+### The part worth keeping
+
+Neither bug was findable from inside this repository. The lab harness and
+`tests/hand_rolled_acme_client.py` both sent `cert`, exactly as the server read
+it, so a full revocation suite — authorization, reason-code policy, CAS races,
+the out-of-band leg — passed against a dialect no other ACME client speaks. And
+the response-body shape was not merely untested but **documented as safe**, in
+the stability contract, on the reasoning that standard clients ignore extra
+fields. A client that shares the server's assumptions cannot test the server's
+assumptions, and a written assumption is not evidence.
+
+### Validation
+
+Suite 928 passed / 1 skipped; ruff and mypy clean. Both fixes verified live
+against the real client on the lab RA: the revocation that had been refused,
+then misreported, returned `isOK=true "Certificate revoked"`.
+
+Scope of that proof, stated rather than implied — the fixes were verified by
+hot-patching the single changed file onto the lab, **not** by a full installer
+deployment, and the lab was restored to the v1.10.0 artifact afterwards. The
+full §A–§L live re-proof was **not** re-run: the change is confined to the
+`revokeCert` route, and the path that matters for it was the path exercised.
+
 ### Changed — revokeCert returns an empty body; the out-of-band hint moves to a header (2026-08-24)
 
 **Breaking for anything that read the response body.** Every `revokeCert`

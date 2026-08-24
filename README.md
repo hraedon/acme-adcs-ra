@@ -85,17 +85,31 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **v1.10.0 — current release.** Closes the 2026-08-15 → 2026-08-23 security
-> review series: finalize is revalidated at the CA boundary, `keyChange` is
-> compare-and-swap guarded, CRL retrieval is pinned to a resolved address, the
-> certsrv leg has a bounded isolated lifetime, CSR application purposes are
-> constrained, and the installer proves its interpreter closure and inbox-module
-> provenance. `Sync-Revocations.ps1` no longer accepts token values on argv —
-> **that is a breaking interface change**, which is why this is 1.10.0 rather
-> than a patch. Live-proven on the lab RA and issuing CA across four runs
-> (2026-08-23 twice, 2026-08-24), with the stale-worker enrollment lease proven
-> end to end for the first time. See the
-> [validation log](docs/pre-pilot-checklist.md#validation-log).
+> **v1.11.0 — current release.** Fixes two defects that made ACME revocation
+> unusable for real clients. `revokeCert` read the payload field `cert`; RFC 8555
+> §7.6 names it **`certificate`**, so every conformant client was refused and
+> **could not revoke at all**. And the success response carried a JSON body,
+> which made Certify the Web report a revocation that had *succeeded* as failed —
+> so the body is now empty and the out-of-band hint moved to the
+> `X-Acme-Ra-Out-Of-Band-Revocation` header. **That response-shape change is
+> breaking** for anything that read the body, which is why this is 1.11.0.
+>
+> Both were found by pointing a real ACME client at the RA for the first time.
+> Neither could have been caught here: the lab harness and the test client both
+> sent `cert` as well, so an entire revocation suite passed against a dialect no
+> other client speaks. See the [changelog](CHANGELOG.md) for why that matters
+> more than the fix itself.
+>
+> **Upgrading from v1.10.0 is strongly recommended** if anything other than this
+> project's own tooling revokes certificates.
+>
+> **v1.10.0** closed the 2026-08-15 → 2026-08-23 security review series:
+> finalize revalidated at the CA boundary, `keyChange` compare-and-swap guarded,
+> CRL retrieval pinned to a resolved address, a bounded isolated certsrv leg,
+> constrained CSR application purposes, and an installer that proves its
+> interpreter closure and inbox-module provenance. Live-proven across four lab
+> runs, with the stale-worker enrollment lease proven end to end for the first
+> time. See the [validation log](docs/pre-pilot-checklist.md#validation-log).
 >
 > **Upgrading from 1.8.0 is strongly recommended**: 1.8.0 predates `838eeb2`,
 > which fixed a defect that left the **entire CA-side revocation loop inert** —
@@ -124,6 +138,8 @@ chaining to the **existing root** — no new intermediate.
 | **v1.7** | Security hardening — CA-capable CSR/cert rejection, CN→SAN binding, rate-limit TOCTOU, JWS streaming cap, algorithm exactness |
 | **v1.8** | `base_url` URL binding, account eviction, serial re-padding to the CA database form |
 | **v1.9** | Two external security reviews. The [2026-08-13 one](docs/security-review-2026-08-13.md) — ten findings, including separated revocation-confirm authority with optional CRL proof, certificate quarantine, and atomic issuance+audit. The [2026-08-14 one](docs/security-review-2026-08-14.md) — seventeen more, including rejecting ACME reason 8 (`removeFromCRL`, which un-revokes), quarantining certificates orphaned by post-issuance *transport* failures, refusing redirects on the gMSA-authenticated enrollment leg, and a hash-pinned install closure |
+| **v1.10** | The 2026-08-15 → 2026-08-23 review series (three external rounds). Finalize revalidated at the CA boundary; `keyChange` compare-and-swap guarded; CRL retrieval pinned to a resolved socket address; the certsrv leg given one monotonic deadline and a dedicated bounded executor; CSR application purposes constrained to `serverAuth`; the installer proving its whole Python interpreter closure and binding inbox cmdlets to a trusted module export table; `audit_prune_enabled` refused rather than silently inert. **Breaking:** `Sync-Revocations.ps1` token parameters became switches, so values can no longer reach argv |
+| **v1.11** | Revocation made usable by real ACME clients: `revokeCert` reads the RFC 8555 field `certificate` (it read `cert`, so conformant clients could not revoke at all), and success returns an empty body with the out-of-band hint moved to a response header (a JSON body made a real client report successful revocations as failed). **Breaking:** the `revokeCert` response shape |
 
 Each release's live re-proof is recorded in the validation log in
 [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).
@@ -196,6 +212,15 @@ template-scoped officer identity, revokes it at the CA and confirms back.
 `scripts/Revoke-Cert.ps1` is the manual equivalent. Reason 7 is rejected by both
 the RA and the scripts (RFC 5280 "unused"; `certutil` rejects it), so an accepted
 reason can never silently break the loop.
+
+**Wire contract (since v1.11.0).** The request payload field is
+**`certificate`**, per RFC 8555 §7.6 — `cert` is still accepted as a deprecated
+alias for in-house tooling, but it is not what clients should send. Success is
+**200 with an empty body**. Because the CA CRL is written out of band, the RA
+adds a non-normative `X-Acme-Ra-Out-Of-Band-Revocation` response **header**
+naming the serial, the runbook and any ReqID. It is a header rather than a body
+field because a JSON body here is *not* ignored by real ACME clients: it made
+Certify the Web report a successful revocation as failed.
 
 Authentication to `/certsrv/` is the ambient **gMSA** identity over SPNEGO with
 **channel binding** (RFC 5929 `tls-server-end-point`), via the in-tree
