@@ -473,9 +473,10 @@ it verifiable, point the RA at the CA's published CRL:
 ACME_RA_REVOCATION_CONFIRM_CRL_URL=http://pki.WORK-DOMAIN.local/crl/WORK-DOMAIN-CA.crl
 # Fail closed: refuse to confirm unless the CRL proves the serial is revoked.
 ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true
-# For this CA: CRLPeriod=604800s; measured nextUpdate-thisUpdate=649200s.
-# The lower bound must be measured at scheduled replacement/publication time.
-ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=<measured age < value < 649200>
+# For this CA: CRLPeriod=604800s; measured nextUpdate-thisUpdate=649200s;
+# A_sched_max=605400s. 626400 sits mid-headroom. DERIVE THIS for your CA --
+# see "Deriving the ceiling (WI-052)" below; do not copy it blindly.
+ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=626400
 ```
 
 The CRL is signed by the CA and readable without privilege, so this is the one
@@ -498,20 +499,73 @@ week) and the `thisUpdate` → `nextUpdate` window as 649200 seconds (7d 12h
 20m). `CRLPeriod` is only the expected publication cadence; it is **not** the
 lower bound for the age ceiling.
 
-Before setting `revocation_confirm_crl_max_age_seconds` (the
-`ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` environment variable), measure
-`A_sched_max`: the maximum age observed, using the RA's clock, for a still-current
-CRL at its scheduled replacement/publication time. Measure representative
-scheduled cycles and include ADCS `thisUpdate` backdating plus the worst observed
-CA/RA clock skew. Then require:
-`A_sched_max < max_age_seconds < V_next_min`, where `V_next_min` is the minimum
-measured `nextUpdate - thisUpdate` validity window across representative CRLs.
-The evidence currently recorded here contains one 649200-second window; use the
-minimum from the deployment's measurements if later windows are shorter. The
-repository does **not** record `A_sched_max`, so it does not justify a numeric
-lower bound or a copy-paste production value. The prior 691200-second (8-day)
-plumbing test is not safe for this CA because it exceeds the measured validity
-window and makes the independent age ceiling non-binding before `nextUpdate`.
+### Deriving the ceiling (WI-052), with worked numbers
+
+`A_sched_max` is the maximum age a still-current CRL reaches, on the RA's clock,
+at its scheduled replacement. Earlier revisions of this runbook asked operators
+to *observe* it over successive publication cycles and declined to suggest a
+number. That was more conservative than necessary: `A_sched_max` follows from
+the CA's own configuration, and the derivation can be checked against a single
+published CRL.
+
+ADCS stamps a CRL as:
+
+```
+thisUpdate = publish_time − ClockSkewMinutes
+nextUpdate = publish_time + CRLPeriod + CRLOverlapPeriod + ClockSkewMinutes
+```
+
+so the validity window is `CRLPeriod + CRLOverlapPeriod + 2·ClockSkewMinutes`,
+and the age of the current CRL when the next one is published is:
+
+```
+A_sched_max = CRLPeriod + ClockSkewMinutes + L + S
+```
+
+where `L` is scheduled-publication lateness and `S` is the worst CA→RA clock
+skew. **Validate the model before trusting it**: compute the predicted validity
+window and compare it with `nextUpdate − thisUpdate` on a real CRL. If they do
+not match, the CA is not behaving as configured and the derivation is void —
+fall back to observing cycles.
+
+Worked example, measured on the lab CA (2026-08-24). Registry: `CRLPeriod =
+1 Week`, `ClockSkewMinutes = 10`, `CRLOverlapUnits = 0` (so ADCS computes the
+overlap, which lands on 12h).
+
+| term | value |
+|---|---|
+| `CRLPeriod` | 604800s |
+| `ClockSkewMinutes` | 600s, applied at **both** ends |
+| computed overlap | 43200s |
+| **predicted** window | 604800 + 43200 + 1200 = **649200s** |
+| **measured** `nextUpdate − thisUpdate` | **649200s** — exact match |
+| `A_sched_max` (on-time, zero skew) | 604800 + 600 = **605400s** |
+| hard ceiling (`nextUpdate`) | **649200s** |
+| **usable headroom** | **43800s ≈ 12h10m** |
+
+`max_age_seconds` must sit strictly inside `(A_sched_max, 649200)`. The headroom
+is the budget for `L + S` plus whatever replay margin you want:
+
+| value | tolerance for lateness+skew | margin below hard expiry |
+|---|---|---|
+| 615600 (7d 3h) | 2h50m | 9h20m |
+| **626400 (7d 6h)** — recommended | **5h50m** | **6h20m** |
+| 637200 (7d 9h) | 8h50m | 3h20m |
+
+**626400 is the shipped recommendation for a CA on this cadence**: it splits the
+headroom evenly, so neither a late publication nor a wider replay window is
+favoured. Measured CA→RA clock skew on this estate is sub-second, so `S` is
+noise; `L` is the only term worth watching, and 5h50m of tolerance is far beyond
+any healthy CA's publication jitter.
+
+Re-derive rather than copy the number if your CA's `CRLPeriod`,
+`CRLOverlapPeriod` or `ClockSkewMinutes` differ — and re-check the predicted
+window against a real CRL, which is the step that makes this a measurement
+rather than an assumption.
+
+The prior 691200-second (8-day) plumbing test is **not** a safe production
+value for this CA: it exceeds the 649200-second validity window and would leave
+the independent age ceiling non-binding before `nextUpdate`.
 
 Any operational margin belongs between the measured `A_sched_max` and the hard
 `nextUpdate` bound. If that gap is insufficient, change the CA's publication

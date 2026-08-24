@@ -6,7 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Docs — WI-052 has a number: the CRL age ceiling is derivable (2026-08-24)
+
+The runbook asked operators to *observe* `A_sched_max` (peak CRL age at
+scheduled replacement) across publication cycles and deliberately refused to
+suggest a value. That was more conservative than the problem needs, and it left
+`require_crl_evidence` effectively unconfigurable without weeks of watching.
+
+`A_sched_max` follows from the CA's own configuration:
+`CRLPeriod + ClockSkewMinutes + lateness + skew`. The derivation is
+**validated against a real CRL** rather than assumed — predict
+`nextUpdate − thisUpdate` and compare. On the lab CA the prediction
+(604800 + 43200 + 1200) matches the measured **649200s exactly**.
+
+That gives `A_sched_max = 605400s` against a 649200s hard ceiling: **12h10m of
+usable headroom**. The shipped recommendation for a 1-week CA is
+**`ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=626400`** (7d 6h), which
+splits the headroom evenly — 5h50m of tolerance for late publication against
+6h20m of margin below hard expiry. Measured CA→RA clock skew on this estate is
+sub-second, so lateness is the only term worth watching.
+
+`docs/operations.md` gains *Deriving the ceiling (WI-052)* with the worked
+numbers and the instruction to re-derive (and re-validate) for a CA on a
+different cadence. The 691200s (8-day) plumbing value remains explicitly unsafe
+here: it exceeds the validity window and would make the age ceiling non-binding.
+
 
 ## [1.10.0] — 2026-08-24
 

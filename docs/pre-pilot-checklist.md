@@ -187,19 +187,17 @@ honest: check a box only when the thing is actually true, not when it's planned.
       both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil` rejects
       it) so an accepted reason can never silently break the out-of-band loop.
 - [ ] **CRL evidence freshness is configured from the actual CA cadence.** Before
-      enabling `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, measure the
-      maximum age of a current CRL at scheduled replacement/publication time,
-      including ADCS `thisUpdate` backdating and worst observed CA/RA clock skew.
-      Set `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` so
-      `A_sched_max < max_age_seconds < V_next_min`. Repo evidence records
-      one `nextUpdate - thisUpdate` window of `649200s` (7d 12h 20m) for this
-      CA; use the minimum from deployment measurements if later windows are
-      shorter. It does not record `A_sched_max`, so do not substitute the 604800s
-      `CRLPeriod` as the lower bound. After `nextUpdate` the CRL fails closed,
-      regardless of this setting.
-      See
-      `docs/operations.md` under **Optional: independent CRL evidence for
-      confirmations**.
+      enabling `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, set
+      `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` so
+      `A_sched_max < max_age_seconds < (nextUpdate - thisUpdate)`.
+      **`A_sched_max` is derivable, not a multi-week observation** —
+      `CRLPeriod + ClockSkewMinutes + lateness + skew` — and the derivation is
+      validated by predicting `nextUpdate - thisUpdate` and comparing it against
+      a real CRL. `docs/operations.md` → *Deriving the ceiling (WI-052)* carries
+      the worked numbers for a 1-week CA: `A_sched_max = 605400s`, hard ceiling
+      `649200s`, **recommended `626400`**. Re-derive if your CA's `CRLPeriod`,
+      `CRLOverlapPeriod` or `ClockSkewMinutes` differ. After `nextUpdate` the CRL
+      fails closed regardless of this setting.
 
 ---
 
@@ -1255,6 +1253,11 @@ engineered to. Until then it has not — regardless of a green local test run.
         verified: with the default (`false`) the same serial confirmed as
         `agent-asserted` and drained. Needs a decision on which trust source may
         verify a CRL for a chain-less row.
+  - [x] **WI-052 CLOSED 2026-08-24 — a number now exists.** The ceiling is
+        derived from the CA's own config (`CRLPeriod`, `ClockSkewMinutes`,
+        computed overlap), and the derivation predicts this CA's measured
+        `649200s` window exactly. `A_sched_max = 605400s`; recommended
+        `max_age_seconds = 626400` (mid-headroom). Original item follows.
   - [ ] **WI-052 remains an operator setting, not a code gap.** `CRLPeriod = 1
         Week` (604800s), and the published CRL's validity window is **7d 12h
         20m** (649200s) against a default `revocation_confirm_crl_max_age_seconds`
