@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — ACME revocation was impossible for every conformant client (2026-08-24)
+
+`revokeCert` read the payload field **`cert`**. RFC 8555 §7.6 names it
+**`certificate`**. So any client following the RFC was refused with
+`urn:ietf:params:acme:error:malformed: missing or invalid cert field` and could
+not revoke at all. Certificate revocation is a security-critical path, and it
+did not work for anyone outside this repository.
+
+**Why no test caught it, which is the more useful half.** The lab harness
+(`raproof.py`) and `tests/hand_rolled_acme_client.py` both sent `cert` as well.
+The client mirrored the server's own mistake, so an entire revocation suite —
+authorization, reason-code policy, CAS races, the out-of-band leg — passed
+against a dialect no other ACME client speaks. Every one of those tests was
+correct about what it claimed and blind to the thing that mattered.
+
+It was found by pointing **Certify the Web** at the RA, i.e. by using the real
+client instead of our own.
+
+- `certificate` is now the field, and the error message names it.
+- `cert` stays accepted as a deprecated alias so in-house tooling keeps working.
+- The hand-rolled test client sends `certificate` by default, with a
+  `field_name` parameter so the alias stays covered.
+- Three regression tests, mutation-proven: reverting the route to read `cert`
+  fails the RFC-field and error-message tests while the alias test still
+  passes — exactly the signature the old behaviour should produce.
+- Verified live: the same Certify the Web revocation that had been refused now
+  reaches the RA and records `certificate-revoked`.
+
 ### Validated — Certify the Web renews against the POST-as-GET-only RA (2026-08-24)
 
 The last open pre-pilot item. Removing the unauthenticated `GET /acme/cert/{id}`

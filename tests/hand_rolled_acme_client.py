@@ -250,9 +250,19 @@ class HandRolledAcmeClient:
         self,
         cert_der: bytes,
         reason: int | None = None,
+        field_name: str = "certificate",
     ) -> Any:
+        """Revoke a certificate (RFC 8555 §7.6).
+
+        ``field_name`` defaults to the RFC spelling, ``certificate``. It used to
+        send ``cert``, which is what the server read -- so client and server
+        shared one non-standard dialect and every revocation test passed while
+        real ACME clients were refused outright. The parameter exists so the
+        deprecated ``cert`` alias stays covered; it is not something a caller
+        should normally set.
+        """
         url = f"{self.base_url}/acme/revoke-cert"
-        payload: dict[str, Any] = {"cert": b64url_encode(cert_der)}
+        payload: dict[str, Any] = {field_name: b64url_encode(cert_der)}
         if reason is not None:
             payload["reason"] = reason
         return self._post_jws(url, payload)

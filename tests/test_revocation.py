@@ -1128,3 +1128,48 @@ from datetime import UTC, datetime, timedelta
 
 def datetime_now(*, days: int = 0) -> datetime:
     return datetime.now(UTC) + timedelta(days=days)
+
+
+class TestRevokeCertFieldName:
+    """RFC 8555 §7.6 names the revocation payload field ``certificate``.
+
+    The route read ``cert`` only, so every conformant ACME client was refused
+    with ``malformed: missing or invalid cert field`` and could not revoke at
+    all. Nothing in this suite caught it, because the hand-rolled client and the
+    lab harness both sent ``cert`` too -- the client mirrored the server's own
+    mistake, so a whole revocation suite passed against a dialect no other
+    client speaks. Found 2026-08-24 by pointing Certify the Web at the RA.
+    """
+
+    def test_rfc_certificate_field_is_accepted(
+        self,
+        client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        ac, cert_der = _issue_cert(client, test_config, account_key)
+        resp = ac.revoke_certificate(cert_der, reason=1)
+        assert resp.status_code == 200, resp.text
+
+    def test_deprecated_cert_alias_still_accepted(
+        self,
+        client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        ac, cert_der = _issue_cert(client, test_config, account_key)
+        resp = ac.revoke_certificate(cert_der, reason=1, field_name="cert")
+        assert resp.status_code == 200, resp.text
+
+    def test_missing_field_names_the_rfc_spelling(
+        self,
+        client: TestClient,
+        test_config: RAConfig,
+        account_key: rsa.RSAPrivateKey,
+    ) -> None:
+        ac, cert_der = _issue_cert(client, test_config, account_key)
+        resp = ac.revoke_certificate(cert_der, reason=1, field_name="nope")
+        assert resp.status_code == 400
+        # The message must name the RFC field: an operator debugging a real
+        # client must not be sent looking for a key the RFC does not define.
+        assert "certificate" in resp.text

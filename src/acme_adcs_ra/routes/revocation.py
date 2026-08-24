@@ -53,14 +53,27 @@ async def revoke_cert(
     )
     account_id = account.id
 
-    cert_b64 = payload.get("cert")
+    # RFC 8555 §7.6 names this field "certificate". This route read "cert" only,
+    # so EVERY conformant ACME client was refused with
+    # `malformed: missing or invalid cert field` and could not revoke at all.
+    # It went unnoticed because the lab harness and tests/hand_rolled_acme_client
+    # both sent "cert" too -- the client mirrored the server's own mistake, so
+    # the whole revocation suite passed against a dialect nobody else speaks.
+    # Found 2026-08-24 by pointing Certify the Web at the RA.
+    #
+    # "cert" stays accepted as a deprecated alias so existing in-house tooling
+    # keeps working, but "certificate" is the spelling clients are told to use
+    # and the one the error message names.
+    cert_b64 = payload.get("certificate")
+    if cert_b64 is None:
+        cert_b64 = payload.get("cert")
     if not isinstance(cert_b64, str) or not cert_b64:
-        raise malformed("missing or invalid cert field")
+        raise malformed("missing or invalid certificate field")
 
     try:
         cert_der = _base64url_decode(cert_b64)
     except Exception as exc:
-        raise malformed(f"cert is not valid base64url: {exc}") from exc
+        raise malformed(f"certificate is not valid base64url: {exc}") from exc
 
     try:
         cert = x509.load_der_x509_certificate(cert_der)
