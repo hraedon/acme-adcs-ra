@@ -153,6 +153,20 @@ honest: check a box only when the thing is actually true, not when it's planned.
       `docs/operations.md` ## Revocation runbook. **Reason 7 is rejected** by
       both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil` rejects
       it) so an accepted reason can never silently break the out-of-band loop.
+- [ ] **CRL evidence freshness is configured from the actual CA cadence.** Before
+      enabling `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, measure the
+      maximum age of a current CRL at scheduled replacement/publication time,
+      including ADCS `thisUpdate` backdating and worst observed CA/RA clock skew.
+      Set `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` so
+      `A_sched_max < max_age_seconds < V_next_min`. Repo evidence records
+      one `nextUpdate - thisUpdate` window of `649200s` (7d 12h 20m) for this
+      CA; use the minimum from deployment measurements if later windows are
+      shorter. It does not record `A_sched_max`, so do not substitute the 604800s
+      `CRLPeriod` as the lower bound. After `nextUpdate` the CRL fails closed,
+      regardless of this setting.
+      See
+      `docs/operations.md` under **Optional: independent CRL evidence for
+      confirmations**.
 
 ---
 
@@ -222,8 +236,10 @@ engineered to. Until then it has not — regardless of a green local test run.
     is fixed and live-proven.
   - **Reproduced, not a regression**: this CA's CRL validity window
     (7d 12h 20m) still exceeds the RA's default 7-day evidence ceiling (CRL3),
-    so the ceiling must be set from the CA's real cadence. Unchanged operator
-    finding, deliberately measured against the shipped default.
+    so the ceiling must be set from the measured maximum CRL age at scheduled
+    replacement, including `thisUpdate` backdating and clock skew, not from
+    `CRLPeriod` alone. Unchanged operator finding, deliberately measured against
+    the shipped default.
   - **Not proven this round**: phase L (`Lqueue`/`Ldrain`, the stale-worker
     enrollment lease) was not run — still the standing validation debt, now
     unproven after three sessions. The MSI no-digest/staged-copy refusals remain
@@ -369,7 +385,9 @@ engineered to. Until then it has not — regardless of a green local test run.
   - **App re-proof**: A 14/14, A1 14/14, G 5/5, Q both branches 6/6 each
     (chain → quarantined row + ReqID; leaf → **no row written**, by design),
     R 5/5. CRL 4/5 — the failure is **WI-052 re-observed unchanged** (CA CRL
-    window 649200s vs the 604800s default ceiling, short by 12.3h).
+    window 649200s vs the 604800s default ceiling, short by 12.3h). The
+    validation did not measure the lower-bound `A_sched_max`; do not infer it
+    from either this validity window or `CRLPeriod` alone.
 
   **Defect found live and fixed** (`01417b5`): the `icacls` owner-candidate
   **fallback loops could not fall back** on Windows PowerShell 5.1.
@@ -811,8 +829,10 @@ engineered to. Until then it has not — regardless of a green local test run.
   non-defect: 86 orders wedge in `processing` for operator reconciliation.
 
   **The CRL cadence finding stands unchanged** (CRL3 FAIL by design of the
-  check): 7d 12h20m window vs the 604800s default ceiling — the WI-052 operator
-  item, configuration not code.
+  check): 7d 12h20m validity window vs the 604800s default ceiling — the WI-052
+  operator item, configuration not code. The lower bound still requires a
+  measured maximum CRL age at scheduled replacement, including `thisUpdate`
+  backdating and clock skew.
 
   **Two harness defects found (not product).** (1) Lqueue's saturation counter
   reads `ca-ip.txt`, which held the *real* CA address, but the §9-approved
@@ -915,7 +935,12 @@ engineered to. Until then it has not — regardless of a green local test run.
   **The CRL cadence finding stands unchanged.** This CA's 7d 12h 20m validity
   window still exceeds the 7-day default ceiling. The override is plumbed and
   works (`ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=691200` reads back as
-  691200 against a 604800 default), so this is configuration, not a code gap.
+  691200 against a 604800 default), proving the setting is configurable. That
+  8-day test value is **not** a safe production value for this CA: it exceeds
+  the 649200-second `nextUpdate` window and would leave the independent age
+  ceiling non-binding. Production must measure `A_sched_max` and choose
+  `A_sched_max < max_age_seconds < 649200`; the repository does not supply the
+  numeric lower bound.
 
   **Teardown verified, not assumed.** CA back to 224 bytes / 4 ACEs /
   `OfficerRights: ABSENT`, `denyUrlSequences` empty (checked via the full
@@ -1108,15 +1133,15 @@ engineered to. Until then it has not — regardless of a green local test run.
         verified: with the default (`false`) the same serial confirmed as
         `agent-asserted` and drained. Needs a decision on which trust source may
         verify a CRL for a chain-less row.
-  - [ ] **The default CRL freshness ceiling is narrower than this CA's
-        cadence.** `CRLPeriod = 1 Week`, and the published CRL's validity window
-        is **7d 12h 20m** against a default `revocation_confirm_crl_max_age_seconds`
-        of 7 days. In steady state the age of the current CRL reaches the
-        ceiling exactly as the next one is published — zero margin — so any
-        delayed publication starts failing evidence checks. The ceiling should
-        be set from the CA's real cadence (≥ `CRLPeriod` + overlap), not left at
-        the default; the freshness gate itself was confirmed live (a 1-second
-        ceiling refuses the real CRL).
+  - [ ] **WI-052 remains an operator setting, not a code gap.** `CRLPeriod = 1
+        Week` (604800s), and the published CRL's validity window is **7d 12h
+        20m** (649200s) against a default `revocation_confirm_crl_max_age_seconds`
+        of 7 days. The runbook now requires measuring `A_sched_max`, the maximum
+        CRL age at scheduled replacement including `thisUpdate` backdating and
+        clock skew, then using `A_sched_max < max_age_seconds < 649200`. The
+        repository does not record `A_sched_max`; a value beyond 649200 would
+        make the independent replay-age ceiling non-binding. The freshness gate
+        itself was confirmed live (a 1-second ceiling refuses the real CRL).
   - [x] **`Register-MaintenanceTasks.ps1` re-introduces the admin token on the
         revocation host.** `-AdminToken` was mandatory and always written into
         the revocation-sync task action as `$env:ACME_ADMIN_TOKEN`, even when a
@@ -1272,14 +1297,16 @@ engineered to. Until then it has not — regardless of a green local test run.
         lock file was exported on Linux for Python 3.13 — a platform-specific
         wheel gap surfaces only here.
   - [x] **CRL freshness against the real publication cadence — measured
-        2026-08-14, and the default does not fit.** The lab CA publishes weekly
-        (`CRLPeriod = 1 Week`) and its CRL declares a **7d 12h 20m** validity
-        window against a 7-day default ceiling, so the current CRL's age reaches
-        the ceiling exactly as the next one is published: zero margin, and any
-        delayed publication fails evidence checks. Set
-        `revocation_confirm_crl_max_age_seconds` from the CA's real cadence
-        (≥ `CRLPeriod` + overlap). The gate itself is live — a 1-second ceiling
-        refuses the real CRL, and the default accepts it.
+        2026-08-14, and the default has zero delay margin.** The lab CA publishes
+        weekly (`CRLPeriod = 1 Week` = 604800s) and its CRL declares a **7d 12h
+        20m** validity window (= 649200s). The lower bound must instead be the
+        measured `A_sched_max` at scheduled replacement, including `thisUpdate`
+        backdating and clock skew; the repository does not record that value.
+        Configure `A_sched_max < revocation_confirm_crl_max_age_seconds < 649200`.
+        Do not widen it past `nextUpdate`: after that hard expiry the CRL must
+        fail closed, and the independent age ceiling must remain binding. The
+        gate itself is live — a 1-second ceiling refuses the real CRL, and the
+        default accepts it.
   - [x] **The unauthenticated GET forms are removed (finding 4, 2026-08-15).**
         Closed entirely on RFC 8555 conformance grounds: `GET /acme/cert/{id}`
         and `GET /acme/authz/{id}` and the `allow_unauthenticated_resource_get`

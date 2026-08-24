@@ -473,6 +473,9 @@ it verifiable, point the RA at the CA's published CRL:
 ACME_RA_REVOCATION_CONFIRM_CRL_URL=http://pki.WORK-DOMAIN.local/crl/WORK-DOMAIN-CA.crl
 # Fail closed: refuse to confirm unless the CRL proves the serial is revoked.
 ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true
+# For this CA: CRLPeriod=604800s; measured nextUpdate-thisUpdate=649200s.
+# The lower bound must be measured at scheduled replacement/publication time.
+ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=<measured age < value < 649200>
 ```
 
 The CRL is signed by the CA and readable without privilege, so this is the one
@@ -481,13 +484,55 @@ The RA verifies the CRL's signature against the issuing CA certificate from the
 certificate's **own stored chain**, and refuses an expired CRL as evidence.
 Confirmations then record `verification: "crl-verified"` with the CRL number.
 
+These are three separate time bounds:
+
+- **Publication cadence:** `CRLPeriod` is the expected interval between CRLs.
+- **Overlap / validity:** `nextUpdate - thisUpdate` is the CRL's validity window;
+  `nextUpdate` is a hard expiry, not a delay budget that can be extended here.
+- **Replay-age ceiling:** `revocation_confirm_crl_max_age_seconds` independently
+  limits how old a signed CRL the RA will accept, so it must remain binding below
+  the hard expiry.
+
+For this CA, the committed evidence measures `CRLPeriod` as 604800 seconds (1
+week) and the `thisUpdate` → `nextUpdate` window as 649200 seconds (7d 12h
+20m). `CRLPeriod` is only the expected publication cadence; it is **not** the
+lower bound for the age ceiling.
+
+Before setting `revocation_confirm_crl_max_age_seconds` (the
+`ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` environment variable), measure
+`A_sched_max`: the maximum age observed, using the RA's clock, for a still-current
+CRL at its scheduled replacement/publication time. Measure representative
+scheduled cycles and include ADCS `thisUpdate` backdating plus the worst observed
+CA/RA clock skew. Then require:
+`A_sched_max < max_age_seconds < V_next_min`, where `V_next_min` is the minimum
+measured `nextUpdate - thisUpdate` validity window across representative CRLs.
+The evidence currently recorded here contains one 649200-second window; use the
+minimum from the deployment's measurements if later windows are shorter. The
+repository does **not** record `A_sched_max`, so it does not justify a numeric
+lower bound or a copy-paste production value. The prior 691200-second (8-day)
+plumbing test is not safe for this CA because it exceeds the measured validity
+window and makes the independent age ceiling non-binding before `nextUpdate`.
+
+Any operational margin belongs between the measured `A_sched_max` and the hard
+`nextUpdate` bound. If that gap is insufficient, change the CA's publication
+schedule/validity policy or accept fail-closed confirmations; do not widen the
+age ceiling past `nextUpdate`.
+
+If publication misses `nextUpdate`, the CRL must fail closed; no extra
+`max_age_seconds` margin can make an expired CRL acceptable. Fix the CA's
+publication path or accept the pending confirmation rather than widening this
+ceiling beyond the measured validity window.
+
 Note the timing trade-off before setting `REQUIRE_CRL_EVIDENCE`: a serial is not
 on the CRL until the CA next publishes one. On the default least-privilege path
 the agent does not force a republish (it has no Manage-CA right), so a
 confirmation can legitimately fail until the scheduled CRL publication catches
 up. The serial simply stays pending and the next sync cycle confirms it.
-**This path has not yet been exercised against a real ADCS CRL** — see
-`docs/security-review-2026-08-13.md`.
+The CRL-evidence path was exercised against a real ADCS CRL in the 2026-08-14
+live re-proof: required evidence refused a serial before publication and
+accepted it as `crl-verified` after publication. See
+`docs/security-review-2026-08-13.md` and the validation log in
+`docs/pre-pilot-checklist.md`.
 
 The retrieval is bounded on both axes, because the CRL host is an
 operator-configured third party on a path a scoped confirmation credential can
