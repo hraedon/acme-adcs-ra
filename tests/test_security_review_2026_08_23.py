@@ -276,6 +276,31 @@ class TestCrlSocketPinning:
             .not_valid_before(now - timedelta(minutes=1))
             .not_valid_after(now + timedelta(days=1))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            # SKI/AKI are not decoration here. OpenSSL 3.5 (shipped with the
+            # CPython 3.13/3.14 builds CI uses) refuses a chain whose issuer
+            # carries no key identifier with X509_V_ERR_MISSING_AUTHORITY_KEY_
+            # IDENTIFIER, while the OpenSSL behind 3.12 accepts it. Without
+            # these the handshake fails before hostname verification is ever
+            # reached, so the assertion below passes only on 3.12 and this test
+            # proves nothing about SNI on the versions the lab host runs.
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+                critical=False,
+            )
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=False,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=True,
+                    crl_sign=True,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
             .sign(ca_key, hashes.SHA256())
         )
         server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -292,6 +317,11 @@ class TestCrlSocketPinning:
             .not_valid_after(now + timedelta(days=1))
             .add_extension(
                 x509.SubjectAlternativeName([x509.DNSName("crl.example.test")]),
+                critical=False,
+            )
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
                 critical=False,
             )
             .sign(ca_key, hashes.SHA256())

@@ -557,6 +557,18 @@ ACME_RA_REVOCATION_CONFIRM_CRL_MAX_WORKERS=2
 ACME_RA_REVOCATION_CONFIRM_CRL_MAX_PENDING=32
 ```
 
+**If the CRL URL is `https://`, the CRL host's own chain must be RFC 5280 clean.**
+CRL retrieval verifies that TLS chain against the system trust store, and the
+OpenSSL shipped with Python 3.13+ (the lab host runs 3.14) enforces checks the
+3.12 build did not: an issuing CA whose certificate omits a Subject Key
+Identifier or a `keyCertSign` Key Usage is refused with
+`CERTIFICATE_VERIFY_FAILED`. A public CA meets this; a hand-rolled internal
+one may not. The failure is a fetch error, so evidence is recorded as absent
+and the confirmation fails closed rather than passing on an unverified CRL —
+correct, but it looks like an unreachable CRL host. Prefer a plain `http://`
+CDP: the CRL is signed by the CA and its signature is verified independently,
+so TLS adds no evidentiary value here.
+
 Concurrent confirmations for the **same certificate** share a single retrieval,
 so a retry loop or a burst on the revocation host costs one CRL fetch rather
 than one per request. Serials are canonicalized at route entry, so `A`, `0A` and

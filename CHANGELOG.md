@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — the CRL hostname-verification test was inert on 3.13 and 3.14 (2026-08-24)
+
+`test_https_pin_preserves_sni_and_real_hostname_verification` built its test CA
+without a Subject Key Identifier or a `keyCertSign` Key Usage, and its leaf
+without an Authority Key Identifier. The OpenSSL behind CPython 3.13/3.14
+enforces all three, so the TLS handshake failed *before* hostname verification
+was reached and the test failed on those versions — caught by CI on the first
+push of the series, not locally, where the dev venv is 3.12.
+
+The certificates now carry SKI, AKI, `keyCertSign`/`crlSign` and leaf
+`BasicConstraints`. Mutation-checked on 3.14: removing the transport's
+`assert_hostname` binding fails this test and the pool-level one. Suite is
+925 passed / 1 skipped identically on 3.12 and 3.14.
+
+**Product code was not involved.** But the version gap is the point: the lab
+host and the shipped deployment run **3.14**, so the control this test exists
+to protect had never actually been exercised on the version that runs it.
+
+`docs/operations.md` gains the operator consequence: an `https://` CRL
+distribution point now needs an RFC 5280-clean chain, because the same OpenSSL
+strictness applies to the RA's own CRL fetch. It fails closed (evidence absent,
+confirmation refused) but presents as an unreachable CRL host. A plain `http://`
+CDP is preferred — the CRL's signature is verified independently, so TLS adds
+no evidentiary value.
+
 ### Security — stale key-change requests could overwrite a completed rollover (2026-08-23)
 
 - `keyChange` now carries the authenticated old-key thumbprint into one
