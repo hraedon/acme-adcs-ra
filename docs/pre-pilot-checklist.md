@@ -62,11 +62,26 @@ honest: check a box only when the thing is actually true, not when it's planned.
         `already-revoked-at-CA`, reaches the confirm POST, and drains the
         pending set. This is the whole point of exit 6, and only a live run
         exercises the wiring.
-  - [ ] **Installer MSI verification (2026-08-17 F1) — STILL OWED.** Pester-proven
-        and source-ordered, never live-executed: the lab host has the handler
-        installed and its DLL fallback short-circuits the MSI path, so forcing
-        it would mean hiding a production DLL. The one native case still owed
-        after five live rounds. With a real
+  - [x] **Installer MSI verification (2026-08-17 F1) — PROVEN LIVE 2026-08-24,
+        after five rounds owed.** Run against the **released `v1.10.0` tarball**
+        on a second Windows Server host, with the handler deliberately
+        uninstalled so the MSI branch became reachable (the RA host's own
+        installed handler is what had made this untestable). All four cases
+        against the real Microsoft MSI:
+        - `http://` URL → refused before any download, handler absent;
+        - `https://` with **no** digest → refused, handler absent;
+        - `https://` with a well-formed but **wrong** digest → the MSI *was*
+          downloaded into protected staging, hashed there, and rejected on
+          value — `msiexec` never opened it, handler absent. This is the
+          staged-copy refusal, live;
+        - correct digest → Authenticode verified against
+          `CN=Microsoft Corporation` (the `Get-AuthenticodeSignature` call no
+          unit test can reach), installed, handler present.
+
+        Host restored and verified against a pre-test snapshot: same handler
+        version, module re-registered, sites and pools running, every
+        installer-created directory removed. Original text follows.
+        **Installer MSI verification (2026-08-17 F1).** With a real
         HttpPlatformHandler MSI: correct `-HttpPlatformHandlerSha256` installs;
         a wrong digest aborts before `msiexec`; an `http://` URL is refused.
         The decision functions are unit-tested, the `Get-FileHash` /
@@ -363,7 +378,11 @@ engineered to. Until then it has not — regardless of a green local test run.
     enrollment lease) was not run. **CLEARED 2026-08-24** — proven end to end,
     22/22, on tip `f6badc9`; see the newest validation-log entry above for why
     it had been unrunnable rather than merely skipped. The MSI
-    no-digest/staged-copy refusals remain owed from round 6. The privileged-script-path item gained live evidence
+    no-digest/staged-copy refusals remain owed from round 6.
+    **BOTH CLEARED 2026-08-24** — phase L proven 22/22, and all four MSI
+    cases proven live on a second Windows host against the released
+    `v1.10.0` tarball (including the Authenticode check and a staged
+    wrong-digest artifact that `msiexec` never opened). The privileged-script-path item gained live evidence
     rather than a fix: `C:\Temp\ra-scripts`, the path the gMSA sync task
     executes from, measures `BUILTIN\Users:(CI)(AD)` and `(WD)`.
   - **Teardown verified**: all 7 certificates this run caused the CA to issue

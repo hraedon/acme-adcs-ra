@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Validated — the installer's MSI gate, proven live at last (2026-08-24)
+
+Owed since round 6 and slipped by five consecutive live rounds, for a
+structural reason rather than neglect: the MSI branch is gated by
+`Test-HttpPlatformHandler`, which is true when the module is registered *or*
+its DLL is present — and the RA host has both, so the branch was unreachable
+there. Forcing it would have meant hiding a production DLL.
+
+Run instead on a second Windows Server host with the handler deliberately
+uninstalled, against the **released `v1.10.0` tarball** and the real Microsoft
+MSI. All four cases:
+
+- `http://` source → refused before any download; handler absent.
+- `https://` with no digest → refused; handler absent.
+- `https://` with a well-formed but wrong digest → the artifact **was**
+  downloaded into protected staging and hashed there, then rejected on value.
+  `msiexec` never opened it. This is the staged-copy refusal, live.
+- Correct digest → Authenticode verified against `CN=Microsoft Corporation`,
+  then installed. That signature check is the half no unit test can reach.
+
+Host restored and verified against a pre-test snapshot: identical handler
+version, module re-registered, sites and pools running, every
+installer-created directory removed.
+
 ### Docs — WI-052 has a number: the CRL age ceiling is derivable (2026-08-24)
 
 The runbook asked operators to *observe* `A_sched_max` (peak CRL age at
