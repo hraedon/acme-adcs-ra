@@ -86,10 +86,36 @@ honest: check a box only when the thing is actually true, not when it's planned.
         a wrong digest aborts before `msiexec`; an `http://` URL is refused.
         The decision functions are unit-tested, the `Get-FileHash` /
         `Get-AuthenticodeSignature` calls around them are not.
-  - [x] **POST-as-GET-only RA (2026-08-15 F4) — 405s PROVEN LIVE 2026-08-23**
-        (§G 5/5, and again in the 9-check CRL/POST-as-GET pass). **The Certify
-        the Web renewal half is still owed** — that is a client-compatibility
-        check no lab phase covers. Original text follows.
+  - [x] **POST-as-GET-only RA (2026-08-15 F4) — FULLY CLOSED 2026-08-24.**
+        The 405s were proven live 2026-08-23 (§G 5/5, and again in the 9-check
+        CRL/POST-as-GET pass). **The Certify the Web half is now proven too**,
+        which no lab phase could cover because it needs the real client.
+
+        Certify the Web 7.1.1.0 (ACME stack `Certify.ACME.Anvil` 3.3.3) drove a
+        full issuance against the RA from a separate domain host. Server-side
+        audit: `account-created` (EAB accepted) → `order-created` →
+        `challenge-validated` → `certificate-issued`. The **IIS log is the
+        direct evidence** that it never used the removed GET forms:
+
+        ```
+        POST /acme/authz/<id>     200
+        POST /acme/order/<id>     200
+        POST /acme/finalize/<id>  200
+        POST /acme/cert/<id>      200   <- certificate retrieval
+        ```
+
+        Every retrieval verb is a POST, all 200, **zero 405s**. So the removed
+        GET forms are not a client-compatibility problem and there is nothing
+        to file against CtW.
+
+        Two client-side notes, neither a product issue: CtW's pre-flight
+        "check the challenge URL is accessible" fails (the name has no DNS
+        record and the RA needs no challenge responder — it auto-validates on
+        EAB + network + SAN scope), and CtW **proceeds anyway**, so the
+        pre-check does not need disabling. Separately, storing the issued
+        certificate failed with "Access is denied" when its service runs as a
+        non-administrator gMSA — a Windows permission matter on the client
+        host, unrelated to the RA. Original text follows.
         **POST-as-GET-only RA (2026-08-15 F4).** Plain `GET /acme/cert/{id}`
         and `/acme/authz/{id}` now return 405. Prove Certify the Web renews
         against it; any breakage is a CtW bug to file, not a reason to restore

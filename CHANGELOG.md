@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Validated — Certify the Web renews against the POST-as-GET-only RA (2026-08-24)
+
+The last open pre-pilot item. Removing the unauthenticated `GET /acme/cert/{id}`
+and `GET /acme/authz/{id}` forms (2026-08-15 F4) was closed on RFC 8555
+conformance grounds, but whether the actual client this RA exists to serve still
+worked was never tested — no lab phase can cover it, because it needs the real
+client.
+
+Certify the Web 7.1.1.0 (ACME stack `Certify.ACME.Anvil` 3.3.3) drove a full
+issuance from a separate domain host. Server-side audit: `account-created` (EAB
+accepted) → `order-created` → `challenge-validated` → `certificate-issued`. The
+IIS log is the direct evidence rather than inference:
+
+```
+POST /acme/authz/<id>     200
+POST /acme/order/<id>     200
+POST /acme/finalize/<id>  200
+POST /acme/cert/<id>      200
+```
+
+Every retrieval verb is a POST, all 200, **zero 405s**. The removed GET forms
+are not a client-compatibility problem and nothing needs filing against CtW.
+
+Two client-side observations, neither a product defect: CtW's pre-flight
+challenge-URL check fails against this RA (the RA auto-validates on EAB +
+network allowlist + SAN scope, so there is no responder to reach) and CtW
+proceeds regardless — the pre-check does not need disabling. And storing the
+issued certificate fails with "Access is denied" when the CtW service runs as a
+non-administrator gMSA, which is a permission matter on the client host.
+
 ### Validated — the installer's MSI gate, proven live at last (2026-08-24)
 
 Owed since round 6 and slipped by five consecutive live rounds, for a
