@@ -2065,9 +2065,22 @@ function Test-AceEndangersChildContainer {
 # question. Only EXISTING directories are examined -- a not-yet-created root has
 # no ACL, and the atomic-creation path already handles the collision race.
 function Get-AncestorSubstitutionViolations {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        # Identities whose delete-class access to $Path ITSELF is part of this
+        # root's DESIGN (the state root grants the worker gMSA Modify, and
+        # Modify carries Delete -- that is the 2026-08-24 live-found defect: the
+        # root-self check judged the designed grant by the executable-owners
+        # list, which can never admit a service identity, so every UPGRADE of
+        # an existing deployment refused at its own state root while fresh
+        # installs passed). ANCESTORS are always judged by the strict list --
+        # no service identity has any business holding delete on a PARENT of a
+        # protected root, whatever it holds on the root.
+        [string[]]$AllowedRootWriterSids = @()
+    )
     $violations = @()
     $allowed = @(Get-AllowedExecutableOwners)
+    $selfAllowed = @($allowed) + @($AllowedRootWriterSids)
     $p = $Path
     $guard = 0
     while ($p -and $guard -lt 32) {
@@ -2097,7 +2110,7 @@ function Get-AncestorSubstitutionViolations {
                             -AceType ([string]$rule.AccessControlType) `
                             -InheritanceFlags ([int]$rule.InheritanceFlags) `
                             -PropagationFlags ([int]$rule.PropagationFlags) `
-                            -AllowedWriterSids $allowed) {
+                            -AllowedWriterSids $(if ($isSelf) { $selfAllowed } else { $allowed })) {
                         $where = if ($isSelf) { 'this root' } else { "a directory above $Path" }
                         $violations += ("$p : '$identity' holds delete-or-own access " +
                                         "('$($rule.FileSystemRights)') on $where -- the protected " +

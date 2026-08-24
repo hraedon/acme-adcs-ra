@@ -3558,6 +3558,32 @@ Describe 'Test-AceEndangersChildContainer (F11: replace-the-child, not rewrite-t
         $bytes | Should -BeTrue
         $container | Should -BeFalse
     }
+
+    # 2026-08-24 live-validation addition: the raw generic-bit branches had no
+    # case at all -- the only generic-bit tests in this suite targeted the BYTE
+    # predicate, so deleting `-bor 0x40000000 -bor 0x10000000` from the
+    # container mask shipped green. Round 5 was burned by exactly this class
+    # (0x80000000 mistaken for GenericAll). Proven live against the deployed
+    # library first (10/10 on the lab host), pinned here afterwards.
+    It 'FAILS the raw GenericAll bit 0x10000000 on its own' {
+        Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights 0x10000000 `
+            -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0 | Should -BeTrue
+    }
+
+    It 'FAILS the raw GenericWrite bit 0x40000000 on its own' {
+        Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights 0x40000000 `
+            -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0 | Should -BeTrue
+    }
+
+    It 'PASSES the raw GenericRead bit 0x80000000 (round-5: it is NOT GenericAll)' {
+        Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights 0x80000000 `
+            -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0 | Should -BeFalse
+    }
+
+    It 'PASSES the raw GenericExecute bit 0x20000000' {
+        Test-AceEndangersChildContainer -Identity 'BUILTIN\Users' -Rights 0x20000000 `
+            -AceType 'Allow' -InheritanceFlags $CI -PropagationFlags 0 | Should -BeFalse
+    }
 }
 
 Describe 'install-windows.ps1: the root claim checks what is ABOVE the root (F11)' {
@@ -3579,6 +3605,94 @@ Describe 'install-windows.ps1: the root claim checks what is ABOVE the root (F11
         $script:installer | Should -Match 'Initialize-SecuredRoot -Path \$InstallDir'
         @([regex]::Matches($script:installer, 'Get-AncestorSubstitutionViolations')).Count |
             Should -BeGreaterOrEqual 1
+    }
+
+    It 'passes the state root its designed writers -- and the runtime root none' {
+        # 2026-08-24 live-found defect: the root-self check judged every root by
+        # the executable-owners list, which can never admit a service identity,
+        # so the DESIGNED gMSA Modify on the state root refused every UPGRADE of
+        # an existing deployment (fresh installs passed -- no root ACL yet).
+        # Only the state root may pass design writers; the runtime root's design
+        # is gMSA RX, so delete-class drift there must keep refusing.
+        $stateCall = [regex]::Match($script:installer,
+            'Initialize-SecuredRoot -Path \$InstallDir[\s\S]*?-AllowedRootWriterSids \$stateOwnerSids',
+            'Singleline')
+        $stateCall.Success | Should -BeTrue -Because 'the state root must pass its designed writers'
+        $runtimeCall = [regex]::Match($script:installer,
+            'Initialize-SecuredRoot -Path \$RuntimeDir(?:(?!Initialize-SecuredRoot)[\s\S])*',
+            'Singleline').Value
+        $runtimeCall | Should -Not -Match 'AllowedRootWriterSids' `
+            -Because 'the runtime root designs gMSA RX only; delete-class drift there must refuse'
+    }
+}
+
+# 2026-08-24 live-found defect regression: designed root writers vs ancestors.
+Describe 'Get-AncestorSubstitutionViolations: designed root writers (live defect 2026-08-24)' {
+    BeforeAll {
+        # Helpers live in BeforeAll, NOT the Describe body: Pester 5 evaluates
+        # Describe-body code during discovery in a scope the It blocks never
+        # see -- the same trap that made this round's first mask tests vacuous.
+        # The stub reads $global: holders because a global function cannot see
+        # this file's scopes, and the scriptblocks close over the file scope
+        # where the helpers live.
+        $script:gmsa = 'S-1-5-21-3780865419-4207977281-163478896-4615'
+        $script:root = Join-Path $TestDrive 'acme-state'
+        New-Item -ItemType Directory -Force -Path $script:root | Out-Null
+        function Script:New-StubAcl {
+            param([object[]]$Rules)
+            [pscustomobject]@{ Access = $Rules }
+        }
+        function Script:New-StubRule {
+            param([string]$Identity, [int]$Rights, [string]$AceType = 'Allow',
+                  [int]$IF = 0, [int]$PF = 0)
+            [pscustomobject]@{
+                IdentityReference   = [pscustomobject]@{ Value = $Identity }
+                FileSystemRights    = $Rights
+                AccessControlType   = $AceType
+                InheritanceFlags    = $IF
+                PropagationFlags    = $PF
+            }
+        }
+        function global:Get-Acl {
+            param([string]$LiteralPath)
+            if ($LiteralPath -eq $global:__StubRoot) { return & $global:__StubForRoot }
+            return & $global:__StubForAncestors
+        }
+        $script:adminTree = { New-StubAcl @((New-StubRule -Identity 'S-1-5-32-544' -Rights 0x1F01FF)) }
+        $script:gmsaModify = { New-StubAcl @((New-StubRule -Identity $script:gmsa -Rights 0x1F01FF)) }
+        $script:gmsaDelete = { New-StubAcl @((New-StubRule -Identity $script:gmsa -Rights 0x10000)) }
+    }
+
+    AfterAll {
+        Remove-Item Function:global:Get-Acl -ErrorAction SilentlyContinue
+    }
+
+    It 'refuses the designed gMSA Modify on the root WITHOUT the design list (the live defect)' {
+        $global:__StubRoot = $script:root; $global:__StubForRoot = $gmsaModify
+        $global:__StubForAncestors = $adminTree
+        @(Get-AncestorSubstitutionViolations -Path $script:root).Count | Should -Be 1
+    }
+
+    It 'accepts the same root WITH -AllowedRootWriterSids (the state-root design)' {
+        $global:__StubRoot = $script:root; $global:__StubForRoot = $gmsaModify
+        $global:__StubForAncestors = $adminTree
+        @(Get-AncestorSubstitutionViolations -Path $script:root `
+                -AllowedRootWriterSids @($script:gmsa)).Count | Should -Be 0
+    }
+
+    It 'NEVER applies the design list to an ANCESTOR -- a gMSA with delete on the parent still refuses' {
+        $global:__StubRoot = $script:root; $global:__StubForRoot = $adminTree
+        $global:__StubForAncestors = $gmsaModify
+        $v = @(Get-AncestorSubstitutionViolations -Path $script:root `
+                -AllowedRootWriterSids @($script:gmsa))
+        $v.Count | Should -BeGreaterOrEqual 1
+        ($v -join ' ') | Should -Match 'above'
+    }
+
+    It 'still refuses delete-class DRIFT on a root that designs no such writer (runtime shape)' {
+        $global:__StubRoot = $script:root; $global:__StubForRoot = $gmsaDelete
+        $global:__StubForAncestors = $adminTree
+        @(Get-AncestorSubstitutionViolations -Path $script:root).Count | Should -Be 1
     }
 }
 

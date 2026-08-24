@@ -618,6 +618,13 @@ function Initialize-SecuredRoot {
         [Parameter(Mandatory = $true)][string[]]$Grants,
         [Parameter(Mandatory = $true)][string[]]$AllowedTrustees,
         [string[]]$AllowedOwnerSids = @('S-1-5-32-544', 'S-1-5-18'),
+        # Design writers for the ROOT ITSELF in the substitution check (see
+        # Get-AncestorSubstitutionViolations). Only the state root passes one:
+        # its design grants the worker gMSA Modify, which carries Delete. The
+        # runtime root passes nothing -- its design is gMSA RX, so any
+        # delete-class ACE an existing runtime root carries is DRIFT and must
+        # refuse.
+        [string[]]$AllowedRootWriterSids = @(),
         [hashtable]$ProtectedEntries = @{},
         [string[]]$ForbiddenTopLevelEntries = @(),
         [string[]]$Preserve = @()
@@ -643,7 +650,8 @@ function Initialize-SecuredRoot {
     # is why this waited for evidence that never came. Asking the narrower
     # question instead passes C:\ProgramData and %ProgramFiles% and still catches
     # a root staged under C:\Temp.
-    $ancestorViolations = @(Get-AncestorSubstitutionViolations -Path $Path)
+    $ancestorViolations = @(Get-AncestorSubstitutionViolations -Path $Path `
+        -AllowedRootWriterSids $AllowedRootWriterSids)
     if ($ancestorViolations.Count -gt 0) {
         throw ("Refusing to claim the $Purpose root $Path : it, or a directory above it, lets a " +
                "non-administrator delete or take ownership of the tree.`n  " +
@@ -735,6 +743,7 @@ if ((Get-PathRelation -A $SitePath -B $RuntimeDir) -ne 'disjoint') {
 Initialize-SecuredRoot -Path $InstallDir -Purpose 'state (database, logs, secrets)' `
     -Grants $stateGrants -AllowedTrustees $raTrustees `
     -AllowedOwnerSids $stateOwnerSids `
+    -AllowedRootWriterSids $stateOwnerSids `
     -ProtectedEntries @{ 'acme-ra.env' = $raTrustees } `
     -ForbiddenTopLevelEntries $stateForbiddenEntries `
     -Preserve @("$InstallDir\acme_ra.db", "$InstallDir\acme-ra.env", "$InstallDir\logs")
