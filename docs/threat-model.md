@@ -378,8 +378,10 @@ The RA must never hold a CA/private signing key or sign a certificate. Enforced 
     honest audit event whose `details.revocation_scope` is `"ra-store-only"`
     and `details.ca_crl_updated` is `false` — the audit log never implies the
     CA CRL was written when it was not. The ACME response carries an
-    `out_of_band_revocation` hint (non-normative; ignored by standard ACME
-    clients) naming the runbook and the serial/ReqID the operator needs.
+    `X-Acme-Ra-Out-Of-Band-Revocation` response header (non-normative).
+    It moved out of the response body on 2026-08-24: a JSON body here is NOT
+    ignored by standard ACME clients -- Certify the Web fails to parse it and
+    reports a successful revocation as failed.
   - `scripts/Revoke-Cert.ps1` is the operator-run, CA-officer credential that
     performs the actual `certutil -revoke` against the CA and republishes the
     CRL, taking the serial or ReqID the RA already stores. It is run by a CA

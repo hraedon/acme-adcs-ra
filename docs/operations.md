@@ -956,7 +956,9 @@ out-of-band revocation loop: an accepted reason 7 would cause
 1. The ACME client (or an operator driving `revokeCert`) revokes the cert
    via the RA. The RA records `revocation_scope=ra-store-only`,
    `ca_crl_updated=false`, and the response carries an
-   `out_of_band_revocation` hint naming the runbook and the serial/ReqID.
+   `X-Acme-Ra-Out-Of-Band-Revocation` response **header** naming the runbook
+   and the serial/ReqID. (It was a JSON body until 2026-08-24; that broke real
+   ACME clients, which reported successful revocations as failed.)
 2. A CA officer runs `scripts/Revoke-Cert.ps1` with the serial or ReqID:
 
    ```powershell

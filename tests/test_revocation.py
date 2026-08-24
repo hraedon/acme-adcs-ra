@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from importlib import resources
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from cryptography import x509
@@ -25,6 +25,19 @@ from acme_adcs_ra.server import ServerContext, create_app
 from acme_adcs_ra.store import Store
 
 from .hand_rolled_acme_client import HandRolledAcmeClient
+
+
+def _oob_hint(resp: Any) -> dict[str, Any] | None:
+    """Read the out-of-band hint from the response HEADER.
+
+    It used to be a JSON body. That broke real ACME clients -- Certify the Web
+    cannot parse any JSON object here and reports the revocation as FAILED even
+    though it succeeded -- so on 2026-08-24 it moved to
+    X-Acme-Ra-Out-Of-Band-Revocation and every success path returns an empty
+    body, which is what RFC 8555 s7.6 clients expect.
+    """
+    raw = resp.headers.get("X-Acme-Ra-Out-Of-Band-Revocation")
+    return None if raw is None else cast("dict[str, Any]", json.loads(raw))
 
 # The package-shipped fixture cert (pre-generated, non-sensitive) is reused for
 # the CertsrvRevocationLeg unit tests so they don't need a live CA or a freshly
@@ -193,7 +206,7 @@ class TestRevokeCertAuthorization:
         ac, cert_der = _issue_cert(client, test_config, account_key)
         resp = ac.revoke_certificate(cert_der, reason=0)
         assert resp.status_code == 200
-        assert resp.json() == {}
+        assert resp.content == b""
 
     def test_different_account_cannot_revoke(
         self,
@@ -555,7 +568,7 @@ class TestCasGuardedRevocation:
         # route returns 200 {} without auditing.
         resp = racing_ac.revoke_certificate(cert_der, reason=5)
         assert resp.status_code == 200
-        assert resp.json() == {}
+        assert resp.content == b""
 
         # No successful certificate-revoked audit event was emitted (the racing
         # leg's direct store flip doesn't audit; the route's lost-CAS path
@@ -668,8 +681,7 @@ class TestOutOfBandRevocation:
 
         resp = ac.revoke_certificate(cert_der, reason=1)
         assert resp.status_code == 200
-        body = resp.json()
-        hint = body.get("out_of_band_revocation")
+        hint = _oob_hint(resp)
         assert hint is not None, "out-of-band leg must surface the out_of_band_revocation hint"
         assert hint["ca_crl_updated"] is False
         assert hint["revocation_scope"] == "ra-store-only"
@@ -732,8 +744,9 @@ class TestOutOfBandRevocation:
 
         resp = ac.revoke_certificate(cert_der, reason=0)
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["out_of_band_revocation"]["req_id"] == "77"
+        hint = _oob_hint(resp)
+        assert hint is not None
+        assert hint["req_id"] == "77"
 
         account_id = ac.account_url.split("/")[-1]
         events = store.list_audit_events(account_id=account_id, event_type="certificate-revoked")
@@ -755,7 +768,7 @@ class TestOutOfBandRevocation:
         assert ac.revoke_certificate(cert_der, reason=0).status_code == 200
         resp = ac.revoke_certificate(cert_der, reason=0)
         assert resp.status_code == 200
-        assert resp.json() == {}
+        assert resp.content == b""
 
     def test_store_reflects_revoked_under_out_of_band_leg(
         self,
@@ -827,7 +840,8 @@ class TestOutOfBandRevocation:
 
         resp = ac.revoke_certificate(cert_der, reason=0)
         assert resp.status_code == 200
-        hint = resp.json()["out_of_band_revocation"]
+        hint = _oob_hint(resp)
+        assert hint is not None
         assert "req_id" not in hint, "req_id must be absent when the cert has none"
 
         account_id = ac.account_url.split("/")[-1]
@@ -909,8 +923,10 @@ class TestFakeLegRevocationResponseShape:
         ac, cert_der = _issue_cert(client, test_config, account_key)
         resp = ac.revoke_certificate(cert_der, reason=0)
         assert resp.status_code == 200
-        body = resp.json()
-        assert body == {}, f"expected empty body for ca_crl_updated=true, got {body}"
+        # Empty body on every success path, and no hint header when the leg
+        # reports the CRL was written.
+        assert resp.content == b"", f"expected empty body, got {resp.content!r}"
+        assert _oob_hint(resp) is None
 
 
 # ---------------------------------------------------------------------------

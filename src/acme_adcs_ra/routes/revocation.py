@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
 from cryptography import x509
@@ -9,7 +10,7 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509 import DNSName
 from cryptography.x509.oid import ExtensionOID
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 
 from acme_adcs_ra.acme_errors import (
     bad_revocation_reason,
@@ -47,7 +48,7 @@ def _dns_sans(cert: x509.Certificate) -> list[str]:
 async def revoke_cert(
     request: Request,
     ctx: ServerContext = Depends(get_context),
-) -> JSONResponse:
+) -> Response:
     _header, payload, account, _authenticated_thumbprint = await authenticate_account(
         ctx, request, _ACME_PATHS["revokeCert"]
     )
@@ -162,8 +163,9 @@ async def revoke_cert(
 
     if cert_record.status == CertStatus.REVOKED:
         # H-4: RFC 8555 §7.6 says an already-revoked cert returns 200 OK
-        # (idempotent) rather than 400 alreadyRevoked.
-        return JSONResponse(status_code=200, content={})
+        # (idempotent) rather than 400 alreadyRevoked. Empty body, like every
+        # other success path here -- a JSON object body breaks real clients.
+        return Response(status_code=200)
 
     try:
         revocation_result = ctx.revocation.revoke(
@@ -239,7 +241,7 @@ async def revoke_cert(
     # re-emitted on the idempotent second call; the first call's audit already
     # recorded it). Deterministic signal — no timestamp-inference race.
     if not won_cas:
-        return JSONResponse(status_code=200, content={})
+        return Response(status_code=200)
 
     # The order transition and the audit row committed with the certificate
     # CAS above. Only the SIEM fan-out is left, and it stays fail-open: the
@@ -250,14 +252,25 @@ async def revoke_cert(
     revocation_scope = audit_details["revocation_scope"]
     ca_crl_updated = audit_details["ca_crl_updated"]
 
-    # WI-010: surface the out-of-band step in the ACME response. RFC 8555 §7.6
-    # specifies an empty body on success; extra fields are non-normative and
-    # ignored by standard ACME clients. The "out_of_band_revocation" hint tells
-    # the operator (and any inspecting client) that the CA CRL was not written
-    # and points at the runbook. It is absent when the leg reports the CRL was
-    # written (ca_crl_updated == "true"), so a future in-band leg that does
-    # write the CRL simply omits the hint.
-    response_body: dict[str, Any] = {}
+    # WI-010: surface the out-of-band step, but in a HEADER, not the body.
+    #
+    # This used to return the hint as a JSON body, on the stated assumption that
+    # extra fields are "ignored by standard ACME clients". That assumption was
+    # disproven live on 2026-08-24: Certify the Web fails to parse ANY JSON
+    # object body here -- it errors at line 1, position 1, on the opening brace,
+    # so even `{}` breaks it -- and then reports the revocation as FAILED to the
+    # operator. The revocation had in fact succeeded. A false negative on a
+    # revocation is worse than a missing hint: an operator may believe a
+    # certificate is still live when it is not, or retry against a CA that has
+    # already revoked it.
+    #
+    # RFC 8555 §7.6 asks only for 200 on success. An empty body is what every
+    # public CA returns and what clients are built against, so that is what we
+    # return. The hint moves to X-Acme-Ra-Out-Of-Band-Revocation, where tooling
+    # that wants it can still read it and no JSON parser ever sees it. The same
+    # information is, as before, in the audit row -- which remains the durable
+    # record.
+    headers: dict[str, str] = {}
     if ca_crl_updated == "false":
         hint: dict[str, Any] = {
             "ca_crl_updated": False,
@@ -267,6 +280,9 @@ async def revoke_cert(
         }
         if req_id:
             hint["req_id"] = req_id
-        response_body = {"out_of_band_revocation": hint}
+        # Compact, header-safe: no newlines, ASCII only.
+        headers["X-Acme-Ra-Out-Of-Band-Revocation"] = json.dumps(
+            hint, separators=(",", ":")
+        )
 
-    return JSONResponse(status_code=200, content=response_body)
+    return Response(status_code=200, headers=headers)

@@ -218,7 +218,7 @@ honest: check a box only when the thing is actually true, not when it's planned.
       order → revoked, GET cert → 410 Gone) — it does **not** write the CA CRL.
       The audit event honestly records `revocation_scope=ra-store-only`,
       `ca_crl_updated=false`; the ACME response surfaces an
-      `out_of_band_revocation` hint. The operator closes the loop by running
+      `X-Acme-Ra-Out-Of-Band-Revocation` header. The operator closes the loop by running
       `scripts/Revoke-Cert.ps1` (a CA officer, **not** the gMSA) which runs
       `certutil -revoke` and republishes the CRL. The enrollment gMSA gains no
       CA-officer rights (the project's tightest security tenet). Confirm the

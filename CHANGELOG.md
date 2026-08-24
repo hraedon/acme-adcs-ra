@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — revokeCert returns an empty body; the out-of-band hint moves to a header (2026-08-24)
+
+**Breaking for anything that read the response body.** Every `revokeCert`
+success path now returns **200 with an empty body**, and the WI-010
+out-of-band hint is carried in `X-Acme-Ra-Out-Of-Band-Revocation` as compact
+JSON.
+
+The old shape returned the hint as a JSON body on the stated assumption that
+"extra fields are ignored by standard ACME clients". Certify the Web disproved
+that live: it fails to parse any JSON object here — at line 1, position 1, the
+opening brace, so even `{}` breaks it — and then reports the revocation as
+**failed** to the operator. The revocation had succeeded. A false negative on a
+revocation is the worst direction for that error to point: an operator may
+believe a certificate is still live when it is not.
+
+RFC 8555 §7.6 asks only for 200 on success; an empty body is what public CAs
+return and what clients are built against. The same information remains in the
+audit row, which was always the durable record.
+
+Seven existing tests asserted the body shape. They were rewritten to read the
+header — not deleted — via a `_oob_hint()` helper, so the hint's contents,
+its absence when `ca_crl_updated=true`, and the `req_id` passthrough all stay
+covered. Suite 928 passed / 1 skipped.
+
 ### Fixed — ACME revocation was impossible for every conformant client (2026-08-24)
 
 `revokeCert` read the payload field **`cert`**. RFC 8555 §7.6 names it
@@ -1902,12 +1926,21 @@ against commit `c283d81` (15/15 E2E cases green, CA database confirms gMSA reque
 
 ### Stability contracts (from 1.0.0-rc1)
 - **ACME API surface:** the directory endpoints, JWS validation, EAB binding,
-  and `revokeCert` response shape (200 OK with non-normative
-  `out_of_band_revocation` hint when `ca_crl_updated=false`) are the frozen
-  public API. The `out_of_band_revocation` hint is extra (ignored by standard
-  ACME clients per RFC 8555 §7.6); removing it or changing `ca_crl_updated` to
-  `true` requires a future in-band revocation capability (a deferred, explicit
-  privilege decision — see `docs/threat-model.md` §E).
+  and the `revokeCert` response shape are the frozen public API.
+
+  > **AMENDED 2026-08-24.** This clause used to say the `out_of_band_revocation`
+  > hint shipped in the response **body** and was "ignored by standard ACME
+  > clients per RFC 8555 §7.6". That claim was disproven live: Certify the Web
+  > cannot parse *any* JSON object body on this endpoint — it fails at line 1,
+  > position 1 — and then reports a revocation that actually SUCCEEDED as
+  > failed. A false negative on revocation is worse than a missing hint. The
+  > hint therefore moved to the `X-Acme-Ra-Out-Of-Band-Revocation` response
+  > header and every success path now returns an empty body. The header, not a
+  > body field, is the frozen surface from here.
+
+  Changing `ca_crl_updated` to `true` still requires a future in-band revocation
+  capability (a deferred, explicit privilege decision — see
+  `docs/threat-model.md` §E).
 - **Audit event types:** the `event_type` strings in `audit_log` are stable
   for SIEM ingestion. New event types may be added; existing ones are not
   renamed or removed.
