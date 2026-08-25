@@ -661,3 +661,71 @@ shape (remove the applicable ACE), or accept that every CA-side privileged
 script run carries the override. Not a product defect — the gate measured a
 real escalation surface — but it should be a conscious choice, and the next
 CA-host deploy should state it in `docs/operator-requirements.md`.
+
+### 9. (bug, medium) — NEW. **Two of this repo's own gates cannot both be satisfied**
+
+*Found 2026-08-25 when the daybreak branch's first CI run went red.*
+
+The pre-push publication guard refuses a push whose commit authors are not
+listed in `publication.toml`'s `author_email`.
+`scripts/check_publication_plumbing.py` compares those entries as **literal
+strings** — there is no pattern, domain, or hash form. So satisfying the guard
+means writing the literal address into a tracked file.
+
+The `identifier-gate` job forbids the homelab domain in tracked files. Both
+addresses this repo's history actually carries end in that domain. **The two
+gates are unsatisfiable together**, and the only ways through today are to
+re-author every commit to the `users.noreply.github.com` address, to push with
+`--no-verify`, or to leave the declaration knowingly stale.
+
+Why it stayed invisible: the addresses are already on 17 commits on `main` and
+CI has been green the whole time, because the identifier gate scans tracked
+**files**, not commit metadata. The collision only surfaces when someone
+declares what history already carries — which is precisely what the file exists
+to do. A guard whose correct use trips a sibling guard is not a working guard.
+
+**Options, in the order they should be considered:**
+
+1. Drop the domain from the `ACME_RA_FORBIDDEN_IDENTIFIERS` secret. It is the
+   homelab, not the work domain, and the repo is public under the owner's real
+   name already — the entry may simply be over-broad. **Owner-only: a repo
+   secret cannot be edited from a checkout.** This is the chosen direction as
+   of 2026-08-25; the declaration re-lands once the secret changes.
+2. Teach `check_publication_plumbing.py` a non-literal form (a domain suffix,
+   or a hash of the address) so the guard can be satisfied without publishing
+   the string. More work, but it is the version that survives the domain being
+   genuinely sensitive later.
+3. Re-author all commits to the noreply address. Cheapest, and it costs the
+   distinct actor identity in the author field — which this repo relies on
+   everywhere else it argues about lineage.
+
+Until one lands, **the pre-push guard refuses this branch on identity**. That
+refusal is expected. Do not silence it by widening the declaration; that is the
+path that just failed CI.
+
+### 10. (bug, medium) — NEW. **The Linux Pester job cannot see the tree gate at all**
+
+*Found 2026-08-25, same CI run.*
+
+`Assert-PrivilegedScriptTreeTrusted` is inert on Linux — it has no ACLs to
+read. Every test that executes a gated script therefore proves nothing about
+the gate on the Linux job, and the Linux job is the one everyone runs locally.
+
+Concretely: the F10 fix (`ade72a8`) put the gate at the top of
+`Sync-Revocations.ps1`, above the credential checks and the RA fetch that three
+cases in `Sync.Tests.ps1` exercise. A CI checkout is not a DACL-trusted tree,
+so on Windows the script refused at the gate with exit 1 and all three failed.
+**Linux stayed 467/0 through the fix session, the live lab validation, and a
+third-lineage adversarial review.** Only `pester-windows-powershell` saw it.
+
+Fixed test-side by passing `-AllowUntrustedScriptPath` in that file's
+invocation helper — the subject there is the credential surface, and the gate
+keeps its own coverage in `InstallVerify.Tests.ps1`. The gate was **not**
+weakened to suit a test.
+
+**The item is the general case, not the three tests.** Any future assertion
+about refusal behaviour written against the Linux job is vacuous by
+construction, and vacuous tests manufacture confidence in the next reviewer.
+Worth either marking the gate-dependent cases Windows-only so the Linux job
+reports them skipped rather than passed, or giving the gate an injectable
+verdict so its refusal path is exercisable everywhere.

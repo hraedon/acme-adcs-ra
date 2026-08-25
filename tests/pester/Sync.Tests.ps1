@@ -272,8 +272,24 @@ Describe 'Sync-Revocations credential surface (2026-08-23 finding 6)' {
             $prevEap = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
             try {
+                # -AllowUntrustedScriptPath is REQUIRED here, and only here.
+                # These three cases execute the script for real, and the
+                # 2026-08-24 F10 fix put Assert-PrivilegedScriptTreeTrusted at
+                # the top of it -- above the credential checks and the RA fetch
+                # these cases are actually about. A CI checkout (D:\a\... on the
+                # hosted runner, any clone anywhere) is not a DACL-trusted tree,
+                # so on WINDOWS the script correctly refused at the gate with
+                # exit 1 and these three failed. On Linux the gate is inert,
+                # which is exactly why the Linux-only run stayed green and only
+                # the Windows PowerShell 5.1 job caught it.
+                #
+                # The override is right rather than convenient: the subject here
+                # is the credential surface, and the tree gate has its own
+                # coverage in InstallVerify.Tests.ps1. What must NOT happen is
+                # weakening the gate to suit a test.
                 $out = & $script:psExe -NoProfile -ExecutionPolicy Bypass -File $script:syncPath `
                     -RaBaseUrl 'https://ra.example.invalid' -CaConfig 'CA01\WORK-DOMAIN-CA' `
+                    -AllowUntrustedScriptPath `
                     @ExtraArgs 2>&1
                 return @{ Output = ($out | Out-String); ExitCode = $LASTEXITCODE }
             } finally {
