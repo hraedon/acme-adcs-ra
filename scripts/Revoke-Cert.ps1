@@ -111,7 +111,11 @@ param(
     [Parameter(Mandatory = $true)][string]$CaConfig,
     [int]$Reason = 0,
     [string]$RequesterName = "WORK-DOMAIN\gMSA-acme-ra$",
-    [switch]$SkipPublishCrl
+    [switch]$SkipPublishCrl,
+    # Accept a script tree that is not administrator-only -- lab and
+    # first-install flows stage scripts\ under paths like C:\Temp, and a hard
+    # refusal with no override strands them. See the gate below.
+    [switch]$AllowUntrustedScriptPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -127,6 +131,17 @@ $ErrorActionPreference = "Stop"
 # Shared pure logic (serial normalization, reason/requester rules), covered by
 # tests/pester/Revocation.Tests.ps1. Deploy scripts/lib/ alongside this script
 # -- see docs/operations.md; copying individual .ps1 files breaks provisioning.
+# PROVENANCE FIRST, THEN SIBLINGS (2026-08-24 F10). This script runs with
+# CA-officer context and dot-sourced its sibling with nothing checking whether
+# the tree it came from is administrator-only -- the same class the paragraph
+# above closed for PATH-selected programs, one line lower down.
+# InstallVerifyLib.ps1 is loaded first because it IS the check; the residual
+# self-reference is documented in Assert-PrivilegedScriptTreeTrusted.
+. "$PSScriptRoot/lib/InstallVerifyLib.ps1"
+Assert-PrivilegedScriptTreeTrusted -Root $PSScriptRoot `
+    -Purpose 'manual certificate revocation' `
+    -AllowUntrusted:$AllowUntrustedScriptPath -RunTime
+
 . "$PSScriptRoot/lib/RevocationLib.ps1"
 
 # Write an error message to stderr and exit with a specific code. Using

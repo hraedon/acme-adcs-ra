@@ -6,7 +6,320 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+## [1.12.0] — 2026-08-25
+
+Three medium security findings from a cross-lineage whole-repository scan, a
+fourth found by measuring the deployed store, and a live re-proof that turned
+up two defects in the lab teardown itself.
+
+**Upgrade if you consume the audit stream.** This is the minor bump, and it is
+a minor rather than a patch for one reason: **audit rows that used to appear no
+longer do.** Nothing is lost that recorded a state change, but row *counts*
+change, so a SIEM rule or dashboard that counts them needs a look:
+
+- `admin-nonce-cleanup` and `admin-expired-order-sweep` emit **only when the
+  sweep actually deleted or invalidated something**. A no-op sweep is silent.
+- `admin-list-pending-revocations` emits **only when the poll returned work**.
+  An empty poll is silent.
+- `finalize-enrollment-admission-denied`, `admin-revocation-confirm-denied` and
+  `admin-list-pending-revocations` now **coalesce**: one row per window with an
+  exact `denial_count`, instead of one row per request.
+
+**Also new:** after a post-issuance store failure the RA answers finalize with
+**503 `issuance_halted`** and keeps doing so until it is restarted. That is
+deliberate and one-way; see the finding below.
+
+### The part worth keeping
+
+The static scan found three call sites. A single `GROUP BY event_type` against
+the real deployed store found two more it could not have — and showed that
+**78.5% of the audit table was this RA narrating its own idle maintenance**,
+against eleven `certificate-issued` rows. Reading the source tells you an
+event exists; only counting rows tells you it dominates.
+
+The same lesson repeated in teardown, twice, and cost more: the procedure's
+"is the CA clean?" check restricted on a template *display name* where the
+column holds an OID, so it matched nothing, returned zero, and read as clean.
+Fifteen certificates from earlier sessions were live at the CA the whole time,
+each of those sessions having recorded a clean teardown. **A verification step
+whose failure mode is silence is not a verification step.**
+
+### Security — 2026-08-25 whole-repository standard scan (three findings, all fixed)
+
+A cross-lineage static scan of `a566050`: three medium, no high or critical.
+Two are audit-growth bounds. The first is the one that mattered — it could
+leave a domain-trusted certificate outside the RA entirely.
+
+- **A post-issuance store failure orphaned a live certificate (medium; high
+  impact, low likelihood).** `Store.record_issuance` is the *first* durable
+  record of something ADCS has **already done**, and it was unguarded. On a
+  full or read-only database the certificate/order/audit transaction rolls
+  back and the exception escapes before the SIEM fan-out, so a live
+  certificate existed with no row, no audit event, no quarantine record and no
+  revocation-queue entry.
+
+  The asymmetry was the tell: both *neighbouring* paths — verifier rejection
+  (`_quarantine_and_fail`) and transport failure
+  (`_quarantine_transport_orphan`) — already had orphan handlers. The success
+  path had none. And neither would have helped: both fall back to `_audit`,
+  which is `Store.record_audit` — **the same database that just failed**.
+  Under this fault that fallback raises from inside its own except block and
+  writes nothing anywhere.
+
+  This breaks an invariant the code states explicitly. `audit_retention`
+  argues that *"the `certificate-issued` audit row commits in the same
+  transaction as the certificate, so a full disk stops issuance rather than
+  issuing unaudited."* That holds only while the disk fills **before** the CA
+  call. In the window between "ADCS committed" and "SQLite committed" it
+  cannot hold, because the issuance has already happened. Worth stating
+  plainly: this deployment **refuses audit pruning on purpose**, so a filling
+  disk is not a freak event — it is the long-run destination of the shipped
+  configuration, and the other two findings shorten the timeline.
+
+  `_emergency_issuance_orphan` now compensates for that window, and **nothing
+  in it touches the store**. Two independent sinks: a `logger.critical`
+  carrying serial, ReqID, order, account and template (a different path from
+  the database), and a direct `ctx.audit_hook` call with a hand-built event —
+  deliberately bypassing `emit_audit_hook`'s after-the-row-commits contract,
+  because there is no row and there is not going to be one. Neither sink is
+  trusted: the hook is wrapped so a SIEM transport error cannot replace the
+  exception being re-raised, and logging handlers swallow transport errors
+  anyway, so a delivered-looking emission is not proof of delivery.
+
+  **Issuance then halts** (`IssuanceHalt`, 503 `issuance_halted`), because
+  every finalize admitted afterwards would orphan another certificate the same
+  way. One-way until restart, deliberately: this process cannot prove the
+  store became writable again, and an endpoint that clears a safety latch is a
+  way to turn the latch off under pressure. The latch does **not** fire for a
+  merely *busy* store (`database is locked`) — lock contention is transient
+  and ordinary, and halting on it would trade a rare orphan for a routine
+  self-inflicted outage. The emergency evidence is emitted either way; only
+  the latch is conditional.
+
+- **Enrollment admission denials were replayable into unbounded audit writes
+  (medium).** The enrollment gate sheds at `adcs_enrollment_max_pending`
+  (default 32) and the route CAS-restores the rejected order to `ready`, so
+  the identical signed finalize can be re-sent for as long as capacity stays
+  full — one durable row apiece. Shipped defaults allow one account to set
+  this up: `rate_limit_orders_per_window` is 50, and 33 ready orders is enough.
+
+  `finalize-enrollment-admission-denied` now coalesces. The reasoning is not
+  new — the coalescer's own docstring already wrote it for
+  `order-rate-limited`: *a denial issued because a cap was hit is unbounded by
+  definition, since the cap throttles the work and not the audit row.* It was
+  simply never pointed at the gate. An explicit `reason_code` pins the
+  coalescing key to a server constant, because `EnrollmentGateBusy`'s message
+  carries live counts and one edit putting `str(exc)` into `reason` would put
+  a varying value back in the key.
+
+- **The revocation-confirm credential was a durable write primitive
+  (medium→low).** Two replayable routes. A confirm-token holder could POST
+  well-formed but nonexistent serials forever
+  (`admin-revocation-confirm-denied`) — nothing transitions, the lookup
+  misses, the row was durable. The probed serial stays in `details` for the
+  investigator but an explicit `reason_code` keys the window, so varying it
+  cannot defeat the bound; the coalesced row then names the window's *first*
+  serial while the count stays exact. That trade is deliberate: "someone is
+  probing serials" is the signal, the individual values are not.
+
+  The pending-list poll is the more interesting half, and **it is not really
+  an attack**. The revocation sync task polls `admin-list-pending-revocations`
+  on a fixed interval, forever, and every poll wrote a row — so the table grew
+  without bound in entirely benign operation. Coalescing alone does not fix
+  that: at a 15-minute cadence and a 60-second window, no two polls ever fold.
+  The route now writes **no row at all when the list is empty**, which is the
+  steady state and reports nothing an investigator can use; a poll that
+  actually returns work keeps its row, because "the revocation host was handed
+  these serials" is the audit trail for what happens next. Coalescing bounds
+  the case the skip cannot — a token holder polling a *non-empty* list at line
+  rate.
+
+  This is the only **success** event in `COALESCED_EVENT_TYPES`, and it is
+  admissible only because nothing counts these rows. The contrast is
+  `account-key-changed`, excluded precisely because its successful rows *are*
+  the 14a limiter's counter. The membership guard test now pins all nine types
+  and states that rule, so the next addition is a reviewed decision.
+
+- **Two more of the same, found by MEASURING rather than reading (added during
+  the live re-proof).** Before deploying, one `GROUP BY event_type` against the
+  backup of the deployed store said this, out of 722 rows:
+
+  ```
+  199  admin-list-pending-revocations
+  184  admin-nonce-cleanup
+  184  admin-expired-order-sweep
+   ...
+   11  certificate-issued
+  ```
+
+  **567 of 722 rows — 78.5% of the entire audit table — were this RA's own
+  scheduled maintenance reporting that it had nothing to do.** The evidence the
+  system exists to produce was eleven rows. On a deployment that refuses audit
+  pruning, every one of those is permanent.
+
+  `admin-nonce-cleanup` and `admin-expired-order-sweep` now follow the same
+  rule as the pending-list poll: a sweep that deleted or invalidated nothing
+  writes no row; a sweep that actually destroyed state keeps its row, because
+  "these nonces were destroyed" is a real fact about the trail. The static scan
+  found one of these three call sites. The other two took one read-only query
+  against a real store — which is the part worth keeping.
+
+**The pattern, said out loud.** All three are the shape the 2026-08-24 entry
+below already names: *the correct primitive already existed, with the correct
+reasoning written beside it, and was not pointed at every call site.* That is
+four rounds running. The durable fix is structural rather than another
+call-site patch — invert the allowlist to a denylist, or add a test that
+enumerates every denial-shaped event emitted under `routes/` and requires each
+to be coalesced or exempt-with-a-reason. Recorded as an open item rather than
+done, because it is a design change and this release is a park.
+
+Suite 953 passed / 1 skipped (was 931); Pester 467 passed / 0 failed / 4
+skipped; ruff and mypy clean. Twenty-two new tests, **every one mutation-checked
+against twelve separate mutations** — including reverting each fix in place and
+recording the failure.
+
+### Security — 2026-08-24 daybreak standard scan (four findings, all fixed)
+
+A cross-lineage standard review at `0a47955`. Two findings were re-rated here
+and one required overturning a documented earlier decision. Full write-up in
+`docs/security-review-2026-08-24-daybreak-standard.md`; the pre-action
+declaration is in `docs/UNFILED-WORK-ITEMS.md`.
+
+Every one of the four is the same shape, which is the part worth keeping: **the
+correct primitive already existed, with the correct reasoning written beside
+it, and was not pointed at every call site.** Several of the new tests are
+therefore coverage assertions rather than behaviour assertions.
+
+- **A privileged script tree was judged AFTER its siblings had already run
+  (high).** `Register-MaintenanceTasks.ps1` dot-sourced `TaskActionLib.ps1` and
+  `SyncLib.ps1` ~70 lines above the provenance gate, so both executed as
+  Administrator before anything checked the tree — and the gate was scoped to
+  the revocation-sync path, so registering only the nonce/sweep tasks skipped it
+  entirely. Writing `SyncLib.ps1` alone was enough; neutering the checker was
+  never necessary. `Sync-Revocations.ps1` (run by the scheduled task as the gMSA
+  every interval, forever), `Revoke-Cert.ps1`, `Set-OfficerRights.ps1` and
+  `Reconcile-Revocation.ps1` had no gate at all.
+
+  One `Assert-PrivilegedScriptTreeTrusted` now runs in all five, **before** any
+  sibling loads. `-AllowUntrustedScriptPath` propagates into the registered task
+  action, so the documented lab flow does not register a task that always
+  refuses.
+
+  This overturns the 2026-08-18 decision to skip the run-time re-check, and the
+  reasons matter. That decision rested on two `Add-Type` C# compiles per load on
+  a 15-minute cadence, and closed with its own condition for revisiting: *"worth
+  revisiting if the lib is ever split so the DACL primitives can be loaded on
+  their own."* Both compiles are now on demand
+  (`Initialize-AtomicDirectoryType`, `Initialize-FinalPathType`) and neither is
+  on the trust path — dot-source cost **1298 ms → 321 ms** (pwsh 7.6/Linux). The
+  objection is retired rather than overruled. The primitives were deliberately
+  *not* split into a second file: `InstallVerifyLib.ps1:1680` records what a
+  duplicated predicate cost last time.
+
+- **Nothing checked whether a parent could replace a protected root (medium;
+  reported as high).** `Get-RootProvenance` inspects the root and its contents,
+  never above it, so everything the installer proves about `$InstallDir` /
+  `$RuntimeDir` could describe a tree an attacker substituted. The installer
+  already makes this argument for the IIS site tree and applies the check there.
+
+  Rated medium because the reported impact does not reproduce on the defaults:
+  swapping a child needs `Delete`/`DeleteSubdirectoriesAndFiles`, and
+  `C:\ProgramData` grants Users create-class rights only. It bites a
+  non-default root under a delete-granting parent — the documented `C:\Temp`
+  staging habit.
+
+  The reason it had never shipped is that `Test-PathChainTrusted` **fails**
+  `C:\ProgramData`, on `WriteData` — which on a directory means *create a new
+  entry*, not *replace an existing child*. So the broad predicate would have
+  refused the default install. `Test-AceEndangersChildContainer` asks the narrow
+  question (`Delete`, `DeleteSubdirectoriesAndFiles`, `ChangePermissions`,
+  `TakeOwnership`, `GenericAll`, `GenericWrite` — and *not* `WriteData`), which
+  passes `C:\ProgramData` and `%ProgramFiles%` and still fails `C:\Temp`.
+  Default-safe by construction; the test asserting `C:\ProgramData` passes is
+  load-bearing, because a wrong refusal aborts the upgrade of a live issuance
+  host.
+
+- **A redirect handed the HEC collector token to another origin (low→medium).**
+  `urllib`'s redirect handler strips only content-length/content-type and
+  copies `Authorization` onto the new request, and permits `http`/`ftp`
+  targets — so the https-only check the sink is gated on was worth one hop.
+  Confirmed by execution against a local redirect pair. The event body does not
+  leak (the new request carries no `data=`, and 301/302/303 downgrade POST to
+  GET), so this is credential disclosure — but an HEC token forges audit *into*
+  the SIEM. The sink now refuses redirects outright.
+
+- **`$env:windir` selected executables that run elevated (medium; reported as
+  high).** `InstallVerifyLib.ps1` derived `icacls.exe` from the inherited
+  process environment with a bare-name PATH fallback, while three sibling
+  scripts and `Get-TrustedInboxModuleRoots` already refused to trust exactly
+  that input. The fallback was the sharper half — reached by *unsetting* windir
+  rather than redirecting it — and icacls is not only executed here, it
+  produces the evidence every provenance verdict is read from.
+
+  `Get-TrustedSystem32Path` resolves from machine-scope `windir` then the folder
+  API, and **throws** on Windows rather than falling back. Applied to all nine
+  installer sites as well as the library; the three test assertions that pinned
+  the old `$env:windir` spelling now pin the new one. Fixing only the library
+  would have split the doctrine across two files, which is how this class keeps
+  returning.
+
+Pester **467 passed / 0 failed** (baseline 424); pytest 931 passed / 1 skipped;
+ruff and mypy clean. Every fix mutation-proven — reverted in place, suite re-run,
+failure recorded. One vacuous test was caught and fixed in the process: rights
+constants declared in a Pester `Describe` body are `$null` inside `It` blocks, so
+every mask assertion would have passed against `[int]$null = 0`.
+
+#### Live validation found two defects **in the fixes themselves** (2026-08-24)
+
+The four fixes above shipped with local gates only. Running them on the lab RA
+host and issuing CA the same day found two of them broken — the reason this
+subsection exists rather than a line in the release notes.
+
+- **The root-self substitution check refused the *designed* gMSA state grant.**
+  The new `Get-AncestorSubstitutionViolations` judged the root itself by
+  `Get-AllowedExecutableOwners`, a list that can never admit a service identity
+  — but the state root's design grants the worker gMSA `Modify`, and `Modify`
+  carries `Delete`. Fresh installs passed only because a not-yet-created root
+  has no ACL to judge: **every upgrade of an existing deployment refused with
+  `INSTALLER_EXIT=1`**, the round-5 wrong-refusal class the `C:\ProgramData`
+  test was written to prevent. `Initialize-SecuredRoot` now passes
+  `-AllowedRootWriterSids` for the **root-self** check only — the state root
+  admits its design writers, the runtime root admits none (its design is gMSA
+  `RX`, so any delete-class ACE there is drift), and **ancestors are never**
+  judged by the design list. Re-proven live: upgrade install exit 0,
+  `/directory` 200, twice.
+
+- **The untrusted-tree override did not reach the `Revoke-Cert.ps1` child.**
+  The chain ran registrar → task action → the sync's own gate and then stopped.
+  `Revoke-Cert.ps1` carries the same tree gate and was never told, so an
+  explicitly-allowed tree could enumerate the pending set and revoke nothing —
+  measured live as `SYNC COMPLETE: 1 pending, 0 revoked, 1 failed` on a
+  genuinely stuck orphan. `Sync-Revocations.ps1` now propagates the flag into
+  the child argv. This is the same defect the F10 fix's own task-action
+  propagation was written to close, one hop lower.
+
+Also closed: the raw generic-bit branches of `Test-AceEndangersChildContainer`
+(`0x10000000`/`0x40000000` flag; `0x80000000`/`0x20000000` do not) were
+live-proven 10/10 against the deployed library and then pinned — the
+adversarial review had found no existing case that reached them. All new tests
+mutation-checked; Pester 457 → 467.
+
+**Operator note, not a code defect:** the lab CA host's `C:\` carries an
+*applicable* `Authenticated Users:(M)` ACE, so no tree on that host passes the
+privileged-script gate and the officer scripts need `-AllowUntrustedScriptPath`
+there. The refusal is correct (measured, not assumed) and the override is loud.
+Filed in `docs/UNFILED-WORK-ITEMS.md`.
+
+**Done since:** live Windows validation (WI-050) and an independent
+third-lineage adversarial review, which rated F10/F12/F13 sound and held F11
+ship-blocking on proof grounds — confirmed prescient by the first defect above.
+A full canonical application re-proof ran on the final tip: §A 14/14, §A1 13/13,
+CRL+§G 9/10 (the one FAIL is CRL3, the designed WI-052 calibration check),
+§K 12/12, both transport-orphan branches 6/6, §R+Rverify through four cycles,
+least privilege, authority split, CRL evidence, teardown verified on both hosts.
+
+**Still not done:** phase L was not re-run here (no enrollment-leg change on
+this branch; owed on a v1.11.x tag per the standing lab-network item).
 
 ## [1.11.0] — 2026-08-24
 
@@ -44,6 +357,22 @@ hot-patching the single changed file onto the lab, **not** by a full installer
 deployment, and the lab was restored to the v1.10.0 artifact afterwards. The
 full §A–§L live re-proof was **not** re-run: the change is confined to the
 `revokeCert` route, and the path that matters for it was the path exercised.
+
+**Superseded 2026-08-24, after release.** The full re-proof did then run on
+`0a47955` — the exact shipped artifact, by real installer deployment reporting
+`VERSION=1.11.0`, not a hot patch. §A 14/14, §A1 13/13, CRL/§G 9/10 (CRL3 is
+the designed WI-052 calibration check), §K 12/12, both transport-orphan
+branches 6/6, §R+Rverify across three cycles, least privilege, authority split,
+CRL evidence. The v1.11.0 delta itself is proven on every cycle by a new `R2b`
+check — empty §7.6 body plus the `X-Acme-Ra-Out-Of-Band-Revocation` header,
+with the harness finally speaking the standard `certificate` dialect rather
+than the server's old `cert` one. **`Lqueue`/`Ldrain` did not run:** three
+attempts were defeated in turn by warm keep-alives surviving the route
+blackhole, a saturation check counting `TIME_WAIT`, and a flapping lab network
+fabric. Not a product regression — the diff to `f6badc9`, where those phases
+passed 22/22 the same morning, touches only `routes/revocation.py` — but it is
+owed on a v1.11.x tag. See the validation log and `docs/UNFILED-WORK-ITEMS.md`
+item 11.
 
 ### Changed — revokeCert returns an empty body; the out-of-band hint moves to a header (2026-08-24)
 

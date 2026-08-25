@@ -14,8 +14,68 @@
 # The installer keeps the I/O (Invoke-WebRequest, Get-FileHash,
 # Get-AuthenticodeSignature) and calls these to decide.
 
-$script:IcaclsExe = if ($env:windir) {
-    Join-Path $env:windir 'System32\icacls.exe'
+# Platform, read from the runtime rather than from $env:OS.
+#
+# The scratch guard below refuses to name a dump path on Windows when no
+# protected directory is configured. Gating that on $env:OS -- an inherited,
+# caller-settable environment variable -- meant anything starting the installer
+# with OS unset silently got the ambient-TEMP fallback the guard exists to
+# remove, in the one function whose whole thesis is not trusting the ambient
+# environment. Overridable as a script variable so the Pester suite can drive
+# both branches; that requires code execution in the session, which an
+# environment variable does not.
+$script:InstallVerifyIsWindows = ([System.Environment]::OSVersion.Platform -eq 'Win32NT')
+
+# Absolute path to a System32 executable, derived from NON-process sources.
+#
+# 2026-08-24 F13. This used to be `if ($env:windir) { Join-Path $env:windir
+# 'System32\icacls.exe' } else { 'icacls.exe' }`, which is two problems in five
+# lines. The process environment is inherited from whatever launched the
+# installer and is caller-settable -- the exact input class this library
+# already refuses to trust in Get-TrustedInboxModuleRoots and in
+# $script:InstallVerifyIsWindows. And the else branch is worse than the if:
+# a bare name resolves through PATH, which is precisely what round-6 finding 3
+# removed from the installer, and it is reached by UNSETTING windir rather than
+# redirecting it -- a lower bar.
+#
+# icacls is not merely executed here, it is the EVIDENCE: Get-RootProvenance
+# decides whether a pre-existing root is ours, and Assert-InstallTreeLocked
+# decides whether the lockdown holds, by parsing what this program prints. A
+# substituted icacls forges every provenance verdict in this file as well as
+# running attacker bytes as Administrator.
+#
+# Sources, in order of preference, matching Get-TrustedInboxModuleRoots: the
+# MACHINE-scope 'windir' (the HKLM Session Manager Environment value, writable
+# only by Administrators/SYSTEM), then the OS folder API for the System
+# directory. Candidates must be drive-absolute Windows paths or they are
+# discarded. On Windows a failure to resolve THROWS rather than falling back to
+# a bare name -- a fallback that restores PATH resolution is the bug with a
+# longer code path. Off Windows there is no System32 and no icacls, so the
+# Pester suite keeps a bare name it will never successfully execute.
+function Get-TrustedSystem32Path {
+    param([Parameter(Mandatory = $true)][string]$FileName)
+    if (-not $script:InstallVerifyIsWindows) { return $FileName }
+    $candidates = @()
+    try {
+        $machineWindir = [string][System.Environment]::GetEnvironmentVariable('windir', 'Machine')
+        if ($machineWindir) { $candidates += ($machineWindir.TrimEnd('\') + '\System32') }
+    } catch { }
+    try {
+        $systemDir = [string][System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)
+        if ($systemDir) { $candidates += $systemDir }
+    } catch { }
+    foreach ($dir in @($candidates)) {
+        $trimmed = ([string]$dir).Trim()
+        if ($trimmed -notmatch '^[A-Za-z]:\\') { continue }
+        return ($trimmed.TrimEnd('\') + '\' + $FileName)
+    }
+    throw ("Cannot resolve a trusted System32 path for '$FileName': neither the machine-scope " +
+           "windir nor the system folder API returned a drive-absolute Windows path. Refusing " +
+           "to fall back to PATH resolution for a program that runs elevated.")
+}
+
+$script:IcaclsExe = if ($script:InstallVerifyIsWindows) {
+    Get-TrustedSystem32Path -FileName 'icacls.exe'
 } else {
     'icacls.exe'
 }
@@ -32,17 +92,6 @@ $script:IcaclsExe = if ($env:windir) {
 # dot-sources this library on its own.
 $script:InstallVerifyScratchDir = $null
 
-# Platform, read from the runtime rather than from $env:OS.
-#
-# The scratch guard below refuses to name a dump path on Windows when no
-# protected directory is configured. Gating that on $env:OS -- an inherited,
-# caller-settable environment variable -- meant anything starting the installer
-# with OS unset silently got the ambient-TEMP fallback the guard exists to
-# remove, in the one function whose whole thesis is not trusting the ambient
-# environment. Overridable as a script variable so the Pester suite can drive
-# both branches; that requires code execution in the session, which an
-# environment variable does not.
-$script:InstallVerifyIsWindows = ([System.Environment]::OSVersion.Platform -eq 'Win32NT')
 
 function Get-InstallVerifyScratchPath {
     param([Parameter(Mandatory = $true)][string]$FileName)
@@ -440,7 +489,18 @@ function Set-ObjectProtectedDacl {
 # Create one directory with its final protected DACL in the same kernel call.
 # Create-then-icacls leaves a window in which a low-privilege process can open
 # a create-capable handle and retain it after the DACL changes.
-if (-not ('ACMERA.AtomicDirectory' -as [type])) {
+#
+# COMPILED ON DEMAND, NOT AT DOT-SOURCE (2026-08-24 F10). This used to run at
+# top level, so merely loading this library paid two Add-Type C# compiles --
+# and that cost is the whole reason the 2026-08-18 round declined to re-check
+# the script tree at RUN time, leaving the every-15-minutes revocation-sync
+# path ungated. Only two functions need these types
+# (New-AtomicProtectedDirectory and Get-CanonicalPathString), and neither is
+# on the trust-checking path, so the compile now happens when the type is
+# first used. The library is cheap to dot-source for its DACL predicates
+# alone, which is what makes the run-time gate affordable.
+function Initialize-AtomicDirectoryType {
+    if ('ACMERA.AtomicDirectory' -as [type]) { return }
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -475,6 +535,7 @@ function New-AtomicProtectedDirectory {
         [Parameter(Mandatory = $true)][string[]]$Grants
     )
     $ErrorActionPreference = 'Stop'
+    Initialize-AtomicDirectoryType
     if (-not $script:InstallVerifyIsWindows) {
         throw 'New-AtomicProtectedDirectory is supported only on Windows.'
     }
@@ -1515,8 +1576,10 @@ function Stop-AppPoolAndWait {
 
 # Kernel-resolved final path (junctions, symlinks, 8.3 names, case) for an
 # EXISTING file or directory. Windows-only; returns $null when the handle or
-# the query fails. Compiled once per session.
-if (-not ('ACMERA.FinalPath' -as [type])) {
+# the query fails. Compiled once per session, on first use rather than at
+# dot-source -- see Initialize-AtomicDirectoryType for why that matters.
+function Initialize-FinalPathType {
+    if ('ACMERA.FinalPath' -as [type]) { return }
     Add-Type -TypeDefinition @"
 using System;
 using Microsoft.Win32.SafeHandles;
@@ -1578,6 +1641,7 @@ function Get-CanonicalPathString {
     # 'disjoint' -- which is the RX/Modify boundary between the code and state
     # roots. Fail-open in the same shape as the scratch guard, one function over.
     if ($script:InstallVerifyIsWindows) {
+        Initialize-FinalPathType
         $segs = @($full -split '\\') | Where-Object { $_ }
         for ($i = $segs.Count; $i -ge 1; $i--) {
             $prefix = ($segs[0..($i - 1)] -join '\')
@@ -1825,6 +1889,240 @@ function Get-TreeTrustViolations {
     $violations = @(Test-PathChainTrusted -Path $Path)
     foreach ($obj in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue)) {
         $violations += Test-ObjectDaclTrusted -Path $obj.FullName
+    }
+    return @($violations | Where-Object { $_ })
+}
+
+# --- 2026-08-24 F10: the provenance gate every privileged entry point runs ----
+#
+# The registration script grew this check inline on 2026-08-18 and it was right,
+# but it sat BELOW two `. "$PSScriptRoot/lib/..."` lines, so two sibling
+# libraries had already executed as Administrator by the time the tree was
+# judged. The gate's own honest caveat -- "the check is loaded from the very
+# tree it judges, so someone who can already write here can neuter it" -- is a
+# different and weaker problem than that: neutering it requires rewriting
+# InstallVerifyLib.ps1, whereas the ordering meant writing SyncLib.ps1 alone was
+# enough and the gate never ran.
+#
+# It was also scoped to the revocation-sync path only, on the reasoning that the
+# nonce/sweep tasks "execute nothing from disk". True of the TASKS; false of the
+# registration script, which dot-sources siblings on every path.
+#
+# So the rule is now one function, called from every privileged entry point,
+# BEFORE that script loads anything else out of lib\. The residual self-
+# reference is unchanged and unavoidable: this file is itself read from the tree
+# under test. What changes is the blast radius -- an attacker must now replace
+# THIS file specifically, not whichever sibling happens to be convenient.
+#
+# On the run-time re-check: the 2026-08-18 note deferred it because loading this
+# library cost two Add-Type C# compiles, which is real on a 15-minute cadence.
+# Those compiles are now on demand (Initialize-AtomicDirectoryType,
+# Initialize-FinalPathType) and neither is on this path, so dot-sourcing for the
+# DACL predicates alone is cheap -- measured 1298ms -> 321ms on pwsh 7.6/Linux.
+# That was the note's stated condition for revisiting, so the run-time gate is
+# now taken in Sync-Revocations.ps1 too.
+function Assert-PrivilegedScriptTreeTrusted {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Purpose,
+        [switch]$AllowUntrusted,
+        # Registration PERSISTS a path for later privileged execution; a run-time
+        # check is guarding this process only. Both refuse by default, but the
+        # advice differs, and a run-time refusal must name the task so the
+        # operator can find what stopped.
+        [switch]$RunTime,
+        # Platform as a PARAMETER, defaulted from the script variable, because
+        # this library's stated design is that decision logic takes plain values
+        # so Linux Pester can drive it. Reaching for $script: inside the body
+        # instead looks equivalent and is not: a Pester It block assigning
+        # $script:InstallVerifyIsWindows writes a DIFFERENT scope from the one
+        # this function resolves, so the Windows branch silently never ran and
+        # the behavioural test reported "no exception thrown". Second instance
+        # of that trap in this change; the first was rights constants declared
+        # in a Describe body.
+        [bool]$IsWindowsHost = $script:InstallVerifyIsWindows
+    )
+    # Windows-only, and this is a correctness requirement rather than tidiness.
+    # Get-TreeTrustViolations reads Windows ACLs through Get-Acl, which does not
+    # exist on Linux/macOS pwsh -- so every path yields "ACL unreadable" and the
+    # gate refuses EVERYTHING. Caught by the Pester suite on the first run: three
+    # Sync tests that invoke the real script died on a refusal listing every
+    # ancestor up to /projects. A gate that fails closed on a platform with no
+    # such ACLs is not a stricter gate, it is a broken one -- and the round-5
+    # lesson is that a wrong refusal on the privileged path costs more than the
+    # hole it closes. $script:InstallVerifyIsWindows is the same overridable
+    # runtime flag the rest of this library gates on, so the suite can still
+    # drive both branches.
+    if (-not $IsWindowsHost) { return }
+    $violations = @(Get-TreeTrustViolations -Path $Root)
+    if ($violations.Count -eq 0) { return }
+    $detail = ($violations | Select-Object -First 8) -join "`n  "
+    if ($AllowUntrusted) {
+        Write-Warning ("The script tree $Root is NOT administrator-only, and the untrusted-path " +
+                       "override was passed:`n  $detail`n$Purpose runs from this tree, so whoever " +
+                       "can write here chooses what runs privileged. Move the tree under " +
+                       "%ProgramFiles% and re-run before pilot.")
+        return
+    }
+    $advice = if ($RunTime) {
+        ("This ran as a scheduled task or an operator invocation, so the tree was writable " +
+         "either at registration time -- with the override -- or since. Move scripts\ under an " +
+         "administrator-only path, re-register the task against the new path, and delete the old " +
+         "tree.")
+    } else {
+        ("Copy scripts\ somewhere administrator-only (a subdirectory of %ProgramFiles% is the " +
+         "shape the installer uses for the code root) and re-run from there.")
+    }
+    throw ("Refusing to run $Purpose from $Root : the tree, or a directory above it, is " +
+           "writable by a non-administrator.`n  $detail`n$advice")
+}
+
+# --- 2026-08-24 F11: can an ancestor SUBSTITUTE a protected root? -------------
+#
+# Test-AceEndangersBytes asks "can a non-administrator rewrite the bytes of this
+# object". That is the right question for a file about to be executed, and the
+# wrong question for a DIRECTORY ABOVE a protected root, where the attack is not
+# rewriting the parent but deleting the child and putting a different tree in
+# its place. DeleteSubdirectoriesAndFiles on a parent is delete-and-recreate on
+# the child WHATEVER the child's own DACL says -- install-windows.ps1 already
+# argues exactly this for the IIS site tree, and applies Get-TreeTrustViolations
+# there. It was never applied to the state or runtime roots.
+#
+# The reason it was never applied is measured and recorded two functions up:
+# C:\ProgramData FAILS Test-PathChainTrusted. It fails on WriteData. On a
+# DIRECTORY, WriteData (icacls `WD`) is "create a new entry in here" -- it does
+# not let anyone touch an existing child. So the broad predicate reports a real
+# ACE that cannot produce this attack, and the default -InstallDir sits directly
+# under it. install-windows.ps1:1385 is explicit that the SitePath refusal
+# shipped only once C:\inetpub was measured clean -- "the evidence this was
+# waiting on" -- and that evidence can never arrive for C:\ProgramData while the
+# question being asked is the byte-rewrite one.
+#
+# So this is the narrow predicate: the bits that let a principal REPLACE an
+# existing child container, and nothing else.
+#
+#   Delete                        -- rename or delete the child itself
+#   DeleteSubdirectoriesAndFiles  -- delete the child from the parent, whatever
+#                                    the child's own DACL says
+#   ChangePermissions (WRITE_DAC) -- rewrite the child's DACL, then do anything
+#   TakeOwnership (WRITE_OWNER)   -- become owner, then grant yourself the above
+#   GenericAll / GenericWrite     -- raw generic bits observed on live hosts;
+#                                    both subsume Delete
+#
+# Deliberately ABSENT, and this is the whole point: WriteData and AppendData.
+# On a container they mean create-a-new-entry, which is how C:\ProgramData and
+# %ProgramFiles% are shaped and is not this attack. Including them is what made
+# the check unusable on the default install path.
+#
+# Verified against the shapes that matter (Pester, both platforms):
+#   C:\ProgramData  Users:(CI)(WD,AD,WEA,WA)          -> PASSES (create-only)
+#   %ProgramFiles%  Users:(RX)                        -> PASSES
+#   C:\Temp         Authenticated Users:(OI)(CI)(M)   -> FAILS (M carries Delete)
+# A predicate that refused the first two would abort the upgrade of a live
+# issuance host, which is worse than the bug it closes -- the round-5 lesson.
+function Test-AceEndangersChildContainer {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Identity,
+        [Parameter(Mandatory = $true)][int]$Rights,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$AceType,
+        [Parameter(Mandatory = $true)][int]$InheritanceFlags,
+        [Parameter(Mandatory = $true)][int]$PropagationFlags,
+        [string[]]$AllowedWriterSids = @('S-1-5-32-544', 'S-1-5-18',
+            'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    )
+    if ($AceType -ne 'Allow') { return $false }
+    # INHERIT_ONLY does not apply to THIS object. Same reasoning as
+    # Test-AceEndangersBytes: C:\ carries Authenticated Users (OI)(CI)(IO)
+    # Modify, which does not let anyone delete C:\'s existing children -- but
+    # where it LANDS (any admin-created first-level directory) the applicable
+    # copy is flagged on that directory, which is the C:\Temp case.
+    if (($PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+        return $false
+    }
+    $mask = [int][System.Security.AccessControl.FileSystemRights]::Delete -bor
+             [int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+             [int][System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+             [int][System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+             0x40000000 -bor 0x10000000      # GenericWrite, GenericAll raw bits
+    if (($Rights -band $mask) -eq 0) { return $false }
+    # Same allowlist discipline as the byte predicate: resolve to a SID and fail
+    # closed on an unresolvable dangerous ACE, rather than pattern-matching
+    # familiar group names.
+    $sid = Resolve-IdentitySidValue -Identity $Identity
+    if ($null -eq $sid) { return $true }
+    foreach ($allowed in @($AllowedWriterSids)) {
+        if ($sid -ieq $allowed) { return $false }
+    }
+    return $true
+}
+
+# Every ancestor of $Path that could substitute the tree at $Path, as
+# violations. Empty list = no ancestor can swap this root out.
+#
+# The root ITSELF is checked too, for Delete/WRITE_DAC/WRITE_OWNER held by a
+# non-administrator: a child you can rename is as replaceable as one your parent
+# can delete, and Get-RootProvenance's owner+DACL match does not ask that
+# question. Only EXISTING directories are examined -- a not-yet-created root has
+# no ACL, and the atomic-creation path already handles the collision race.
+function Get-AncestorSubstitutionViolations {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        # Identities whose delete-class access to $Path ITSELF is part of this
+        # root's DESIGN (the state root grants the worker gMSA Modify, and
+        # Modify carries Delete -- that is the 2026-08-24 live-found defect: the
+        # root-self check judged the designed grant by the executable-owners
+        # list, which can never admit a service identity, so every UPGRADE of
+        # an existing deployment refused at its own state root while fresh
+        # installs passed). ANCESTORS are always judged by the strict list --
+        # no service identity has any business holding delete on a PARENT of a
+        # protected root, whatever it holds on the root.
+        [string[]]$AllowedRootWriterSids = @()
+    )
+    $violations = @()
+    $allowed = @(Get-AllowedExecutableOwners)
+    $selfAllowed = @($allowed) + @($AllowedRootWriterSids)
+    $p = $Path
+    $guard = 0
+    while ($p -and $guard -lt 32) {
+        $guard++
+        if (Test-Path -LiteralPath $p) {
+            $acl = $null
+            try { $acl = Get-Acl -LiteralPath $p } catch {
+                $violations += "$p : ACL unreadable ($($_.Exception.Message))"
+                $acl = $null
+            }
+            if ($acl) {
+                # A NULL DACL is EVERYONE:FullControl and surfaces as an empty
+                # rule collection, identical to deny-everyone. Fails closed here
+                # for the same reason Test-ObjectDaclTrusted fails closed on it.
+                if (@($acl.Access).Count -eq 0) {
+                    $violations += ("$p : DACL carries no ACEs -- a NULL DACL grants EVERYONE " +
+                                    "full control and is indistinguishable here from a " +
+                                    "deny-everyone one; both fail closed")
+                }
+                $isSelf = [string]::Equals($p.TrimEnd('\'), $Path.TrimEnd('\'),
+                                           [System.StringComparison]::OrdinalIgnoreCase)
+                foreach ($rule in $acl.Access) {
+                    $identity = ''
+                    try { $identity = $rule.IdentityReference.Value } catch { }
+                    if (Test-AceEndangersChildContainer -Identity $identity `
+                            -Rights ([int]$rule.FileSystemRights) `
+                            -AceType ([string]$rule.AccessControlType) `
+                            -InheritanceFlags ([int]$rule.InheritanceFlags) `
+                            -PropagationFlags ([int]$rule.PropagationFlags) `
+                            -AllowedWriterSids $(if ($isSelf) { $selfAllowed } else { $allowed })) {
+                        $where = if ($isSelf) { 'this root' } else { "a directory above $Path" }
+                        $violations += ("$p : '$identity' holds delete-or-own access " +
+                                        "('$($rule.FileSystemRights)') on $where -- the protected " +
+                                        "tree can be renamed aside and replaced regardless of its " +
+                                        "own DACL")
+                    }
+                }
+            }
+        }
+        $parent = Split-Path -Parent $p
+        if (-not $parent -or $parent -eq $p) { break }
+        $p = $parent
     }
     return @($violations | Where-Object { $_ })
 }

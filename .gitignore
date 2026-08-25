@@ -34,3 +34,6 @@ secrets/
 
 # never commit the local denylist (identifier gate)
 .identifiers-denylist.local
+
+# Pester -CI writes this next to the invocation directory.
+testResults.xml

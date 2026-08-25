@@ -45,7 +45,11 @@
 param(
     [Parameter(Mandatory = $true)][string]$CaConfig,
     [Parameter(Mandatory = $true)][string]$DbPath,
-    [switch]$Json
+    [switch]$Json,
+    # Accept a script tree that is not administrator-only -- lab and
+    # first-install flows stage scripts\ under paths like C:\Temp, and a hard
+    # refusal with no override strands them. See the gate below.
+    [switch]$AllowUntrustedScriptPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,6 +99,16 @@ if ($pythonExe -like '*\WindowsApps\*') {
     Die "Refusing the Windows Store python stub at $pythonExe; install Python 3.12+ machine-wide." 2
 }
 . (Join-Path $PSScriptRoot 'lib\InstallVerifyLib.ps1')
+
+# The interpreter's chain was already held to the installer's provenance rule
+# below; the tree THIS script and its siblings are read from was not
+# (2026-08-24 F10). Both questions have the same answer shape and neither is
+# worth more than the other -- a planted RevocationLib is as good as a planted
+# python.exe.
+Assert-PrivilegedScriptTreeTrusted -Root $PSScriptRoot `
+    -Purpose 'the RA-vs-CA revocation reconciler' `
+    -AllowUntrusted:$AllowUntrustedScriptPath -RunTime
+
 $pyChainViolations = @(Test-PathChainTrusted -Path $pythonExe)
 if ($pyChainViolations.Count -gt 0) {
     Die ("Refusing to run ${pythonExe}: it or its ancestor chain is not administrator-only.`n  " +

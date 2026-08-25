@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any, NoReturn, cast
 
 from cryptography import x509
@@ -47,6 +48,8 @@ from acme_adcs_ra.store import (
     CertificateRecord,
     OrderRecord,
     OrderStatus,
+    _now_iso,
+    _serial_from_pem,
     is_expired,
 )
 
@@ -902,6 +905,163 @@ def _quarantine_transport_orphan(
     )
 
 
+
+# Substrings that mean the store cannot be WRITTEN TO, as opposed to being
+# momentarily busy. Matched case-insensitively against the exception text,
+# because sqlite3 reports all of these as OperationalError and the message is
+# the only discriminator the driver offers.
+#
+# "database is locked" / "table is locked" are deliberately ABSENT: contention
+# is transient and ordinary, and latching issuance on it would trade a rare
+# orphan for a routine self-inflicted outage.
+_UNWRITABLE_STORE_MARKERS = (
+    "disk is full",
+    "database or disk is full",
+    "readonly database",
+    "read-only database",
+    "attempt to write a readonly database",
+    "disk i/o error",
+    "unable to open database file",
+    "database disk image is malformed",
+    "no space left",
+)
+
+
+def _store_is_unwritable(exc: BaseException) -> bool:
+    """True when *exc* says the store cannot take writes at all."""
+    if isinstance(exc, sqlite3.IntegrityError):
+        # A constraint violation is a bug or a duplicate, not a dead disk.
+        return False
+    if isinstance(exc, OSError):
+        # ENOSPC/EROFS surfacing from the filesystem rather than the driver.
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _UNWRITABLE_STORE_MARKERS)
+
+
+def _emergency_issuance_orphan(
+    ctx: ServerContext,
+    *,
+    order_id: str,
+    account_id: str,
+    requested_sans: list[str],
+    enrollment_result: EnrollmentResult,
+    exc: BaseException,
+) -> None:
+    """Record a live certificate the store could not be told about.
+
+    ADCS has already issued by the time ``record_issuance`` runs, and that call
+    is the FIRST durable record of the fact. If it raises -- a full disk, a
+    read-only database, a corrupt file -- the whole certificate/order/audit
+    transaction rolls back and the certificate is live at the CA with no row,
+    no audit event, no quarantine record and no revocation queue entry.
+
+    ``audit_retention`` states the invariant this protects: *"the
+    certificate-issued audit row commits in the same transaction as the
+    certificate, so a full disk stops issuance rather than issuing unaudited."*
+    That holds only while the disk fills BEFORE the CA call. In the window
+    between "ADCS committed" and "SQLite committed" it cannot hold, because the
+    issuance has already happened and no local rollback can undo it. This is
+    the compensation for that window.
+
+    **Nothing here touches the store.** That is the whole point, and it is why
+    the two neighbouring handlers are not reused: ``_quarantine_and_fail`` and
+    ``_quarantine_transport_orphan`` both fall back to ``_audit``, which is
+    ``Store.record_audit`` -- the same database that just failed. Under the
+    fault this function exists for, that fallback raises from inside its own
+    except block and no evidence is written anywhere.
+
+    Two sinks, both independent of SQLite:
+
+    * ``logger.critical`` -- goes to the RA's own log file, which is on a
+      DIFFERENT path from the database and, on the supported deployment, is
+      also what the Windows Event Log collector reads.
+    * ``ctx.audit_hook`` -- called DIRECTLY with a hand-built event rather than
+      through ``emit_audit_hook``'s usual after-the-row-commits contract,
+      because there is no row and there is not going to be one. When
+      ``audit_offbox_required`` is set this is a live off-box collector and the
+      evidence leaves the host.
+
+    Neither sink is trusted to succeed. The hook is wrapped because a SIEM
+    transport error must not replace the exception the caller is about to
+    re-raise, and because logging handlers swallow transport errors anyway --
+    so a delivered-looking emission is not proof of delivery.
+    """
+    try:
+        serial = _serial_from_pem(enrollment_result.cert_pem)
+    except Exception:  # noqa: BLE001 - never let evidence fail on a parse
+        serial = ""
+    req_id = str(enrollment_result.metadata.get("req_id", ""))
+
+    logger.critical(
+        "ORPHANED a CA-issued certificate: the RA could not record it. "
+        "serial=%s req_id=%s order=%s account=%s template=%s sans=%s. "
+        "The certificate is LIVE at the CA, is NOT in the RA store, and CANNOT "
+        "be revoked by the sync agent. Revoke it at the CA by hand using the "
+        "serial (or the ReqID), then restart the RA once the store is writable. "
+        "Store error: %s",
+        serial,
+        req_id,
+        order_id,
+        account_id,
+        enrollment_result.template,
+        requested_sans,
+        exc,
+        exc_info=True,
+    )
+
+    unwritable = _store_is_unwritable(exc)
+    event = {
+        "event_type": "finalize-issuance-record-failed",
+        "outcome": "failed",
+        "timestamp": _now_iso(),
+        "account_id": account_id,
+        "order_id": order_id,
+        "sans": list(requested_sans),
+        "template": enrollment_result.template,
+        "requester": enrollment_result.requester,
+        "details": {
+            "ca_issued": True,
+            "serial": serial,
+            "req_id": req_id,
+            "recorded": False,
+            "store_error": str(exc),
+            "store_unwritable": unwritable,
+            "issuance_halted": unwritable,
+            "reason": (
+                "the CA issued this certificate and the RA could not persist "
+                "it; no store row exists and it must be revoked by hand"
+            ),
+            # This event never had a durable local row -- say so on the row
+            # itself, so an investigator reconciling SIEM against the local
+            # audit table does not read the absence as a gap in the SIEM feed.
+            "emergency_offbox_only": True,
+        },
+    }
+    if ctx.audit_hook is not None:
+        try:
+            ctx.audit_hook(event)
+        except Exception:  # noqa: BLE001 - the caller's exception must survive
+            logger.critical(
+                "the emergency off-box emission for orphaned serial %s ALSO "
+                "failed; the log line above is the only remaining record",
+                serial,
+                exc_info=True,
+            )
+    else:
+        logger.critical(
+            "no audit hook is configured, so the orphaned serial %s has NO "
+            "off-box record at all",
+            serial,
+        )
+
+    if unwritable:
+        ctx.issuance_halt.halt(
+            f"post-issuance store failure on order {order_id} "
+            f"(serial {serial or 'unknown'}): {exc}"
+        )
+
+
 def _finalize_complete(
     ctx: ServerContext,
     order_id: str,
@@ -1015,19 +1175,41 @@ def _finalize_complete(
 
     # The certificate row, the order transition, and the mandatory issuance
     # audit row commit together — see Store.record_issuance.
-    cert_record, applied, _event = ctx.store.record_issuance(
-        order_id=order_id,
-        account_id=account_id,
-        cert_pem=enrollment_result.cert_pem,
-        chain_pem=enrollment_result.chain_pem,
-        template=enrollment_result.template,
-        requester=enrollment_result.requester,
-        metadata=dict(enrollment_result.metadata),
-        certificate_url_fn=lambda cert_id: _certificate_url(ctx, cert_id),
-        sans=requested_sans,
-        csr_subject=csr_subject,
-        expected_generation=generation,
-    )
+    #
+    # Guarded because this is the first durable record of something the CA has
+    # ALREADY done, and a local rollback cannot undo a CA issuance. Both
+    # neighbouring failure paths (verifier rejection, transport failure) have
+    # an orphan handler; this one — the SUCCESS path — did not, so a store
+    # failure here left a live certificate with no row, no audit event and no
+    # revocation queue entry. See _emergency_issuance_orphan.
+    try:
+        cert_record, applied, _event = ctx.store.record_issuance(
+            order_id=order_id,
+            account_id=account_id,
+            cert_pem=enrollment_result.cert_pem,
+            chain_pem=enrollment_result.chain_pem,
+            template=enrollment_result.template,
+            requester=enrollment_result.requester,
+            metadata=dict(enrollment_result.metadata),
+            certificate_url_fn=lambda cert_id: _certificate_url(ctx, cert_id),
+            sans=requested_sans,
+            csr_subject=csr_subject,
+            expected_generation=generation,
+        )
+    except Exception as exc:
+        _emergency_issuance_orphan(
+            ctx,
+            order_id=order_id,
+            account_id=account_id,
+            requested_sans=requested_sans,
+            enrollment_result=enrollment_result,
+            exc=exc,
+        )
+        # Re-raised, not swallowed: the client must not be told the order is
+        # valid when nothing was recorded, and the order stays `processing`
+        # so a retried finalize cannot re-enroll against a request the CA has
+        # already satisfied.
+        raise
     # The audit row is already durable; this only fans it out to SIEM.
     emit_audit_hook(ctx, _event)
 

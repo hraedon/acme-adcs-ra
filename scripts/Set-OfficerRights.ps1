@@ -89,7 +89,11 @@ param(
     [Parameter(Mandatory = $true)][string]$CaConfig,
     [Parameter(Mandatory = $true)][string]$OfficerSid,
     [Parameter(Mandatory = $true)][string]$TemplateOid,
-    [switch]$Remove
+    [switch]$Remove,
+    # Accept a script tree that is not administrator-only -- lab and
+    # first-install flows stage scripts\ under paths like C:\Temp, and a hard
+    # refusal with no override strands them. See the gate below.
+    [switch]$AllowUntrustedScriptPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,6 +105,17 @@ $ErrorActionPreference = "Stop"
 # with that context. The System directory comes from the RUNTIME, not
 # $env:windir -- which is caller-settable process state, the same class as the
 # $env:OS gate the round-3 review moved off the environment.
+
+# PROVENANCE FIRST, THEN SIBLINGS (2026-08-24 F10). This script edits CA
+# officer rights and dot-sourced its sibling with nothing checking whether the
+# tree it came from is administrator-only -- the same class the paragraph above
+# closed for PATH-selected programs, one line lower down. InstallVerifyLib.ps1
+# is loaded first because it IS the check; the residual self-reference is
+# documented in Assert-PrivilegedScriptTreeTrusted.
+. "$PSScriptRoot/lib/InstallVerifyLib.ps1"
+Assert-PrivilegedScriptTreeTrusted -Root $PSScriptRoot `
+    -Purpose 'the CA officer-rights editor' `
+    -AllowUntrusted:$AllowUntrustedScriptPath -RunTime
 
 . "$PSScriptRoot/lib/OfficerRightsLib.ps1"
 

@@ -172,11 +172,22 @@ async def cleanup_nonces(
 ) -> JSONResponse:
     _require_admin_token(request, ctx)
     deleted = ctx.store.cleanup_expired_nonces()
-    _audit(ctx,
-        event_type="admin-nonce-cleanup",
-        outcome="success",
-        details={"deleted": deleted},
-    )
+    # 2026-08-25, found by MEASURING the deployed store rather than reading the
+    # code: `admin-nonce-cleanup` and `admin-expired-order-sweep` were 184 rows
+    # each out of 722, and `admin-list-pending-revocations` another 199 --
+    # 78.5% of the entire audit table was this RA's own maintenance tasks
+    # reporting that they had nothing to do. `certificate-issued`, the evidence
+    # this system exists to produce, was 11 rows.
+    #
+    # A sweep that changed nothing is not evidence, and on a deployment that
+    # refuses audit pruning it is permanent. A sweep that DID something keeps
+    # its row: "these nonces were destroyed" is a real fact about the trail.
+    if deleted:
+        _audit(ctx,
+            event_type="admin-nonce-cleanup",
+            outcome="success",
+            details={"deleted": deleted},
+        )
     return JSONResponse(content={"deleted": deleted})
 
 
@@ -188,11 +199,14 @@ async def sweep_expired_orders(
 ) -> JSONResponse:
     _require_admin_token(request, ctx)
     invalidated = ctx.store.sweep_expired_orders()
-    _audit(ctx,
-        event_type="admin-expired-order-sweep",
-        outcome="success",
-        details={"invalidated": invalidated},
-    )
+    # Same rule as the nonce cleanup above: a sweep that invalidated nothing
+    # records nothing. See that comment for the measurement behind it.
+    if invalidated:
+        _audit(ctx,
+            event_type="admin-expired-order-sweep",
+            outcome="success",
+            details={"invalidated": invalidated},
+        )
     return JSONResponse(content={"invalidated": invalidated})
 
 
@@ -455,11 +469,26 @@ async def list_pending_revocations(
             # able to tell a routine revocation from a template misconfiguration.
             "status": cert.status,
         })
-    _audit(ctx,
-        event_type="admin-list-pending-revocations",
-        outcome="success",
-        details={"returned": len(pending_revocations)},
-    )
+    # 2026-08-25. This route is polled by the revocation sync task on a fixed
+    # interval, forever, and every poll used to write a durable row. That grows
+    # the audit table without bound in entirely BENIGN operation -- no attacker
+    # needed -- and this deployment refuses audit pruning on purpose, so nothing
+    # ever reclaims it.
+    #
+    # An empty list is the steady state and reports nothing an investigator can
+    # use, so it gets no row. A poll that actually returns work still does,
+    # because "the revocation host was handed these serials" is the audit trail
+    # for what happens next. The event is also coalesced, which bounds the case
+    # this skip cannot: a token holder polling a NON-empty list at line rate.
+    if pending_revocations:
+        _audit(ctx,
+            event_type="admin-list-pending-revocations",
+            outcome="success",
+            details={
+                "returned": len(pending_revocations),
+                "reason_code": "pending-revocations-listed",
+            },
+        )
     return JSONResponse(content={"pending_revocations": pending_revocations})
 
 
@@ -504,17 +533,32 @@ async def confirm_ca_revocation(
         raise malformed("serial must be hexadecimal")
     cert = ctx.store.get_certificate_by_serial(serial_upper)
     if cert is None:
+        # The serial is attacker-chosen and stays in `details` for the
+        # investigator, but `reason_code` is what keys the coalescing window --
+        # otherwise one character of variance per probe mints a durable row
+        # apiece, which is the bound-defeating move audit_coalesce exists to
+        # stop. The coalesced row names the window's FIRST serial; the count
+        # stays exact.
         _audit(ctx,
             event_type="admin-revocation-confirm-denied",
             outcome="failed",
-            details={"serial": serial_upper, "reason": "not-found"},
+            details={
+                "serial": serial_upper,
+                "reason": "not-found",
+                "reason_code": "not-found",
+            },
         )
         raise not_found("certificate not found in RA store")
     if cert.status not in (CertStatus.REVOKED, CertStatus.QUARANTINED):
         _audit(ctx,
             event_type="admin-revocation-confirm-denied",
             outcome="failed",
-            details={"serial": serial_upper, "reason": "not-revoked", "cert_status": cert.status},
+            details={
+                "serial": serial_upper,
+                "reason": "not-revoked",
+                "reason_code": "not-revoked",
+                "cert_status": cert.status,
+            },
         )
         raise malformed("certificate is not revoked in the RA store")
 

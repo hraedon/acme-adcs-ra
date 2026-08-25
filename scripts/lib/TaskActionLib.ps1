@@ -134,11 +134,20 @@ function Build-SyncActionCommand {
         [bool]$PublishCrlMode,
         [Parameter(Mandatory = $true)][string]$DotEnvPath,
         [bool]$LoadAdminToken = $false,
-        [bool]$LoadConfirmToken = $true
+        [bool]$LoadConfirmToken = $true,
+        # Carried through from the registrar (2026-08-24 F10). Sync-Revocations
+        # now re-checks its own tree on every run, so a task registered from a
+        # deliberately untrusted lab path must be told that was deliberate --
+        # otherwise the documented -AllowUntrustedScriptPath flow registers a
+        # task that refuses to run, which strands exactly the case the override
+        # exists for. Default false: the flag never appears in an ordinary
+        # action, so the run-time gate stays armed everywhere it matters.
+        [bool]$AllowUntrustedScriptPath = $false
     )
     $localFlag = if ($Local) { " -LocalMode" } else { "" }
     $modeFlag = if ($DryRunMode) { " -DryRun" } else { " -Execute" }
     $crlFlag = if ($PublishCrlMode) { " -PublishCrl" } else { "" }
+    $untrustedFlag = if ($AllowUntrustedScriptPath) { " -AllowUntrustedScriptPath" } else { "" }
 
     $adminEnv = ""
     if ($LoadAdminToken) {
@@ -156,5 +165,5 @@ function Build-SyncActionCommand {
     $caLit = ConvertTo-PsSingleQuotedLiteral $CaConfigStr
     $reqLit = ConvertTo-PsSingleQuotedLiteral $Requester
     return ("$adminEnv$confirmEnv& $scriptLit -RaBaseUrl $baseLit -CaConfig $caLit " +
-            "-RequesterName $reqLit$modeFlag$localFlag$crlFlag; exit `$LASTEXITCODE")
+            "-RequesterName $reqLit$modeFlag$localFlag$crlFlag$untrustedFlag; exit `$LASTEXITCODE")
 }

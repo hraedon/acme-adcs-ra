@@ -72,6 +72,89 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**2026-08-25 whole-repository scan: three medium findings, fixed and LIVE
+VALIDATED on tip `5580519`.** (1) `Store.record_issuance` was unguarded — the
+first durable record of something ADCS had already done, so a full or
+read-only store rolled back the transaction and left a live certificate with
+no row, no audit event and no revocation-queue entry. Both neighbouring paths
+already had orphan handlers and neither would have helped: both fall back
+through `_audit` to the same database. `_emergency_issuance_orphan` now
+compensates without touching the store (critical log + direct SIEM hook), and
+issuance halts one-way until restart — but not for a merely busy store, which
+would trade a rare orphan for a routine outage. (2)
+`finalize-enrollment-admission-denied` and (3) the two revocation-confirm
+routes were replayable into unbounded durable audit writes; all now coalesce,
+with `reason_code` keeping attacker-chosen values out of the key.
+
+**A fourth came from measuring rather than reading.** One `GROUP BY
+event_type` against the deployed store before deploy: 567 of 722 audit rows
+(78.5%) were this RA's own scheduled maintenance reporting it had nothing to
+do, against 11 `certificate-issued` rows. Idle sweeps now write nothing; a
+sweep that destroyed state still does. Proven live: 60 idle maintenance calls
+wrote **zero** rows, 15 distinct unknown-serial probes wrote **one**.
+
+Live results on `5580519`: §A 14/14, §A1 13/13, CRL+§G 9/10 (CRL3 = WI-052),
+§K 12/12, orphans 6/6 ×2, §R+Rverify ×3, least privilege, authority split, CRL
+evidence. Suite 953 + 1 skip; Pester 467; 22 new tests, 12 mutations.
+**Teardown found two harness defects:** the clean-CA check restricted on the
+template's display name, which never matches (the column holds the OID), so it
+returned zero and read as clean — 18 certificates were actually still Issued,
+15 of them residue from earlier "verified" teardowns; and the teardown order
+put revocation before reverting the officer grant, which locks out
+administrators too. Both fixed in the runbook. Not run: phase L. Open at park:
+the deployed dotenv is still the prior session's 13-kid throwaway env.
+
+**2026-08-24 daybreak review: four findings, fixed at `ade72a8`, then LIVE
+VALIDATED the same day on the branch — the validation found and fixed two
+defects in the fixes themselves (final tip `b8d3343`).** (1) The F11
+root-self substitution check judged the DESIGNED gMSA Modify on the state
+root by the executable-owners list — first install refused (`INSTALLER_EXIT=1`)
+and every upgrade of an existing deployment would brick; fixed with
+`-AllowedRootWriterSids` (state root passes its design writers, runtime root
+none, ancestors never) and live-re-proven. (2) The untrusted-tree override
+propagated registrar→task action→sync but not into the `Revoke-Cert.ps1`
+child, so an allowed tree could list pending revocations and never revoke
+one; fixed and live-re-proven by draining a genuinely stuck orphan. (3) The
+CA host's `C:\` carries an applicable `Authenticated Users:(M)` ACE — no
+tree on that host passes the gate; officer scripts there need
+`-AllowUntrustedScriptPath` (correct refusal, loud override, operator item).
+Generic-bit branches of the new predicate live-proven 10/10 then pinned;
+Pester 457→467, all new tests mutation-checked; third-lineage adversarial
+review rated F10/F12/F13 SOUND. Full canonical app re-proof on `b8d3343`:
+§A 14/14, §A1 13/13, CRL+§G 9/10 (CRL3 = WI-052), §K 12/12, orphans 6/6×2,
+§R+Rverify ×4 with R2b, least privilege, authority split, CRL evidence.
+Teardown verified both hosts. Phase L not run (no enrollment-leg change
+here; owed on a v1.11.x tag per the standing lab-network item). See
+`docs/security-review-2026-08-24-daybreak-standard.md` (live addendum) and
+the validation log.
+
+
+**v1.11.0 re-proven live on the released tip `0a47955` (2026-08-24).** Full
+re-proof on the exact shipped artifact: §A 14/14, §A1 13/13, CRL/§G 9/10 (the
+one FAIL is CRL3, the designed WI-052 calibration check), §K 12/12, both
+transport-orphan branches 6/6 each, §R+Rverify through three revocation
+cycles, least-privilege, authority split, and the CRL-evidence cycle. **The
+v1.11.0 delta itself is live-proven by a new R2b check on every cycle: empty
+RFC 8555 §7.6 body + `X-Acme-Ra-Out-Of-Band-Revocation` header, with the
+harness finally speaking the standard `certificate` dialect.** Phase L: §L
+9/9 and Ld5, but **Lqueue/Ldrain NOT PROVEN on this tip** — three attempts
+were defeated, in order, by warm keep-alives surviving the route blackhole, a
+TIME_WAIT-counting saturation check, and finally a **flapping lab network
+fabric** (the same probe hung 5 s at 13:23 and connected in 22 ms at 13:38
+with identical routes; enrollments really completed through a
+verified-blackholed state — real CA issuance, gMSA requester, CA IIS log
+evidence). Not a product regression: the diff to `f6badc9` (where
+Lqueue/Ldrain passed 22/22 the same morning) touches only
+`routes/revocation.py`. Owed: lease-pass on a v1.11.x tag once the lab
+network stabilizes (the harness now blackholes every resolved address, counts
+live socket states only, and recycles the pool after route-on — runbook §12).
+Teardown verified: 141+1 serials revoked (0 failed, template fully drained),
+CA pristine (224/4/absent), store fingerprint identical, pool Started. Note:
+the deployed dotenv is the prior session's throwaway phase-L env (13 kids),
+restored as-found — see the checklist log. Local gates before deploy: 928
+pytest + 1 skip, 424 Pester + 4 platform skips, ruff, mypy; CI 8/8 on the
+exact commit.
+
 **Daybreak standard pass (review of `7325cdb`, 2026-08-17) found four medium
 issues, no high or critical. One fixed, three triaged and consciously left.**
 Fixed: syslog transport failures were counted as successful off-box audit

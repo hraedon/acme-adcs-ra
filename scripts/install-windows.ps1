@@ -418,7 +418,7 @@ function Test-HttpPlatformHandler {
             if ($m) { return $true }
         }
     } catch { }
-    $dll = Join-Path $env:windir "System32\inetsrv\httpPlatformHandler.dll"
+    $dll = Get-TrustedSystem32Path -FileName 'inetsrv\httpPlatformHandler.dll'
     return (Test-Path $dll)
 }
 
@@ -499,7 +499,7 @@ function Install-Prerequisites {
             Write-Host ("  [ok]   MSI Authenticode signature valid, signed by {0}." -f $signerSubject)
 
             Write-Host "  [..]   Installing the verified staged HttpPlatformHandler MSI ..."
-            $msiexec = Join-Path $env:windir 'System32\msiexec.exe'
+            $msiexec = Get-TrustedSystem32Path -FileName 'msiexec.exe'
             $p = Start-Process $msiexec -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
             if ($p.ExitCode -ne 0) { throw "msiexec failed installing HttpPlatformHandler (exit $($p.ExitCode))." }
             if (Test-HttpPlatformHandler) { Write-Host "  [ok]   HttpPlatformHandler installed." }
@@ -535,7 +535,7 @@ function Install-Prerequisites {
 # those bytes. Stopping the pool -- and proving the worker process is gone --
 # has to come first, or none of the verification below binds anything.
 $script:poolWasStopped = $false
-$appcmdExe = "$env:windir\system32\inetsrv\appcmd.exe"
+$appcmdExe = Get-TrustedSystem32Path -FileName 'inetsrv\appcmd.exe'
 # Absolute System32 path, resolved ONCE at script scope. Round 6 moved the
 # elevated native utilities off ambient PATH, but assigned this one twice in
 # places that were not in scope where it was used: function-locally inside
@@ -544,7 +544,7 @@ $appcmdExe = "$env:windir\system32\inetsrv\appcmd.exe"
 # a RuntimeException under EAP=Stop, killing the install after the TLS binding
 # was written and before the app pool was started. One script-scope variable,
 # used everywhere.
-$netshExe = Join-Path $env:windir 'System32\netsh.exe'
+$netshExe = Get-TrustedSystem32Path -FileName 'netsh.exe'
 if (Test-Path $appcmdExe) {
     Write-Host "Stopping app pool `"$AppPool`" (and waiting for its worker) before touching $InstallDir ..."
     $script:poolWasStopped = Stop-AppPoolAndWait -AppcmdExe $appcmdExe -AppPool $AppPool
@@ -618,12 +618,50 @@ function Initialize-SecuredRoot {
         [Parameter(Mandatory = $true)][string[]]$Grants,
         [Parameter(Mandatory = $true)][string[]]$AllowedTrustees,
         [string[]]$AllowedOwnerSids = @('S-1-5-32-544', 'S-1-5-18'),
+        # Design writers for the ROOT ITSELF in the substitution check (see
+        # Get-AncestorSubstitutionViolations). Only the state root passes one:
+        # its design grants the worker gMSA Modify, which carries Delete. The
+        # runtime root passes nothing -- its design is gMSA RX, so any
+        # delete-class ACE an existing runtime root carries is DRIFT and must
+        # refuse.
+        [string[]]$AllowedRootWriterSids = @(),
         [hashtable]$ProtectedEntries = @{},
         [string[]]$ForbiddenTopLevelEntries = @(),
         [string[]]$Preserve = @()
     )
     $ErrorActionPreference = 'Stop'
     Write-Host "Claiming $Purpose root $Path ..."
+    # THE PARENTS DECIDE WHETHER THIS ROOT CAN BE SWAPPED (2026-08-24 F11).
+    #
+    # Everything below proves things about the root and its contents. None of it
+    # asks whether a directory ABOVE the root lets a non-administrator delete the
+    # root and put a different tree in its place -- at which point the ownership,
+    # the DACL and the read-back proof are all statements about a tree the
+    # attacker created. This installer already makes exactly this argument for
+    # the IIS site tree (~700 lines below, "a writable directory ABOVE the site
+    # root is not a lesser problem than a writable file inside it") and applies
+    # Get-TreeTrustViolations there; the state and runtime roots never got it.
+    #
+    # The narrow predicate is the point. Test-PathChainTrusted asks "can a
+    # non-administrator rewrite bytes here", which C:\ProgramData fails on
+    # WriteData -- create-a-new-entry, not replace-an-existing-child -- so
+    # applying it here would refuse the DEFAULT install. A refusal that aborts
+    # the upgrade of a live issuance host is worse than the bug it closes, which
+    # is why this waited for evidence that never came. Asking the narrower
+    # question instead passes C:\ProgramData and %ProgramFiles% and still catches
+    # a root staged under C:\Temp.
+    $ancestorViolations = @(Get-AncestorSubstitutionViolations -Path $Path `
+        -AllowedRootWriterSids $AllowedRootWriterSids)
+    if ($ancestorViolations.Count -gt 0) {
+        throw ("Refusing to claim the $Purpose root $Path : it, or a directory above it, lets a " +
+               "non-administrator delete or take ownership of the tree.`n  " +
+               (($ancestorViolations | Select-Object -First 8) -join "`n  ") +
+               "`nEverything this installer proves about $Path -- ownership, DACL, the read-back " +
+               "at the end -- describes a tree that can be renamed aside and replaced between " +
+               "runs, so the proof would be about the attacker's tree. Choose a root under an " +
+               "administrator-only parent (%ProgramData% and %ProgramFiles% are the defaults for " +
+               "exactly this reason), or fix the parent's ACL, and re-run.")
+    }
     $prov = Get-RootProvenance -Path $Path -AllowedTrustees $AllowedTrustees `
         -AllowedOwnerSids $AllowedOwnerSids -ProtectedEntries $ProtectedEntries `
         -ForbiddenTopLevelEntries $ForbiddenTopLevelEntries
@@ -705,6 +743,7 @@ if ((Get-PathRelation -A $SitePath -B $RuntimeDir) -ne 'disjoint') {
 Initialize-SecuredRoot -Path $InstallDir -Purpose 'state (database, logs, secrets)' `
     -Grants $stateGrants -AllowedTrustees $raTrustees `
     -AllowedOwnerSids $stateOwnerSids `
+    -AllowedRootWriterSids $stateOwnerSids `
     -ProtectedEntries @{ 'acme-ra.env' = $raTrustees } `
     -ForbiddenTopLevelEntries $stateForbiddenEntries `
     -Preserve @("$InstallDir\acme_ra.db", "$InstallDir\acme-ra.env", "$InstallDir\logs")
@@ -806,7 +845,7 @@ function Invoke-PyProbe {
     }
     $argStr = ($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
     $tmp = Join-Path $installerScratch ("ra-py-probe-" + [guid]::NewGuid().ToString('N') + ".txt")
-    $cmdExe = Join-Path $env:windir 'System32\cmd.exe'
+    $cmdExe = Get-TrustedSystem32Path -FileName 'cmd.exe'
     & $cmdExe /d /c "`"$Exe`" $argStr > `"$tmp`" 2>&1"
     $exit = $LASTEXITCODE
     $out = ""
@@ -1018,7 +1057,7 @@ try {
         }
         foreach ($vl in @("Lib\venv\scripts\nt\venvlauncher.exe", "Lib\venv\scripts\nt\venvwlauncher.exe")) {
             $vlPath = Join-Path (Split-Path $runtimePyExe) $vl
-            if (Test-Path $vlPath) { & (Join-Path $env:windir 'System32\attrib.exe') -H -S $vlPath 2>$null | Out-Null }
+            if (Test-Path $vlPath) { & (Get-TrustedSystem32Path -FileName 'attrib.exe') -H -S $vlPath 2>$null | Out-Null }
         }
         $python = @{ Exe = $runtimePyExe; Args = @() }
         Write-Host "  [ok]   runtime interpreter at $runtimePyExe"
@@ -1031,7 +1070,7 @@ try {
     $pyPrefix = Split-Path $python.Exe
     foreach ($vl in @("Lib\venv\scripts\nt\venvlauncher.exe", "Lib\venv\scripts\nt\venvwlauncher.exe")) {
         $vlPath = Join-Path $pyPrefix $vl
-        if (Test-Path $vlPath) { & (Join-Path $env:windir 'System32\attrib.exe') -H -S $vlPath 2>$null | Out-Null }
+        if (Test-Path $vlPath) { & (Get-TrustedSystem32Path -FileName 'attrib.exe') -H -S $vlPath 2>$null | Out-Null }
     }
 
     # No delete-before-create dance any more: `current` was created empty
@@ -1313,7 +1352,7 @@ function Grant-ServiceLogonRight {
         New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
         $cfg = Join-Path $tmpDir "secpol.cfg"
         $db  = Join-Path $tmpDir "secpol.sdb"
-        $secedit = Join-Path $env:windir 'System32\secedit.exe'
+        $secedit = Get-TrustedSystem32Path -FileName 'secedit.exe'
         & $secedit /export /cfg $cfg /areas USER_RIGHTS | Out-Null
         $lines = Get-Content $cfg
         $rightLine = ($lines | Where-Object { $_ -match "^SeServiceLogonRight" } | Select-Object -First 1)
