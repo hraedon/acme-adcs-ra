@@ -102,6 +102,30 @@ leave a domain-trusted certificate outside the RA entirely.
   the 14a limiter's counter. The membership guard test now pins all nine types
   and states that rule, so the next addition is a reviewed decision.
 
+- **Two more of the same, found by MEASURING rather than reading (added during
+  the live re-proof).** Before deploying, one `GROUP BY event_type` against the
+  backup of the deployed store said this, out of 722 rows:
+
+  ```
+  199  admin-list-pending-revocations
+  184  admin-nonce-cleanup
+  184  admin-expired-order-sweep
+   ...
+   11  certificate-issued
+  ```
+
+  **567 of 722 rows — 78.5% of the entire audit table — were this RA's own
+  scheduled maintenance reporting that it had nothing to do.** The evidence the
+  system exists to produce was eleven rows. On a deployment that refuses audit
+  pruning, every one of those is permanent.
+
+  `admin-nonce-cleanup` and `admin-expired-order-sweep` now follow the same
+  rule as the pending-list poll: a sweep that deleted or invalidated nothing
+  writes no row; a sweep that actually destroyed state keeps its row, because
+  "these nonces were destroyed" is a real fact about the trail. The static scan
+  found one of these three call sites. The other two took one read-only query
+  against a real store — which is the part worth keeping.
+
 **The pattern, said out loud.** All three are the shape the 2026-08-24 entry
 below already names: *the correct primitive already existed, with the correct
 reasoning written beside it, and was not pointed at every call site.* That is
@@ -111,9 +135,9 @@ enumerates every denial-shaped event emitted under `routes/` and requires each
 to be coalesced or exempt-with-a-reason. Recorded as an open item rather than
 done, because it is a design change and this release is a park.
 
-Suite 950 passed / 1 skipped (was 931); Pester 467 passed / 0 failed / 4
-skipped; ruff and mypy clean. Nineteen new tests, **every one mutation-checked
-against ten separate mutations** — including reverting each fix in place and
+Suite 953 passed / 1 skipped (was 931); Pester 467 passed / 0 failed / 4
+skipped; ruff and mypy clean. Twenty-two new tests, **every one mutation-checked
+against twelve separate mutations** — including reverting each fix in place and
 recording the failure.
 
 ### Security — 2026-08-24 daybreak standard scan (four findings, all fixed)

@@ -526,3 +526,83 @@ class TestRevocationConfirmAuditGrowth:
         rows = _rows(ctx, "admin-list-pending-revocations")
         assert len(rows) == 1
         assert json.loads(rows[0]["details"])["returned"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# F3b — found by MEASURING the deployed store, not by reading the code
+# ---------------------------------------------------------------------------
+
+
+class TestMaintenanceSweepsDoNotNarrate:
+    """The audit table on the lab RA was 78.5% self-generated noise.
+
+    Counted on the real deployed store at the start of the 2026-08-25 re-proof,
+    722 rows total::
+
+        199  admin-list-pending-revocations
+        184  admin-nonce-cleanup
+        184  admin-expired-order-sweep
+         ...
+         11  certificate-issued
+
+    567 of 722 rows were this RA's own scheduled maintenance reporting that it
+    had nothing to do. The evidence the system exists to produce was 11 rows.
+    On a deployment that refuses audit pruning, every one of those is permanent.
+
+    The static scan found the first of the three. The other two came from one
+    ``GROUP BY event_type`` against the backup taken before deploy.
+    """
+
+    def test_a_nonce_cleanup_that_deleted_nothing_writes_no_row(
+        self, tmp_path: Path
+    ) -> None:
+        """Mutation: drop the ``if deleted:`` guard — this finds 20 rows."""
+        client, ctx = _build_env(tmp_path)
+        for _ in range(20):
+            resp = client.delete(
+                "/acme/admin/nonces",
+                headers={"Authorization": f"Bearer {_ADMIN}"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["deleted"] == 0
+        assert _rows(ctx, "admin-nonce-cleanup") == []
+
+    def test_a_sweep_that_invalidated_nothing_writes_no_row(
+        self, tmp_path: Path
+    ) -> None:
+        """Mutation: drop the ``if invalidated:`` guard."""
+        client, ctx = _build_env(tmp_path)
+        for _ in range(20):
+            resp = client.delete(
+                "/acme/admin/expired-orders",
+                headers={"Authorization": f"Bearer {_ADMIN}"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["invalidated"] == 0
+        assert _rows(ctx, "admin-expired-order-sweep") == []
+
+    def test_a_cleanup_that_did_something_is_still_audited(
+        self, tmp_path: Path
+    ) -> None:
+        """The skip must not become a hole: destroying state stays on the record.
+
+        Mutation: skip the audit unconditionally and this finds no row.
+        """
+        client, ctx = _build_env(tmp_path)
+        # A nonce is minted per newNonce; expire them all, then sweep.
+        for _ in range(3):
+            assert client.head("/acme/new-nonce").status_code in (200, 204)
+        con = sqlite3.connect(ctx.config.db_path, timeout=30)
+        try:
+            con.execute("UPDATE nonces SET created_at = '2000-01-01T00:00:00Z'")
+            con.commit()
+        finally:
+            con.close()
+
+        resp = client.delete(
+            "/acme/admin/nonces", headers={"Authorization": f"Bearer {_ADMIN}"}
+        )
+        assert resp.json()["deleted"] >= 1, "the sweep must actually delete"
+        rows = _rows(ctx, "admin-nonce-cleanup")
+        assert len(rows) == 1
+        assert json.loads(rows[0]["details"])["deleted"] >= 1

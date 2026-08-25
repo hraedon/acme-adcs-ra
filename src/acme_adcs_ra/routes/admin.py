@@ -172,11 +172,22 @@ async def cleanup_nonces(
 ) -> JSONResponse:
     _require_admin_token(request, ctx)
     deleted = ctx.store.cleanup_expired_nonces()
-    _audit(ctx,
-        event_type="admin-nonce-cleanup",
-        outcome="success",
-        details={"deleted": deleted},
-    )
+    # 2026-08-25, found by MEASURING the deployed store rather than reading the
+    # code: `admin-nonce-cleanup` and `admin-expired-order-sweep` were 184 rows
+    # each out of 722, and `admin-list-pending-revocations` another 199 --
+    # 78.5% of the entire audit table was this RA's own maintenance tasks
+    # reporting that they had nothing to do. `certificate-issued`, the evidence
+    # this system exists to produce, was 11 rows.
+    #
+    # A sweep that changed nothing is not evidence, and on a deployment that
+    # refuses audit pruning it is permanent. A sweep that DID something keeps
+    # its row: "these nonces were destroyed" is a real fact about the trail.
+    if deleted:
+        _audit(ctx,
+            event_type="admin-nonce-cleanup",
+            outcome="success",
+            details={"deleted": deleted},
+        )
     return JSONResponse(content={"deleted": deleted})
 
 
@@ -188,11 +199,14 @@ async def sweep_expired_orders(
 ) -> JSONResponse:
     _require_admin_token(request, ctx)
     invalidated = ctx.store.sweep_expired_orders()
-    _audit(ctx,
-        event_type="admin-expired-order-sweep",
-        outcome="success",
-        details={"invalidated": invalidated},
-    )
+    # Same rule as the nonce cleanup above: a sweep that invalidated nothing
+    # records nothing. See that comment for the measurement behind it.
+    if invalidated:
+        _audit(ctx,
+            event_type="admin-expired-order-sweep",
+            outcome="success",
+            details={"invalidated": invalidated},
+        )
     return JSONResponse(content={"invalidated": invalidated})
 
 

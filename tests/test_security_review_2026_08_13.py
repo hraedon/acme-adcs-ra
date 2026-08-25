@@ -424,7 +424,20 @@ class TestHecQueueBound:
             revocation=FakeRevocationLeg(),
         )
         client = TestClient(create_app(ctx), raise_server_exceptions=False)
+        # 2026-08-25: this loop used to fire 20 bare cleanups and rely on each
+        # one writing a row even though it deleted nothing. That narration is
+        # gone -- a sweep that changed nothing is not evidence -- so the loop
+        # now makes each cleanup do real work. The SUBJECT is unchanged (the
+        # durable trail survives HEC backpressure) and the vehicle got closer
+        # to a real one: these are 20 genuine state changes, not 20 no-ops.
         for _ in range(20):
+            client.head("/acme/new-nonce")
+            con = sqlite3.connect(cfg.db_path, timeout=30)
+            try:
+                con.execute("UPDATE nonces SET created_at = '2000-01-01T00:00:00Z'")
+                con.commit()
+            finally:
+                con.close()
             client.request(
                 "DELETE",
                 "/acme/admin/nonces",
