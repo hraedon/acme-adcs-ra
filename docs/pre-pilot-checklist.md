@@ -249,6 +249,80 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **2026-08-25 whole-repository scan remediation — live validation EXECUTED,
+  tip `5580519`.** Preflight: CI green on all eight jobs for the exact commit;
+  local gates 953 pytest + 1 skip, 467 Pester + 4 platform skips, ruff, mypy.
+  Installer exited 0, deployment reports VERSION=1.11.0, `/directory` 200.
+
+  **Results: §A 14/14, §A1 13/13, CRL+§G 9/10, §K 12/12, both transport-orphan
+  branches 6/6 each, §R+Rverify 6/6 + 3/3 through three cycles, least
+  privilege, authority split, CRL-evidence cycle.** The one FAIL is CRL3, the
+  designed WI-052 calibration check (this CA's 649200 s window vs the 604800 s
+  default ceiling) — unchanged operator finding, deliberately measured against
+  the shipped default. Least privilege re-proven live: gMSA token succeeds,
+  CRL publication denied `0x80070005`, out-of-template revocation denied
+  `CERTSRV_E_RESTRICTEDOFFICER`, reason 8 refused by the script before any CA
+  action (exit 3). Authority split re-proven: admin-token-only revokes at the
+  CA but the confirm 401s → exit 2; confirm-token-only recovers → exit 0. CRL
+  evidence fail-closed (`crl-evidence-required-but-absent`) → administrator
+  republishes → `crl-verified`.
+
+  **This round's own fixes proven live, not just in unit tests.** 60 idle
+  maintenance calls (15 each to nonce-cleanup, expired-order-sweep, and the
+  pending-revocations poll) wrote **zero** audit rows, where before the fix
+  each call wrote one. 15 confirm probes for 15 **different** nonexistent
+  serials wrote **one** coalesced row. F1 (the post-issuance orphan) and F2
+  (admission-denial coalescing) could not be driven live — one needs a genuine
+  ENOSPC at a precise moment, the other needs sustained gate saturation — and
+  are covered by fault injection and mutation testing only. Said plainly
+  because it is the gap in this proof.
+
+  **Two teardown defects found, both in the HARNESS and both now fixed.**
+
+  1. **The teardown's own "is the CA clean?" check was inert, and had been for
+     an unknown number of rounds.** The runbook prescribed
+     `certutil -view -restrict "CertificateTemplate=ACME-ServerAuth"`. The
+     `CertificateTemplate` column stores the **OID** for a custom template, so
+     the name form matches nothing and returns zero rows — indistinguishable
+     from "the CA is clean", and recorded as exactly that. Restricting on the
+     OID found **18 certificates still Issued, of which only 3 were from this
+     run**: fifteen were live residue from earlier sessions whose records each
+     claimed zero remained. Same family as the stale-constant CONNECT-PROBE and
+     the inert firewall rule — a check pointed at the wrong thing certifies the
+     state it was written to detect. All 18 are now revoked.
+  2. **The teardown list had the ORDER wrong.** It said revoke (step 1) before
+     reverting the officer grant (step 3). A template-scoped `OfficerRights`
+     blob restricts *every* certificate manager to its scoped requesters,
+     administrators included, so revoking while the grant is live fails every
+     serial with `CERTSRV_E_RESTRICTEDOFFICER` — measured here as 18/18
+     refused, then 18/18 succeeding after the revert. The runbook now leads
+     with the ordering.
+
+  Also confirmed unchanged: the CA host's `C:\` still carries an *applicable*
+  `Authenticated Users:(M)` ACE, so `Set-OfficerRights.ps1` exits 1 there
+  without `-AllowUntrustedScriptPath`. The refusal is the gate working; the
+  harness now passes the override on both the grant and the revert paths.
+
+  **Teardown verified, not assumed:** 18 serials revoked (0 failed), zero
+  `ACME-ServerAuth` certificates remain Issued, CRL republished, CA back to
+  224 bytes / 4 ACEs / `OfficerRights` ABSENT / certsvc Running, IIS
+  `denyUrlSequences` empty, all three scheduled tasks unregistered (0
+  remaining), web.config carrying no CRL or unauthenticated-GET overrides, the
+  store restored with `integrity=ok` and **every table count identical to the
+  session-start fingerprint** (accounts 37, audit_log 722, authorizations 38,
+  certificates 13, challenges 38, nonces 0, orders 38), the dotenv restored
+  with the throwaway kid gone, pool Started, `/directory` 200, and scratch
+  removed on both hosts.
+
+  **Not run:** phase L (`Lqueue`/`Ldrain`). No enrollment-leg change on this
+  branch, and the blackhole mechanism is still unsound for this topology — see
+  `docs/UNFILED-WORK-ITEMS.md` item 11 and the analysis recorded there.
+
+  **Still open at park:** the deployed dotenv is the prior session's throwaway
+  phase-L env (13 kids), restored as-found. That is item 12, and closing it
+  means minting a real dotenv, which is an operator action.
+
+
 - **2026-08-24 daybreak review — live validation EXECUTED on the branch, final
   tip `b8d3343`.** Scope: the four findings of
   `docs/security-review-2026-08-24-daybreak-standard.md` (F10 provenance gates,

@@ -816,3 +816,44 @@ event type that was never added to anything.
 (2) is the smaller change and would have caught all three of this round's
 findings. Not done here because this release is a park and a design change
 wants its own round.
+
+### 14. (harness, medium) — RESOLVED 2026-08-25. **The teardown's clean-CA check was inert**
+
+The runbook's "did we clean up?" command was
+`certutil -view -restrict "CertificateTemplate=ACME-ServerAuth"`. The
+`CertificateTemplate` column holds the template **OID** for a custom template,
+so the display-name form matches nothing and returns zero rows — which reads
+exactly like "the CA is clean", and was recorded as that.
+
+Restricting on the OID during the 2026-08-25 teardown found **18 certificates
+still Issued under the template, only 3 of them from that run.** Fifteen were
+live residue from earlier sessions, each of which had recorded a clean CA.
+
+Third instance of this exact class in this project: the CONNECT-PROBE that
+dialled a stale constant and certified an inert firewall rule; the blackhole
+whose own probe hung on the wrong address; and now this. **The pattern is a
+verification step whose failure mode is silence.** A check that can return
+"nothing found" must be cross-checked against a broader query that is known to
+return something, or it proves nothing.
+
+Fixed in the runbook (OID form, plus an explicit instruction to cross-check a
+zero against an unrestricted `Disposition=20` sweep) and in a new
+`samples/lab-harness/teardown-revoke.ps1` that builds the revocation set from
+the CA's own view rather than a pasted serial list — which is also what makes
+it catch the ReqID-only transport orphan, the one certificate nothing in the RA
+tracks.
+
+### 15. (harness, low) — RESOLVED 2026-08-25. **Teardown order made administrators unable to revoke**
+
+The teardown list said revoke first (step 1), revert the officer grant later
+(step 3). A template-scoped `OfficerRights` blob restricts **every** certificate
+manager to its own scoped requesters — Domain Admins included — so revoking as
+an administrator while the grant is live fails with
+`CERTSRV_E_RESTRICTEDOFFICER`. Measured 2026-08-25: 18/18 refused, then 18/18
+succeeded after reverting the grant first.
+
+This was already known (it is in the estate memory) and the runbook still had
+it backwards, which is the more useful half of the lesson: a trap recorded in
+one place and not in the procedure is a trap you pay for again. The runbook now
+leads the teardown section with the ordering.
+

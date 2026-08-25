@@ -72,6 +72,38 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**2026-08-25 whole-repository scan: three medium findings, fixed and LIVE
+VALIDATED on tip `5580519`.** (1) `Store.record_issuance` was unguarded — the
+first durable record of something ADCS had already done, so a full or
+read-only store rolled back the transaction and left a live certificate with
+no row, no audit event and no revocation-queue entry. Both neighbouring paths
+already had orphan handlers and neither would have helped: both fall back
+through `_audit` to the same database. `_emergency_issuance_orphan` now
+compensates without touching the store (critical log + direct SIEM hook), and
+issuance halts one-way until restart — but not for a merely busy store, which
+would trade a rare orphan for a routine outage. (2)
+`finalize-enrollment-admission-denied` and (3) the two revocation-confirm
+routes were replayable into unbounded durable audit writes; all now coalesce,
+with `reason_code` keeping attacker-chosen values out of the key.
+
+**A fourth came from measuring rather than reading.** One `GROUP BY
+event_type` against the deployed store before deploy: 567 of 722 audit rows
+(78.5%) were this RA's own scheduled maintenance reporting it had nothing to
+do, against 11 `certificate-issued` rows. Idle sweeps now write nothing; a
+sweep that destroyed state still does. Proven live: 60 idle maintenance calls
+wrote **zero** rows, 15 distinct unknown-serial probes wrote **one**.
+
+Live results on `5580519`: §A 14/14, §A1 13/13, CRL+§G 9/10 (CRL3 = WI-052),
+§K 12/12, orphans 6/6 ×2, §R+Rverify ×3, least privilege, authority split, CRL
+evidence. Suite 953 + 1 skip; Pester 467; 22 new tests, 12 mutations.
+**Teardown found two harness defects:** the clean-CA check restricted on the
+template's display name, which never matches (the column holds the OID), so it
+returned zero and read as clean — 18 certificates were actually still Issued,
+15 of them residue from earlier "verified" teardowns; and the teardown order
+put revocation before reverting the officer grant, which locks out
+administrators too. Both fixed in the runbook. Not run: phase L. Open at park:
+the deployed dotenv is still the prior session's 13-kid throwaway env.
+
 **2026-08-24 daybreak review: four findings, fixed at `ade72a8`, then LIVE
 VALIDATED the same day on the branch — the validation found and fixed two
 defects in the fixes themselves (final tip `b8d3343`).** (1) The F11
