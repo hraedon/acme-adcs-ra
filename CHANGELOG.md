@@ -6,6 +6,116 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security — 2026-08-25 whole-repository standard scan (three findings, all fixed)
+
+A cross-lineage static scan of `a566050`: three medium, no high or critical.
+Two are audit-growth bounds. The first is the one that mattered — it could
+leave a domain-trusted certificate outside the RA entirely.
+
+- **A post-issuance store failure orphaned a live certificate (medium; high
+  impact, low likelihood).** `Store.record_issuance` is the *first* durable
+  record of something ADCS has **already done**, and it was unguarded. On a
+  full or read-only database the certificate/order/audit transaction rolls
+  back and the exception escapes before the SIEM fan-out, so a live
+  certificate existed with no row, no audit event, no quarantine record and no
+  revocation-queue entry.
+
+  The asymmetry was the tell: both *neighbouring* paths — verifier rejection
+  (`_quarantine_and_fail`) and transport failure
+  (`_quarantine_transport_orphan`) — already had orphan handlers. The success
+  path had none. And neither would have helped: both fall back to `_audit`,
+  which is `Store.record_audit` — **the same database that just failed**.
+  Under this fault that fallback raises from inside its own except block and
+  writes nothing anywhere.
+
+  This breaks an invariant the code states explicitly. `audit_retention`
+  argues that *"the `certificate-issued` audit row commits in the same
+  transaction as the certificate, so a full disk stops issuance rather than
+  issuing unaudited."* That holds only while the disk fills **before** the CA
+  call. In the window between "ADCS committed" and "SQLite committed" it
+  cannot hold, because the issuance has already happened. Worth stating
+  plainly: this deployment **refuses audit pruning on purpose**, so a filling
+  disk is not a freak event — it is the long-run destination of the shipped
+  configuration, and the other two findings shorten the timeline.
+
+  `_emergency_issuance_orphan` now compensates for that window, and **nothing
+  in it touches the store**. Two independent sinks: a `logger.critical`
+  carrying serial, ReqID, order, account and template (a different path from
+  the database), and a direct `ctx.audit_hook` call with a hand-built event —
+  deliberately bypassing `emit_audit_hook`'s after-the-row-commits contract,
+  because there is no row and there is not going to be one. Neither sink is
+  trusted: the hook is wrapped so a SIEM transport error cannot replace the
+  exception being re-raised, and logging handlers swallow transport errors
+  anyway, so a delivered-looking emission is not proof of delivery.
+
+  **Issuance then halts** (`IssuanceHalt`, 503 `issuance_halted`), because
+  every finalize admitted afterwards would orphan another certificate the same
+  way. One-way until restart, deliberately: this process cannot prove the
+  store became writable again, and an endpoint that clears a safety latch is a
+  way to turn the latch off under pressure. The latch does **not** fire for a
+  merely *busy* store (`database is locked`) — lock contention is transient
+  and ordinary, and halting on it would trade a rare orphan for a routine
+  self-inflicted outage. The emergency evidence is emitted either way; only
+  the latch is conditional.
+
+- **Enrollment admission denials were replayable into unbounded audit writes
+  (medium).** The enrollment gate sheds at `adcs_enrollment_max_pending`
+  (default 32) and the route CAS-restores the rejected order to `ready`, so
+  the identical signed finalize can be re-sent for as long as capacity stays
+  full — one durable row apiece. Shipped defaults allow one account to set
+  this up: `rate_limit_orders_per_window` is 50, and 33 ready orders is enough.
+
+  `finalize-enrollment-admission-denied` now coalesces. The reasoning is not
+  new — the coalescer's own docstring already wrote it for
+  `order-rate-limited`: *a denial issued because a cap was hit is unbounded by
+  definition, since the cap throttles the work and not the audit row.* It was
+  simply never pointed at the gate. An explicit `reason_code` pins the
+  coalescing key to a server constant, because `EnrollmentGateBusy`'s message
+  carries live counts and one edit putting `str(exc)` into `reason` would put
+  a varying value back in the key.
+
+- **The revocation-confirm credential was a durable write primitive
+  (medium→low).** Two replayable routes. A confirm-token holder could POST
+  well-formed but nonexistent serials forever
+  (`admin-revocation-confirm-denied`) — nothing transitions, the lookup
+  misses, the row was durable. The probed serial stays in `details` for the
+  investigator but an explicit `reason_code` keys the window, so varying it
+  cannot defeat the bound; the coalesced row then names the window's *first*
+  serial while the count stays exact. That trade is deliberate: "someone is
+  probing serials" is the signal, the individual values are not.
+
+  The pending-list poll is the more interesting half, and **it is not really
+  an attack**. The revocation sync task polls `admin-list-pending-revocations`
+  on a fixed interval, forever, and every poll wrote a row — so the table grew
+  without bound in entirely benign operation. Coalescing alone does not fix
+  that: at a 15-minute cadence and a 60-second window, no two polls ever fold.
+  The route now writes **no row at all when the list is empty**, which is the
+  steady state and reports nothing an investigator can use; a poll that
+  actually returns work keeps its row, because "the revocation host was handed
+  these serials" is the audit trail for what happens next. Coalescing bounds
+  the case the skip cannot — a token holder polling a *non-empty* list at line
+  rate.
+
+  This is the only **success** event in `COALESCED_EVENT_TYPES`, and it is
+  admissible only because nothing counts these rows. The contrast is
+  `account-key-changed`, excluded precisely because its successful rows *are*
+  the 14a limiter's counter. The membership guard test now pins all nine types
+  and states that rule, so the next addition is a reviewed decision.
+
+**The pattern, said out loud.** All three are the shape the 2026-08-24 entry
+below already names: *the correct primitive already existed, with the correct
+reasoning written beside it, and was not pointed at every call site.* That is
+four rounds running. The durable fix is structural rather than another
+call-site patch — invert the allowlist to a denylist, or add a test that
+enumerates every denial-shaped event emitted under `routes/` and requires each
+to be coalesced or exempt-with-a-reason. Recorded as an open item rather than
+done, because it is a design change and this release is a park.
+
+Suite 950 passed / 1 skipped (was 931); Pester 467 passed / 0 failed / 4
+skipped; ruff and mypy clean. Nineteen new tests, **every one mutation-checked
+against ten separate mutations** — including reverting each fix in place and
+recording the failure.
+
 ### Security — 2026-08-24 daybreak standard scan (four findings, all fixed)
 
 A cross-lineage standard review at `0a47955`. Two findings were re-rated here

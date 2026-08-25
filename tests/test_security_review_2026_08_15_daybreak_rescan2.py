@@ -277,13 +277,13 @@ class TestDenialCoalescing:
     def test_authenticated_and_issuance_events_are_never_coalesced(
         self, tmp_path: Path
     ) -> None:
-        """Accountable, one-time events keep one row each.
+        """Accountable, STATE-CHANGING events keep one row each.
 
         The set was extended in round 5 with the *replayable* authenticated
-        denial classes (see test_security_review_2026_08_15_daybreak_round5);
-        issuance, revocation and admin actions must never join it. The exact
-        membership is pinned so a future addition is a deliberate, reviewed
-        change rather than drift.
+        denial classes (see test_security_review_2026_08_15_daybreak_round5).
+        The exact membership is pinned so a future addition is a deliberate,
+        reviewed change rather than drift — this test failing is that review
+        being demanded, not a bug.
 
         ``key-change-rate-limited`` was added deliberately with 14a: it is a
         cap-exceeded denial, the same class as ``order-rate-limited`` and
@@ -291,7 +291,26 @@ class TestDenialCoalescing:
         ``account-key-changed``, deliberately stays out — that row is both the
         provenance of the new key and the counter the ceiling reads.
 
-        Mutation: coalesce every event type.
+        Extended again 2026-08-25, and the wording above had to sharpen with
+        it. The old rule said "issuance, revocation and admin actions must
+        never join"; two admin events now do, and the distinction that matters
+        is not the SUBSYSTEM but whether the event records a state change:
+
+        * ``finalize-enrollment-admission-denied`` — a cap-exceeded denial on
+          an order the route restores to ``ready``. Identical in class to
+          ``order-rate-limited``; missed when the enrollment gate was added.
+        * ``admin-revocation-confirm-denied`` — a confirm-token holder can POST
+          a nonexistent serial forever. Nothing transitions; the lookup misses.
+        * ``admin-list-pending-revocations`` — a read-only poll. The ONLY
+          success in the set, admissible solely because nothing counts these
+          rows (contrast ``account-key-changed``, which is a counter).
+
+        What must still never join: issuance, actual revocation, key rotation,
+        and any admin call that changes state. ``certificate-issued`` is
+        asserted below.
+
+        Mutation: coalesce every event type; or drop any member and watch its
+        own bound test fail.
         """
         assert COALESCED_EVENT_TYPES == {
             "account-creation-denied",
@@ -300,8 +319,14 @@ class TestDenialCoalescing:
             "key-change-rate-limited",
             "finalize-csr-mismatch",
             "finalize-policy-denied",
+            "finalize-enrollment-admission-denied",
+            "admin-revocation-confirm-denied",
+            "admin-list-pending-revocations",
         }
         assert "account-key-changed" not in COALESCED_EVENT_TYPES
+        # The state-changing counterparts of the two admin additions.
+        assert "admin-revocation-confirmed" not in COALESCED_EVENT_TYPES
+        assert "certificate-revoked" not in COALESCED_EVENT_TYPES
         store = _store(tmp_path)
         coalescer = DenialCoalescer(60, clock=_Clock())
 

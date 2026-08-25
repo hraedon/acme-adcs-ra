@@ -783,3 +783,36 @@ than high.
 restore since has re-installed the same 13. Do it before pilot regardless; a
 pilot RA that inherits throwaway credentials from a test harness is the exact
 shape this checklist exists to prevent.
+
+### 13. (design, medium) — NEW. **The coalescing allowlist is a call-site patch four rounds running**
+
+*Raised 2026-08-25 while fixing the third instance of it.*
+
+Every audit-growth finding since round 5 has had the same shape: the coalescer
+already existed, its docstring already contained the exact sentence justifying
+the fix, and the new call site was simply not in `COALESCED_EVENT_TYPES`. Round
+5 added four types. 14a added one. 2026-08-25 added three more.
+
+`COALESCED_EVENT_TYPES` is an **allowlist**, so the default for a new
+denial-shaped event is unbounded durable growth, and nothing fails until a
+reviewer notices. The membership guard test
+(`test_authenticated_and_issuance_events_are_never_coalesced`) catches *drift*
+in the set — it fired correctly on this round's change — but it cannot catch an
+event type that was never added to anything.
+
+**Two candidate fixes, neither done:**
+
+1. **Invert to a denylist.** Coalesce by default; list the event types that
+   must keep one row per event (issuance, revocation, key rotation, admin state
+   change) with a reason each. The default then fails safe. Cost: every
+   existing call site needs auditing once, and a wrongly-defaulted *success*
+   would silently lose a counter — which is exactly the
+   `account-key-changed` hazard, so the denylist must be got right in one pass.
+2. **Enumerate at test time.** A test that walks `routes/` for `_audit(...)`
+   calls with a denial-shaped `outcome` and asserts each event type is either
+   coalesced or in an explicit exempt-with-a-reason table. Cheaper, catches the
+   next omission at CI rather than at review, and needs no behaviour change.
+
+(2) is the smaller change and would have caught all three of this round's
+findings. Not done here because this release is a park and a design change
+wants its own round.

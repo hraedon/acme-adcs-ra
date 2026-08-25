@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from acme_adcs_ra.acme_errors import (
+    issuance_halted,
     malformed,
     rate_limited,
     rejected_identifier,
@@ -312,6 +313,19 @@ async def finalize_order(
         # The worker re-checks `generation` against the store immediately before
         # it touches ADCS. That is the durable half of the guarantee: the mark
         # above is process-local memory, the lease is a row.
+        # Refuse before admitting when a previous issuance was orphaned by an
+        # unwritable store (see finalize._emergency_issuance_orphan). Every
+        # finalize admitted after that point would issue at the CA and fail to
+        # record it the same way, so the second orphan is refused rather than
+        # created. One-way until restart, deliberately: this process cannot
+        # prove the store became writable again.
+        if ctx.issuance_halt:
+            raise issuance_halted(
+                "issuance is halted: a previous certificate was issued at the "
+                "CA and could not be recorded, so the RA is refusing to issue "
+                "more until an operator restores the store and restarts. "
+                f"Cause: {ctx.issuance_halt.reason}"
+            )
         try:
             enrollment_result = await ctx.enrollment_gate.run(
                 _finalize_submit_enrollment,
@@ -337,7 +351,17 @@ async def finalize_order(
                 sans=requested_sans,
                 template=decision.template,
                 outcome="denied",
-                details={"reason": "enrollment-capacity", "revert_applied": reverted},
+                # reason_code pins the coalescing key to a server constant.
+                # `reason` happens to be a literal today, but the key must not
+                # depend on that staying true -- EnrollmentGateBusy carries a
+                # message with live counts in it, and one edit putting str(exc)
+                # in `reason` would put a varying value back in the key and
+                # defeat the bound. See audit_coalesce's reason/reason_code split.
+                details={
+                    "reason": "enrollment-capacity",
+                    "reason_code": "enrollment-capacity",
+                    "revert_applied": reverted,
+                },
             )
             raise rate_limited(
                 f"enrollment capacity is full: {exc}", retry_after=3

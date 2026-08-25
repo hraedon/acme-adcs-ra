@@ -168,6 +168,47 @@ class AccountIssuanceLocks:
             lock.release()
 
 
+class IssuanceHalt:
+    """A one-way latch that stops admitting new issuance.
+
+    Set when the RA proves it can no longer record what the CA has already
+    done: ``record_issuance`` failed on an UNWRITABLE store after ADCS issued
+    (see ``finalize._emergency_issuance_orphan``). Every finalize admitted
+    after that would orphan another live certificate the same way, so the
+    second one is refused rather than issued-and-lost.
+
+    **One way on purpose.** Clearing it means asserting the store is writable
+    again, and this process cannot prove that -- a probe write that happens to
+    land in free space says nothing about the next one. An operator who has
+    fixed the disk restarts the service, which is what they do anyway, and the
+    restart is the assertion. No admin endpoint clears it, because an endpoint
+    that clears a safety latch is a way to turn the latch off under pressure.
+
+    Not latched for a BUSY store (``database is locked``): lock contention is
+    transient and ordinary, and halting issuance on it would trade a rare
+    orphan for a routine self-inflicted outage. The emergency evidence is
+    emitted either way -- the certificate is just as orphaned -- only the latch
+    is conditional.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reason: str | None = None
+
+    def halt(self, reason: str) -> None:
+        with self._lock:
+            if self._reason is None:
+                self._reason = reason
+
+    @property
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
+
+    def __bool__(self) -> bool:
+        return self.reason is not None
+
+
 @dataclass
 class ServerContext:
     """Dependencies shared across every request."""
@@ -186,6 +227,9 @@ class ServerContext:
         default_factory=AccountIssuanceLocks
     )
     enrollment_gate: EnrollmentGate = field(default_factory=EnrollmentGate)
+    # Latched when a post-issuance store failure orphaned a live certificate.
+    # Checked before admitting any further enrollment; see IssuanceHalt.
+    issuance_halt: IssuanceHalt = field(default_factory=IssuanceHalt)
     # Dedicated, bounded, single-flight execution for CRL evidence fetches so
     # that a slow CRL host cannot queue behind — or ahead of — enrollment on
     # the shared worker pool. Closed by the app lifespan.

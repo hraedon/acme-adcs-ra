@@ -87,12 +87,43 @@ from acme_adcs_ra.store import Store, _now_iso
 # * ``finalize-csr-mismatch`` / ``finalize-policy-denied`` -- cheap pre-enrollment
 #   validation failures on an order that stays ``ready``, so the identical
 #   failing finalize can be replayed forever.
+# * ``finalize-enrollment-admission-denied`` (2026-08-25) -- the enrollment gate
+#   sheds at ``adcs_enrollment_max_pending`` and the route CAS-restores the
+#   rejected order to ``ready``, so the identical finalize can be re-sent for as
+#   long as capacity stays full. This is the same sentence as
+#   ``order-rate-limited`` two bullets up -- a denial issued BECAUSE a cap was
+#   hit is unbounded by definition, since the cap throttles the work and not the
+#   audit row -- and it was missed when the gate was added. Its ``reason`` is a
+#   fixed server literal and an explicit ``reason_code`` pins it, so nothing
+#   attacker-chosen reaches the key.
+# * ``admin-revocation-confirm-denied`` (2026-08-25) -- the confirm credential
+#   can POST a well-formed but nonexistent serial forever; the store lookup
+#   misses, nothing transitions, and the row was durable. The probed serial
+#   stays in ``details`` for the investigator but NOT in the key (an explicit
+#   ``reason_code`` carries the key), so varying it cannot defeat the bound.
+#   Note the row then names the WINDOW'S FIRST serial while ``denial_count``
+#   stays exact -- the trade the module docstring describes, chosen here
+#   because "someone is probing serials" is the signal and the individual
+#   values are not.
 #
-# Everything else -- issuance, revocation, admin action, one-time state
-# transitions -- keeps one row per event, unconditionally. In particular the
-# SUCCESSFUL ``account-key-changed`` row is never coalesced: it is both the
-# only record naming the new key's thumbprint and the counter the 14a limiter
-# reads.
+# One SUCCESS type is coalesced, against the general rule below, and the reason
+# is worth stating because the rule is otherwise load-bearing:
+#
+# * ``admin-list-pending-revocations`` (2026-08-25) -- a read-only poll of the
+#   revocation work list that transitions nothing. It is safe to fold ONLY
+#   because nothing counts these rows. The contrast is ``account-key-changed``,
+#   which is excluded precisely because the successful rows ARE the 14a
+#   limiter's counter (see ``Store.change_account_key``). Before coalescing any
+#   future success, check whether something reads it as a tally.
+#
+#   Coalescing alone does not fix that route: the sync agent polls on a
+#   15-minute cadence and the window is 60s, so benign polls never fold. The
+#   route therefore ALSO skips the audit row entirely when the pending list is
+#   empty, which is the steady state. Coalescing is what bounds the other case
+#   -- a token holder polling a non-empty list at line rate.
+#
+# Everything else -- issuance, revocation, admin state change, one-time
+# transitions -- keeps one row per event, unconditionally.
 COALESCED_EVENT_TYPES = frozenset(
     {
         "account-creation-denied",
@@ -101,6 +132,9 @@ COALESCED_EVENT_TYPES = frozenset(
         "key-change-rate-limited",
         "finalize-csr-mismatch",
         "finalize-policy-denied",
+        "finalize-enrollment-admission-denied",
+        "admin-revocation-confirm-denied",
+        "admin-list-pending-revocations",
     }
 )
 

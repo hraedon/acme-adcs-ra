@@ -98,6 +98,26 @@ def server_internal(detail: str = "internal server error") -> AcmeError:
     )
 
 
+def issuance_halted(detail: str = "issuance is halted") -> AcmeError:
+    """503 for the one-way post-issuance-orphan latch (see IssuanceHalt).
+
+    ``serverInternal`` is the correct URN — RFC 8555 defines no "temporarily
+    refusing" type and inventing one would break clients that switch on it —
+    but the STATUS is 503, not 500, because the condition is an operator-
+    clearable outage rather than a bug in this request. A conformant client
+    treats 503 as retryable, which is right: the order is still ``processing``
+    at the CA's expense and retrying after a restart is exactly what should
+    happen. ``Retry-After`` is deliberately omitted: nothing here can estimate
+    when a human will fix a disk, and a number that is always wrong is worse
+    than no number.
+    """
+    return AcmeError(
+        "urn:ietf:params:acme:error:serverInternal",
+        detail,
+        status=503,
+    )
+
+
 def unsupported_identifier(detail: str = "unsupported identifier") -> AcmeError:
     return AcmeError(
         "urn:ietf:params:acme:error:unsupportedIdentifier",
