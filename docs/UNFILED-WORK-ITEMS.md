@@ -729,3 +729,57 @@ construction, and vacuous tests manufacture confidence in the next reviewer.
 Worth either marking the gate-dependent cases Windows-only so the Linux job
 reports them skipped rather than passed, or giving the gate an injectable
 verdict so its refusal path is exercisable everywhere.
+
+### 11. (observation, would-be medium) — Lab network fabric flaps reachability, defeating any host-local CA blackhole
+
+*Unfilable in the store (MIGRATION_REQUIRED, see header). Discovered
+2026-08-24 during the v1.11.0 re-proof of `0a47955`, three Lqueue attempts.*
+
+With a /32 host route for the CA's verified IPv4 via a verified-unreachable
+next hop (and a /128 for its dead AAAA), a fresh .NET probe to the CA hung at
+the 5 s ceiling at 13:23 — and the **identical probe, identical route, and an
+Unreachable neighbor entry for the dead gateway, connected in 22 ms at
+13:38**. During the same window, real enrollments completed in 0.5–0.7 s
+through the verified-blackholed state: genuine CA issuance (ReqIDs advanced),
+requester `WORK-DOMAIN\gMSA-acme-ra$`, and the CA's IIS log records the certsrv
+requests arriving from the RA host's IPv4. The CA also carries a **dead AAAA
+record** (refused in ~2 ms with or without routes), so single-family
+blackholes are unsound even when the fabric is stable.
+
+Risk: `Lqueue`/`Ldrain` of the live re-proof cannot produce a sound result
+while this holds — the premise (enrollments hang on connect, so one order
+provably queues) is silently false, and the failure mode reads like a product
+defect. Second lab-network event this month (the CA silently changed v4
+addresses earlier in August — runbook §11).
+
+First step when picked up: from the RA host, run the same probe twice a few
+minutes apart, with and without a route blackhole; if reachability still
+flaps, the fabric (Hyper-V virtual switch / ARP / the dead-gateway `.251`)
+needs the operator before any lease-pass re-run. Harness side is already
+fixed (bh-route blackholes every resolved address; lease-pass recycles the
+pool after route-on; the socket counter counts live states only) — owed is
+re-running `lease-pass.sh` on a v1.11.x tag and getting Lqueue/Ldrain green
+on the record.
+
+### 12. (operator, medium) — NEW. **13 throwaway EAB kids are still allowlisted on the deployed lab RA**
+
+*Found 2026-08-25 by a cross-lineage review of the v1.11.0 re-proof record,
+which had closed with "the throwaway kids are gone" one sentence after saying
+the dotenv was restored as-found. Both cannot be true; the record is corrected
+in `docs/pre-pilot-checklist.md`.*
+
+The deployed RA dotenv carries the previous session's throwaway phase-L EAB
+allowlist — **13 kids** — because the v1.11.0 re-proof backed up that state and
+restored to it. Restoring a backup preserves a deviation; it does not clean it.
+
+Each kid is a live EAB credential path into the lab RA for whoever still holds
+its MAC key, and **who holds them is unknown** — they were minted as throwaways
+across two sessions with no record of disposal. EAB is the front control on
+account creation: a holder can create an account and then operate inside that
+kid's configured SAN scope. Lab-only today, which is why this is medium rather
+than high.
+
+**Close it by minting a real dotenv**, not by restoring another backup — every
+restore since has re-installed the same 13. Do it before pilot regardless; a
+pilot RA that inherits throwaway credentials from a test harness is the exact
+shape this checklist exists to prevent.

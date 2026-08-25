@@ -186,6 +186,22 @@ deployment, and the lab was restored to the v1.10.0 artifact afterwards. The
 full §A–§L live re-proof was **not** re-run: the change is confined to the
 `revokeCert` route, and the path that matters for it was the path exercised.
 
+**Superseded 2026-08-24, after release.** The full re-proof did then run on
+`0a47955` — the exact shipped artifact, by real installer deployment reporting
+`VERSION=1.11.0`, not a hot patch. §A 14/14, §A1 13/13, CRL/§G 9/10 (CRL3 is
+the designed WI-052 calibration check), §K 12/12, both transport-orphan
+branches 6/6, §R+Rverify across three cycles, least privilege, authority split,
+CRL evidence. The v1.11.0 delta itself is proven on every cycle by a new `R2b`
+check — empty §7.6 body plus the `X-Acme-Ra-Out-Of-Band-Revocation` header,
+with the harness finally speaking the standard `certificate` dialect rather
+than the server's old `cert` one. **`Lqueue`/`Ldrain` did not run:** three
+attempts were defeated in turn by warm keep-alives surviving the route
+blackhole, a saturation check counting `TIME_WAIT`, and a flapping lab network
+fabric. Not a product regression — the diff to `f6badc9`, where those phases
+passed 22/22 the same morning, touches only `routes/revocation.py` — but it is
+owed on a v1.11.x tag. See the validation log and `docs/UNFILED-WORK-ITEMS.md`
+item 11.
+
 ### Changed — revokeCert returns an empty body; the out-of-band hint moves to a header (2026-08-24)
 
 **Breaking for anything that read the response body.** Every `revokeCert`

@@ -304,6 +304,112 @@ engineered to. Until then it has not — regardless of a green local test run.
   staging tree removed. Not run: phase L (no enrollment-leg change on this
   branch; owed on a v1.11.x tag per the standing lab-network item).
 
+
+- **v1.11.0 full re-proof — 2026-08-24, tip `0a47955` (the exact released
+  artifact), on the lab RA host and issuing CA.** The v1.11.0 code commits
+  touch the revocation leg (`routes/revocation.py` only — verified by diff
+  against `f6badc9`), so per the standing rule the whole re-proof ran on the
+  shipped commit. Preflight: CI green on all eight jobs for `0a47955`; local
+  gates 928 pytest + 1 skip, 424 Pester + 4 platform skips, ruff, mypy clean.
+  The installer exited 0 and the deployment reports **VERSION=1.11.0** (first
+  deploy carrying 1.11.0 metadata) with the lease symbols verified in the
+  installed package, not the source tree.
+
+  **The v1.11.0 delta itself is now live-proven, on every revocation cycle of
+  the run (3/3):** new check R2b asserts the RFC 8555 §7.6 success body is
+  **empty** and the `X-Acme-Ra-Out-Of-Band-Revocation` header carries the
+  out-of-band hint JSON. The harness now sends the standard `certificate`
+  field (it had mirrored the server's old `cert` dialect — the reason no
+  in-repo test could catch the original defect). Also proven: a
+  reason-1 revoke through the standard dialect is accepted (200), the cert
+  serves 410 afterwards, the serial queues for CA-side revocation, and the
+  registered sync task drains it.
+
+  Full results: §A 14/14 (issuance, serverAuth-only EKU, SAN-from-CSR, chain
+  off the existing CA, out-of-scope SAN refused at finalize, CA policy denial
+  mapped to 400, reasons 7 and 8 refused and not queued); §A1 13/13 front
+  controls; CRL/§G 9/10 with the single failure being **CRL3, the designed
+  WI-052 calibration check** (649200 s validity window vs the 604800 s default
+  ceiling — unchanged operator finding, deliberately measured against the
+  shipped default); §K 12/12 key-rollover ceiling; **both transport-orphan
+  branches 6/6 each** (leaf-in-hand quarantined with serial+ReqID and queued;
+  ReqID-only leaves no row, audit-only — the orphan was later found and revoked
+  by hand at teardown from the audit row's ReqID); §R+Rverify 9/9 per cycle;
+  least privilege re-proven (gMSA token succeeds, CRL publication denied
+  `0x80070005`, out-of-template revocation denied `CERTSRV_E_RESTRICTEDOFFICER`,
+  reason 8 refused by the script before CA action, exit 3); authority split
+  re-proven (admin-token-only revokes at the CA but confirm 401s → exit 2;
+  confirm-token-only recovers and exits 0); CRL evidence fail-closed
+  (`crl-evidence-required-but-absent`) then `crl-verified` after an
+  administrator republishes; `audit_prune_enabled=true` refused by the
+  deployed config loader.
+
+  **Phase L: §L 9/9 (migration, lease minted on a real issuance, reclaim
+  refused mid-flight, enrollment completes despite the reclaim attempt) and
+  Ld5 (no order anywhere has two certificates) PASS. Lqueue/Ldrain NOT PROVEN
+  on this tip — blocked by a lab-network anomaly, not by product behavior.**
+  Three attempts, each defeating a different harness assumption; the evidence
+  chain, in order:
+
+  1. Attempt 1 (unmodified harness): 43 filler enrollments completed *through*
+     the blackhole within ~1 s — the enrollment session's keep-alive pool held
+     connections established during phase L's real issuance, and established
+     Windows flows are not redirected by a route added afterwards. The
+     saturation check passed **vacuously** on TIME_WAIT leftovers (the socket
+     counter counted every state).
+  2. Attempt 2 (pool recycled after route-on, counter fixed to live states
+     only): enrollments still completed — the CA name now carries a working
+     path beyond the pinned IPv4. Both fixes were correct but insufficient.
+  3. Attempt 3 (route blackhole on **every** resolved address — v4 /32 and
+     v6 /128): the CA's AAAA turned out to be dead (refused in ~2 ms with or
+     without routes), yet enrollments *still* completed. Controlled
+     single-issuance probes through the verified-blackholed state completed in
+     0.5–0.7 s, the CA database shows real issuances by
+     `WORK-DOMAIN\gMSA-acme-ra$`, and the CA's IIS log records the certsrv
+     requests arriving from the RA host — while a fresh `.NET` probe to the
+     same address hung 5 s at 13:23 and **connected in 22 ms at 13:38 with the
+     identical route present and the dead-gateway neighbor entry unchanged**.
+     The lab network fabric is flapping reachability today; no host-local
+     blackhole mechanism can be trusted against it.
+
+  **Disposition.** Not a product regression: (a) `git diff f6badc9..0a47955`
+  touches only `routes/revocation.py` — zero enrollment-path delta from the
+  tip where Lqueue/Ldrain passed 22/22 earlier the same day; (b) §L 9/9 and
+  Ld5 pass on this tip; (c) the bypass is environmental, demonstrated at the
+  packet level. **Owed:** re-run `lease-pass.sh` on a v1.11.x tag once the lab
+  network stabilizes; the harness now blackholes every resolved address,
+  counts only live socket states, and the driver recycles the pool after
+  route-on, so the first two failure modes cannot recur. The flapping itself
+  is filed for the operator (see the lab runbook §12).
+
+  **Teardown verified, not assumed:** 141 store-diffed serials plus the
+  ReqID-only orphan (serial resolved at the CA from ReqID 353) revoked —
+  141 + 1, **0 failed**, first/middle/last/orphan spot-checked at disposition
+  21, and **zero** `ACME-ServerAuth` certificates remain Issued on the CA;
+  CRL republished; `CA\Security` back to 224 bytes/4 ACEs with `OfficerRights`
+  absent and certsvc running; IIS `denyUrlSequences` empty; the RA store
+  restored from the pre-run backup with `integrity=ok` and **every table
+  count identical** (audit_log 701); web.config at steady state; app pool
+  `Started`, `/directory` 200; no leftover one-shot tasks; scratch cleaned on
+  both hosts. The deployed runtime stays at the last-proven tip (`0a47955`,
+  VERSION=1.11.0), per house pattern.
+
+  **Inherited deviation, recorded:** the RA dotenv at session start carried the
+  previous session's throwaway phase-L allowlist (13 kids) and the store held
+  36 post-backup audit rows — the 2026-08-24 Certify/v1.11.0 session restored
+  neither. This run's backup captured that state and restored to it ("as
+  found").
+
+  **Restored as-found means those 13 throwaway kids are still allowlisted in
+  the deployed dotenv.** An earlier draft of this paragraph closed with "the
+  throwaway kids are gone", which contradicted its own preceding sentence and
+  was corrected on 2026-08-25 after a review caught it. Restoring a backup
+  preserves the deviation; it does not clean it. Each kid is a live EAB
+  credential path into the lab RA for whoever still holds its MAC key, which
+  is unknown — they were minted as throwaways across two sessions. Filed as an
+  operator item; the correct close is minting a real dotenv, not restoring
+  another backup.
+
 - **Phase L (the stale-worker enrollment lease) PROVEN END TO END for the first
   time — 2026-08-24, tip `f6badc9`, on the lab RA host and issuing CA.**
   22/22: §L 9/9, §Lqueue 8/8, §Ldrain 5/5. CI green on all six jobs for the

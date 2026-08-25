@@ -96,6 +96,33 @@ here; owed on a v1.11.x tag per the standing lab-network item). See
 `docs/security-review-2026-08-24-daybreak-standard.md` (live addendum) and
 the validation log.
 
+
+**v1.11.0 re-proven live on the released tip `0a47955` (2026-08-24).** Full
+re-proof on the exact shipped artifact: §A 14/14, §A1 13/13, CRL/§G 9/10 (the
+one FAIL is CRL3, the designed WI-052 calibration check), §K 12/12, both
+transport-orphan branches 6/6 each, §R+Rverify through three revocation
+cycles, least-privilege, authority split, and the CRL-evidence cycle. **The
+v1.11.0 delta itself is live-proven by a new R2b check on every cycle: empty
+RFC 8555 §7.6 body + `X-Acme-Ra-Out-Of-Band-Revocation` header, with the
+harness finally speaking the standard `certificate` dialect.** Phase L: §L
+9/9 and Ld5, but **Lqueue/Ldrain NOT PROVEN on this tip** — three attempts
+were defeated, in order, by warm keep-alives surviving the route blackhole, a
+TIME_WAIT-counting saturation check, and finally a **flapping lab network
+fabric** (the same probe hung 5 s at 13:23 and connected in 22 ms at 13:38
+with identical routes; enrollments really completed through a
+verified-blackholed state — real CA issuance, gMSA requester, CA IIS log
+evidence). Not a product regression: the diff to `f6badc9` (where
+Lqueue/Ldrain passed 22/22 the same morning) touches only
+`routes/revocation.py`. Owed: lease-pass on a v1.11.x tag once the lab
+network stabilizes (the harness now blackholes every resolved address, counts
+live socket states only, and recycles the pool after route-on — runbook §12).
+Teardown verified: 141+1 serials revoked (0 failed, template fully drained),
+CA pristine (224/4/absent), store fingerprint identical, pool Started. Note:
+the deployed dotenv is the prior session's throwaway phase-L env (13 kids),
+restored as-found — see the checklist log. Local gates before deploy: 928
+pytest + 1 skip, 424 Pester + 4 platform skips, ruff, mypy; CI 8/8 on the
+exact commit.
+
 **Daybreak standard pass (review of `7325cdb`, 2026-08-17) found four medium
 issues, no high or critical. One fixed, three triaged and consciously left.**
 Fixed: syslog transport failures were counted as successful off-box audit
