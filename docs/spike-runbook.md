@@ -78,6 +78,14 @@ Get-Content "C:\acme-ra\spike-out\spike-run.log" -Wait -ErrorAction SilentlyCont
 # Or re-run capturing: (Start-ScheduledTask … then read the task's last result)
 ```
 
+`ACME_RA_SPIKE_OUT` must name an **absent child of an existing, non-reparse
+directory**. The Windows-only lab helper creates it with a protected DACL for
+the ambient gMSA/current user, SYSTEM, and Administrators, and creates the
+private key exclusively with the same allowlist. It refuses an existing output
+directory or any symlink/junction in its parent chain. Remove or rename an old
+throwaway spike directory before a deliberate rerun; the script never adopts
+or overwrites it.
+
 > A gMSA's negotiable identity is its **ambient** process identity — that is
 > exactly what the in-tree `negotiate_auth.NegotiateAuth` (pyspnego, with channel
 > binding) uses. No password is read or stored. This is the same posture the

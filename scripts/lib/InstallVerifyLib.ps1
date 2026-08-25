@@ -1847,6 +1847,59 @@ function Test-ObjectDaclTrusted {
     return $violations
 }
 
+# Enumerate one filesystem path and every parent through the filesystem root.
+# Security callers must never interpret a partial walk as proof, so relative
+# paths, parent-resolution errors, cycles and non-progress all throw.
+function Get-FilesystemAncestorChain {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not [System.IO.Path]::IsPathRooted($Path)) {
+        throw "ancestor walk requires a rooted filesystem path (got '$Path')"
+    }
+    $chain = @()
+    $seen = @{}
+    $p = $Path
+    while ($p) {
+        $key = ([string]$p).TrimEnd('\', '/').ToLowerInvariant()
+        if (-not $key) { $key = ([string]$p).ToLowerInvariant() }
+        if ($seen.ContainsKey($key)) {
+            throw "ancestor walk encountered a cycle at '$p'"
+        }
+        $seen[$key] = $true
+        $chain += $p
+
+        $root = $null
+        try { $root = [System.IO.Path]::GetPathRoot($p) } catch {
+            throw "filesystem root for '$p' could not be determined: $($_.Exception.Message)"
+        }
+        if (-not $root) {
+            throw "filesystem root for '$p' could not be determined"
+        }
+        if ([string]::Equals($p.TrimEnd('\', '/'), $root.TrimEnd('\', '/'),
+                [System.StringComparison]::OrdinalIgnoreCase)) { break }
+
+        $parent = $null
+        try { $parent = Split-Path -Parent $p -ErrorAction Stop } catch {
+            throw "parent path for '$p' could not be determined: $($_.Exception.Message)"
+        }
+        if (-not $parent) {
+            # PowerShell's FileSystem provider reports no parent for '/tmp' on
+            # Unix rather than returning '/'. Finish the final edge using the
+            # runtime's filesystem root, which was already determined above.
+            if (-not [string]::Equals($p.TrimEnd('\', '/'), $root.TrimEnd('\', '/'),
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+                $parent = $root
+            } else {
+                break
+            }
+        }
+        if ([string]::Equals($parent, $p, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "ancestor walk made no progress before the filesystem root at '$p'"
+        }
+        $p = $parent
+    }
+    return @($chain)
+}
+
 # The FULL provenance gate for a file we are about to execute elevated: the
 # file itself plus every existing ancestor directory up to the drive root must
 # be administrator-only. Observed-baseline semantics (live host, 2026-08-15):
@@ -1856,16 +1909,14 @@ function Test-ObjectDaclTrusted {
 function Test-PathChainTrusted {
     param([Parameter(Mandatory = $true)][string]$Path)
     $violations = @()
-    $p = $Path
-    $guard = 0
-    while ($p -and $guard -lt 32) {
-        $guard++
+    $chain = @()
+    try { $chain = @(Get-FilesystemAncestorChain -Path $Path) } catch {
+        return @("$Path : ancestor chain could not be proven ($($_.Exception.Message))")
+    }
+    foreach ($p in $chain) {
         if (Test-Path -LiteralPath $p) {
             $violations += Test-ObjectDaclTrusted -Path $p
         }
-        $parent = Split-Path -Parent $p
-        if ($parent -eq $p) { break }
-        $p = $parent
     }
     return @($violations | Where-Object { $_ })
 }
@@ -1887,7 +1938,15 @@ function Test-PathChainTrusted {
 function Get-TreeTrustViolations {
     param([Parameter(Mandatory = $true)][string]$Path)
     $violations = @(Test-PathChainTrusted -Path $Path)
-    foreach ($obj in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue)) {
+    $objects = @()
+    try {
+        $objects = @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop)
+    } catch {
+        $violations += ("$Path : tree enumeration could not be completed " +
+                        "($($_.Exception.Message)); a partial tree is not proof")
+        return @($violations | Where-Object { $_ })
+    }
+    foreach ($obj in $objects) {
         $violations += Test-ObjectDaclTrusted -Path $obj.FullName
     }
     return @($violations | Where-Object { $_ })
@@ -2081,10 +2140,11 @@ function Get-AncestorSubstitutionViolations {
     $violations = @()
     $allowed = @(Get-AllowedExecutableOwners)
     $selfAllowed = @($allowed) + @($AllowedRootWriterSids)
-    $p = $Path
-    $guard = 0
-    while ($p -and $guard -lt 32) {
-        $guard++
+    $chain = @()
+    try { $chain = @(Get-FilesystemAncestorChain -Path $Path) } catch {
+        return @("$Path : ancestor substitution chain could not be proven ($($_.Exception.Message))")
+    }
+    foreach ($p in $chain) {
         if (Test-Path -LiteralPath $p) {
             $acl = $null
             try { $acl = Get-Acl -LiteralPath $p } catch {
@@ -2120,9 +2180,6 @@ function Get-AncestorSubstitutionViolations {
                 }
             }
         }
-        $parent = Split-Path -Parent $p
-        if (-not $parent -or $parent -eq $p) { break }
-        $p = $parent
     }
     return @($violations | Where-Object { $_ })
 }
@@ -2152,20 +2209,21 @@ function Get-InterpreterRuntimeTree {
     $queue = New-Object System.Collections.Generic.Queue[string]
     $queue.Enqueue($InterpreterPath)
     $seen = @{}
-    $guard = 0
     while ($queue.Count -gt 0) {
-        $guard++
-        if ($guard -gt 16) { break }
         $exePath = $queue.Dequeue()
-        if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { continue }
+        if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+            throw ("Get-InterpreterRuntimeTree: queued interpreter '$exePath' disappeared or " +
+                   "is not a file; a partial runtime closure is not proof.")
+        }
         $prefix = Split-Path -Parent $exePath
         $canonical = Get-CanonicalPathString -Path $prefix
-        if (-not $canonical) { continue }
-        $key = $canonical.ToLowerInvariant()
-        if (-not $seen.ContainsKey($key)) {
-            $seen[$key] = $true
-            $roots += $canonical
+        if (-not $canonical) {
+            throw "Get-InterpreterRuntimeTree: could not canonicalize interpreter prefix '$prefix'."
         }
+        $key = $canonical.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $roots += $canonical
         # A venv's python.exe carries pyvenv.cfg beside the executable OR -- the
         # conventional Windows layout -- one directory up in the venv root
         # (python.exe lives in <venv>\Scripts\). In both cases the directory
@@ -2223,8 +2281,14 @@ function Get-InterpreterRuntimeTree {
                        "'home' nor 'base-executable'; the base installation the venv executes " +
                        "from cannot be determined, so the runtime closure cannot be proven.")
             }
-            if ($baseExe -and (Test-Path -LiteralPath $baseExe -PathType Leaf)) { $queue.Enqueue($baseExe) }
-            elseif ($homePrefix) {
+            if ($baseExe) {
+                if (-not (Test-Path -LiteralPath $baseExe -PathType Leaf)) {
+                    throw ("Get-InterpreterRuntimeTree: pyvenv.cfg at $cfgPath declares " +
+                           "base-executable '$baseExe', but it is absent or not a file; " +
+                           "a partial runtime closure is not proof.")
+                }
+                $queue.Enqueue($baseExe)
+            } elseif ($homePrefix) {
                 # home names the base PREFIX (a directory); enqueue a python.exe
                 # inside it when one exists so the prefix is picked up as a root.
                 # String concat, not Join-Path: Join-Path is provider-aware and
@@ -2284,6 +2348,28 @@ function Get-InterpreterRuntimeViolations {
             foreach ($link in $links) {
                 $violations += ("$link : reparse point inside the interpreter runtime tree -- " +
                                 "Python loads (and the installer copies) follow it outside the proven tree")
+            }
+            continue
+        }
+        # pythonXY._pth/python._pth overrides sys.path before ordinary command
+        # line isolation takes effect. Even `-I -S` cannot make an arbitrary
+        # path declaration in one safe to execute. The installer does not need
+        # this embeddable-distribution feature, so refuse every such override
+        # in a candidate closure rather than trying to emulate each CPython
+        # version's filename and path-resolution rules.
+        $pathOverrides = @()
+        try {
+            $pathOverrides = @(Get-ChildItem -LiteralPath $root -Filter 'python*._pth' `
+                -File -Recurse -Force -ErrorAction Stop)
+        } catch {
+            $violations += ("$root : could not enumerate Python path-override files " +
+                            "($($_.Exception.Message)); a partial runtime closure is not proof")
+            continue
+        }
+        if ($pathOverrides.Count -gt 0) {
+            foreach ($override in $pathOverrides) {
+                $violations += ("$($override.FullName) : python*._pth can redirect sys.path " +
+                                "outside the proven runtime tree and is refused")
             }
             continue
         }

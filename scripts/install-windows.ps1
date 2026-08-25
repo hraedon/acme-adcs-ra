@@ -843,7 +843,12 @@ function Invoke-PyProbe {
         $resolved = Get-Command $Exe -ErrorAction SilentlyContinue
         if ($resolved -and $resolved.Source) { $Exe = $resolved.Source }
     }
-    $argStr = ($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
+    # `-I` ignores PYTHON* variables, the user site and the current directory;
+    # `-S` prevents site.py from processing ordinary .pth files or importing
+    # sitecustomize. Get-InterpreterRuntimeViolations separately refuses
+    # python*._pth, whose sys.path override takes precedence over these flags.
+    $isolatedArguments = @('-I', '-S') + @($Arguments)
+    $argStr = ($isolatedArguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
     $tmp = Join-Path $installerScratch ("ra-py-probe-" + [guid]::NewGuid().ToString('N') + ".txt")
     $cmdExe = Get-TrustedSystem32Path -FileName 'cmd.exe'
     & $cmdExe /d /c "`"$Exe`" $argStr > `"$tmp`" 2>&1"
@@ -1078,13 +1083,16 @@ try {
     # survived from. Executed bytes are minted by THIS run, by construction
     # rather than by cleanup.
     Write-Host "  Creating virtualenv at $venv ..."
-    $venvOut = & $python.Exe @($python.Args + @("-m", "venv", $venv)) 2>&1
+    # This is the only base-interpreter invocation outside Invoke-PyProbe. Keep
+    # it under the identical isolated/no-site startup contract; the venv module
+    # is in the standard library and does not require site initialisation.
+    $venvOut = & $python.Exe @($python.Args + @("-I", "-S", "-m", "venv", $venv)) 2>&1
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
         if ($venvOut) { Write-Host ($venvOut | Out-String) }
         throw "Failed to create virtualenv at $venv using $($python.Exe)."
     }
     $venvPy = Join-Path $venv "Scripts\python.exe"
-    $venvProbe = & $venvPy -c "import sys; print(sys.executable)" 2>&1
+    $venvProbe = & $venvPy -I -S -c "import sys; print(sys.executable)" 2>&1
     if ($LASTEXITCODE -ne 0) {
         if ($venvOut) { Write-Host ($venvOut | Out-String) }
         throw "venv created but python.exe is not functional (exit $LASTEXITCODE): $venvProbe"
@@ -1106,7 +1114,7 @@ Write-Host "Installing acme-adcs-ra ..."
 # ARRAY filters instead of capturing. $Matches stayed unset, $Matches[1] read as
 # $null, [int]$null was 0, and 0 -lt 23 threw "pip is too old" on pip 26.2.1 --
 # blocking every fresh install on Windows, the RA's only production platform.
-$pipVerRaw  = (& $venvPy -m pip --version) 2>&1
+$pipVerRaw  = (& $venvPy -I -m pip --version) 2>&1
 $pipVerText = ((@($pipVerRaw) | ForEach-Object { $_.ToString() }) -join ' ').Trim()
 $pipMajor   = Get-PipMajorVersion $pipVerRaw
 if ($pipMajor -ge 0) {
@@ -1133,7 +1141,7 @@ if ($pipMajor -ge 0) {
 $lockFile = Join-Path $sourceSnapshot "deploy\requirements.lock.txt"
 if (Test-Path $lockFile) {
     Write-Host "  Installing pinned dependencies from deploy/requirements.lock.txt ..."
-    & $venvPy -m pip install --require-hashes --only-binary :all: -r $lockFile
+    & $venvPy -I -m pip install --require-hashes --only-binary :all: -r $lockFile
     if ($LASTEXITCODE -ne 0) {
         throw ("Pinned dependency install failed (exit $LASTEXITCODE). Do NOT fall back to " +
                "an unpinned install on an issuance-path host: regenerate the lock file " +
@@ -1154,14 +1162,14 @@ if (Test-Path $lockFile) {
                "Copy the full repository, or regenerate it (see the file header).")
     }
     Write-Host "  Installing pinned build closure from deploy/build-requirements.lock.txt ..."
-    & $venvPy -m pip install --require-hashes --only-binary :all: -r $buildLock
+    & $venvPy -I -m pip install --require-hashes --only-binary :all: -r $buildLock
     if ($LASTEXITCODE -ne 0) {
         throw ("Pinned build-closure install failed (exit $LASTEXITCODE). Do NOT fall " +
                "back to an isolated build on an issuance-path host: that resolves the " +
                "build backend from the index unpinned. Regenerate the lock for this " +
                "platform and Python version instead.")
     }
-    & $venvPy -m pip install --no-deps --no-build-isolation --upgrade $sourceSnapshot
+    & $venvPy -I -m pip install --no-deps --no-build-isolation --upgrade $sourceSnapshot
     if ($LASTEXITCODE -ne 0) { throw "pip install of acme-adcs-ra failed (exit $LASTEXITCODE)." }
 } else {
     # The lock file ships with the repo; its absence means an incomplete copy.
@@ -1170,7 +1178,7 @@ if (Test-Path $lockFile) {
            "repository, or regenerate it with: uv export --locked --format requirements-txt " +
            "--no-emit-project --no-dev -o deploy/requirements.lock.txt")
 }
-$installedVer = ((& $venvPy -m pip show acme-adcs-ra 2>$null | Select-String "^Version:") -replace "^Version:\s*", "").Trim()
+$installedVer = ((& $venvPy -I -m pip show acme-adcs-ra 2>$null | Select-String "^Version:") -replace "^Version:\s*", "").Trim()
 Write-Host "  Installed acme-adcs-ra version: $installedVer"
 
     # The retired runtime goes NOW, before the proof, not after it.

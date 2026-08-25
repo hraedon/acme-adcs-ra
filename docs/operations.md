@@ -733,6 +733,9 @@ tasks above). Monitor:
 
 ### SIEM delivery
 
+- `audit_offbox_required=true` accepts only authenticated HTTPS HEC. Plain
+  syslog remains supported when that requirement is false, but TCP delivery
+  alone does not authenticate the collector or protect audit events in transit.
 - The SIEM startup probe logs **ERROR** on init if the JSONL sink is
   unwritable or the HEC/syslog config is invalid; the sink is set to
   `enabled=False` and issuance continues (fail-open applies to *emission*,

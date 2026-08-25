@@ -7,7 +7,6 @@ to fail against the pre-fix code. See docs/security-review-2026-08-13.md.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sqlite3
 import time
@@ -260,34 +259,16 @@ class TestOffboxAuditGate:
                 "siem_hec_url": "http://hec.example/x",
                 "siem_hec_token": SecretStr("t"),
             },
-            # TCP so config validation admits the combination at all: an
-            # `audit_offbox_required` + UDP config is refused outright as of
-            # 2026-08-18 item 8, and this case is about the *emitter* being
-            # disabled by an empty host, which is a later gate.
-            {
-                "siem_sink": "syslog",
-                "siem_syslog_host": "",
-                "siem_syslog_proto": "tcp",
-            },
         ],
     )
-    def test_startup_fails_when_the_required_emitter_is_disabled(
+    def test_config_refuses_when_the_required_hec_sink_is_invalid(
         self, tmp_path: Path, overrides: dict[str, Any]
     ) -> None:
-        cfg = _config(tmp_path, audit_offbox_required=True, **overrides)
-        assert SiemEmitter(build_siem_config(cfg)).enabled is False
-        ctx = ServerContext(
-            config=cfg,
-            store=Store(cfg.db_path),
-            policy=IssuancePolicy(allowed_kids=set(), san_scopes={}),
-            enrollment=FakeEnrollmentLeg(),
-            revocation=FakeRevocationLeg(),
-        )
-        with pytest.raises(RuntimeError, match="audit_offbox_required"):
-            create_app(ctx)
+        with pytest.raises(ValueError, match="authenticated HTTPS HEC"):
+            _config(tmp_path, audit_offbox_required=True, **overrides)
 
     def test_startup_succeeds_when_off_box_delivery_actually_works(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A *reachable* sink satisfies the gate.
 
@@ -298,47 +279,26 @@ class TestOffboxAuditGate:
         force (2026-08-18 wave 3 F2). The gate now probes, so the test has to
         offer something that can actually answer.
         """
-        import socket
-        import threading
-
-        listener = socket.socket()
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(4)
-        accepted: list[socket.socket] = []
-
-        def serve() -> None:
-            while True:
-                try:
-                    conn, _ = listener.accept()
-                except OSError:
-                    return
-                accepted.append(conn)
-
-        threading.Thread(target=serve, daemon=True).start()
-        try:
-            cfg = _config(
-                tmp_path,
-                audit_offbox_required=True,
-                siem_sink="syslog",
-                siem_syslog_host="127.0.0.1",
-                siem_syslog_port=listener.getsockname()[1],
-                siem_syslog_proto="tcp",
-            )
-            ctx = ServerContext(
-                config=cfg,
-                store=Store(cfg.db_path),
-                policy=IssuancePolicy(allowed_kids=set(), san_scopes={}),
-                enrollment=FakeEnrollmentLeg(),
-                revocation=FakeRevocationLeg(),
-            )
-            assert create_app(ctx) is not None
-        finally:
-            for conn in accepted:
-                with contextlib.suppress(OSError):
-                    conn.close()
-            with contextlib.suppress(OSError):
-                listener.close()
+        monkeypatch.setattr(
+            SiemEmitter,
+            "probe_offbox_delivery",
+            lambda self: (True, "HEC acknowledged the startup probe"),
+        )
+        cfg = _config(
+            tmp_path,
+            audit_offbox_required=True,
+            siem_sink="hec",
+            siem_hec_url="https://hec.example/services/collector",
+            siem_hec_token=SecretStr("hec-token"),
+        )
+        ctx = ServerContext(
+            config=cfg,
+            store=Store(cfg.db_path),
+            policy=IssuancePolicy(allowed_kids=set(), san_scopes={}),
+            enrollment=FakeEnrollmentLeg(),
+            revocation=FakeRevocationLeg(),
+        )
+        assert create_app(ctx) is not None
 
     def test_startup_fails_when_the_required_sink_is_unreachable(
         self, tmp_path: Path

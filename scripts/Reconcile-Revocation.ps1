@@ -98,7 +98,32 @@ $pythonExe = $pythonCmd.Source
 if ($pythonExe -like '*\WindowsApps\*') {
     Die "Refusing the Windows Store python stub at $pythonExe; install Python 3.12+ machine-wide." 2
 }
-. (Join-Path $PSScriptRoot 'lib\InstallVerifyLib.ps1')
+# InstallVerifyLib is the code that authenticates this privileged script tree,
+# so executing it from disk before authenticating it would make the later tree
+# verdict self-referential. Pin its canonical UTF-8/LF bytes here, hash the
+# in-memory text, and execute that exact verified text (never reopen the path).
+$installVerifyLibPath = Join-Path $PSScriptRoot 'lib\InstallVerifyLib.ps1'
+$installVerifyExpectedSha256 = '01a351e5494d0f3bf968488a99710f2a902e807e91acb27a8d576d4669428686'
+try {
+    $installVerifyBytes = [System.IO.File]::ReadAllBytes($installVerifyLibPath)
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $installVerifyText = $strictUtf8.GetString($installVerifyBytes).Replace("`r`n", "`n").Replace("`r", "`n")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $installVerifyActualSha256 = [System.BitConverter]::ToString(
+            $sha256.ComputeHash($strictUtf8.GetBytes($installVerifyText))).Replace('-', '').ToLowerInvariant()
+    } finally { $sha256.Dispose() }
+} catch {
+    throw "InstallVerifyLib.ps1 could not be authenticated before execution: $($_.Exception.Message)"
+}
+if ($installVerifyActualSha256 -cne $installVerifyExpectedSha256) {
+    if (-not $AllowUntrustedScriptPath) {
+        throw "InstallVerifyLib.ps1 does not match this entry point's pinned release digest; refusing privileged execution."
+    }
+    Write-Warning "UNSAFE LAB OVERRIDE: InstallVerifyLib.ps1 does not match this entry point's release digest. Executing only the already-read bytes because -AllowUntrustedScriptPath was explicit."
+}
+$installVerifyScriptBlock = [scriptblock]::Create($installVerifyText)
+. $installVerifyScriptBlock
 
 # The interpreter's chain was already held to the installer's provenance rule
 # below; the tree THIS script and its siblings are read from was not
@@ -113,6 +138,11 @@ $pyChainViolations = @(Test-PathChainTrusted -Path $pythonExe)
 if ($pyChainViolations.Count -gt 0) {
     Die ("Refusing to run ${pythonExe}: it or its ancestor chain is not administrator-only.`n  " +
          (($pyChainViolations | Select-Object -First 4) -join "`n  ")) 2
+}
+$pyTreeViolations = @(Get-InterpreterRuntimeViolations -InterpreterPath $pythonExe)
+if ($pyTreeViolations.Count -gt 0) {
+    Die ("Refusing to run ${pythonExe}: its complete runtime tree is not administrator-only.`n  " +
+         (($pyTreeViolations | Select-Object -First 4) -join "`n  ")) 2
 }
 
 $pythonScript = Join-Path $PSScriptRoot 'reconcile_revocation.py'
@@ -164,7 +194,10 @@ try {
     }
 
     Write-Output "Running reconciliation against RA store..."
-    & $pythonExe @arguments
+    # The reconciler imports only the standard library. Isolated/no-site mode
+    # keeps PYTHONPATH, the user site, CWD, .pth and sitecustomize outside this
+    # privileged process after the on-disk runtime closure has been proven.
+    & $pythonExe -I -S @arguments
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -eq 0) {

@@ -198,8 +198,9 @@ honest: check a box only when the thing is actually true, not when it's planned.
 - [ ] **Audit leaves the box — REQUIRED, not "consider" (§4.D.1).** The default
       `jsonl` sink writes next to the database, so a compromise of the RA host —
       the adversary §4.A calls load-bearing — destroys the audit table *and* its
-      only mirror. Set `ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with the syslog or
-      HEC sink; the RA then refuses to start in the same-host-only posture. A
+      only mirror. Set `ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with an
+      authenticated HTTPS HEC sink; the RA then refuses to start with local
+      JSONL or unauthenticated plaintext syslog as its load-bearing trail. A
       write-once/append-only destination on the SIEM side remains desirable.
       SIEM delivery monitoring: `docs/operations.md` ## Monitoring and SLOs.
 - [ ] **Nonce ceiling reviewed.** `/acme/new-nonce` is unauthenticated and each

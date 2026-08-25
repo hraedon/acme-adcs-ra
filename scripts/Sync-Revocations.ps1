@@ -220,8 +220,33 @@ $ErrorActionPreference = "Stop"
 # the revocation-sync path, and only after the registrar had already loaded two
 # siblings unchecked -- and it never covered -AllowUntrustedScriptPath, which
 # registers against a writable tree by design and then warns into the void.
-# Checking here is what makes that override self-correcting.
-. "$PSScriptRoot/lib/InstallVerifyLib.ps1"
+# Checking here is what makes that override self-correcting. InstallVerifyLib
+# is itself the code that authenticates this privileged script tree, so execute
+# it only after its canonical UTF-8/LF bytes match the release digest pinned in
+# this entry point. The scriptblock is built from those same verified in-memory
+# bytes; the path is never reopened between validation and use.
+$installVerifyLibPath = Join-Path $PSScriptRoot 'lib\InstallVerifyLib.ps1'
+$installVerifyExpectedSha256 = '01a351e5494d0f3bf968488a99710f2a902e807e91acb27a8d576d4669428686'
+try {
+    $installVerifyBytes = [System.IO.File]::ReadAllBytes($installVerifyLibPath)
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $installVerifyText = $strictUtf8.GetString($installVerifyBytes).Replace("`r`n", "`n").Replace("`r", "`n")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $installVerifyActualSha256 = [System.BitConverter]::ToString(
+            $sha256.ComputeHash($strictUtf8.GetBytes($installVerifyText))).Replace('-', '').ToLowerInvariant()
+    } finally { $sha256.Dispose() }
+} catch {
+    throw "InstallVerifyLib.ps1 could not be authenticated before execution: $($_.Exception.Message)"
+}
+if ($installVerifyActualSha256 -cne $installVerifyExpectedSha256) {
+    if (-not $AllowUntrustedScriptPath) {
+        throw "InstallVerifyLib.ps1 does not match this entry point's pinned release digest; refusing privileged execution."
+    }
+    Write-Warning "UNSAFE LAB OVERRIDE: InstallVerifyLib.ps1 does not match this entry point's release digest. Executing only the already-read bytes because -AllowUntrustedScriptPath was explicit."
+}
+$installVerifyScriptBlock = [scriptblock]::Create($installVerifyText)
+. $installVerifyScriptBlock
 Assert-PrivilegedScriptTreeTrusted -Root $PSScriptRoot `
     -Purpose 'the revocation-sync task' `
     -AllowUntrusted:$AllowUntrustedScriptPath -RunTime
