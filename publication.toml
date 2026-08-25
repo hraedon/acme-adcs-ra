@@ -21,7 +21,21 @@ remote_owner = "hraedon"
 # address or a list — real history often carries more than one (a web-UI commit
 # lands as <user>@users.noreply.github.com). List every identity legitimate for
 # this repo; anything else refuses the push.
-author_email = ["hraedon@users.noreply.github.com"]
+author_email = [
+  "hraedon@users.noreply.github.com",
+  # The owner's own address. Already carried by 17 commits on main before this
+  # file declared anything, so the single-entry declaration was stale from the
+  # day it was written -- every push since went through a checkout without the
+  # hook installed, which is exactly the blind spot the guard's own docs warn
+  # about (hooks are per-checkout; a stale declaration is invisible from the
+  # pushing box). Declared 2026-08-25 to match reality rather than to widen it.
+  "plm@hraedon.com",
+  # Lab validation sessions. Kept DISTINCT on purpose: this repo argues about
+  # actor and lineage in every review record, and collapsing the validating
+  # actor into the owner's identity would make the commit trailer disagree with
+  # the doc that cites it.
+  "lab@hraedon.com",
+]
 
 # "private-until-review" | "public"
 #
