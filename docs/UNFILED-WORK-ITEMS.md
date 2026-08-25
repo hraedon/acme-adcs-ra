@@ -647,7 +647,7 @@ and the next reviewer finds whichever half they open first.
 ### 8. (observation, medium) — The lab CA's C:\ carries an APPLICABLE Authenticated Users Modify ACE
 
 *Found live 2026-08-24 during the daybreak-branch validation (F10 gates).*
-`MVMCA01`'s `C:\` DACL includes `NT AUTHORITY\Authenticated Users:(M)` with
+`CA01`'s `C:\` DACL includes `NT AUTHORITY\Authenticated Users:(M)` with
 no inheritance flags (applicable to the root itself), alongside the normal
 `(OI)(CI)(IO)(M)` twin. Every tree on that host has `C:\` in its ancestor
 chain, so **no path on the CA passes the privileged-script tree gate** — the

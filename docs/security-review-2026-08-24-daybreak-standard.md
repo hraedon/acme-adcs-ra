@@ -383,7 +383,7 @@ emptied).
 
 ### Live finding 3 (environment, operator) — the CA host's C:\ carries an applicable AU Modify
 
-`MVMCA01`'s `C:\` DACL includes `Authenticated Users:(M)` **applicable**
+`CA01`'s `C:\` DACL includes `Authenticated Users:(M)` **applicable**
 (alongside the inherit-only twin). The ancestor chain of every tree on that
 host terminates at `C:\`, so **no path on the CA passes the tree gate** — the
 officer scripts (`Set-OfficerRights.ps1` first observed refusing organically

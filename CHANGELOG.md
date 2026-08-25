@@ -91,14 +91,63 @@ therefore coverage assertions rather than behaviour assertions.
   would have split the doctrine across two files, which is how this class keeps
   returning.
 
-Pester **452 passed / 0 failed** (baseline 424); pytest, ruff and mypy clean.
-Every fix mutation-proven — reverted in place, suite re-run, failure recorded.
-One vacuous test was caught and fixed in the process: rights constants declared
-in a Pester `Describe` body are `$null` inside `It` blocks, so every mask
-assertion would have passed against `[int]$null = 0`.
+Pester **467 passed / 0 failed** (baseline 424); pytest 931 passed / 1 skipped;
+ruff and mypy clean. Every fix mutation-proven — reverted in place, suite re-run,
+failure recorded. One vacuous test was caught and fixed in the process: rights
+constants declared in a Pester `Describe` body are `$null` inside `It` blocks, so
+every mask assertion would have passed against `[int]$null = 0`.
 
-**Not done:** no live Windows validation (Linux Pester cannot exercise real
-ACLs — WI-050), and the fix has not been independently reviewed.
+#### Live validation found two defects **in the fixes themselves** (2026-08-24)
+
+The four fixes above shipped with local gates only. Running them on the lab RA
+host and issuing CA the same day found two of them broken — the reason this
+subsection exists rather than a line in the release notes.
+
+- **The root-self substitution check refused the *designed* gMSA state grant.**
+  The new `Get-AncestorSubstitutionViolations` judged the root itself by
+  `Get-AllowedExecutableOwners`, a list that can never admit a service identity
+  — but the state root's design grants the worker gMSA `Modify`, and `Modify`
+  carries `Delete`. Fresh installs passed only because a not-yet-created root
+  has no ACL to judge: **every upgrade of an existing deployment refused with
+  `INSTALLER_EXIT=1`**, the round-5 wrong-refusal class the `C:\ProgramData`
+  test was written to prevent. `Initialize-SecuredRoot` now passes
+  `-AllowedRootWriterSids` for the **root-self** check only — the state root
+  admits its design writers, the runtime root admits none (its design is gMSA
+  `RX`, so any delete-class ACE there is drift), and **ancestors are never**
+  judged by the design list. Re-proven live: upgrade install exit 0,
+  `/directory` 200, twice.
+
+- **The untrusted-tree override did not reach the `Revoke-Cert.ps1` child.**
+  The chain ran registrar → task action → the sync's own gate and then stopped.
+  `Revoke-Cert.ps1` carries the same tree gate and was never told, so an
+  explicitly-allowed tree could enumerate the pending set and revoke nothing —
+  measured live as `SYNC COMPLETE: 1 pending, 0 revoked, 1 failed` on a
+  genuinely stuck orphan. `Sync-Revocations.ps1` now propagates the flag into
+  the child argv. This is the same defect the F10 fix's own task-action
+  propagation was written to close, one hop lower.
+
+Also closed: the raw generic-bit branches of `Test-AceEndangersChildContainer`
+(`0x10000000`/`0x40000000` flag; `0x80000000`/`0x20000000` do not) were
+live-proven 10/10 against the deployed library and then pinned — the
+adversarial review had found no existing case that reached them. All new tests
+mutation-checked; Pester 457 → 467.
+
+**Operator note, not a code defect:** the lab CA host's `C:\` carries an
+*applicable* `Authenticated Users:(M)` ACE, so no tree on that host passes the
+privileged-script gate and the officer scripts need `-AllowUntrustedScriptPath`
+there. The refusal is correct (measured, not assumed) and the override is loud.
+Filed in `docs/UNFILED-WORK-ITEMS.md`.
+
+**Done since:** live Windows validation (WI-050) and an independent
+third-lineage adversarial review, which rated F10/F12/F13 sound and held F11
+ship-blocking on proof grounds — confirmed prescient by the first defect above.
+A full canonical application re-proof ran on the final tip: §A 14/14, §A1 13/13,
+CRL+§G 9/10 (the one FAIL is CRL3, the designed WI-052 calibration check),
+§K 12/12, both transport-orphan branches 6/6, §R+Rverify through four cycles,
+least privilege, authority split, CRL evidence, teardown verified on both hosts.
+
+**Still not done:** phase L was not re-run here (no enrollment-leg change on
+this branch; owed on a v1.11.x tag per the standing lab-network item).
 
 ## [1.11.0] — 2026-08-24
 
