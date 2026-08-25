@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-08-25
+
+Three medium security findings from a cross-lineage whole-repository scan, a
+fourth found by measuring the deployed store, and a live re-proof that turned
+up two defects in the lab teardown itself.
+
+**Upgrade if you consume the audit stream.** This is the minor bump, and it is
+a minor rather than a patch for one reason: **audit rows that used to appear no
+longer do.** Nothing is lost that recorded a state change, but row *counts*
+change, so a SIEM rule or dashboard that counts them needs a look:
+
+- `admin-nonce-cleanup` and `admin-expired-order-sweep` emit **only when the
+  sweep actually deleted or invalidated something**. A no-op sweep is silent.
+- `admin-list-pending-revocations` emits **only when the poll returned work**.
+  An empty poll is silent.
+- `finalize-enrollment-admission-denied`, `admin-revocation-confirm-denied` and
+  `admin-list-pending-revocations` now **coalesce**: one row per window with an
+  exact `denial_count`, instead of one row per request.
+
+**Also new:** after a post-issuance store failure the RA answers finalize with
+**503 `issuance_halted`** and keeps doing so until it is restarted. That is
+deliberate and one-way; see the finding below.
+
+### The part worth keeping
+
+The static scan found three call sites. A single `GROUP BY event_type` against
+the real deployed store found two more it could not have — and showed that
+**78.5% of the audit table was this RA narrating its own idle maintenance**,
+against eleven `certificate-issued` rows. Reading the source tells you an
+event exists; only counting rows tells you it dominates.
+
+The same lesson repeated in teardown, twice, and cost more: the procedure's
+"is the CA clean?" check restricted on a template *display name* where the
+column holds an OID, so it matched nothing, returned zero, and read as clean.
+Fifteen certificates from earlier sessions were live at the CA the whole time,
+each of those sessions having recorded a clean teardown. **A verification step
+whose failure mode is silence is not a verification step.**
+
 ### Security — 2026-08-25 whole-repository standard scan (three findings, all fixed)
 
 A cross-lineage static scan of `a566050`: three medium, no high or critical.
