@@ -403,13 +403,31 @@ def main() -> int:
 
     if sys.platform != "win32":
         log.error(
-            "This spike uses requests-negotiate-sspi (Windows SSPI). "
+            "This spike authenticates with Windows Negotiate. "
             "Run it on the domain-joined RA host, as the gMSA."
         )
         return 2
 
     import requests
-    from requests_negotiate_sspi import HttpNegotiateAuth  # type: ignore[import-not-found]
+
+    # The product's own Negotiate implementation, not requests-negotiate-sspi.
+    #
+    # Two reasons, and the second is why this changed. First, the product
+    # retired requests-negotiate-sspi in 2026-06 (single-maintainer in the
+    # issuance path, broken on 3.14) in favour of in-tree pyspnego with RFC 5929
+    # channel binding, so a spike on the old library was proving a leg the RA no
+    # longer has -- and would fail against EPA=Require, which is the setting the
+    # lab actually runs.
+    #
+    # Second: it is not installable where the spike has to run. The installer
+    # builds the venv from a hash-pinned closure that does not contain
+    # requests-negotiate-sspi, and this import sits ABOVE every line that
+    # creates anything, so on the deployed interpreter the spike died with
+    # ModuleNotFoundError before reaching the code under test. That cost the
+    # 2026-08-25 validation its enrollment leg (UNFILED item 16); the
+    # protected-output changes had to be proven by driving these functions
+    # individually instead.
+    from acme_adcs_ra.negotiate_auth import NegotiateAuth
 
     # LAB ONLY: refuse reuse. On Windows the directory is created atomically
     # with a protected DACL and every existing reparse-point ancestor is
@@ -421,7 +439,10 @@ def main() -> int:
     log.info("auth    : ambient Windows identity (MUST be gMSA-acme-ra$)")
 
     session = requests.Session()
-    session.auth = HttpNegotiateAuth()  # passwordless; uses the gMSA's ambient identity
+    # Passwordless: pyspnego uses the process's ambient Windows identity, which
+    # must be the gMSA. ``host`` is needed for the SPN and for the
+    # tls-server-end-point channel binding that EPA=Require demands.
+    session.auth = NegotiateAuth(HOST, ca_bundle=CA_BUNDLE or None)
     session.headers["User-agent"] = "acme-adcs-ra-spike/0.1 (Mode A)"
     session.verify = CA_BUNDLE if CA_BUNDLE else True
 
