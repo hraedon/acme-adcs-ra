@@ -8,19 +8,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Remediation of a standard scan of `7808046`, live-validated on 2026-08-25.
 
-**BREAKING for anyone who set `audit_offbox_required` — read this before
-upgrading.** `audit_offbox_required=true` now refuses **every** syslog sink,
-including TCP. Only an authenticated HTTPS HEC sink satisfies it: an `https`
-`siem_hec_url` with no embedded credentials, plus a non-empty `siem_hec_token`.
-The reasoning is that a *load-bearing* off-box audit trail has to authenticate
-its collector and protect events in transit, and plain syslog does neither —
-TCP proves a live transport, not a trustworthy one.
+**Check this before upgrading if you set `audit_offbox_required`.** The sink
+that satisfies it by default is now authenticated HTTPS HEC — an `https`
+`siem_hec_url` with no embedded credentials, plus a non-empty
+`siem_hec_token` — because a *load-bearing* off-box trail should authenticate
+its collector and protect events in transit, and plain syslog does neither.
 
-Note that this reverses the guidance of the previous release, which told
-operators to move from UDP to TCP syslog. **If you followed that, the RA will
-refuse to start** until you either configure HEC or set
-`audit_offbox_required=false`. Syslog remains fully available in the
-not-load-bearing posture.
+**TCP syslog still works, but you now have to say so.** Set
+`audit_offbox_allow_unauthenticated_syslog=true` and the requirement is
+satisfied by TCP syslog exactly as it was in 1.12.0. It is deliberately not
+silent: the RA logs `UNAUTHENTICATED OFF-BOX AUDIT` on every start and stamps
+`offbox_transport=syslog-unauthenticated` on the startup probe event, so the
+posture is visible to whoever reads the audit trail and not only to whoever
+wrote the config file.
+
+The acknowledgement exists because requiring HEC outright would strand every
+estate that reaches its SIEM through a syslog relay — this codebase has no
+syslog-over-TLS transport to offer instead — and the realistic response to a
+refused start is `audit_offbox_required=false`, which is strictly worse: it
+drops the off-box requirement entirely rather than just the transport
+strictness. Two further boundaries are deliberate: the acknowledgement does
+**not** reach UDP (that refusal is about whether "required" can assert anything
+at all, since a datagram socket accepts bytes with nothing listening), and it
+does **not** relax the HEC checks. Setting it without `audit_offbox_required`
+is refused rather than ignored, so it can never be a switch that looks set and
+does nothing.
 
 **Also check your SIEM rules — one event was renamed and four more now
 coalesce.** The reclaim route's order-not-found branch emits

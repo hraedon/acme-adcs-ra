@@ -203,6 +203,14 @@ honest: check a box only when the thing is actually true, not when it's planned.
       JSONL or unauthenticated plaintext syslog as its load-bearing trail. A
       write-once/append-only destination on the SIEM side remains desirable.
       SIEM delivery monitoring: `docs/operations.md` ## Monitoring and SLOs.
+- [ ] **If HEC is not available, the syslog trade is recorded and accepted.**
+      `ACME_RA_AUDIT_OFFBOX_ALLOW_UNAUTHENTICATED_SYSLOG=true` lets TCP syslog
+      satisfy the requirement. Tick this box only if someone with the authority
+      to accept it has: the collector is unauthenticated and the trail is
+      readable and forgeable in transit. Prefer fixing the transport. UDP is
+      refused regardless. Confirm the `UNAUTHENTICATED OFF-BOX AUDIT` startup
+      warning is visible in whatever reads the RA's logs — it fires on every
+      start by design.
 - [ ] **Nonce ceiling reviewed.** `/acme/new-nonce` is unauthenticated and each
       call is a SQLite write; the in-app token bucket
       (`nonce_rate_limit_per_second`, default 20/s burst 100) bounds it before

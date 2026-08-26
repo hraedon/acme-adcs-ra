@@ -329,6 +329,11 @@ class SiemConfig:
     # or HEC). See SiemEmitter._submit_bounded for why an unbounded queue
     # was a liability.
     hec_queue_max: int = 1000
+    # True when the operator satisfied ``audit_offbox_required`` with plain TCP
+    # syslog by explicit acknowledgement. Carried here for one reason: the
+    # startup probe event says so, so the weakened posture is legible to
+    # whoever reads the trail rather than only to whoever read the config file.
+    offbox_unauthenticated_acknowledged: bool = False
 
 
 class SiemEmitter:
@@ -749,6 +754,13 @@ class SiemEmitter:
                         "schema": self.SCHEMA_VERSION,
                         "event_type": "audit-offbox-startup-probe",
                         "outcome": "success",
+                        # The posture travels with the probe: a reader of this
+                        # trail can tell an authenticated off-box requirement
+                        # from an acknowledged unauthenticated one without
+                        # access to the RA host's configuration.
+                        "offbox_transport": "syslog-unauthenticated"
+                        if cfg.offbox_unauthenticated_acknowledged
+                        else "syslog",
                     }
                 )
             except Exception as exc:  # noqa: BLE001
@@ -874,6 +886,9 @@ def build_siem_config(config: RAConfig) -> SiemConfig:
         hec_index=config.siem_hec_index,
         hec_sourcetype=config.siem_hec_sourcetype,
         hec_queue_max=config.siem_hec_queue_max,
+        offbox_unauthenticated_acknowledged=(
+            config.audit_offbox_allow_unauthenticated_syslog
+        ),
     )
 
 
