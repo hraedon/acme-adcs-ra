@@ -3052,10 +3052,21 @@ Describe 'install-windows.ps1: interpreter runtime tree gate (2026-08-23 finding
         $marker = Join-Path $TestDrive 'python-startup-marker'
         Set-Content -LiteralPath (Join-Path $poison 'sitecustomize.py') `
             -Value ("from pathlib import Path; Path(r'{0}').write_text('ran')" -f $marker)
+        # The probe program goes in a FILE rather than through -c. Windows
+        # PowerShell 5.1 strips the embedded double quotes while building the
+        # native command line, so `-c 'assert all("x" not in p ...)'` reaches
+        # Python as `assert all(x not in p ...)` and dies with a NameError --
+        # a failure that says nothing at all about the flags under test. pwsh 7
+        # quotes it correctly, which is exactly why only the 5.1 job saw it.
+        $probeFile = Join-Path $TestDrive 'python-flag-probe.py'
+        Set-Content -LiteralPath $probeFile -Encoding ASCII -Value @(
+            'import sys'
+            'assert all("python-startup-poison" not in p for p in sys.path)'
+        )
         $oldPythonPath = $env:PYTHONPATH
         $env:PYTHONPATH = $poison
         try {
-            & $py.Source -I -S -c 'import sys; assert all("python-startup-poison" not in p for p in sys.path)' | Out-Null
+            & $py.Source -I -S $probeFile | Out-Null
             $LASTEXITCODE | Should -Be 0
             Test-Path -LiteralPath $marker | Should -BeFalse
         } finally {
@@ -3972,6 +3983,16 @@ Describe 'Privileged entry points prove the tree BEFORE loading siblings (F10)' 
         # this is Windows PowerShell 5.1, whose parsing/encoding behavior is a
         # separate compatibility contract from pwsh 7.
         $engine = (Get-Process -Id $PID).Path
+        # The child REFUSING is the behaviour under test, so its stderr has to
+        # arrive as data. GitHub's `shell: powershell` prepends
+        # $ErrorActionPreference='stop', and under Stop on Windows PowerShell
+        # 5.1 a native child's `2>&1` stderr becomes ErrorRecords that
+        # TERMINATE this block -- so the correct refusal read as a test
+        # failure. pwsh 7 leaves
+        # $PSNativeCommandUseErrorActionPreference false and never does this,
+        # which is why the Linux job and the interactive lab run both passed.
+        # Same family as the Sync-Revocations batch-abort defect of 2026-08-13.
+        $ErrorActionPreference = 'Continue'
 
         function New-ProbeTree([string]$Name, [byte[]]$HelperBytes) {
             $tree = Join-Path $TestDrive $Name
