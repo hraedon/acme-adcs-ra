@@ -817,6 +817,43 @@ event type that was never added to anything.
 findings. Not done here because this release is a park and a design change
 wants its own round.
 
+> **RESOLVED 2026-08-26** — option (2), in
+> `tests/test_audit_coalescing_enumeration.py`. Five tests, six mutations, each
+> caught.
+>
+> The enumeration walks the whole package rather than `routes/` alone: the
+> denial-shaped sites are spread across `finalize.py`, `app_state.py` and
+> `audit_retention.py` too, and a walker aimed only at `routes/` would have
+> reported a clean tree while missing ten of them. It resolves `details` through
+> one level of local-variable indirection, because the one site that builds its
+> dict as a local (`orders.py`) is also the one site that had no `reason_code`.
+>
+> Two invariants, not one. The first is the item as filed: a denial-shaped event
+> must be coalesced or listed in `_UNCOALESCED_WITH_A_BOUND` **with a written
+> statement of what bounds the row count instead**. Ten events are listed there
+> now, each with its actual bound (a one-way CAS, a TOCTOU race that cannot be
+> replayed on demand, a CA round trip).
+>
+> The second was not in the filing and is the sharper of the two: **the
+> coalescing key must be provably server-chosen.** The round-6 SAN defect was
+> not that a call site was missing from the allowlist — it was *in* the
+> allowlist, and still produced one durable row per request, because the key
+> fell back to `reason` prose carrying the client's SAN. So the test requires
+> the load-bearing value (`reason_code`, else `reason`) to be a source literal,
+> or an allowlisted attribute expression whose closed set is **proven on every
+> run** by reading the module that constructs it. Mutating
+> `reason_code="san-out-of-scope"` to an f-string carrying the SAN fails that
+> proof — the original defect is now caught at its source.
+>
+> One production change fell out of it: `order-rate-limited` in `orders.py` was
+> the last coalesced site with no `reason_code`, keying on `f"{exc.scope}-limit"`.
+> `scope` is server-chosen so there was no live defect, but the invariant could
+> not be stated without it. It now sends `reason_code=exc.scope`; per-account
+> and global denials keep separate windows exactly as before.
+>
+> A new denial-shaped event added with no decision now fails CI rather than
+> waiting for round five of this class.
+
 ### 14. (harness, medium) — RESOLVED 2026-08-25. **The teardown's clean-CA check was inert**
 
 The runbook's "did we clean up?" command was
