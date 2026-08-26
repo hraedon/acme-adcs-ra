@@ -250,6 +250,91 @@ engineered to. Until then it has not — regardless of a green local test run.
 
 ## Validation log
 
+- **2026-08-25 security-fix branch `security-fix-7808046` — live validation
+  EXECUTED, tip `3c599ca` (base `7808046` = v1.12.0, live-proven at
+  `5580519`).** Preflight: local gates 960 pytest + 1 skip, 482 Pester + 4
+  platform skips, ruff, mypy; the branch's pinned InstallVerifyLib digest was
+  independently recomputed and matches the committed file. **CI has not run on
+  this commit** (local branch, not pushed) — local gates are the proxy, said
+  plainly.
+
+  **Standard pass: §A 14/14 (twice — the second run under load-bearing HEC,
+  below), §A1 13/13, CRL+§G 9/10, §K 12/12, both transport-orphan branches
+  6/6 each, §R 6/6 ×3, Rverify 3/3 ×3, §D least privilege, authority split,
+  CRL-evidence cycle.** The one FAIL is CRL3, the designed WI-052 calibration
+  check (unchanged operator finding). Least privilege: gMSA token succeeds,
+  CRL publication denied `0x80070005`, out-of-template revocation
+  `CERTSRV_E_RESTRICTEDOFFICER`, reason 8 refused pre-CA (exit 3). Authority
+  split: admin-token-only → exit 2; confirm-token-only → exit 0. CRL
+  evidence: `crl-evidence-required-but-absent` → admin republish →
+  `crl-verified`.
+
+  **This delta's own fixes proven live on Windows PowerShell 5.1 through the
+  real call sites, not just unit tests:**
+
+  1. **HEC-only `audit_offbox_required`.** Config layer, one fresh process
+     per case on the deployed interpreter, 7/7: syslog/TCP and syslog/UDP
+     refused, `http://` HEC URL refused, embedded-credentials URL refused,
+     empty token refused, valid HTTPS+token accepted, syslog still allowed
+     when the requirement is false. Live app cycle against a localhost mock
+     collector (TLS-1.3-verified, throwaway self-signed cert imported to
+     `LocalMachine\Root` and removed at teardown): startup probe delivered
+     with the `Authorization: Splunk` header; a full §A under
+     `audit_offbox_required=true` delivered `order-created` and
+     `certificate-issued` off-box (14/14 again); collector killed → pool
+     recycle → the RA refuses to serve (`/directory` fails; no worker);
+     collector restored → recycle → 200 with a second probe event.
+  2. **Replayable admin audit growth bounded by the global key.** 8/8 live:
+     15 reclaim probes against 15 different nonexistent order ids wrote
+     exactly ONE durable row (`denial_count` 15, attacker id kept only as a
+     bounded `sample_order_id`, structured `order_id` empty); 15 list-orders
+     polls with varying filters wrote one row; a real-order reclaim kept its
+     own `noop` row WITH order-id attribution (distinct reasons stay
+     distinct); a further in-window probe folded (count 16).
+  3. **Pinned-digest InstallVerifyLib loading.** RA host, admin-only tree so
+     only the digest could fail, `Revoke-Cert -Reason 8` (no CA contact):
+     untampered passes (reason-8 exit 3); one byte appended to the lib →
+     "does not match this entry point's pinned release digest", exit 1, no
+     script logic ran; tampered + `-AllowUntrustedScriptPath` → the UNSAFE
+     LAB OVERRIDE warning then reason-8 exit 3; restored → passes again. CA
+     host (everything under its `AU:(M)` `C:\` carries the override): the
+     digest differential still proved itself 3/3.
+  4. **Fail-closed ancestor/runtime-tree walks + `python*._pth` refusal.**
+     Every privileged run this session exercised the strict
+     `Get-FilesystemAncestorChain` path on 5.1 (Set-OfficerRights
+     provisioning, the registered sync task, Revoke-Cert, the reconcile
+     gate). A throwaway venv under an admin-only scratch: clean control →
+     planted `python._pth` refused with the path-override violation →
+     removed → clean again.
+  5. **Spike protected-at-creation output.** Run as the gMSA via scheduled
+     task: output directory born with exactly SYSTEM / Administrators /
+     gMSA full control, `AreAccessRulesProtected=True`, OI/CI to children,
+     owner gMSA; `spike.key` born with the same three-trustee DACL, no
+     inheritance flags; rerun refuses the existing directory and the
+     existing key path (FileExistsError). Driven through the spike's own
+     functions (`_create_protected_output_directory`, `build_csr`,
+     `_write_new_protected_private_key`) in main()'s order because
+     `requests_negotiate_sspi` is not in the pinned deployment closure —
+     see `docs/UNFILED-WORK-ITEMS.md` item 16. The spike's enrollment leg
+     did not run this round (that leg is separately covered by §A against
+     the product).
+
+  **Not run:** phase L (`Lqueue`/`Ldrain`) — no enrollment-leg change in this
+  delta and the lab fabric remains unsound for it (unchanged status);
+  the spike's full enrollment path (item 16); CI on this exact commit.
+
+  **Teardown verified, not assumed:** 5 serials revoked (0 failed), zero
+  `ACME-ServerAuth` certificates remain Issued, CRL republished, CA back to
+  224 bytes / 4 ACEs / `OfficerRights` ABSENT / certsvc Running, IIS
+  `denyUrlSequences` empty, all scheduled tasks unregistered (0 remaining),
+  the mock collector's root cert removed (0 left) and its task stopped,
+  web.config carrying no SIEM/CRL/GET overrides, the store restored with
+  `integrity=ok` and every table count identical to the session-start
+  fingerprint (accounts 37, audit_log 722, authorizations 38, certificates
+  13, challenges 38, nonces 0, orders 38), dotenv restored, pool Started,
+  `/directory` 200. The deployed runtime is now the `3c599ca` build (version
+  string 1.12.0); the store and all operator configuration are as found.
+
 - **2026-08-25 whole-repository scan remediation — live validation EXECUTED,
   tip `5580519`.** Preflight: CI green on all eight jobs for the exact commit;
   local gates 953 pytest + 1 skip, 467 Pester + 4 platform skips, ruff, mypy.

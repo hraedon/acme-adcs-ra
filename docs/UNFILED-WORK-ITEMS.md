@@ -857,3 +857,18 @@ it backwards, which is the more useful half of the lesson: a trap recorded in
 one place and not in the procedure is a trap you pay for again. The runbook now
 leads the teardown section with the ordering.
 
+
+### 16. (harness, low) — NEW 2026-08-25. **lab/spike_mode_a.py cannot run on the deployed venv**
+
+Found during the `3c599ca` lab validation (2026-08-25). The installer rebuilds
+the venv from the hash-pinned product closure, which does not include
+`requests_negotiate_sspi`; `spike main()` imports it BEFORE
+`_create_protected_output_directory`, so the spike aborts with
+`ModuleNotFoundError` before it creates anything. The 3c599ca protected-output
+delta was therefore proven by driving the spike's own functions directly
+(`spike-drive.py`, run as the gMSA: fresh-dir creation, exclusive key create,
+rerun refusals, DACL evidence — 4/4), but the spike's enrollment leg has not
+run since the code/state split moved the interpreter (the spike-runbook still
+names the retired single-tree venv). Options: pin an SSPI client for a lab
+extra, or port the spike to the product's own pyspnego-based
+`negotiate_auth.NegotiateAuth` (already installed).
