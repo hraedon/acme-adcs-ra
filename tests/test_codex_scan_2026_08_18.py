@@ -103,8 +103,15 @@ class TestUdpCannotSatisfyOffboxRequired:
             collector.close()
 
     def test_config_refuses_the_combination_at_startup(self) -> None:
-        """Fail at config validation, not only at the probe: it is a posture."""
-        with pytest.raises(ValueError, match="authenticated HTTPS HEC"):
+        """Fail at config validation, not only at the probe: it is a posture.
+
+        This refusal is unconditional and has no override, because it is about
+        whether ``required`` can assert anything at all -- a datagram socket
+        accepts bytes with nothing listening. See
+        ``test_offbox_syslog_acknowledgement.py``, which pins that the
+        acknowledgement flag does not reach UDP.
+        """
+        with pytest.raises(ValueError, match="fire-and-forget"):
             RAConfig(
                 audit_offbox_required=True,
                 siem_sink="syslog",
@@ -113,8 +120,15 @@ class TestUdpCannotSatisfyOffboxRequired:
             )
 
     def test_config_refuses_tcp_as_the_load_bearing_posture(self) -> None:
-        """A live TCP peer is not an authenticated or confidential collector."""
-        with pytest.raises(ValueError, match="authenticated HTTPS HEC"):
+        """A live TCP peer is not an authenticated or confidential collector.
+
+        Still the DEFAULT, which is what this test pins. Unlike UDP above,
+        this one is reachable by explicit acknowledgement --
+        ``audit_offbox_allow_unauthenticated_syslog`` -- because refusing it
+        outright stranded every estate whose SIEM is behind a syslog relay and
+        the realistic response was to turn the whole requirement off.
+        """
+        with pytest.raises(ValueError, match="does not authenticate the collector"):
             RAConfig(
                 audit_offbox_required=True,
                 siem_sink="syslog",

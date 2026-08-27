@@ -136,7 +136,9 @@ def test_offbox_audit_required_rejects_the_jsonl_sink(tmp_path: Path) -> None:
 
 
 def test_offbox_audit_required_rejects_plaintext_syslog(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="authenticated HTTPS HEC"):
+    """Still refused by DEFAULT; the acknowledged posture is exercised in
+    ``test_offbox_syslog_acknowledgement.py``."""
+    with pytest.raises(ValidationError, match="does not authenticate the collector"):
         RAConfig(
             base_url="http://testserver",
             db_path=tmp_path / "ra.db",

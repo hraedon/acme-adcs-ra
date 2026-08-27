@@ -95,6 +95,22 @@ def create_app(context: ServerContext) -> FastAPI:
                     "require is not actually working."
                 )
             logger.info("off-box audit delivery probe succeeded: %s", detail)
+            if context.config.audit_offbox_allow_unauthenticated_syslog:
+                # An accepted trade has to stay visible for as long as it is in
+                # force. A one-time decision recorded only in a config file is
+                # invisible to whoever reads the audit trail later and assumes
+                # "required" meant authenticated.
+                logger.warning(
+                    "UNAUTHENTICATED OFF-BOX AUDIT: audit_offbox_required is "
+                    "satisfied by plain TCP syslog to %s:%s because "
+                    "audit_offbox_allow_unauthenticated_syslog is set. The "
+                    "collector is not authenticated and events are not "
+                    "protected in transit; anyone on the path can read this "
+                    "trail or forge events into the SIEM. Prefer the "
+                    "authenticated HTTPS HEC sink.",
+                    context.config.siem_syslog_host,
+                    context.config.siem_syslog_port,
+                )
         context.audit_hook = _siem_emitter.export
     if context.nonce_bucket is None:
         context.nonce_bucket = _default_nonce_bucket(context.config)

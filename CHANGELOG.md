@@ -6,6 +6,78 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Remediation of a standard scan of `7808046`, live-validated on 2026-08-25.
+
+**Check this before upgrading if you set `audit_offbox_required`.** The sink
+that satisfies it by default is now authenticated HTTPS HEC — an `https`
+`siem_hec_url` with no embedded credentials, plus a non-empty
+`siem_hec_token` — because a *load-bearing* off-box trail should authenticate
+its collector and protect events in transit, and plain syslog does neither.
+
+**TCP syslog still works, but you now have to say so.** Set
+`audit_offbox_allow_unauthenticated_syslog=true` and the requirement is
+satisfied by TCP syslog exactly as it was in 1.12.0. It is deliberately not
+silent: the RA logs `UNAUTHENTICATED OFF-BOX AUDIT` on every start and stamps
+`offbox_transport=syslog-unauthenticated` on the startup probe event, so the
+posture is visible to whoever reads the audit trail and not only to whoever
+wrote the config file.
+
+The acknowledgement exists because requiring HEC outright would strand every
+estate that reaches its SIEM through a syslog relay — this codebase has no
+syslog-over-TLS transport to offer instead — and the realistic response to a
+refused start is `audit_offbox_required=false`, which is strictly worse: it
+drops the off-box requirement entirely rather than just the transport
+strictness. Two further boundaries are deliberate: the acknowledgement does
+**not** reach UDP (that refusal is about whether "required" can assert anything
+at all, since a datagram socket accepts bytes with nothing listening), and it
+does **not** relax the HEC checks. Setting it without `audit_offbox_required`
+is refused rather than ignored, so it can never be a switch that looks set and
+does nothing.
+
+**Also check your SIEM rules — one event was renamed and four more now
+coalesce.** The reclaim route's order-not-found branch emits
+`admin-order-reclaim-not-found` instead of `admin-order-reclaim-denied`; the
+denied event now means only "an order existed and reclaiming it was refused",
+which is the sharper signal. `admin-list-orders`,
+`admin-list-pending-revocations`, the three reclaim outcomes and
+`admin-revocation-confirm-deferred` now coalesce, so row *counts* change on
+those exactly as they did in 1.12.0 for the sweeps.
+
+### Security
+
+- **The library that authenticates the privileged script tree could not
+  authenticate itself.** All five privileged entry points (`Revoke-Cert`,
+  `Set-OfficerRights`, `Sync-Revocations`, `Register-MaintenanceTasks`,
+  `Reconcile-Revocation`) now verify `InstallVerifyLib.ps1` against a pinned
+  release digest, computed over canonical UTF-8/LF bytes so a CRLF checkout
+  still matches, and then execute **those same verified in-memory bytes** — the
+  path is never reopened between validation and use.
+- **Three provenance walks were fail-open.** The hand-rolled
+  `while ($p -and $guard -lt 32)` ancestor loops, a `Get-ChildItem
+  -ErrorAction SilentlyContinue` tree enumeration, and a runtime-closure walk
+  that skipped past a queued interpreter that had vanished all returned a
+  partial answer that read as proof. They now throw, and callers treat an
+  unprovable chain as a violation.
+- **Replayable admin audit growth is bounded.** A stolen maintenance credential
+  could enumerate order ids and, because each id was part of the coalescing key,
+  cycle through more keys than the in-memory window cap and force a fresh
+  durable row per request. Those paths now key on the event and a stable reason
+  code only; the probed id survives as a bounded `sample_order_id` sample and
+  the replay count stays exact.
+- **The lab spike wrote its private key and then protected it.** The output
+  directory and key are now created with their final restrictive DACL, and a
+  rerun refuses an existing directory or key rather than overwriting it.
+
+### Fixed
+
+- Two Pester tests added by this work could never pass on Windows PowerShell
+  5.1, the engine these scripts ship on — they were green on the Linux pwsh job
+  and through a full live lab validation. One read a correct refusal as a
+  failure because CI runs with `$ErrorActionPreference='stop'`, under which 5.1
+  turns a native child's stderr into a terminating error; the other had its
+  embedded double quotes stripped out of a native command line. No product
+  behaviour was involved in either.
+
 ## [1.12.0] — 2026-08-25
 
 Three medium security findings from a cross-lineage whole-repository scan, a

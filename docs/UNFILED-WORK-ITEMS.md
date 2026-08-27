@@ -909,3 +909,59 @@ run since the code/state split moved the interpreter (the spike-runbook still
 names the retired single-tree venv). Options: pin an SSPI client for a lab
 extra, or port the spike to the product's own pyspnego-based
 `negotiate_auth.NegotiateAuth` (already installed).
+
+> **RESOLVED 2026-08-26** — the second option, which was the right one on the
+> merits and not merely the installable one. `requests-negotiate-sspi` was
+> retired from the issuance path in 2026-06 (single maintainer, broken on
+> 3.14), so a spike still on it was exercising a leg the RA no longer has, and
+> would fail against EPA=Require — which is what the lab actually runs.
+> `docs/spike-runbook.md` had *already* been updated to tell operators to use
+> the in-tree implementation, so the code was the last thing still on the old
+> library. **The enrollment leg still has not run; it is now merely able to.**
+
+### 17. (harness, medium) — NEW 2026-08-26. **The phase-L blackhole instrument is unsound in two independent ways**
+
+Both found by inspection plus execution on 2026-08-26, while deciding what to
+fix before booking the next rig. Neither is the "flapping lab network" that
+item 11 blamed, and item 11's diagnosis should be treated as retracted.
+
+**The probe cannot distinguish success from refusal.** `bh-route.ps1`'s `Probe`
+calls `BeginConnect(...).AsyncWaitHandle.WaitOne(5000)` and never calls
+`EndConnect`, so it reports whether the operation *completed*, not whether it
+*connected*. Running the old function verbatim against real sockets:
+
+```
+OLD CONNECT-PROBE[127.0.0.1:22]:  completed=True   elapsed_ms=66     <- real connection
+OLD CONNECT-PROBE[127.0.0.1:9]:   completed=True   elapsed_ms=2      <- REFUSED
+OLD CONNECT-PROBE[192.0.2.1:443]: completed=False  elapsed_ms=3000   <- dropped
+```
+
+Two opposite verdicts, one word. With the blackhole on, a refusal reads as a
+failed blackhole; with it off, a refusal reads as a restored CA — so a teardown
+can certify itself complete while the CA is unreachable, and every later phase
+measures a broken lab without saying so. The distinction is load-bearing beyond
+reporting: an RST unblocks the client immediately, so the enrollment pool never
+saturates and **Lqueue cannot build a queue at all**. Only a silent drop hangs
+the client.
+
+**The mechanism is unsound for this topology.** A `/32` via a dead next hop
+cannot be trusted when the CA is **on-link**: the destination is also covered by
+the interface's connected route, and Windows can satisfy the send from it while
+`Get-NetRoute` still reports the `/32` as `PRESENT`. The precheck is fail-open
+in the literal sense — `if ($n -and $n.State -notin (...))` proceeds when
+`Get-NetNeighbor` returns nothing, treating *unknown* as *verified
+unreachable* — and it only ever checks the v4 dead gateway, never the v6 one.
+
+**Replacement written, not yet run on the lab:** `reachprobe.ps1` (three
+verdicts — connected/refused/dropped — as exit codes, proven against real
+sockets) and `ca-inbound-block.ps1` (inbound Block on the CA scoped to the RA's
+source addresses; Windows Firewall Block discards silently, which is the
+behaviour phase L needs). Both live outside the repo because
+`samples/lab-harness/` is gitignored; they were handed off on 2026-08-26 with
+`PHASE-L-HANDOFF.md`. **Do not go back to an outbound Block on the RA** — that
+was measured not blocking at all on that host.
+
+This is the third instrument in this project whose failure mode was silence
+(stale CONNECT-PROBE target, inert firewall rule, the template-name teardown
+check that matched nothing). **Prove the instrument before the phenomenon:**
+blackhole on, probe says `dropped` on every address, and only then run Lqueue.
