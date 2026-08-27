@@ -1180,6 +1180,32 @@ then deleted it.
    or accept that only within-session properties can ever be measured. The first
    is nearly free.
 
+> **BUILT 2026-08-27.** Both halves.
+>
+> * `scripts/sample_crl_age.py` — samples a CDP, appends
+>   `thisUpdate`/`nextUpdate`/observed age/CRL Number to a JSONL file, and
+>   `--summarize` prints the age distribution, the binding upper bound, and any
+>   **CRL Number regressions** (which is also the false-positive measurement
+>   item 23's control needs). Failed fetches are recorded, not skipped: a
+>   sampler that drops failures measures only the CA's good days.
+> * `samples/lab-harness/restore.ps1` now copies the post-run store — all three
+>   SQLite files, after the pool is confirmed stopped — to
+>   `postrun-store-<ts>` **before** removing anything, and throws rather than
+>   warning if it cannot, so the restore can be re-run without loss.
+>
+> **Caveat on the second half: `samples/` is gitignored**, so the `restore.ps1`
+> change exists only in this operator box's checkout. It ships to the RA host on
+> the next teardown (the harness is scp'd per run), but it is not in the repo, not
+> on CI, and not in a fresh clone. The *policy* is therefore also written into
+> `docs/live-reproof-runbook.md` §E, which is committed — if the harness copy is
+> ever lost, the requirement survives. Anyone re-proving from a clean checkout
+> must re-apply it.
+>
+> Running against the lab CA every 30 minutes from the operator box since
+> 2026-08-27T19:13Z (first sample: CRL Number 127, age 55446s, window 649200s).
+> The first thing it found was **item 24**, which is not the question it was
+> pointed at.
+
 ### 23. (design, medium) — NEW 2026-08-27. **Replace the replay control: monotonic CRL, not an age ceiling**
 
 *Design filed rather than built; it wants its own round and a live proof.*
@@ -1242,3 +1268,95 @@ change, no officer rights, no teardown risk.
 first observation; rollover producing a distinct key; watermark advancing in the
 confirm's transaction and not before it. Mutation-prove the regress refusal —
 it is the only branch that carries the security property.
+
+> **BUILT 2026-08-27**, to the design above, with two deviations worth naming.
+>
+> * **The watermark identity is derived from the certificate's stored chain, not
+>   from the fetched CRL.** The design said "issuer DN plus the CA cert's SPKI"
+>   without saying where the DN comes from, and taking it from the CRL would
+>   have meant a network round trip before the store could be consulted — plus a
+>   DN-encoding comparison (PrintableString vs UTF8String) that CAs do not
+>   always make cleanly. Both halves now come from the CA certificate the leaf
+>   was issued under; the fetched document is bound to that identity by the
+>   signature check that already existed.
+> * **`enforce_monotonic=False`** was not in the design. It records the verdict
+>   without refusing on it, for an estate whose replicas are known to lag —
+>   because the alternative an operator reaches for is turning CRL evidence off
+>   entirely, and then nothing is measured either.
+>
+> Shipped: `crl_watermark` table (`Store.read_crl_watermark`,
+> `reset_crl_watermark`, and a compare-and-set advance inside the confirm's own
+> transaction), `compare_to_watermark` / `crl_watermark_key` in `crl_evidence`,
+> the single re-fetch before a regression is believed, the
+> `crl-evidence-regressed` denial reason, and
+> `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC` (default **true**).
+> `tests/test_crl_watermark.py`, 21 tests, mutation-proved against four
+> reverted fixes: the regress refusal, the compare-and-set, the SPKI in the key,
+> and CRL-Number precedence — each kills exactly the tests that claim it.
+>
+> **Still owed: the live proof.** It needs no CA-side change — point
+> `revocation_confirm_crl_url` at a stand-in serving a captured older CRL after
+> a newer one has been seen, and assert `crl-evidence-regressed`. Until that
+> runs, this is a control that has only ever been exercised against CRLs this
+> repository generated itself.
+
+### 24. (measurement, HIGH) — NEW 2026-08-27. **The WI-052 floor conflates the attacker's reach with the CDP's output**
+
+*Found while writing the sampler's tests for item 22: a test asserting "no
+binding ceiling can exist" failed against the summariser, and the summariser was
+right.*
+
+Item 20's resolution derives the floor as **published window + one
+`ClockSkewMinutes` = 649800s**, on the reasoning that "the oldest still-valid CRL
+the RA can be handed is one full window old". That sentence is true, and it is
+the wrong quantity for a floor.
+
+Two different ages are in play and the derivation uses one for both:
+
+| quantity | what it is | value on this CA |
+|---|---|---|
+| **publication interval `P`** | how often the CA republishes; bounds the age of what an honest CDP serves | `CRLPeriod` = 604800s |
+| **published window `W`** | `nextUpdate − thisUpdate`; bounds how long a replayed document stays unexpired | measured 649200s |
+
+The **floor** (below which healthy CRLs get refused) is set by `P` plus
+lateness and skew — the RA is only ever *served* the current document. The
+**upper bound** (above which the ceiling adds nothing to `nextUpdate`) is set by
+`W` — that is the attacker's reach. Using `W` for both closes the interval by
+construction, which is exactly the "unsatisfiable for any CA" conclusion.
+
+For a CA that publishes with **overlap** (`P < W`, which is the point of
+overlap) the interval is not empty; its width is the overlap itself. On this CA
+that is `604800 < max_age < 649200`, a 44400s (12h20m) gap — and the originally
+shipped **626400** sits inside it. So the "wrong published number" finding may
+itself be wrong, and the correction to `≥ 649800` may have made the ceiling
+non-binding for no reason.
+
+**Not changing the number on this reasoning.** Item 20 warns in its own body
+that shipping a second unverified recommendation is how it arrived, and this is
+a third derivation on paper — the fourth would be the same mistake with a
+different sign. **`P` is the measurable one**: it is the maximum age the CDP
+actually serves, and `scripts/sample_crl_age.py` (item 22) has been sampling it
+every 30 minutes since 2026-08-27T19:13Z. Two publication cycles settle it.
+
+* if measured max served age stays near 604800 → a binding ceiling exists, item
+  20's floor is wrong, and 626400 was defensible all along;
+* if it reaches toward 649200 (the CA publishes late, or a cache serves stale)
+  → item 20's floor is right for the reason it is *actually* right, which is
+  lateness rather than the window, and the ceiling genuinely cannot bind.
+
+**This does not change item 23.** The monotonic watermark is the replay control
+either way, and its value is that it does not depend on which of these answers
+is correct — no calibration, so no derivation to get wrong a fifth time. The
+ceiling stays a liveness alarm regardless; the only thing at stake here is where
+that alarm's threshold sits.
+
+**In fairness to item 20:** `operations.md` already flags this as an open
+question — *"How often the RA is handed an old-but-still-current CRL depends on
+CDP and cache behaviour — measure it before tightening"*. What is added here is
+naming **which quantity the floor actually is** (served age, not window) and
+pointing a running instrument at it, rather than leaving it as an open question
+for a fifth session to re-derive on paper.
+
+**Do not "resolve" this from the registry, the docs, or another table.** Three
+of the four derivations so far were done that way and two of them were wrong.
+Read the sampler.

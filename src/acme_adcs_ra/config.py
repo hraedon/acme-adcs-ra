@@ -358,10 +358,40 @@ class RAConfig(BaseSettings):
     # sheds with 429 + Retry-After rather than queueing — the serial stays
     # pending, so the next sync sweep picks it up.
     revocation_confirm_crl_max_pending: int = 32
-    # An absolute ceiling on how stale a CRL the RA will act on. A signed CRL
-    # never stops verifying, and `nextUpdate` is chosen by the CA, so neither
-    # bounds replay of a pre-revocation view on its own.
+    # A LIVENESS ALARM on the CA's publication pipeline, not a replay control.
+    #
+    # It was introduced as an independent bound on replay, and it cannot be one
+    # (WI-052, UNFILED items 20/22/23). To bind against replay the ceiling would
+    # have to sit *below* the CA's publication window, since any value at or
+    # above it admits the whole of the previous period; but to avoid refusing
+    # healthy CRLs it must sit *above* the maximum age the CDP actually serves,
+    # which for a CA that republishes once per window is essentially the window
+    # itself. Those two constraints do not overlap for any CA, so no value is
+    # both safe and binding. Chasing one cost this project four derivations.
+    #
+    # What replaced it as the replay control is the monotonic watermark below.
+    # What this number is still good for is noticing that a CA has stopped
+    # publishing: set it above the observed maximum served age (measure with
+    # `scripts/sample_crl_age.py`, item 22) and treat a refusal as an alarm on
+    # the CA, not as evidence about a certificate.
     revocation_confirm_crl_max_age_seconds: int = 7 * 24 * 3600
+
+    # Refuse a CRL older than the newest one already acted on for the same
+    # issuing CA (UNFILED item 23). This is the replay control the ceiling above
+    # could never be, and it needs no calibration: RFC 5280 already requires the
+    # CRL Number to increase per CA, so the property is the CA's to maintain
+    # rather than the operator's to derive.
+    #
+    # The threat it closes is narrow and real. A stale CRL that *lacks* a serial
+    # already fails closed, so age never protected the "was it really revoked?"
+    # direction. The only wrong-*accept* an old CRL can produce is a hold→unhold
+    # replay: a certificate revoked with reason 6 and later released with reason
+    # 8 (`removeFromCRL`) still appears revoked on the older document.
+    #
+    # Set False in an estate whose CDP replicas are known to lag: the watermark
+    # is still recorded and the regression still reaches the audit trail, so the
+    # measurement survives without the refusal.
+    revocation_confirm_crl_require_monotonic: bool = True
     # Ceiling on concurrently-served requests when the RA runs Uvicorn directly
     # (2026-08-19 F3, CWE-400). Behind IIS the proxy imposes its own limit, but
     # the direct-TLS topology is supported and had none: every slow client got a

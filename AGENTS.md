@@ -72,6 +72,36 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**2026-08-27: WI-052 is closed by replacing the control, not by finding the
+number.** The CRL age ceiling was introduced as an independent replay bound and
+cannot be one — to bind it must sit below the CA's published window, to avoid
+refusing healthy CRLs it must sit above the age the CDP actually serves. Four
+derivations were spent looking for a value in between. The replay control is now
+a **monotonic CRL watermark** (`ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC`,
+default true): the newest CRL acted on per issuing CA is recorded, and one that
+goes backwards is denied `crl-evidence-regressed`. It needs no calibration, since
+RFC 5280 already requires the CRL Number to increase. The ceiling is demoted to a
+liveness alarm on the CA's publication pipeline. **Live proof still owed** — a
+stand-in serving a captured older CRL; no CA-side change needed.
+
+**The reason WI-052 survived so long is the more useful finding.** Its
+calibration data existed — `crl_this_update` on every confirmation — and the lab
+teardown restored the store that held it at the end of every session. 722 audit
+rows spanning two months, not one carrying `crl_this_update`. The item was not
+un-measured; under that procedure it was **un-measurable**, and no number of
+further validation rounds would have changed it. Generalise it: *any*
+longitudinal property is invisible to a lab process that restores to a pre-run
+fingerprint. `restore.ps1` now preserves the post-run store first (and throws
+before destroying anything if it cannot), and `scripts/sample_crl_age.py` samples
+the CDP from outside the restore scope entirely — running against the lab CA
+every 30 minutes since 2026-08-27T19:13Z.
+
+The first thing the sampler found was that the merged floor derivation uses the
+published *window* where it needs the *served age* — different quantities on any
+CA with publication overlap. **Do not re-derive that number on paper; read the
+sampler** (UNFILED item 24). The watermark is deliberately independent of how
+that resolves.
+
 **2026-08-25 whole-repository scan: three medium findings, fixed and LIVE
 VALIDATED on tip `5580519`.** (1) `Store.record_issuance` was unguarded — the
 first durable record of something ADCS had already done, so a full or

@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### CRL replay is now bounded by a monotonic watermark, not by an age ceiling
+
+**New setting: `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC`, default
+`true`.** It only affects deployments that have already configured
+`revocation_confirm_crl_url`; nothing changes for anyone who has not.
+
+The RA now records the newest CRL it has acted on for each issuing CA, and
+refuses one that goes backwards — the confirmation is denied with reason
+`crl-evidence-regressed`. The threat this closes is narrow and specific: a
+**hold→unhold replay**. A certificate revoked with reason 6 and later released
+with reason 8 (`removeFromCRL`) is still listed as revoked on the older CRL, so
+replaying that document confirms a revocation for a certificate that is
+currently valid. A stale CRL that *lacks* the serial already failed closed, so
+this was the only wrong-accept an old CRL could produce.
+
+`revocation_confirm_crl_max_age_seconds` is **demoted to a liveness alarm** on
+the CA's publication pipeline. It was introduced as an independent replay bound
+and could never be one — to bind it must sit below the CA's publication window,
+to avoid refusing healthy CRLs it must sit above the age the CDP actually
+serves, and on a CA without publication overlap those constraints do not
+overlap. Its value did not change; what it claims to do did.
+
+**What the watermark does not do, stated because a quiet no-op is worse than no
+control:** the first CRL seen for a CA is trust-on-first-use and protects
+nothing. A CA key rollover creates a fresh watermark by construction (the key is
+the issuer DN *and* the CA certificate's SPKI). A CA restored from backup
+restarts its CRL Number sequence and will wedge confirmations until an operator
+clears the watermark — deliberately manual, because an automatic reset on "the
+number went backwards" would hand an attacker the sequence that defeats the
+control. Round-robin CDP replicas at different vintages are retried once before
+a regression is believed; if yours lag persistently, set the new setting to
+`false` and the verdict is still recorded (`crl_watermark_verdict`) without the
+refusal.
+
+### New: `scripts/sample_crl_age.py`
+
+An operator tool that samples a CDP on a schedule and reports the observed CRL
+age distribution, the published window, and any CRL Number regressions. It uses
+no RA, no store and no privilege — only reach.
+
+It exists because this project could not measure its own CRL ages: the setting
+above was calibrated four times without data, since every lab validation
+restored the store that held the evidence. Use `--summarize` to set the liveness
+alarm from measurement, and to find out whether your CDP is stable enough to
+enforce monotonicity before you enable it.
+
+### Earlier in this cycle
+
 Remediation of a standard scan of `7808046`, live-validated on 2026-08-25.
 
 **Check this before upgrading if you set `audit_offbox_required`.** The sink

@@ -263,6 +263,29 @@ honest: check a box only when the thing is actually true, not when it's planned.
       observed window.** Re-derive if your CA's `CRLPeriod`,
       `CRLOverlapPeriod` or `ClockSkewMinutes` differ. After `nextUpdate` the CRL
       fails closed regardless of this setting.
+      **⚠ Do not re-derive this number on paper — a fourth attempt is running as
+      a measurement (UNFILED item 24).** The floor above is the published
+      *window*, which is how long a **replayed** document stays unexpired; the
+      floor that matters for false refusals is the maximum age an **honest CDP
+      serves**, and on a CA that publishes with overlap those differ by exactly
+      the overlap. `scripts/sample_crl_age.py` measures the second one. Leave
+      `≥ 649800` in place until it has two publication cycles of data.
+
+- [ ] **Monotonic CRL evidence is left enabled, and its first-use gap is
+      understood.** `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC` defaults
+      to `true` and is the control that actually bounds CRL replay — the age
+      ceiling above cannot be, whatever number it carries. It needs no
+      calibration. Two things to know before pilot:
+      **(1)** the first CRL seen for a CA is trust-on-first-use and protects
+      nothing, so the first confirmation after deployment or a CA key rollover
+      is unprotected by it;
+      **(2)** if the CA is ever restored from backup its CRL Number sequence
+      restarts, and confirmations then wedge until an operator clears the
+      watermark. That reset is deliberately manual — record who can do it, and
+      where, **before** you need it at 2am. If your CDP round-robins replicas at
+      different vintages, run `scripts/sample_crl_age.py --summarize` first: it
+      reports CRL Number regressions, which is exactly the false-refusal rate
+      you would be signing up for.
 
 ---
 

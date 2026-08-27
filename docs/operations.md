@@ -641,6 +641,85 @@ actually has some; on this CA it does not. See the superseded banner below.
 > `ClockSkewMinutes`; do not reconstruct the window from configuration and
 > assume it matches.
 
+### The replay control is the monotonic watermark, not this ceiling
+
+*Added 2026-08-27 (UNFILED item 23). This is the answer to the "open question"
+immediately above: the ceiling was never able to be the control it was designed
+to be, so the control moved rather than the number.*
+
+The RA records the newest CRL it has acted on for each issuing CA, and refuses
+one that goes **backwards** from it —
+`revocation-ca-confirmed` is denied with reason `crl-evidence-regressed`.
+
+Why this is the right shape and the ceiling was not:
+
+* it needs **no calibration**. RFC 5280 §5.2.3 already requires the CRL Number
+  to increase per CA, so the property is the CA's to maintain rather than the
+  operator's to derive. Four derivations of the ceiling produced two wrong
+  numbers; there is no number here to get wrong;
+* it defends the threat that is actually there. A stale CRL that *lacks* the
+  serial already fails closed, so age never protected the "was it really
+  revoked?" direction — `nextUpdate` and the signature do that. The only
+  wrong-*accept* an old CRL can produce is a **hold→unhold replay**: a
+  certificate revoked with reason 6 and later released with reason 8
+  (`removeFromCRL`) is still listed as revoked on the older document. Narrow,
+  real, and it carries the confirm token.
+
+```
+ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC=true    # default
+```
+
+**What it does not do, said plainly.** The first CRL seen for a CA becomes the
+baseline whatever it is — trust on first use, which protects nothing on the
+first confirmation after a deployment or a CA key rollover. A control that
+quietly does nothing on first contact is worse than no control, so it is stated
+here rather than left to be discovered.
+
+**Operational behaviour to expect:**
+
+| situation | what happens |
+|---|---|
+| CDP replicas at different vintages | the fetch is retried **once** before a regression is believed; a transient skew resolves itself |
+| a CDP that persistently serves backwards | denied with `crl-evidence-regressed`, and that is a real fault worth an alarm |
+| CA key rollover | new SPKI ⇒ new watermark, by construction — the watermark is keyed on the issuer DN **and** the CA certificate's SPKI |
+| CA restored from backup (CRL Number resets) | confirmations wedge until an operator resets the watermark. **Deliberately manual**: an automatic reset on "the number went backwards" would hand the attacker the exact sequence that defeats the control |
+| an estate with known-lagging replicas | set `...REQUIRE_MONOTONIC=false`. The verdict is still recorded in the audit trail (`crl_watermark_verdict`) and the watermark still advances, so you keep the measurement without the refusal |
+
+**What the age ceiling is for now.** A **liveness alarm** on the CA's
+publication pipeline. Set it above the maximum age the CDP actually serves —
+measure that, do not derive it — and read a refusal as "the CA has stopped
+publishing", not as evidence about a certificate.
+
+```bash
+# Sample the CDP on a schedule. Needs nothing but reach: no RA, no store, no
+# privilege. Run it from a cron entry or a scheduled task, anywhere.
+python scripts/sample_crl_age.py \
+    --url http://pki.example.local/crl/example-CA.crl \
+    --out /var/lib/crl-samples.jsonl
+
+# After two-plus publication cycles, what the data says:
+python scripts/sample_crl_age.py --out /var/lib/crl-samples.jsonl --summarize
+```
+
+The summary prints the observed age distribution (which is what the ceiling is
+compared against), the published window (which is the bound a ceiling has to sit
+below to do anything at all), and any **CRL Number regressions** — each one a
+document a strict watermark would have refused, which is how you find out
+whether your CDP replicas are stable enough to enforce monotonicity before you
+turn it on.
+
+The log lives **outside** anything a lab teardown or a store restore touches, on
+purpose: this project's own audit trail could not answer the age question
+because every validation session restored the store that held the answer
+(UNFILED item 22).
+
+> **Before re-tightening the ceiling, read UNFILED item 24.** The floor above is
+> derived from the published *window*, which is the age a replayed document
+> stays unexpired — not the age an honest CDP serves. Those differ by exactly
+> the CA's overlap, and a sampler has been running against the lab CA since
+> 2026-08-27 to settle which one binds. Do not produce a fifth derivation on
+> paper.
+
 **626400 was the shipped recommendation for a CA on this cadence** — see the
 refutation above before using it. The reasoning was that it splits the headroom
 evenly, so neither a late publication nor a wider replay window is favoured.
