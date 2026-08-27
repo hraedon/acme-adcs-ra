@@ -71,7 +71,17 @@ def main(argv: list[str] | None = None) -> int:
         if not path.is_file():
             missing.append(name)
             continue
-        text = path.read_text(encoding="utf-8")
+        # newline="" so CRLF survives into the string. Without it, read_text's
+        # universal-newline translation turns every CRLF into \n in memory, and
+        # writing back with newline="" then emits LF -- rewriting a Windows
+        # checkout's entire file to change one 64-character hex string.
+        # Measured before the fix: 514 CRLF lines became 514 LF lines.
+        #
+        # The Linux round-trip check that "proved" this tool safe could not see
+        # it, because an LF file stays LF whatever the newline handling does.
+        # A check whose failure mode is silence proves nothing.
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            text = handle.read()
         match = PIN_RE.search(text)
         if match is None:
             # An entry point that lost its pin is a worse problem than a stale
