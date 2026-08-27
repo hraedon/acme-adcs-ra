@@ -244,8 +244,14 @@ honest: check a box only when the thing is actually true, not when it's planned.
       `CRLPeriod + ClockSkewMinutes + lateness + skew` — and the derivation is
       validated by predicting `nextUpdate - thisUpdate` and comparing it against
       a real CRL. `docs/operations.md` → *Deriving the ceiling (WI-052)* carries
-      the worked numbers for a 1-week CA: `A_sched_max = 605400s`, hard ceiling
-      `649200s`, **recommended `626400`**. Re-derive if your CA's `CRLPeriod`,
+      the worked numbers for a 1-week CA. **⚠ The shipped `626400`
+      recommendation was REFUTED by live measurement on 2026-08-27**: the
+      measured `A_sched_max` is `649800s`, above the `649200s` hard ceiling, so
+      no safe value exists on that cadence and `626400` sits 6h30m below the
+      floor. Until it is re-derived, leave
+      `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE` at `false` on a CA with
+      this schedule, or change the CA's publication policy. Re-derive if your
+      CA's `CRLPeriod`,
       `CRLOverlapPeriod` or `ClockSkewMinutes` differ. After `nextUpdate` the CRL
       fails closed regardless of this setting.
 
@@ -257,6 +263,51 @@ engineered to. Until then it has not — regardless of a green local test run.
 ---
 
 ## Validation log
+
+- **2026-08-27 — full hazard-scoped validation of `a60768d` (PRs #9/#10/#11),
+  run by GLM against a brief written by the agent that authored four of the
+  five changes.** That split was deliberate: on this project, fixes get found
+  defective by whoever did not write them.
+
+  **PHASE L IS GREEN, for the first time, and item 11's "flapping lab fabric"
+  is RETRACTED.** §L 9/9, Lqueue 8/8, Ldrain 4/5 (Ld1 = the documented §9
+  caveat from a manual gap; Ld2–Ld5 pass: stale worker abandoned on a lapsed
+  generation, one certificate, no double issuance).
+
+  **Rule zero — prove the instrument before the phenomenon — paid for itself
+  twice, and both defects were in the NEW instruments.** `reachprobe.ps1`'s
+  parameterless `TcpClient` binds AF_INET on .NET Framework, so every IPv6
+  target read as an instant `refused` (and the "dead AAAA" assumed by earlier
+  rounds is alive — the CA holds a ULA); `ca-inbound-block.ps1` reported
+  through the success stream, so `-Mode show` printed nothing and the `-Mode
+  on` postcheck compared an array and could never fire. Both fixed live. See
+  UNFILED item 21 — the second is the same defect class as the 2026-08-14
+  wave-3 F1 finding.
+
+  **Hazard results.** CRLF: `lib_digest` STALE×5/exit 1 → `--write` ×5/exit 0 →
+  sizes and CRLF counts identical (514→514, `lf_only=0` everywhere), pins
+  re-verify, an entry point runs past the digest gate. Off-box ack: 6/6 matrix
+  with exact refusal markers, plus the real-pool halves — ack in force → pool
+  starts, `UNAUTHENTICATED OFF-BOX AUDIT` in the real stdout log, collector
+  receives `offbox_transport=syslog-unauthenticated`; no ack → fails closed,
+  zero collector receipts. Spike enrollment: gMSA/`NegotiateAuth`/EPA=Require
+  accepted, **ReqID 671, disposition 20**, cert verified serverAuth-only with
+  SAN from CSR — with a finding, item 19. Audit volume: the idle trio wrote
+  **+0 rows across a ~10-recycle session** (last wrote 08-25), the 4 new
+  pending-revocations rows carried real serials with live coalesce counters,
+  27 new `certificate-issued`.
+
+  **Regression in the record:** WI-052's shipped `626400` recommendation is
+  **refuted** — measured floor 649800s exceeds the 649200s hard ceiling, so no
+  safe value exists on this cadence. §F and `operations.md` corrected; UNFILED
+  item 20, rated HIGH because the published number is wrong today.
+
+  **Teardown verified, not asserted:** revert-before-revoke honoured, 26/26
+  revoked by OID with 0 still Issued **cross-checked against queries known to
+  return rows**, fingerprint-identical store restore, firewall rule count 0,
+  mock-collector cert untrusted, both hosts as-found.
+
+  **Not run:** the MSI no-digest/staged-copy refusals — still owed.
 
 - **2026-08-25 security-fix branch `security-fix-7808046` — live validation
   EXECUTED, tip `3c599ca` (base `7808046` = v1.12.0, live-proven at

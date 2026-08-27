@@ -427,6 +427,7 @@ def main() -> int:
     # 2026-08-25 validation its enrollment leg (UNFILED item 16); the
     # protected-output changes had to be proven by driving these functions
     # individually instead.
+    from acme_adcs_ra.enrollment import _parse_cert_body
     from acme_adcs_ra.negotiate_auth import NegotiateAuth
 
     # LAB ONLY: refuse reuse. On Windows the directory is created atomically
@@ -492,11 +493,27 @@ def main() -> int:
             timeout=TIMEOUT,
         )
         cert_r.raise_for_status()
-        if cert_r.headers.get("Content-Type") != "application/pkix-cert":
+        # Content-type is DIAGNOSTIC here, never a gate.
+        #
+        # This used to require exactly `application/pkix-cert`, and real ADCS
+        # serves certnew.cer as **text/html** with the PEM inside it. So a
+        # SUCCESSFUL enrollment exited 1: measured live 2026-08-27, ReqID 671,
+        # disposition 20 at the CA, certificate genuinely issued, spike reported
+        # failure. The spike was stricter than the CA is truthful.
+        #
+        # The product has always known this — `_parse_cert_body` tolerates a PEM
+        # block or a raw base64 DER blob and uses the content-type only to
+        # decorate a parse *failure*. Calling the product's own parser here
+        # means the spike proves the shipped parser against real CA output
+        # rather than re-implementing a stricter rule beside it.
+        try:
+            cert_text = _parse_cert_body(cert_r.content)
+        except Exception as exc:
             raise RuntimeError(
-                f"Unexpected content-type fetching cert: {cert_r.headers.get('Content-Type')}"
-            )
-        cert_pem = cert_r.content
+                "certnew.cer did not return a parseable certificate "
+                f"(content-type {cert_r.headers.get('Content-Type')!r}): {exc}"
+            ) from exc
+        cert_pem = cert_text.encode("ascii")
         (OUT / "spike.cert.pem").write_bytes(cert_pem)
         log.info("saved issued cert -> %s", OUT / "spike.cert.pem")
 

@@ -1000,3 +1000,98 @@ re-prove the enrollment leg afterwards.
 
 The second site (`ReqID=73`) had never failed but carried identical exposure —
 fixed at the same time rather than waiting for it to lose the race too.
+
+> **NUMBERING NOTE.** This file already contains two independent numbering runs
+> merged together, so items 8–13 each appear twice. New items continue from 18
+> to avoid a third collision; refer to anything below by number **and title**.
+
+### 19. (bug, low) — RESOLVED 2026-08-27. **The spike failed a SUCCESSFUL enrollment on content-type**
+
+*Found by the 2026-08-27 lab validation, hazard 4 — the first run of the spike's
+enrollment leg since the code/state split.*
+
+`lab/spike_mode_a.py` required `Content-Type: application/pkix-cert` exactly
+when fetching `certnew.cer`. Real ADCS serves that response as **text/html**
+with the PEM inside it. So the leg worked perfectly — gMSA identity,
+`NegotiateAuth` against `EPA=Require`, CSR accepted, **ReqID 671, disposition
+20 at the CA, certificate genuinely issued and verified serverAuth-only with
+the SAN from the CSR** — and the spike then exited 1. The spike was stricter
+than the CA is truthful.
+
+The product has always known this: `_parse_cert_body` tolerates a PEM block or
+a raw base64 DER blob, and uses the content-type only to decorate a parse
+*failure*. The gate was a lab-code re-implementation that was stricter than the
+shipped behaviour it was supposed to be exercising.
+
+> **Fixed** by calling the product's own `_parse_cert_body` and demoting
+> content-type to diagnostic. The spike now proves the shipped parser against
+> real CA output instead of asserting a rule the product does not hold.
+
+### 20. (operator, HIGH) — NEW 2026-08-27. **The shipped CRL-freshness recommendation is below the floor**
+
+*WI-052 / CRL3, finally measured. This supersedes every prior "unchanged
+operator calibration item" note — it is no longer a calibration gap, it is a
+wrong published number.*
+
+`docs/operations.md` derives `A_sched_max = CRLPeriod + ClockSkewMinutes =
+605400s`, a hard ceiling of `649200s`, and recommends **626400**. The live
+re-derivation measured `A_sched_max` at **649800s**.
+
+That is **above** the hard ceiling. The interval
+`(A_sched_max, nextUpdate − thisUpdate)` that `max_age_seconds` must sit
+strictly inside is therefore **empty**: no safe value exists on this cadence.
+The shipped 626400 is **23400s (6h30m) below the floor**, so an operator
+following the documentation would judge a genuinely current CRL stale and fail
+every confirmation closed — the failure the setting exists to prevent.
+
+**Docs corrected 2026-08-27** with a refutation banner in `operations.md` and a
+warning in the checklist: leave
+`ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE` at `false` on a CA with this
+schedule, or change the CA's publication policy.
+
+**The open half is the model, not the number.** A floor above the ceiling means
+the derivation is wrong somewhere, and the obvious candidate is the 43200s
+overlap that `A_sched_max` excludes — whether a still-*current* CRL can be
+served at an age past `CRLPeriod`, through CDP caching or otherwise. **Do not
+just substitute 649800 and republish**: shipping a second unverified
+recommendation is exactly how this item arrived. Capture the working from the
+2026-08-27 run, decide whether the overlap belongs in `A_sched_max`, then
+re-derive and re-measure against a real CRL.
+
+### 21. (harness, medium) — RESOLVED LIVE 2026-08-27. **Both phase-L instruments were defective, and Rule Zero caught them**
+
+*The replacements written on 2026-08-26 (item 17) had two defects of their own,
+both found before the phenomenon ran. Recording them because the pattern is the
+point: an instrument written to replace a silently-failing instrument failed
+silently in two new ways.*
+
+1. **`reachprobe.ps1` was IPv4-only.** The parameterless `TcpClient`
+   constructor binds AF_INET on .NET Framework, so every IPv6 target reported
+   an instant `refused`. Compounding it, the "dead AAAA record" assumed by
+   earlier rounds **is alive** — the CA holds a ULA. The probe would have
+   reported `refused` on v6 forever; the gate ("anything but `dropped` → stop")
+   held, but for the wrong reason.
+2. **`ca-inbound-block.ps1` reported through the success stream.** `Show-State`
+   used `Write-Output` *and* returned a count, so `$n = Show-State` captured
+   the printed lines too and `if ($n -lt 1)` compared an array — the postcheck
+   could never fire, and `-Mode show` printed nothing. **This is the same
+   defect class as the 2026-08-14 wave-3 F1 finding** (`Write-Output`×3 +
+   `return $false` read as a non-empty array = true), reproduced by the author
+   of the memory note describing it, inside a script written specifically about
+   instruments that fail silently.
+
+Both fixed live; the fixes persist in gitignored `samples/lab-harness/`.
+
+**Result once the instrument was sound: phase L is GREEN for the first time.**
+Inbound Block scoped to both RA addresses → probe `dropped` on both CA
+addresses at the ceiling → §L 9/9 → Lqueue 8/8 → block off → `connected` →
+Ldrain 4/5 (Ld1 is the documented §9 caveat from a manual gap; Ld2–Ld5 pass —
+stale worker abandoned on a lapsed generation, one certificate, no double
+issuance). **Item 11's "flapping lab fabric" is formally RETRACTED**; the fabric
+was never the problem.
+
+**Also found:** `raproof.py`'s Lqueue fired 42 fillers against a 32-slot
+admission gate, deterministically shedding the target
+(`finalize-enrollment-admission-denied`, `revert_applied=true`). The product
+was correct both times — the harness was over-driving it. Fillers now capped at
+`max_pending − workers − 1`; new driver `lease-pass-fw.sh`.
