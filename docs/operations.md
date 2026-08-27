@@ -552,11 +552,40 @@ is the budget for `L + S` plus whatever replay margin you want:
 | **626400 (7d 6h)** — recommended | **5h50m** | **6h20m** |
 | 637200 (7d 9h) | 8h50m | 3h20m |
 
-**626400 is the shipped recommendation for a CA on this cadence**: it splits the
-headroom evenly, so neither a late publication nor a wider replay window is
-favoured. Measured CA→RA clock skew on this estate is sub-second, so `S` is
-noise; `L` is the only term worth watching, and 5h50m of tolerance is far beyond
-any healthy CA's publication jitter.
+> ## ⚠ REFUTED BY MEASUREMENT, 2026-08-27 — do not use 626400
+>
+> A live re-derivation against the real CA measured `A_sched_max` at
+> **649800s**, not the 605400s derived above. That is **larger than the
+> 649200s hard ceiling**, so the interval
+> `(A_sched_max, nextUpdate − thisUpdate)` that `max_age_seconds` must sit
+> strictly inside is **empty**. There is no safe value on this cadence, and the
+> shipped 626400 recommendation is **23400s (6h30m) below the floor** — setting
+> it would judge a genuinely current CRL stale and fail every confirmation
+> closed.
+>
+> **What to do until this is re-derived:** leave
+> `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE` at its default `false` on a
+> CA with this publication schedule, or change the CA's
+> `CRLPeriod`/`CRLOverlapPeriod`/`ClockSkewMinutes` so a real gap exists. The
+> closing paragraph of this section already said that an insufficient gap means
+> changing the CA's policy rather than widening the ceiling — the measurement
+> says the gap here is not merely insufficient, it is negative.
+>
+> **The derivation error is not yet characterised, and that is the open half.**
+> The table below computes `A_sched_max` as `CRLPeriod + ClockSkewMinutes`,
+> which excludes the 43200s overlap; the measured floor is close to the full
+> window plus skew. Whether the overlap belongs in `A_sched_max` — i.e. whether
+> a still-*current* CRL can be served at an age past `CRLPeriod`, through CDP
+> caching or otherwise — is the question to answer before publishing a new
+> number. **Do not simply substitute 649800 and carry on**: a floor above the
+> ceiling means the model is wrong somewhere, and shipping a second unverified
+> recommendation is how this item got here. Tracked as UNFILED item 20.
+
+**626400 was the shipped recommendation for a CA on this cadence** — see the
+refutation above before using it. The reasoning was that it splits the headroom
+evenly, so neither a late publication nor a wider replay window is favoured.
+Measured CA→RA clock skew on this estate is sub-second, so `S` is noise; `L` is
+the only term worth watching.
 
 Re-derive rather than copy the number if your CA's `CRLPeriod`,
 `CRLOverlapPeriod` or `ClockSkewMinutes` differ — and re-check the predicted
