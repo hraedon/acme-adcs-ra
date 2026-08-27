@@ -473,10 +473,13 @@ it verifiable, point the RA at the CA's published CRL:
 ACME_RA_REVOCATION_CONFIRM_CRL_URL=http://pki.WORK-DOMAIN.local/crl/WORK-DOMAIN-CA.crl
 # Fail closed: refuse to confirm unless the CRL proves the serial is revoked.
 ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true
-# For this CA: CRLPeriod=604800s; measured nextUpdate-thisUpdate=649200s;
-# A_sched_max=605400s. 626400 sits mid-headroom. DERIVE THIS for your CA --
-# see "Deriving the ceiling (WI-052)" below; do not copy it blindly.
-ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=626400
+# For this CA: measured nextUpdate-thisUpdate=649200s, plus one
+# ClockSkewMinutes (600s) => floor 649800s. Anything below that judges a
+# genuinely current CRL stale. DERIVE THIS FROM A REAL CRL for your CA -- see
+# "Deriving the ceiling (WI-052)" below; do not copy it blindly, and do not
+# reconstruct the window from the CRLOverlap* registry values, which do not
+# decompose to the observed one.
+ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=649800
 ```
 
 The CRL is signed by the CA and readable without privilege, so this is the one
@@ -549,37 +552,62 @@ is the budget for `L + S` plus whatever replay margin you want:
 | value | tolerance for lateness+skew | margin below hard expiry |
 |---|---|---|
 | 615600 (7d 3h) | 2h50m | 9h20m |
-| **626400 (7d 6h)** — recommended | **5h50m** | **6h20m** |
+| 626400 (7d 6h) — ~~recommended~~ **SUPERSEDED, below the floor** | **5h50m** | **6h20m** |
 | 637200 (7d 9h) | 8h50m | 3h20m |
 
-> ## ⚠ REFUTED BY MEASUREMENT, 2026-08-27 — do not use 626400
+**Every row above is below the 649800s floor and would fail CRL3.** The table is
+retained because its *method* is still how you reason about headroom once a CA
+actually has some; on this CA it does not. See the superseded banner below.
+
+> ## ⚠ SUPERSEDED, 2026-08-27 — use **≥ 649800**, not 626400
 >
-> A live re-derivation against the real CA measured `A_sched_max` at
-> **649800s**, not the 605400s derived above. That is **larger than the
-> 649200s hard ceiling**, so the interval
-> `(A_sched_max, nextUpdate − thisUpdate)` that `max_age_seconds` must sit
-> strictly inside is **empty**. There is no safe value on this cadence, and the
-> shipped 626400 recommendation is **23400s (6h30m) below the floor** — setting
-> it would judge a genuinely current CRL stale and fail every confirmation
-> closed.
+> The floor was derived live against the real CA and is **649800s**, not the
+> 605400s in the table below. The table's `A_sched_max` omits the overlap, and
+> that is the error: a CRL stays **current** for its whole published window, so
+> the oldest still-valid CRL the RA can be served is one full window old.
 >
-> **What to do until this is re-derived:** leave
-> `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE` at its default `false` on a
-> CA with this publication schedule, or change the CA's
-> `CRLPeriod`/`CRLOverlapPeriod`/`ClockSkewMinutes` so a real gap exists. The
-> closing paragraph of this section already said that an insufficient gap means
-> changing the CA's policy rather than widening the ceiling — the measurement
-> says the gap here is not merely insufficient, it is negative.
+> ```
+> 649800 = 604800  CRLPeriod
+>        +  43200  computed overlap (CRLOverlapUnits=0 ⇒ ADCS computes it; lands on 12h)
+>        +   1200  2 × ClockSkewMinutes, stamped at BOTH thisUpdate and nextUpdate
+>        +    600  1 × ClockSkewMinutes, CA↔RA skew allowance
+> ```
 >
-> **The derivation error is not yet characterised, and that is the open half.**
-> The table below computes `A_sched_max` as `CRLPeriod + ClockSkewMinutes`,
-> which excludes the 43200s overlap; the measured floor is close to the full
-> window plus skew. Whether the overlap belongs in `A_sched_max` — i.e. whether
-> a still-*current* CRL can be served at an age past `CRLPeriod`, through CDP
-> caching or otherwise — is the question to answer before publishing a new
-> number. **Do not simply substitute 649800 and carry on**: a floor above the
-> ceiling means the model is wrong somewhere, and shipping a second unverified
-> recommendation is how this item got here. Tracked as UNFILED item 20.
+> The first three terms are the published window itself (**649200s**, which
+> matched the measured `nextUpdate − thisUpdate` exactly); the fourth is the
+> allowance for the RA's clock differing from the CA's.
+>
+> **Set `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS ≥ 649800` on a CA with
+> this cadence.** The previously recommended 626400 is short by 23400s (6h30m)
+> and fails CRL3 with zero margin.
+>
+> ### The trade this forces, stated plainly
+>
+> 649800 is **above** the 649200s window, so the original constraint
+> `A_sched_max < max_age_seconds < (nextUpdate − thisUpdate)` is
+> **unsatisfiable here** — and it is the *upper* bound that has to give.
+>
+> A `max_age_seconds` of 649800 never fires before the CRL's own `nextUpdate`
+> does, so on this CA the independent age ceiling is **non-binding**: it stops
+> being a second, tighter check and becomes a backstop behind the CRL's own
+> expiry. That is a weaker control than the setting was designed to be, and it
+> is the same objection this section raises below against the 691200 plumbing
+> value. The difference is that 649800 is the *smallest* value that does not
+> produce false staleness, so it gives up nothing that was actually available.
+>
+> You get a binding independent ceiling only by shortening the CA's
+> **overlap** — the 43200s term is what pushes the floor past the window.
+> Until then, ≥ 649800 with a non-binding ceiling is the correct configuration,
+> and it is strictly better than the alternative of leaving
+> `REQUIRE_CRL_EVIDENCE` off.
+>
+> ### Methodological point, worth more than the number
+>
+> **Derive the floor from the published CRL, not from the registry.** Whatever
+> mechanism produces the observed 12h20m, the `CRLOverlap*` registry values do
+> not decompose to it. Read `thisUpdate`/`nextUpdate` off a real CRL and add one
+> `ClockSkewMinutes`; do not reconstruct the window from configuration and
+> assume it matches.
 
 **626400 was the shipped recommendation for a CA on this cadence** — see the
 refutation above before using it. The reasoning was that it splits the headroom

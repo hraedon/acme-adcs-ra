@@ -1058,6 +1058,48 @@ recommendation is exactly how this item arrived. Capture the working from the
 2026-08-27 run, decide whether the overlap belongs in `A_sched_max`, then
 re-derive and re-measure against a real CRL.
 
+> ## RESOLVED 2026-08-27 — the overlap does belong, and **≥ 649800** is the answer
+>
+> The decomposition, derived live against the CA:
+>
+> ```
+> 649800 = 604800  CRLPeriod (CRLPeriod=Weeks, CRLPeriodUnits=1)
+>        +  43200  computed overlap (CRLOverlapUnits=0 ⇒ ADCS computes it; lands on 12h)
+>        +   1200  2 × ClockSkewMinutes, stamped at BOTH thisUpdate and nextUpdate
+>        +    600  1 × ClockSkewMinutes, CA↔RA skew allowance
+> ```
+>
+> The first three are the published window (**649200s**, matching the measured
+> `nextUpdate − thisUpdate` exactly); the fourth is the RA-clock allowance. So
+> the overlap **does** belong in `A_sched_max`: a CRL is *current* for its whole
+> published window, and the oldest still-valid CRL the RA can be handed is one
+> full window old. The original table's `CRLPeriod + ClockSkewMinutes` was the
+> age of the newest CRL, not the oldest valid one.
+>
+> **Two corrections to what this item said yesterday**, both mine:
+>
+> 1. **"No safe value exists" was wrong** — an overstatement. 649800 is
+>    perfectly safe against false staleness. What does not exist is a value that
+>    is *both* safe and **binding**, because 649800 exceeds the 649200s window.
+>    The original constraint `A_sched_max < max_age < window` is unsatisfiable
+>    here and it is the **upper** bound that must give.
+> 2. **"Leave `REQUIRE_CRL_EVIDENCE` at false" was the wrong remedy.** It should
+>    be enabled with `max_age_seconds ≥ 649800`. A non-binding ceiling behind
+>    the CRL's own `nextUpdate` is a weaker control than designed, but it is
+>    strictly better than no CRL evidence at all.
+>
+> **The trade to state in any deployment review:** on this cadence the
+> independent age ceiling does not fire before the CRL expires on its own. A
+> binding ceiling comes back only by shortening the CA's **overlap** — the
+> 43200s term is what pushes the floor past the window.
+>
+> **The durable methodological point, which outlives the number: derive the
+> floor from the published CRL, not from the registry.** Whatever mechanism
+> produces the observed 12h20m, the `CRLOverlap*` registry values do not
+> decompose to it. Read `thisUpdate`/`nextUpdate` off a real CRL and add one
+> `ClockSkewMinutes`. Reconstructing the window from configuration is what
+> produced both wrong numbers in this item's history.
+
 ### 21. (harness, medium) — RESOLVED LIVE 2026-08-27. **Both phase-L instruments were defective, and Rule Zero caught them**
 
 *The replacements written on 2026-08-26 (item 17) had two defects of their own,
