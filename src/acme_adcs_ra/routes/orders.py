@@ -172,6 +172,13 @@ async def new_order(
     except OrderRateLimitExceeded as exc:
         details = {
             "reason": f"{exc.scope}-limit",
+            # The coalescing identity, split out from the prose for the same
+            # reason finalize-policy-denied splits it: the key must be a value
+            # the server chose. ``scope`` is raised from a closed set of
+            # literals in Store.create_order_with_authz, so per-account and
+            # global denials keep separate windows without any client-supplied
+            # text reaching the key.
+            "reason_code": exc.scope,
             "limit": exc.limit,
             "window_seconds": exc.window_seconds,
             "count": exc.count,
