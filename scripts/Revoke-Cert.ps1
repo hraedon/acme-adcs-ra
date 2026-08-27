@@ -135,9 +135,32 @@ $ErrorActionPreference = "Stop"
 # CA-officer context and dot-sourced its sibling with nothing checking whether
 # the tree it came from is administrator-only -- the same class the paragraph
 # above closed for PATH-selected programs, one line lower down.
-# InstallVerifyLib.ps1 is loaded first because it IS the check; the residual
-# self-reference is documented in Assert-PrivilegedScriptTreeTrusted.
-. "$PSScriptRoot/lib/InstallVerifyLib.ps1"
+# InstallVerifyLib is the code that authenticates this privileged script tree,
+# so executing it from disk before authenticating it would make the later tree
+# verdict self-referential. Pin its canonical UTF-8/LF bytes here, hash the
+# in-memory text, and execute that exact verified text (never reopen the path).
+$installVerifyLibPath = Join-Path $PSScriptRoot 'lib\InstallVerifyLib.ps1'
+$installVerifyExpectedSha256 = '01a351e5494d0f3bf968488a99710f2a902e807e91acb27a8d576d4669428686'
+try {
+    $installVerifyBytes = [System.IO.File]::ReadAllBytes($installVerifyLibPath)
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $installVerifyText = $strictUtf8.GetString($installVerifyBytes).Replace("`r`n", "`n").Replace("`r", "`n")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $installVerifyActualSha256 = [System.BitConverter]::ToString(
+            $sha256.ComputeHash($strictUtf8.GetBytes($installVerifyText))).Replace('-', '').ToLowerInvariant()
+    } finally { $sha256.Dispose() }
+} catch {
+    throw "InstallVerifyLib.ps1 could not be authenticated before execution: $($_.Exception.Message)"
+}
+if ($installVerifyActualSha256 -cne $installVerifyExpectedSha256) {
+    if (-not $AllowUntrustedScriptPath) {
+        throw "InstallVerifyLib.ps1 does not match this entry point's pinned release digest; refusing privileged execution."
+    }
+    Write-Warning "UNSAFE LAB OVERRIDE: InstallVerifyLib.ps1 does not match this entry point's release digest. Executing only the already-read bytes because -AllowUntrustedScriptPath was explicit."
+}
+$installVerifyScriptBlock = [scriptblock]::Create($installVerifyText)
+. $installVerifyScriptBlock
 Assert-PrivilegedScriptTreeTrusted -Root $PSScriptRoot `
     -Purpose 'manual certificate revocation' `
     -AllowUntrusted:$AllowUntrustedScriptPath -RunTime

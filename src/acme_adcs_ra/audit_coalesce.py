@@ -105,9 +105,16 @@ from acme_adcs_ra.store import Store, _now_iso
 #   stays exact -- the trade the module docstring describes, chosen here
 #   because "someone is probing serials" is the signal and the individual
 #   values are not.
+# * ``admin-order-reclaim-not-found`` / ``admin-order-reclaim-denied`` /
+#   ``admin-order-reclaim-noop`` -- the maintenance credential can replay each
+#   outcome forever without changing state. Unknown order ids are omitted from
+#   the row's structured ``order_id`` and key; the first probed value is kept
+#   only as a bounded sample in ``details``.
+# * ``admin-revocation-confirm-deferred`` -- capacity shedding changes no
+#   revocation state and explicitly asks the caller to retry.
 #
-# One SUCCESS type is coalesced, against the general rule below, and the reason
-# is worth stating because the rule is otherwise load-bearing:
+# Two SUCCESS types are coalesced, against the general rule below, and the
+# reason is worth stating because the rule is otherwise load-bearing:
 #
 # * ``admin-list-pending-revocations`` (2026-08-25) -- a read-only poll of the
 #   revocation work list that transitions nothing. It is safe to fold ONLY
@@ -115,6 +122,9 @@ from acme_adcs_ra.store import Store, _now_iso
 #   which is excluded precisely because the successful rows ARE the 14a
 #   limiter's counter (see ``Store.change_account_key``). Before coalescing any
 #   future success, check whether something reads it as a tally.
+# * ``admin-list-orders`` -- a read-only monitoring query. Its bounded status
+#   and limit remain on the first row as a sample, but not in the key, so
+#   varying filters cannot turn a polling credential into durable row growth.
 #
 #   Coalescing alone does not fix that route: the sync agent polls on a
 #   15-minute cadence and the window is 60s, so benign polls never fold. The
@@ -133,7 +143,31 @@ COALESCED_EVENT_TYPES = frozenset(
         "finalize-csr-mismatch",
         "finalize-policy-denied",
         "finalize-enrollment-admission-denied",
+        "admin-order-reclaim-not-found",
+        "admin-order-reclaim-denied",
+        "admin-order-reclaim-noop",
+        "admin-list-orders",
         "admin-revocation-confirm-denied",
+        "admin-revocation-confirm-deferred",
+        "admin-list-pending-revocations",
+    }
+)
+
+# These authenticated admin operations are deliberately keyed only by their
+# event type and stable reason code. Keying on account_id/order_id looked more
+# attributable, but it let a stolen admin token cycle through more live order
+# keys than MAX_OPEN_WINDOWS, evict each window, and force a fresh durable row
+# on every request. The first target remains in the row as a bounded sample and
+# the exact replay count remains authoritative; target variation cannot choose
+# durable-row cardinality.
+_GLOBAL_ADMIN_KEY_EVENT_TYPES = frozenset(
+    {
+        "admin-order-reclaim-not-found",
+        "admin-order-reclaim-denied",
+        "admin-order-reclaim-noop",
+        "admin-list-orders",
+        "admin-revocation-confirm-denied",
+        "admin-revocation-confirm-deferred",
         "admin-list-pending-revocations",
     }
 )
@@ -326,17 +360,17 @@ class DenialCoalescer:
         # The coalescing key. For account-creation denials it is (type, reason)
         # as before -- there is no account to key on, and keying on the
         # attacker-chosen kid would let one character of variance defeat the
-        # bound. For the replayable authenticated classes (round 5) the key
-        # additionally carries account_id and order_id: different accounts'
-        # denials stay in separate rows (each remains individually
-        # accountable), while one account replaying one request folds into a
-        # single window. Both key shapes tuple naturally; absent ids read as
-        # "" and keep the no-account behaviour byte-identical.
+        # bound. Finalize denials additionally carry account_id/order_id so one
+        # order's evidence stays distinct. Replayable admin operations use a
+        # fixed global key per event/reason: even server-issued order ids become
+        # attacker-selectable once an admin token can enumerate and rotate
+        # through more keys than the in-memory window cap.
+        global_admin_key = event_type in _GLOBAL_ADMIN_KEY_EVENT_TYPES
         key = (
             event_type,
             reason_key,
-            str(kwargs.get("account_id") or ""),
-            str(kwargs.get("order_id") or ""),
+            "" if global_admin_key else str(kwargs.get("account_id") or ""),
+            "" if global_admin_key else str(kwargs.get("order_id") or ""),
         )
         now = self._clock()
 

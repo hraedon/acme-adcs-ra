@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -207,8 +208,28 @@ class RAConfig(BaseSettings):
     # The default jsonl sink writes next to the database, so a host compromise
     # — the adversary the threat model calls load-bearing (§4.A) — destroys the
     # audit table and its only mirror together. Set this in production to
-    # refuse startup unless audit events leave the box (syslog or HEC).
+    # refuse startup unless audit events leave the box. The default sink that
+    # satisfies it is authenticated HTTPS HEC, which both proves delivery and
+    # authenticates the collector.
     audit_offbox_required: bool = False
+
+    # TCP syslog satisfies what ``audit_offbox_required`` actually asserts --
+    # that the trail leaves the box and that delivery is demonstrable -- but it
+    # authenticates nothing and protects nothing in transit, and this codebase
+    # has no syslog-over-TLS transport to offer instead. Requiring HEC outright
+    # therefore strands every estate whose SIEM is reached by a syslog relay,
+    # and the realistic response to a refused start is to turn
+    # ``audit_offbox_required`` off entirely -- which is strictly worse, because
+    # it drops the off-box requirement rather than just the transport
+    # strictness.
+    #
+    # So the strictness stays the default and the weaker posture is available
+    # by explicit acknowledgement, the same shape as ``-AllowInsecureUrl`` and
+    # ``-AllowUntrustedScriptPath``: you have to say it, it warns on every
+    # start, and it is recorded in the audit trail it weakens. UDP is NOT
+    # reachable this way -- that refusal is about whether "required" can mean
+    # anything at all, not about transport security.
+    audit_offbox_allow_unauthenticated_syslog: bool = False
 
     # Coalescing window for account-creation denial audit rows, in seconds
     # (second daybreak rescan F4 / the standing WI-014). A peer that passes the
@@ -521,27 +542,69 @@ class RAConfig(BaseSettings):
         zero-config jsonl sink, but once an operator sets it the RA will not
         start in a posture where the audit trail dies with the host.
         """
-        if self.audit_offbox_required and self.siem_sink not in ("syslog", "hec"):
+        if not self.audit_offbox_required:
+            # A security-relevant switch must never be silently inert: an
+            # operator who sets the acknowledgement and watches the RA start
+            # cannot tell from that whether anything leaves the host.
+            if self.audit_offbox_allow_unauthenticated_syslog:
+                raise ValueError(
+                    "audit_offbox_allow_unauthenticated_syslog is set but "
+                    "audit_offbox_required is not, so it weakens nothing and "
+                    "guarantees nothing. Set audit_offbox_required=true if you "
+                    "want the off-box trail enforced, or drop the "
+                    "acknowledgement."
+                )
+            return self
+
+        if self.siem_sink == "jsonl":
             raise ValueError(
-                "audit_offbox_required is set, but siem_sink is "
-                f"{self.siem_sink!r}: the jsonl sink writes to the RA host "
-                "itself, so a host compromise takes the audit trail with it. "
-                "Configure the syslog or hec sink."
+                "audit_offbox_required is set, but siem_sink is 'jsonl', which "
+                "writes next to the database: a host compromise takes the audit "
+                "table and its only mirror together. Configure the hec sink "
+                "(authenticated HTTPS, the default posture) or the syslog sink "
+                "over tcp with "
+                "audit_offbox_allow_unauthenticated_syslog=true."
             )
+
+        if self.siem_sink == "syslog":
+            if self.siem_syslog_proto == "udp":
+                raise ValueError(
+                    "audit_offbox_required is set with siem_syslog_proto='udp'. "
+                    "UDP is fire-and-forget: the socket accepts every datagram "
+                    "whether or not a collector exists, so the startup delivery "
+                    "probe cannot distinguish a working collector from none at "
+                    "all, and 'required' would mean nothing. This is not about "
+                    "transport security and the acknowledgement flag does NOT "
+                    "reach it. Set siem_syslog_proto='tcp' (proves a live "
+                    "transport) or use the hec sink (proves receipt)."
+                )
+            if not self.audit_offbox_allow_unauthenticated_syslog:
+                raise ValueError(
+                    "audit_offbox_required is set with the syslog sink. TCP "
+                    "syslog does prove a live transport, but it does not "
+                    "authenticate the collector and does not protect events in "
+                    "transit -- an attacker positioned on the path can read the "
+                    "trail or feed the SIEM forged issuance events. Prefer the "
+                    "hec sink (authenticated HTTPS). If your SIEM is reached by "
+                    "a syslog relay and you accept that trade, set "
+                    "audit_offbox_allow_unauthenticated_syslog=true: it is "
+                    "logged as a warning on every start and recorded in the "
+                    "audit trail."
+                )
+            return self
+
+        hec_url = urlsplit(self.siem_hec_url)
         if (
-            self.audit_offbox_required
-            and self.siem_sink == "syslog"
-            and self.siem_syslog_proto == "udp"
+            hec_url.scheme != "https"
+            or hec_url.hostname is None
+            or hec_url.username is not None
+            or hec_url.password is not None
+            or not self.siem_hec_token.get_secret_value()
         ):
             raise ValueError(
-                "audit_offbox_required is set with siem_syslog_proto='udp'. "
-                "UDP is fire-and-forget: the socket accepts every datagram "
-                "whether or not a collector exists, so the startup delivery "
-                "probe cannot distinguish a working collector from none at "
-                "all, and 'required' would mean nothing. Set "
-                "siem_syslog_proto='tcp' (proves a live transport) or use the "
-                "hec sink (proves receipt). The shipped web.config already "
-                "selects tcp."
+                "audit_offbox_required needs an authenticated HTTPS HEC "
+                "sink: configure an https siem_hec_url without embedded "
+                "credentials and a non-empty siem_hec_token"
             )
         return self
 

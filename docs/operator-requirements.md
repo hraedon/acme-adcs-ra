@@ -85,7 +85,7 @@ installer never runs PATH-selected `py`, `python`, or `winget`.
 | Python 3.12+ | Install machine-wide before running this script | Fatal — the runtime cannot be built; `-InstallPrereqs` deliberately does not run winget |
 | A TLS server certificate in `LocalMachine\My` | Your PKI | Binding created without a certificate, with a warning |
 | A network allowlist in front of the endpoint | `<ipSecurity>` in web.config, or a scoped firewall rule | Not enforced by the installer — **your responsibility**, and it is a stated pilot condition in the threat model |
-| Capacity for the local audit store, **or** off-box audit | Monitor the footprint warning; or set `audit_offbox_required` with a working sink | Not enforced — **your responsibility**. The `certificate-issued` audit row commits in the *same transaction* as the certificate, so **a full disk stops issuance** rather than issuing unaudited. See below. |
+| Capacity for the local audit store, **or** off-box audit | Monitor the footprint warning; or set `audit_offbox_required` with working authenticated HTTPS HEC | Not enforced — **your responsibility**. The `certificate-issued` audit row commits in the *same transaction* as the certificate, so **a full disk stops issuance** rather than issuing unaudited. See below. |
 
 ### Local-only audit: a supported posture with a stated cost
 
@@ -303,9 +303,10 @@ Then finish the operator-owned configuration:
    rule). This is a stated threat-model pilot condition, not a suggestion.
 4. Decide the audit retention policy — see `operations.md`. The RA bounds
    attacker-driven growth but never deletes an audit row; pruning is yours.
-5. Set `ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with a syslog or HEC sink for
+5. Set `ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with authenticated HTTPS HEC for
    production. The default JSONL sink lives on the host an attacker is assumed
-   to control.
+   to control; plain syslog remains an optional mirror but cannot satisfy this
+   load-bearing requirement.
 
 ---
 

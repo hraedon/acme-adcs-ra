@@ -293,8 +293,8 @@ class TestDenialCoalescing:
 
         Extended again 2026-08-25, and the wording above had to sharpen with
         it. The old rule said "issuance, revocation and admin actions must
-        never join"; two admin events now do, and the distinction that matters
-        is not the SUBSYSTEM but whether the event records a state change:
+        never join"; replayable admin events now do, and the distinction that
+        matters is not the SUBSYSTEM but whether the event records a state change:
 
         * ``finalize-enrollment-admission-denied`` — a cap-exceeded denial on
           an order the route restores to ``ready``. Identical in class to
@@ -302,8 +302,11 @@ class TestDenialCoalescing:
         * ``admin-revocation-confirm-denied`` — a confirm-token holder can POST
           a nonexistent serial forever. Nothing transitions; the lookup misses.
         * ``admin-list-pending-revocations`` — a read-only poll. The ONLY
-          success in the set, admissible solely because nothing counts these
-          rows (contrast ``account-key-changed``, which is a counter).
+          success in the original set, admissible solely because nothing counts
+          these rows (contrast ``account-key-changed``, which is a counter).
+        * The reclaim not-found/denied/noop outcomes, order-list read, and
+          revocation-confirm deferral likewise transition nothing. Unknown
+          probed order ids are samples only and never coalescing keys.
 
         What must still never join: issuance, actual revocation, key rotation,
         and any admin call that changes state. ``certificate-issued`` is
@@ -320,12 +323,18 @@ class TestDenialCoalescing:
             "finalize-csr-mismatch",
             "finalize-policy-denied",
             "finalize-enrollment-admission-denied",
+            "admin-order-reclaim-not-found",
+            "admin-order-reclaim-denied",
+            "admin-order-reclaim-noop",
+            "admin-list-orders",
             "admin-revocation-confirm-denied",
+            "admin-revocation-confirm-deferred",
             "admin-list-pending-revocations",
         }
         assert "account-key-changed" not in COALESCED_EVENT_TYPES
-        # The state-changing counterparts of the two admin additions.
+        # State-changing admin counterparts remain individual.
         assert "admin-revocation-confirmed" not in COALESCED_EVENT_TYPES
+        assert "admin-order-reclaimed" not in COALESCED_EVENT_TYPES
         assert "certificate-revoked" not in COALESCED_EVENT_TYPES
         store = _store(tmp_path)
         coalescer = DenialCoalescer(60, clock=_Clock())

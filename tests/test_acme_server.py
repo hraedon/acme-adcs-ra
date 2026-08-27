@@ -1804,19 +1804,27 @@ class TestStuckProcessingReclaim:
     def test_reclaim_unknown_order_is_not_found_and_audited(
         self, test_config: RAConfig, client: TestClient
     ) -> None:
-        resp = client.post(
-            "/acme/admin/orders/does-not-exist/reclaim-processing",
-            headers={"Authorization": "Bearer test-admin-token-0123456789abcdef-32+"},
-        )
-        assert resp.status_code == 404
+        for i in range(40):
+            resp = client.post(
+                f"/acme/admin/orders/does-not-exist-{i}/reclaim-processing",
+                headers={
+                    "Authorization":
+                        "Bearer test-admin-token-0123456789abcdef-32+"
+                },
+            )
+            assert resp.status_code == 404
 
-        # The probe is audited as a denied reclaim (order-not-found).
+        # Unknown ids use a distinct coalesced event whose structured order_id
+        # stays empty, so varying attacker input cannot mint coalescing keys.
         store = Store(test_config.db_path)
-        events = store.list_audit_events(event_type="admin-order-reclaim-denied")
-        assert any(
-            e["outcome"] == "failed" and e["details"].get("reason") == "order-not-found"
-            for e in events
-        )
+        events = store.list_audit_events(event_type="admin-order-reclaim-not-found")
+        assert len(events) == 1
+        event = events[0]
+        assert event["outcome"] == "failed"
+        assert event["order_id"] is None
+        assert event["details"].get("reason") == "order-not-found"
+        assert event["details"].get("sample_order_id") == "does-not-exist-0"
+        assert event["details"].get("denial_count") == 40
 
 
 # ---------------------------------------------------------------------------

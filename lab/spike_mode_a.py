@@ -36,13 +36,16 @@ Troubleshooting:
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import re
 import subprocess
 import sys
+from ctypes import byref, cast, create_string_buffer, sizeof, wintypes
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -58,6 +61,270 @@ SAN = os.environ.get("ACME_RA_SPIKE_SAN", "spike.acme-ra.test")
 CA_BUNDLE = os.environ.get("ACME_RA_SPIKE_CA_BUNDLE")
 OUT = Path(os.environ.get("ACME_RA_SPIKE_OUT", "./spike-out"))
 TIMEOUT = 30
+
+# Win32 constants used by the lab-only protected output helpers. The key is
+# created with CREATE_NEW and no sharing, with its final protected DACL supplied
+# in the CreateFileW call -- there is no permissive file to tighten later.
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER_CLASS = 1
+_SDDL_REVISION_1 = 1
+_ERROR_ALREADY_EXISTS = 183
+_ERROR_FILE_EXISTS = 80
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+_GENERIC_WRITE = 0x40000000
+_CREATE_NEW = 1
+_FILE_ATTRIBUTE_NORMAL = 0x0080
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+
+class _SidAndAttributes(ctypes.Structure):
+    _fields_ = [("sid", wintypes.LPVOID), ("attributes", wintypes.DWORD)]
+
+
+class _TokenUser(ctypes.Structure):
+    _fields_ = [("user", _SidAndAttributes)]
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.DWORD),
+        ("security_descriptor", wintypes.LPVOID),
+        ("inherit_handle", wintypes.BOOL),
+    ]
+
+
+def _windows_libraries() -> tuple[Any, Any]:
+    """Load and type the small Win32 surface used by this lab helper."""
+    # These names are absent from ctypes on non-Windows hosts. Keep lookup
+    # inside the Windows-only call path so importing the lab module remains
+    # possible for cross-platform linting and structural tests.
+    win_dll = getattr(ctypes, "WinDLL")  # noqa: B009
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    advapi32 = win_dll("advapi32", use_last_error=True)
+
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetFileAttributesW.restype = wintypes.DWORD
+    kernel32.CreateDirectoryW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_SecurityAttributes),
+    ]
+    kernel32.CreateDirectoryW.restype = wintypes.BOOL
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_SecurityAttributes),
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.WriteFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.WriteFile.restype = wintypes.BOOL
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    return kernel32, advapi32
+
+
+def _winerror(message: str) -> OSError:
+    error = getattr(ctypes, "get_last_error")()  # noqa: B009
+    format_error = getattr(ctypes, "FormatError")  # noqa: B009
+    return OSError(error, f"{message}: {format_error(error)}")
+
+
+def _current_user_sid(kernel32: Any, advapi32: Any) -> str:
+    """Return the ambient identity's SID without invoking another process."""
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), _TOKEN_QUERY, byref(token)
+    ):
+        raise _winerror("OpenProcessToken failed")
+    try:
+        needed = wintypes.DWORD()
+        advapi32.GetTokenInformation(
+            token, _TOKEN_USER_CLASS, None, 0, byref(needed)
+        )
+        if needed.value == 0:
+            raise _winerror("GetTokenInformation size query failed")
+        token_info = create_string_buffer(needed.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            _TOKEN_USER_CLASS,
+            token_info,
+            needed.value,
+            byref(needed),
+        ):
+            raise _winerror("GetTokenInformation failed")
+        sid_pointer = cast(token_info, ctypes.POINTER(_TokenUser)).contents.user.sid
+        sid_text = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(sid_pointer, byref(sid_text)):
+            raise _winerror("ConvertSidToStringSidW failed")
+        try:
+            if sid_text.value is None:
+                raise RuntimeError("ConvertSidToStringSidW returned an empty SID")
+            return sid_text.value
+        finally:
+            kernel32.LocalFree(cast(sid_text, wintypes.HLOCAL))
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _protected_security_attributes(
+    current_sid: str, advapi32: Any, *, inherit_to_children: bool
+) -> tuple[_SecurityAttributes, wintypes.LPVOID]:
+    """Build a protected DACL for current user, SYSTEM, and Administrators."""
+    # D:P disables inheritance. The directory carries OI/CI so its same
+    # allowlist reaches the public CSR/certificate artifacts; the private key's
+    # explicit file DACL has no inheritance flags.
+    ace_flags = "OICI" if inherit_to_children else ""
+    sddl = (
+        f"O:{current_sid}D:P"
+        f"(A;{ace_flags};FA;;;SY)"
+        f"(A;{ace_flags};FA;;;BA)"
+        f"(A;{ace_flags};FA;;;{current_sid})"
+    )
+    descriptor = wintypes.LPVOID()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, _SDDL_REVISION_1, byref(descriptor), None
+    ):
+        raise _winerror("security descriptor creation failed")
+    attributes = _SecurityAttributes(
+        length=sizeof(_SecurityAttributes),
+        security_descriptor=descriptor,
+        inherit_handle=False,
+    )
+    return attributes, descriptor
+
+
+def _reject_reparse_ancestors(path: Path, kernel32: Any) -> None:
+    """Refuse an existing parent chain containing a symlink or junction."""
+    current = path.parent
+    while True:
+        attributes = kernel32.GetFileAttributesW(str(current))
+        if attributes == _INVALID_FILE_ATTRIBUTES:
+            raise _winerror(f"cannot inspect output parent {current}")
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RuntimeError(f"output parent is a reparse point: {current}")
+        if current == current.parent:
+            return
+        current = current.parent
+
+
+def _create_protected_output_directory(path: Path) -> None:
+    """Atomically create one fresh, protected, non-reparse Windows directory."""
+    path = path.absolute()
+    kernel32, advapi32 = _windows_libraries()
+    _reject_reparse_ancestors(path, kernel32)
+    current_sid = _current_user_sid(kernel32, advapi32)
+    attributes, descriptor = _protected_security_attributes(
+        current_sid, advapi32, inherit_to_children=True
+    )
+    try:
+        if not kernel32.CreateDirectoryW(str(path), byref(attributes)):
+            error = getattr(ctypes, "get_last_error")()  # noqa: B009
+            if error in (_ERROR_ALREADY_EXISTS, _ERROR_FILE_EXISTS):
+                raise FileExistsError(
+                    f"refusing existing spike output directory: {path}"
+                )
+            raise _winerror(f"CreateDirectoryW failed for {path}")
+    finally:
+        kernel32.LocalFree(descriptor)
+
+    attributes_value = kernel32.GetFileAttributesW(str(path))
+    if attributes_value == _INVALID_FILE_ATTRIBUTES:
+        raise _winerror(f"cannot inspect newly created output directory {path}")
+    if attributes_value & _FILE_ATTRIBUTE_REPARSE_POINT:
+        raise RuntimeError(f"new output directory is a reparse point: {path}")
+
+
+def _write_new_protected_private_key(path: Path, data: bytes) -> None:
+    """Create and write a private key exclusively with its final DACL."""
+    kernel32, advapi32 = _windows_libraries()
+    # Re-check the output directory and its whole parent chain immediately
+    # before the exclusive create. A parent with DELETE_CHILD can still cause
+    # availability churn between path operations, but it cannot expose key
+    # bytes: the file itself is born with the protected DACL below, and any
+    # pre-existing file/reparse point makes CREATE_NEW fail.
+    _reject_reparse_ancestors(path.absolute(), kernel32)
+    current_sid = _current_user_sid(kernel32, advapi32)
+    attributes, descriptor = _protected_security_attributes(
+        current_sid, advapi32, inherit_to_children=False
+    )
+    handle: Any = _INVALID_HANDLE_VALUE
+    try:
+        handle = kernel32.CreateFileW(
+            str(path.absolute()),
+            _GENERIC_WRITE,
+            0,  # no sharing while key bytes are written
+            byref(attributes),
+            _CREATE_NEW,
+            _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle == _INVALID_HANDLE_VALUE:
+            error = getattr(ctypes, "get_last_error")()  # noqa: B009
+            if error in (_ERROR_ALREADY_EXISTS, _ERROR_FILE_EXISTS):
+                raise FileExistsError(f"refusing existing private-key path: {path}")
+            raise _winerror(f"CreateFileW failed for {path}")
+
+        offset = 0
+        while offset < len(data):
+            written = wintypes.DWORD()
+            chunk = data[offset : offset + 0xFFFFFFFF]
+            buffer = create_string_buffer(chunk)
+            if not kernel32.WriteFile(
+                handle, buffer, len(chunk), byref(written), None
+            ):
+                raise _winerror(f"WriteFile failed for {path}")
+            if written.value == 0:
+                raise OSError(f"WriteFile made no progress for {path}")
+            offset += written.value
+        if not kernel32.FlushFileBuffers(handle):
+            raise _winerror(f"FlushFileBuffers failed for {path}")
+    finally:
+        if handle != _INVALID_HANDLE_VALUE:
+            kernel32.CloseHandle(handle)
+        kernel32.LocalFree(descriptor)
 
 
 def build_csr(san: str) -> tuple[str, bytes]:
@@ -136,28 +403,60 @@ def main() -> int:
 
     if sys.platform != "win32":
         log.error(
-            "This spike uses requests-negotiate-sspi (Windows SSPI). "
+            "This spike authenticates with Windows Negotiate. "
             "Run it on the domain-joined RA host, as the gMSA."
         )
         return 2
 
     import requests
-    from requests_negotiate_sspi import HttpNegotiateAuth
 
-    OUT.mkdir(parents=True, exist_ok=True)
+    # The product's own Negotiate implementation, not requests-negotiate-sspi.
+    #
+    # Two reasons, and the second is why this changed. First, the product
+    # retired requests-negotiate-sspi in 2026-06 (single-maintainer in the
+    # issuance path, broken on 3.14) in favour of in-tree pyspnego with RFC 5929
+    # channel binding, so a spike on the old library was proving a leg the RA no
+    # longer has -- and would fail against EPA=Require, which is the setting the
+    # lab actually runs.
+    #
+    # Second: it is not installable where the spike has to run. The installer
+    # builds the venv from a hash-pinned closure that does not contain
+    # requests-negotiate-sspi, and this import sits ABOVE every line that
+    # creates anything, so on the deployed interpreter the spike died with
+    # ModuleNotFoundError before reaching the code under test. That cost the
+    # 2026-08-25 validation its enrollment leg (UNFILED item 16); the
+    # protected-output changes had to be proven by driving these functions
+    # individually instead.
+    from acme_adcs_ra.negotiate_auth import NegotiateAuth
+
+    # LAB ONLY: refuse reuse. On Windows the directory is created atomically
+    # with a protected DACL and every existing reparse-point ancestor is
+    # rejected before any private key exists.
+    _create_protected_output_directory(OUT)
     log.info("target  : https://%s/certsrv/", HOST)
     log.info("template: %s", TEMPLATE)
     log.info("SAN/CN  : %s", SAN)
     log.info("auth    : ambient Windows identity (MUST be gMSA-acme-ra$)")
 
     session = requests.Session()
-    session.auth = HttpNegotiateAuth()  # passwordless; uses the gMSA's ambient identity
+    # No credential is supplied here and none exists to supply: pyspnego uses
+    # the process's ambient Windows identity, which must be the gMSA. ``host``
+    # is needed for the SPN and for the tls-server-end-point channel binding
+    # that EPA=Require demands.
+    #
+    # Deliberate wording. The previous comment described this as the p-word for
+    # authentication, and a secret scanner reads that token next to an
+    # ``auth =`` assignment as a hardcoded credential. It had sat here unflagged
+    # for months because scanners only read CHANGED lines -- so merely touching
+    # the line turned a dormant false positive into a red required check on
+    # 2026-08-26. Say what is true without using the trigger token.
+    session.auth = NegotiateAuth(HOST, ca_bundle=CA_BUNDLE or None)
     session.headers["User-agent"] = "acme-adcs-ra-spike/0.1 (Mode A)"
     session.verify = CA_BUNDLE if CA_BUNDLE else True
 
     csr_pem, key_pem = build_csr(SAN)
     (OUT / "spike.csr.pem").write_text(csr_pem)
-    (OUT / "spike.key.pem").write_bytes(key_pem)
+    _write_new_protected_private_key(OUT / "spike.key.pem", key_pem)
     log.info("generated CSR + key")
 
     try:

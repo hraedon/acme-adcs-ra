@@ -2728,6 +2728,16 @@ Describe 'Get-TreeTrustViolations: the tree a privileged task runs from' {
         ($v -join ' ') | Should -Match 'SyncLib'
     }
 
+    It 'refuses when recursive enumeration cannot prove the whole tree' {
+        $script:WritablePaths = @()
+        Mock Get-ChildItem { throw 'access denied below tree' } `
+            -ParameterFilter { $LiteralPath -eq $script:tree -and $Recurse }
+        $v = @(Get-TreeTrustViolations -Path $script:tree)
+        $v.Count | Should -BeGreaterThan 0
+        ($v -join ' ') | Should -Match 'partial tree is not proof'
+        ($v -join ' ') | Should -Match 'access denied below tree'
+    }
+
     It 'refuses a NULL DACL anywhere in the tree' {
         $script:WritablePaths = @()
         function global:Get-Acl {
@@ -2795,6 +2805,21 @@ Describe 'Get-InterpreterRuntimeTree (2026-08-23 finding 3)' {
         }
     }
 
+    It 'a dangling pyvenv.cfg base-executable is reported, not silently dropped' {
+        $dangling = Join-Path ([System.IO.Path]::GetTempPath()) ("ra-dangling-base-" + [guid]::NewGuid())
+        $null = New-Item -ItemType Directory -Path (Join-Path $dangling 'Scripts') -Force
+        Set-Content -LiteralPath (Join-Path $dangling 'Scripts\python.exe') -Value 'MZ'
+        Set-Content -LiteralPath (Join-Path $dangling 'pyvenv.cfg') `
+            -Value 'base-executable = C:\Definitely\Not\Here\python.exe'
+        try {
+            $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $dangling 'Scripts\python.exe'))
+            ($v -join ' ') | Should -Match 'base-executable'
+            ($v -join ' ') | Should -Match 'partial runtime closure'
+        } finally {
+            Remove-Item -LiteralPath $dangling -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'a self-referential home does not loop or duplicate roots' {
         $loop = Join-Path $script:base 'loopvenv'
         $null = New-Item -ItemType Directory -Path (Join-Path $loop 'Scripts') -Force
@@ -2804,6 +2829,23 @@ Describe 'Get-InterpreterRuntimeTree (2026-08-23 finding 3)' {
         $unique = @($roots | Select-Object -Unique)
         $unique.Count | Should -Be $roots.Count
         $roots.Count | Should -BeLessThan 5
+    }
+
+    It 'walks a runtime chain longer than the former 16-item silent cutoff' {
+        $chain = Join-Path $script:base 'long-chain'
+        $count = 20
+        for ($i = 0; $i -lt $count; $i++) {
+            $prefix = Join-Path $chain ("base-{0:D2}" -f $i)
+            $null = New-Item -ItemType Directory -Path $prefix -Force
+            Set-Content -LiteralPath (Join-Path $prefix 'python.exe') -Value 'MZ'
+            if ($i -lt ($count - 1)) {
+                $nextExe = Join-Path (Join-Path $chain ("base-{0:D2}" -f ($i + 1))) 'python.exe'
+                Set-Content -LiteralPath (Join-Path $prefix 'pyvenv.cfg') `
+                    -Value ("base-executable = {0}" -f $nextExe)
+            }
+        }
+        $roots = @(Get-InterpreterRuntimeTree -InterpreterPath (Join-Path (Join-Path $chain 'base-00') 'python.exe'))
+        $roots.Count | Should -Be $count
     }
 }
 
@@ -2867,6 +2909,20 @@ Describe 'Get-InterpreterRuntimeViolations (2026-08-23 finding 3)' {
         $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $script:py 'python.exe'))
         $v.Count | Should -BeGreaterThan 0
         ($v -join ' ') | Should -Match 'innocent\.pth'
+    }
+
+    It 'refuses python*._pth even when the override file itself has a trusted ACL' {
+        $script:WritablePaths = @()
+        $override = Join-Path $script:py 'python314._pth'
+        Set-Content -LiteralPath $override -Value '..\outside'
+        try {
+            $v = @(Get-InterpreterRuntimeViolations -InterpreterPath (Join-Path $script:py 'python.exe'))
+            $v.Count | Should -BeGreaterThan 0
+            ($v -join ' ') | Should -Match 'python314\._pth'
+            ($v -join ' ') | Should -Match 'redirect sys\.path'
+        } finally {
+            Remove-Item -LiteralPath $override -Force -ErrorAction SilentlyContinue
+        }
     }
 
     It 'refuses a reparse point inside the tree (a link redirects imports/copies)' {
@@ -2975,6 +3031,47 @@ Describe 'install-windows.ps1: interpreter runtime tree gate (2026-08-23 finding
         $probe = $script:installer.IndexOf('Invoke-PyProbe -Exe $chainProbePath -Arguments ($l.Args + @("--version"))')
         $gate | Should -BeGreaterThan 0
         $probe | Should -BeGreaterThan $gate
+    }
+
+    It 'every probe and the base-interpreter venv creation use isolated no-site startup' {
+        $script:installer | Should -Match '\$isolatedArguments = @\(''-I'', ''-S''\) \+ @\(\$Arguments\)'
+        $script:installer | Should -Match '@\("-I", "-S", "-m", "venv", \$venv\)'
+        @([regex]::Matches($script:installer, '& \$python\.Exe')).Count | Should -Be 1 `
+            -Because 'the sole direct base-interpreter call is the isolated venv creation'
+        $script:installer | Should -Match '& \$venvPy -I -S -c'
+        @([regex]::Matches($script:installer, '& \$venvPy -I -m pip')).Count | Should -Be 5
+        $script:installer | Should -Not -Match '& \$venvPy -(?!I\b)'
+    }
+
+    It 'the selected flags suppress PYTHONPATH, user/current-directory imports and ordinary .pth processing' {
+        $py = Get-Command python3 -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $py) { Set-ItResult -Skipped -Because 'python3 is unavailable on this test host'; return }
+        $poison = Join-Path $TestDrive 'python-startup-poison'
+        $null = New-Item -ItemType Directory -Path $poison -Force
+        $marker = Join-Path $TestDrive 'python-startup-marker'
+        Set-Content -LiteralPath (Join-Path $poison 'sitecustomize.py') `
+            -Value ("from pathlib import Path; Path(r'{0}').write_text('ran')" -f $marker)
+        # The probe program goes in a FILE rather than through -c. Windows
+        # PowerShell 5.1 strips the embedded double quotes while building the
+        # native command line, so `-c 'assert all("x" not in p ...)'` reaches
+        # Python as `assert all(x not in p ...)` and dies with a NameError --
+        # a failure that says nothing at all about the flags under test. pwsh 7
+        # quotes it correctly, which is exactly why only the 5.1 job saw it.
+        $probeFile = Join-Path $TestDrive 'python-flag-probe.py'
+        Set-Content -LiteralPath $probeFile -Encoding ASCII -Value @(
+            'import sys'
+            'assert all("python-startup-poison" not in p for p in sys.path)'
+        )
+        $oldPythonPath = $env:PYTHONPATH
+        $env:PYTHONPATH = $poison
+        try {
+            & $py.Source -I -S $probeFile | Out-Null
+            $LASTEXITCODE | Should -Be 0
+            Test-Path -LiteralPath $marker | Should -BeFalse
+        } finally {
+            $env:PYTHONPATH = $oldPythonPath
+        }
     }
 
     It 'the self-resolved interpreter gets chain AND tree gates before adoption' {
@@ -3696,6 +3793,78 @@ Describe 'Get-AncestorSubstitutionViolations: designed root writers (live defect
     }
 }
 
+# A numeric ceiling on an authentication walk is safe only when hitting it is
+# itself a refusal. These functions used to return success after 32 components,
+# leaving a writable high ancestor outside the evidence.
+Describe 'Ancestor trust walks reach the root and fail closed on cycles' {
+    BeforeAll {
+        $script:deepBase = Join-Path $TestDrive 'deep-trust-root'
+        $script:deepLeaf = $script:deepBase
+        for ($i = 0; $i -lt 36; $i++) {
+            $script:deepLeaf = Join-Path $script:deepLeaf ("d{0:D2}" -f $i)
+        }
+        $null = New-Item -ItemType Directory -Path $script:deepLeaf -Force
+        $script:badDeepAncestor = Join-Path $script:deepBase 'd00'
+        function global:Get-Acl {
+            param([string]$LiteralPath, [string]$Path)
+            $p = if ($LiteralPath) { $LiteralPath } else { $Path }
+            $rights = if ($p -eq $global:__BadDeepAncestor) {
+                [System.Security.AccessControl.FileSystemRights]::Delete
+            } else {
+                [System.Security.AccessControl.FileSystemRights]::FullControl
+            }
+            $identity = if ($p -eq $global:__BadDeepAncestor) { 'S-1-5-32-545' } else { 'S-1-5-32-544' }
+            [pscustomobject]@{
+                Owner = 'S-1-5-32-544'
+                Access = @([pscustomobject]@{
+                    IdentityReference = [pscustomobject]@{ Value = $identity }
+                    FileSystemRights = $rights
+                    AccessControlType = 'Allow'
+                    InheritanceFlags = 0
+                    PropagationFlags = 0
+                })
+                Sddl = 'O:BAG:BAD:'
+            }
+        }
+        $global:__BadDeepAncestor = $script:badDeepAncestor
+    }
+
+    AfterAll {
+        Remove-Item Function:global:Get-Acl -ErrorAction SilentlyContinue
+        Remove-Variable __BadDeepAncestor -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'Test-PathChainTrusted finds a bad ancestor beyond component 32' {
+        $v = @(Test-PathChainTrusted -Path $script:deepLeaf)
+        ($v -join ' ') | Should -Match 'S-1-5-32-545'
+    }
+
+    It 'Get-AncestorSubstitutionViolations finds a bad ancestor beyond component 32' {
+        $v = @(Get-AncestorSubstitutionViolations -Path $script:deepLeaf)
+        ($v -join ' ') | Should -Match 'S-1-5-32-545'
+    }
+
+    It 'Test-PathChainTrusted reports a cyclic parent walk instead of accepting partial evidence' {
+        Mock Test-Path { $false } -ParameterFilter { $LiteralPath -like '/cycle-*' }
+        Mock Split-Path { if ($Path -eq '/cycle-a') { '/cycle-b' } else { '/cycle-a' } } `
+            -ParameterFilter { $Parent -and $Path -like '/cycle-*' }
+        $v = @(Test-PathChainTrusted -Path '/cycle-a')
+        ($v -join ' ') | Should -Match 'cycle'
+    }
+
+    It 'Get-AncestorSubstitutionViolations reports non-progress before a root' {
+        Mock Test-Path { $false } -ParameterFilter { $LiteralPath -eq '/stuck-path' }
+        Mock Split-Path { '/stuck-path' } -ParameterFilter { $Parent -and $Path -eq '/stuck-path' }
+        $v = @(Get-AncestorSubstitutionViolations -Path '/stuck-path')
+        ($v -join ' ') | Should -Match 'made no progress'
+    }
+
+    It 'the shared walk refuses a relative path instead of treating no parent as a root' {
+        $v = @(Test-PathChainTrusted -Path 'relative/path')
+        ($v -join ' ') | Should -Match 'rooted filesystem path'
+    }
+}
+
 # --- 2026-08-24 F10: provenance before siblings -------------------------------
 Describe 'Privileged entry points prove the tree BEFORE loading siblings (F10)' {
     BeforeAll {
@@ -3727,6 +3896,16 @@ Describe 'Privileged entry points prove the tree BEFORE loading siblings (F10)' 
         $text | Should -Match 'Assert-PrivilegedScriptTreeTrusted'
     }
 
+    It 'Reconcile-Revocation proves the full Python closure and runs stdlib-only isolation' {
+        $text = Get-Content -Raw "$PSScriptRoot/../../scripts/Reconcile-Revocation.ps1"
+        $chain = $text.IndexOf('Test-PathChainTrusted -Path $pythonExe')
+        $tree = $text.IndexOf('Get-InterpreterRuntimeViolations -InterpreterPath $pythonExe')
+        $run = $text.IndexOf('& $pythonExe -I -S @arguments')
+        $chain | Should -BeGreaterThan 0
+        $tree | Should -BeGreaterThan $chain
+        $run | Should -BeGreaterThan $tree
+    }
+
     It 'the registrar gate is NOT scoped to the revocation-sync path' {
         # It used to live inside `if ($registerSync)`, so registering only the
         # nonce/sweep tasks skipped it entirely while still loading two siblings.
@@ -3735,6 +3914,121 @@ Describe 'Privileged entry points prove the tree BEFORE loading siblings (F10)' 
         $scoped = $text.IndexOf('if ($registerSync')
         $gate | Should -BeGreaterThan 0
         $scoped | Should -BeGreaterThan $gate -Because 'the gate must precede any registerSync scoping'
+    }
+
+    It 'all five authentic entry points pin the canonical helper digest and execute verified memory' {
+        $entryPoints = @(
+            'Reconcile-Revocation.ps1',
+            'Register-MaintenanceTasks.ps1',
+            'Revoke-Cert.ps1',
+            'Set-OfficerRights.ps1',
+            'Sync-Revocations.ps1'
+        )
+        $helperBytes = [System.IO.File]::ReadAllBytes(
+            (Resolve-Path "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1").Path)
+        $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        $helperText = $utf8.GetString($helperBytes).Replace("`r`n", "`n").Replace("`r", "`n")
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $expected = [System.BitConverter]::ToString(
+                $sha.ComputeHash($utf8.GetBytes($helperText))).Replace('-', '').ToLowerInvariant()
+        } finally { $sha.Dispose() }
+
+        foreach ($entryPoint in $entryPoints) {
+            $text = Get-Content -Raw "$PSScriptRoot/../../scripts/$entryPoint"
+            $pin = [regex]::Match($text, '\$installVerifyExpectedSha256 = ''([0-9a-f]{64})''')
+            $pin.Success | Should -BeTrue -Because "$entryPoint must carry its own release pin"
+            $pin.Groups[1].Value | Should -Be $expected `
+                -Because "$entryPoint and InstallVerifyLib.ps1 must ship as one authenticated release set"
+            $hash = $text.IndexOf('$sha256.ComputeHash($strictUtf8.GetBytes($installVerifyText))')
+            $mismatch = $text.IndexOf('if ($installVerifyActualSha256 -cne $installVerifyExpectedSha256)')
+            $defaultRefusal = $text.IndexOf('if (-not $AllowUntrustedScriptPath)', $mismatch)
+            $overrideWarning = $text.IndexOf('Write-Warning "UNSAFE LAB OVERRIDE:', $mismatch)
+            $create = $text.IndexOf('[scriptblock]::Create($installVerifyText)')
+            $execute = $text.IndexOf('. $installVerifyScriptBlock')
+            $gate = $text.IndexOf('Assert-PrivilegedScriptTreeTrusted')
+            $hash | Should -BeGreaterThan 0
+            $mismatch | Should -BeGreaterThan $hash
+            $defaultRefusal | Should -BeGreaterThan $mismatch
+            $overrideWarning | Should -BeGreaterThan $defaultRefusal
+            $create | Should -BeGreaterThan $overrideWarning
+            $execute | Should -BeGreaterThan $create
+            $gate | Should -BeGreaterThan $execute
+            $text | Should -Not -Match '(?m)^\s*\.\s+["'']?[^\r\n]*InstallVerifyLib\.ps1' `
+                -Because 'the verified helper path must never be reopened for execution'
+        }
+    }
+
+    It 'canonical LF and CRLF helper bytes produce the same pinned digest' {
+        $helperBytes = [System.IO.File]::ReadAllBytes(
+            (Resolve-Path "$PSScriptRoot/../../scripts/lib/InstallVerifyLib.ps1").Path)
+        $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        $lf = $utf8.GetString($helperBytes).Replace("`r`n", "`n").Replace("`r", "`n")
+        $crlf = $lf.Replace("`n", "`r`n")
+        function Get-CanonicalDigest([string]$Text) {
+            $canonical = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+            $algorithm = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                [System.BitConverter]::ToString(
+                    $algorithm.ComputeHash($utf8.GetBytes($canonical))).Replace('-', '').ToLowerInvariant()
+            } finally { $algorithm.Dispose() }
+        }
+        (Get-CanonicalDigest $crlf) | Should -Be (Get-CanonicalDigest $lf)
+    }
+
+    It 'default mismatch and invalid UTF-8 refuse before helper bytes execute; the explicit lab override warns and runs memory' {
+        $source = "$PSScriptRoot/../../scripts/Revoke-Cert.ps1"
+        $marker = Join-Path $TestDrive 'helper-executed'
+        # Spawn the same engine running Pester: on the native validation host
+        # this is Windows PowerShell 5.1, whose parsing/encoding behavior is a
+        # separate compatibility contract from pwsh 7.
+        $engine = (Get-Process -Id $PID).Path
+        # The child REFUSING is the behaviour under test, so its stderr has to
+        # arrive as data. GitHub's `shell: powershell` prepends
+        # $ErrorActionPreference='stop', and under Stop on Windows PowerShell
+        # 5.1 a native child's `2>&1` stderr becomes ErrorRecords that
+        # TERMINATE this block -- so the correct refusal read as a test
+        # failure. pwsh 7 leaves
+        # $PSNativeCommandUseErrorActionPreference false and never does this,
+        # which is why the Linux job and the interactive lab run both passed.
+        # Same family as the Sync-Revocations batch-abort defect of 2026-08-13.
+        $ErrorActionPreference = 'Continue'
+
+        function New-ProbeTree([string]$Name, [byte[]]$HelperBytes) {
+            $tree = Join-Path $TestDrive $Name
+            $lib = Join-Path $tree 'lib'
+            $null = New-Item -ItemType Directory -Path $lib -Force
+            Copy-Item -LiteralPath $source -Destination (Join-Path $tree 'Revoke-Cert.ps1')
+            [System.IO.File]::WriteAllBytes((Join-Path $lib 'InstallVerifyLib.ps1'), $HelperBytes)
+            Set-Content -LiteralPath (Join-Path $lib 'RevocationLib.ps1') -Value '# probe sibling'
+            return (Join-Path $tree 'Revoke-Cert.ps1')
+        }
+
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $tamperedText = @"
+Set-Content -LiteralPath '$marker' -Value 'ran'
+function Assert-PrivilegedScriptTreeTrusted { param([string]`$Root,[string]`$Purpose,[switch]`$AllowUntrusted,[switch]`$RunTime) }
+"@
+        $defaultScript = New-ProbeTree 'default-mismatch' $utf8.GetBytes($tamperedText)
+        $defaultOutput = @(& $engine -NoLogo -NoProfile -File $defaultScript `
+            -Serial AB -CaConfig 'CA01\WORK-DOMAIN-CA' 2>&1)
+        $LASTEXITCODE | Should -Not -Be 0
+        ($defaultOutput -join ' ') | Should -Match 'pinned release'
+        ($defaultOutput -join ' ') | Should -Match 'digest; refusing privileged execution'
+        Test-Path -LiteralPath $marker | Should -BeFalse
+
+        $invalidScript = New-ProbeTree 'invalid-utf8' ([byte[]](0xff, 0xfe, 0xff))
+        $invalidOutput = @(& $engine -NoLogo -NoProfile -File $invalidScript `
+            -Serial AB -CaConfig 'CA01\WORK-DOMAIN-CA' 2>&1)
+        $LASTEXITCODE | Should -Not -Be 0
+        ($invalidOutput -join ' ') | Should -Match 'could not be authenticated before execution'
+        Test-Path -LiteralPath $marker | Should -BeFalse
+
+        $overrideScript = New-ProbeTree 'explicit-override' $utf8.GetBytes($tamperedText)
+        $overrideOutput = @(& $engine -NoLogo -NoProfile -File $overrideScript `
+            -Serial AB -CaConfig 'CA01\WORK-DOMAIN-CA' -AllowUntrustedScriptPath 2>&1)
+        ($overrideOutput -join ' ') | Should -Match 'UNSAFE LAB OVERRIDE'
+        Test-Path -LiteralPath $marker | Should -BeTrue
     }
 
     It 'the lab override reaches the registered action, or the task cannot run' {

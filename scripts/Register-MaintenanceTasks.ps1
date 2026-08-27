@@ -205,10 +205,32 @@ $ErrorActionPreference = "Stop"
 # path, which left the nonce/sweep path loading two siblings with no check at
 # all.
 #
-# InstallVerifyLib.ps1 is loaded first because it IS the check. That it is read
-# from the tree it judges is the known, documented residual -- but it narrows
-# the attack from "any sibling" to "this specific file".
-. "$PSScriptRoot/lib/InstallVerifyLib.ps1"
+# InstallVerifyLib is the code that authenticates this privileged script tree,
+# so executing it from disk before authenticating it would make the later tree
+# verdict self-referential. Pin its canonical UTF-8/LF bytes here, hash the
+# in-memory text, and execute that exact verified text (never reopen the path).
+$installVerifyLibPath = Join-Path $PSScriptRoot 'lib\InstallVerifyLib.ps1'
+$installVerifyExpectedSha256 = '01a351e5494d0f3bf968488a99710f2a902e807e91acb27a8d576d4669428686'
+try {
+    $installVerifyBytes = [System.IO.File]::ReadAllBytes($installVerifyLibPath)
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $installVerifyText = $strictUtf8.GetString($installVerifyBytes).Replace("`r`n", "`n").Replace("`r", "`n")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $installVerifyActualSha256 = [System.BitConverter]::ToString(
+            $sha256.ComputeHash($strictUtf8.GetBytes($installVerifyText))).Replace('-', '').ToLowerInvariant()
+    } finally { $sha256.Dispose() }
+} catch {
+    throw "InstallVerifyLib.ps1 could not be authenticated before execution: $($_.Exception.Message)"
+}
+if ($installVerifyActualSha256 -cne $installVerifyExpectedSha256) {
+    if (-not $AllowUntrustedScriptPath) {
+        throw "InstallVerifyLib.ps1 does not match this entry point's pinned release digest; refusing privileged execution."
+    }
+    Write-Warning "UNSAFE LAB OVERRIDE: InstallVerifyLib.ps1 does not match this entry point's release digest. Executing only the already-read bytes because -AllowUntrustedScriptPath was explicit."
+}
+$installVerifyScriptBlock = [scriptblock]::Create($installVerifyText)
+. $installVerifyScriptBlock
 Assert-PrivilegedScriptTreeTrusted -Root $PSScriptRoot `
     -Purpose 'the maintenance-task registrar' `
     -AllowUntrusted:$AllowUntrustedScriptPath

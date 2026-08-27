@@ -733,6 +733,24 @@ tasks above). Monitor:
 
 ### SIEM delivery
 
+- `audit_offbox_required=true` accepts authenticated HTTPS HEC by default, and
+  that is the posture to deploy: it proves delivery *and* authenticates the
+  collector.
+- If your SIEM is reached through a **syslog relay**, set
+  `audit_offbox_allow_unauthenticated_syslog=true` alongside
+  `siem_syslog_proto=tcp`. The requirement is then satisfied by plain TCP
+  syslog, which proves a live transport but does **not** authenticate the
+  collector and does **not** protect events in transit — anyone on the path can
+  read the trail or feed the SIEM forged issuance events. The RA logs a
+  `UNAUTHENTICATED OFF-BOX AUDIT` warning on every start and stamps
+  `offbox_transport=syslog-unauthenticated` on the startup probe event, so the
+  posture is legible to whoever reads the trail rather than only to whoever
+  wrote the config. This exists so that an estate without HEC is not pushed
+  into turning `audit_offbox_required` off altogether, which is strictly worse.
+- **UDP can never satisfy the requirement**, acknowledged or not: a datagram
+  socket accepts bytes with nothing listening, so the delivery probe cannot
+  distinguish a working collector from none and "required" would assert
+  nothing.
 - The SIEM startup probe logs **ERROR** on init if the JSONL sink is
   unwritable or the HEC/syslog config is invalid; the sink is set to
   `enabled=False` and issuance continues (fail-open applies to *emission*,

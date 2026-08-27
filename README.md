@@ -175,9 +175,11 @@ are load-bearing enough to call out here:
   **separate EAB kids per environment**; a kid shared with a staging RA no
   longer verifies against production.
 - **An off-box audit sink is required, not recommended.** Set
-  `ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with syslog or HEC — the default `jsonl`
-  sink dies with the host it is auditing. Since v1.9 the RA refuses to start if
-  the configured sink cannot actually emit.
+  `ACME_RA_AUDIT_OFFBOX_REQUIRED=true` with authenticated HTTPS HEC — the
+  default `jsonl` sink dies with the host it is auditing, while plain syslog
+  cannot authenticate the collector or protect events in transit. Syslog is
+  still supported as an optional mirror when this requirement is false. The RA
+  refuses to start if the required HEC sink cannot actually emit.
 - **The network allowlist is required**, in front of the unauthenticated nonce
   endpoint.
 - **`ACME_RA_REVOCATION_CONFIRM_TOKEN` is required** for the CA-side revocation

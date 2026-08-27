@@ -225,12 +225,17 @@ async def reclaim_processing_order(
     order = ctx.store.get_order(order_id)
     if order is None:
         # Audit the probe — a stolen admin token enumerating order IDs is a
-        # meaningful reconnaissance signal (threat-model §4.A/§4.F).
+        # meaningful reconnaissance signal (threat-model §4.A/§4.F). The
+        # attacker-chosen id is a bounded sample in details, not the structured
+        # order_id column that forms part of the coalescing key.
         _audit(ctx,
-            event_type="admin-order-reclaim-denied",
-            order_id=order_id,
+            event_type="admin-order-reclaim-not-found",
             outcome="failed",
-            details={"reason": "order-not-found"},
+            details={
+                "reason": "order-not-found",
+                "reason_code": "order-not-found",
+                "sample_order_id": order_id,
+            },
         )
         raise not_found("order not found")
 
@@ -242,7 +247,11 @@ async def reclaim_processing_order(
             order_id=order_id,
             account_id=order.account_id,
             outcome="noop",
-            details={"reason": "not-processing", "order_status": order.status},
+            details={
+                "reason": "not-processing",
+                "reason_code": "not-processing",
+                "order_status": order.status,
+            },
         )
         return JSONResponse(content=_order_to_json(order))
 
@@ -261,7 +270,10 @@ async def reclaim_processing_order(
             order_id=order_id,
             account_id=order.account_id,
             outcome="failed",
-            details={"reason": "enrollment-in-flight"},
+            details={
+                "reason": "enrollment-in-flight",
+                "reason_code": "enrollment-in-flight",
+            },
         )
         raise malformed(
             "an enrollment worker for this order is running in this process "
@@ -283,6 +295,7 @@ async def reclaim_processing_order(
             outcome="failed",
             details={
                 "reason": "still-within-enrollment-window",
+                "reason_code": "still-within-enrollment-window",
                 "processing_age_seconds": round(age_seconds, 1),
                 "minimum_seconds": minimum,
             },
@@ -311,6 +324,7 @@ async def reclaim_processing_order(
             outcome="failed",
             details={
                 "reason": "ca-request-pending",
+                "reason_code": "ca-request-pending",
                 "pending_ca_request_id": pending_req_id,
                 "asserted": ca_request_resolved,
             },
@@ -350,7 +364,10 @@ async def reclaim_processing_order(
                 order_id=order_id,
                 account_id=order.account_id,
                 outcome="failed",
-                details={"reason": "ca-verification-not-asserted"},
+                details={
+                    "reason": "ca-verification-not-asserted",
+                    "reason_code": "ca-verification-not-asserted",
+                },
             )
             raise malformed(
                 "reclaiming this order to 'ready' lets the client re-enroll. "
@@ -398,7 +415,11 @@ async def reclaim_processing_order(
             order_id=order_id,
             account_id=order.account_id,
             outcome="failed",
-            details={"reason": "lost-race", "current_status": refreshed.status},
+            details={
+                "reason": "lost-race",
+                "reason_code": "lost-race",
+                "current_status": refreshed.status,
+            },
         )
         return JSONResponse(content=_order_to_json(refreshed))
 
@@ -434,7 +455,12 @@ async def list_orders(
     _audit(ctx,
         event_type="admin-list-orders",
         outcome="success",
-        details={"status": status, "limit": limit, "returned": len(orders)},
+        details={
+            "reason_code": "read-only-list",
+            "status": status,
+            "limit": limit,
+            "returned": len(orders),
+        },
     )
     return JSONResponse(
         content={"orders": [_order_to_admin_json(o) for o in orders]}
@@ -615,6 +641,7 @@ async def confirm_ca_revocation(
             details={
                 "serial": serial_upper,
                 "reason": "crl-evidence-capacity",
+                "reason_code": "crl-evidence-capacity",
                 "detail": str(exc),
             },
         )

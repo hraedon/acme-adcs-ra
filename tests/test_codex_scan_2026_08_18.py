@@ -103,7 +103,14 @@ class TestUdpCannotSatisfyOffboxRequired:
             collector.close()
 
     def test_config_refuses_the_combination_at_startup(self) -> None:
-        """Fail at config validation, not only at the probe: it is a posture."""
+        """Fail at config validation, not only at the probe: it is a posture.
+
+        This refusal is unconditional and has no override, because it is about
+        whether ``required`` can assert anything at all -- a datagram socket
+        accepts bytes with nothing listening. See
+        ``test_offbox_syslog_acknowledgement.py``, which pins that the
+        acknowledgement flag does not reach UDP.
+        """
         with pytest.raises(ValueError, match="fire-and-forget"):
             RAConfig(
                 audit_offbox_required=True,
@@ -112,15 +119,31 @@ class TestUdpCannotSatisfyOffboxRequired:
                 siem_syslog_proto="udp",
             )
 
-    def test_config_accepts_the_documented_tcp_posture(self) -> None:
-        """The shipped web.config selects TCP; it must keep validating."""
+    def test_config_refuses_tcp_as_the_load_bearing_posture(self) -> None:
+        """A live TCP peer is not an authenticated or confidential collector.
+
+        Still the DEFAULT, which is what this test pins. Unlike UDP above,
+        this one is reachable by explicit acknowledgement --
+        ``audit_offbox_allow_unauthenticated_syslog`` -- because refusing it
+        outright stranded every estate whose SIEM is behind a syslog relay and
+        the realistic response was to turn the whole requirement off.
+        """
+        with pytest.raises(ValueError, match="does not authenticate the collector"):
+            RAConfig(
+                audit_offbox_required=True,
+                siem_sink="syslog",
+                siem_syslog_host="collector.example",
+                siem_syslog_proto="tcp",
+            )
+
+    def test_config_accepts_authenticated_https_hec(self) -> None:
         cfg = RAConfig(
             audit_offbox_required=True,
-            siem_sink="syslog",
-            siem_syslog_host="collector.example",
-            siem_syslog_proto="tcp",
+            siem_sink="hec",
+            siem_hec_url="https://collector.example/services/collector",
+            siem_hec_token="placeholder-token",
         )
-        assert cfg.siem_syslog_proto == "tcp"
+        assert cfg.siem_sink == "hec"
 
     def test_udp_without_the_requirement_is_untouched(self) -> None:
         """Off-box audit is opt-in; UDP stays available to everyone else."""
@@ -128,6 +151,14 @@ class TestUdpCannotSatisfyOffboxRequired:
             siem_sink="syslog",
             siem_syslog_host="collector.example",
             siem_syslog_proto="udp",
+        )
+        assert cfg.audit_offbox_required is False
+
+    def test_tcp_without_the_requirement_is_untouched(self) -> None:
+        cfg = RAConfig(
+            siem_sink="syslog",
+            siem_syslog_host="collector.example",
+            siem_syslog_proto="tcp",
         )
         assert cfg.audit_offbox_required is False
 
