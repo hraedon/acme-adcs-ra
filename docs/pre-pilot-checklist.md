@@ -244,14 +244,16 @@ honest: check a box only when the thing is actually true, not when it's planned.
       `CRLPeriod + ClockSkewMinutes + lateness + skew` — and the derivation is
       validated by predicting `nextUpdate - thisUpdate` and comparing it against
       a real CRL. `docs/operations.md` → *Deriving the ceiling (WI-052)* carries
-      the worked numbers for a 1-week CA. **⚠ The shipped `626400`
-      recommendation was REFUTED by live measurement on 2026-08-27**: the
-      measured `A_sched_max` is `649800s`, above the `649200s` hard ceiling, so
-      no safe value exists on that cadence and `626400` sits 6h30m below the
-      floor. Until it is re-derived, leave
-      `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE` at `false` on a CA with
-      this schedule, or change the CA's publication policy. Re-derive if your
-      CA's `CRLPeriod`,
+      the worked numbers for a 1-week CA. **⚠ The shipped `626400` was
+      SUPERSEDED on 2026-08-27: use `≥ 649800`.** The floor is the published
+      window (`649200s`, measured) plus one `ClockSkewMinutes` (`600s`);
+      `626400` is 6h30m below it and fails CRL3 with zero margin. Note the
+      trade this forces: 649800 exceeds the window, so the independent age
+      ceiling is **non-binding** on this cadence — it sits behind the CRL's own
+      `nextUpdate` rather than in front of it. Shortening the CA's overlap is
+      what restores a binding ceiling. **Derive the floor from a real CRL, not
+      from the `CRLOverlap*` registry values, which do not decompose to the
+      observed window.** Re-derive if your CA's `CRLPeriod`,
       `CRLOverlapPeriod` or `ClockSkewMinutes` differ. After `nextUpdate` the CRL
       fails closed regardless of this setting.
 
@@ -298,9 +300,18 @@ engineered to. Until then it has not — regardless of a green local test run.
   27 new `certificate-issued`.
 
   **Regression in the record:** WI-052's shipped `626400` recommendation is
-  **refuted** — measured floor 649800s exceeds the 649200s hard ceiling, so no
-  safe value exists on this cadence. §F and `operations.md` corrected; UNFILED
-  item 20, rated HIGH because the published number is wrong today.
+  **superseded — use `≥ 649800`**. The floor is the measured published window
+  (649200s) plus one `ClockSkewMinutes` (600s), because a CRL is *current* for
+  its whole window and the oldest still-valid CRL the RA can be handed is one
+  full window old. `626400` is 6h30m below that and fails CRL3 with zero
+  margin. Since 649800 exceeds the window, the independent age ceiling is
+  **non-binding** on this cadence — a real trade, and a weaker control than
+  designed, but strictly better than leaving CRL evidence off. §F and
+  `operations.md` corrected; UNFILED item 20.
+
+  *(An earlier revision of this entry said "no safe value exists" and advised
+  leaving `REQUIRE_CRL_EVIDENCE` at `false`. Both were wrong: 649800 is safe,
+  it is merely non-binding, and the feature should be enabled at that value.)*
 
   **Teardown verified, not asserted:** revert-before-revoke honoured, 26/26
   revoked by OID with 0 still Issued **cross-checked against queries known to
