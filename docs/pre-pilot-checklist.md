@@ -238,12 +238,19 @@ honest: check a box only when the thing is actually true, not when it's planned.
       it) so an accepted reason can never silently break the out-of-band loop.
 - [ ] **CRL evidence freshness is configured from the actual CA cadence.** Before
       enabling `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, set
-      `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` so
-      `A_sched_max < max_age_seconds < (nextUpdate - thisUpdate)`.
-      **`A_sched_max` is derivable, not a multi-week observation** —
-      `CRLPeriod + ClockSkewMinutes + lateness + skew` — and the derivation is
-      validated by predicting `nextUpdate - thisUpdate` and comparing it against
-      a real CRL. `docs/operations.md` → *Deriving the ceiling (WI-052)* carries
+      `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` to **at least
+      `A_sched_max`**, which is the CRL's **published window plus one
+      `ClockSkewMinutes`** — read `thisUpdate`/`nextUpdate` off a real CRL, do
+      **not** reconstruct the window from the `CRLOverlap*` registry values,
+      which do not decompose to it.
+      **This checklist previously required
+      `A_sched_max < max_age_seconds < (nextUpdate - thisUpdate)`. That is
+      unsatisfiable for any CA** — `A_sched_max` exceeds the window by one skew
+      by construction — and chasing it produced two wrong published numbers.
+      A ceiling at or above `A_sched_max` cannot false-fail but does **not fire
+      before `nextUpdate`**; a binding ceiling requires going below the window
+      and accepting that a genuinely current CRL can be refused. Pick one
+      knowingly. `docs/operations.md` → *Deriving the ceiling (WI-052)* carries
       the worked numbers for a 1-week CA. **⚠ The shipped `626400` was
       SUPERSEDED on 2026-08-27: use `≥ 649800`.** The floor is the published
       window (`649200s`, measured) plus one `ClockSkewMinutes` (`600s`);
@@ -1497,6 +1504,9 @@ engineered to. Until then it has not — regardless of a green local test run.
   ceiling non-binding. Production must measure `A_sched_max` and choose
   `A_sched_max < max_age_seconds < 649200`; the repository does not supply the
   numeric lower bound.
+  *(Record retained as written. **Superseded 2026-08-27**: `A_sched_max` was
+  measured at 649800s, so that interval is empty — it is empty for any CA. See
+  §F and `operations.md` → Deriving the ceiling.)*
 
   **Teardown verified, not assumed.** CA back to 224 bytes / 4 ACEs /
   `OfficerRights: ABSENT`, `denyUrlSequences` empty (checked via the full
@@ -1703,6 +1713,10 @@ engineered to. Until then it has not — regardless of a green local test run.
         repository does not record `A_sched_max`; a value beyond 649200 would
         make the independent replay-age ceiling non-binding. The freshness gate
         itself was confirmed live (a 1-second ceiling refuses the real CRL).
+        *(Record retained as written. **Superseded 2026-08-27**: `A_sched_max`
+        measured at 649800s, so that interval is empty — for any CA. The
+        non-binding ceiling this entry warns against is now the documented,
+        deliberate default. See §F.)*
   - [x] **`Register-MaintenanceTasks.ps1` re-introduces the admin token on the
         revocation host.** `-AdminToken` was mandatory and always written into
         the revocation-sync task action as `$env:ACME_ADMIN_TOKEN`, even when a
