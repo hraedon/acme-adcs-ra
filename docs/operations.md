@@ -474,9 +474,18 @@ ACME_RA_REVOCATION_CONFIRM_CRL_URL=http://pki.WORK-DOMAIN.local/crl/WORK-DOMAIN-
 # Fail closed: refuse to confirm unless the CRL proves the serial is revoked.
 ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true
 # For this CA: measured nextUpdate-thisUpdate=649200s, plus one
-# ClockSkewMinutes (600s) => floor 649800s. Anything below that judges a
-# genuinely current CRL stale. DERIVE THIS FROM A REAL CRL for your CA -- see
-# "Deriving the ceiling (WI-052)" below; do not copy it blindly, and do not
+# ClockSkewMinutes (600s) => floor 649800s. Anything below that can judge a
+# genuinely current CRL stale.
+#
+# READ THIS BEFORE COPYING IT. 649800 is ABOVE the CRL's own 649200s validity
+# window, so this ceiling NEVER FIRES BEFORE nextUpdate does: it is a backstop
+# behind the CRL's expiry, not an independent replay-age bound. That is the
+# conservative choice -- it cannot false-fail -- and it is deliberate. If you
+# need a ceiling that actually binds, you must set it BELOW the window and
+# accept that a genuinely current CRL can be refused; see "Deriving the
+# ceiling (WI-052)" below, which explains why you cannot have both.
+#
+# DERIVE THIS FROM A REAL CRL for your CA -- do not copy it blindly, and do not
 # reconstruct the window from the CRLOverlap* registry values, which do not
 # decompose to the observed one.
 ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=649800
@@ -581,25 +590,48 @@ actually has some; on this CA it does not. See the superseded banner below.
 > this cadence.** The previously recommended 626400 is short by 23400s (6h30m)
 > and fails CRL3 with zero margin.
 >
-> ### The trade this forces, stated plainly
+> ### You cannot have both. Pick one, knowingly.
 >
-> 649800 is **above** the 649200s window, so the original constraint
-> `A_sched_max < max_age_seconds < (nextUpdate − thisUpdate)` is
-> **unsatisfiable here** — and it is the *upper* bound that has to give.
+> The constraint this section used to state —
+> `A_sched_max < max_age_seconds < (nextUpdate − thisUpdate)` — **cannot be
+> satisfied by any CA**, and that is a property of the arithmetic rather than of
+> this deployment:
 >
-> A `max_age_seconds` of 649800 never fires before the CRL's own `nextUpdate`
-> does, so on this CA the independent age ceiling is **non-binding**: it stops
-> being a second, tighter check and becomes a backstop behind the CRL's own
-> expiry. That is a weaker control than the setting was designed to be, and it
-> is the same objection this section raises below against the 691200 plumbing
-> value. The difference is that 649800 is the *smallest* value that does not
-> produce false staleness, so it gives up nothing that was actually available.
+> ```
+> A_sched_max = window + skew          (a CRL is current for its WHOLE window)
+> binding requires max_age < window
+> ⇒ needs window + skew < max_age < window, which is empty for any skew > 0
+> ```
 >
-> You get a binding independent ceiling only by shortening the CA's
-> **overlap** — the 43200s term is what pushes the floor past the window.
-> Until then, ≥ 649800 with a non-binding ceiling is the correct configuration,
-> and it is strictly better than the alternative of leaving
-> `REQUIRE_CRL_EVIDENCE` off.
+> Chasing that constraint is what produced two wrong numbers in this item's
+> history. The real choice is between two postures:
+>
+> | posture | `max_age_seconds` | fires before `nextUpdate`? | risk |
+> |---|---|---|---|
+> | **Conservative — the shipped default** | **≥ 649800** | no | none: cannot false-fail |
+> | Tightened | below 649200 | yes | refuses a genuinely current CRL whenever the RA is served one older than the value |
+>
+> **The conservative posture is the default because its risk is zero and the
+> tightened posture's risk is unmeasured.** How often the RA is handed an
+> old-but-still-current CRL depends on CDP and cache behaviour — measure it
+> before tightening; do not assume the newest CRL is always served.
+>
+> Choosing ≥ 649800 means the independent age ceiling is a **backstop behind the
+> CRL's own expiry**, not a second tighter check. That is genuinely weaker than
+> the setting was designed to be, and it is the same objection this section
+> raises below against the 691200 plumbing value. The difference is that 649800
+> is the *smallest* non-false-failing value, so it concedes nothing that was
+> actually available.
+>
+> Shortening the CA's **overlap** (the 43200s term) narrows the window and moves
+> the floor down with it — but the floor still exceeds the window by one skew,
+> so it changes the numbers, not the choice.
+>
+> **Open question worth confirming:** the original design clearly intended a
+> binding, independent replay-age ceiling. Since that is unreachable as
+> specified, either the intent was a *deliberate* tightening with accepted
+> false-fail risk, or the ceiling was always redundant with `nextUpdate`. Worth
+> settling before anyone rebuilds this reasoning a fourth time.
 >
 > ### Methodological point, worth more than the number
 >
