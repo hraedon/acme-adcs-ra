@@ -1137,3 +1137,108 @@ admission gate, deterministically shedding the target
 (`finalize-enrollment-admission-denied`, `revert_applied=true`). The product
 was correct both times — the harness was over-driving it. Fillers now capped at
 `max_pending − workers − 1`; new driver `lease-pass-fw.sh`.
+
+### 22. (measurement, medium) — NEW 2026-08-27. **The teardown destroys the only evidence that could calibrate WI-052**
+
+*Found while trying to answer "what age of CRL is the RA actually served?" from
+the deployed store.*
+
+`routes/admin.py` records `crl_this_update` on every revocation confirmation, so
+the age distribution should be derivable from `audit_log`. It is not. Measured
+against the deployed store (read-only copy, 2026-08-27):
+
+```
+audit_log rows: 722
+span:           2026-06-20T01:49:26Z -> 2026-08-25T04:35:26Z
+rows carrying crl_this_update:  NONE
+admin-revocation-confirm-* rows: NONE
+```
+
+The CRL-evidence path has been exercised live in at least three sessions
+(2026-08-14, 08-17, 08-25/27), each producing `crl-verified` confirmations. Not
+one survives. **Every validation ends by restoring the store to its pre-run
+fingerprint, which is exactly right for isolation and is amnesia for
+measurement.** All the `reproof-backup-*` copies on the RA host are *pre*-run
+snapshots; no post-run store is retained.
+
+So WI-052 was never merely un-measured — under the current procedure it is
+**un-measurable**, and would have stayed that way however many validations ran.
+That is why the item survived so long: each session generated the evidence and
+then deleted it.
+
+**Two things follow.**
+
+1. **The age distribution needs a sampler that lives outside the restore
+   scope**, not the RA's audit table. It does not need the RA at all: fetch the
+   CDP URL on a schedule for two-plus publication cycles and log
+   `thisUpdate` / `nextUpdate` / observed age to a file. That answers the
+   binding-vs-non-binding question directly, and it can run from anywhere with
+   CDP reach. See item 20 for why the question matters.
+2. **The general case is worth a decision:** any property needing longitudinal
+   evidence is invisible to this lab process. Either preserve the post-run store
+   under a dated name (one file per session, no interference with the restore),
+   or accept that only within-session properties can ever be measured. The first
+   is nearly free.
+
+### 23. (design, medium) — NEW 2026-08-27. **Replace the replay control: monotonic CRL, not an age ceiling**
+
+*Design filed rather than built; it wants its own round and a live proof.*
+
+**Why.** `revocation_confirm_crl_max_age_seconds` was intended as an independent
+replay-age bound, and item 20 shows it cannot be one: the floor
+(`window + skew`) exceeds the binding upper bound (`window`) for **any** CA. An
+age ceiling is the wrong shape for the job.
+
+**What the control is actually defending.** A stale CRL that *lacks* the serial
+fails closed, so age never protects the "was it really revoked?" direction —
+`nextUpdate` and the signature do that. The only wrong-*accept* an old CRL can
+produce is a **hold→unhold replay**: a certificate revoked with reason 6 and
+later removed from the CRL with reason 8 (which this lab does routinely) is
+still listed on an older CRL, so replaying it confirms a revocation for a
+currently-valid certificate. Narrow, but real, and it needs the confirm token.
+
+**Design.**
+
+A watermark per issuing CA, checked on every CRL fetch that reaches evidence
+evaluation:
+
+- New table, one row per CA:
+  `crl_watermark(issuer_key TEXT PRIMARY KEY, crl_number TEXT NULL,
+  this_update TEXT NOT NULL, observed_at TEXT NOT NULL, source_url TEXT)`.
+- `issuer_key` = digest over the issuer DN **and** the CA certificate's SPKI.
+  Not the CDP URL (which changes), and not the DN alone (which is reused across
+  key rollover).
+- Prefer the **CRL Number** extension (2.5.29.20): RFC 5280 requires it to be
+  monotonically increasing per CA, which is exactly the property wanted. Fall
+  back to `thisUpdate` when absent.
+- Compare, then: `newer` → accept and advance the watermark **in the same
+  transaction as the confirm**; `equal` → accept (same document); `older` →
+  refuse with `crl-evidence-regressed`.
+
+**Failure modes that must be designed for, not discovered:**
+
+- **Replica skew.** Round-robin CDP replicas at different vintages will regress.
+  Retry once before refusing; refuse loudly if it persists, because a regressing
+  CDP is a genuine operational fault worth surfacing.
+- **CA key rollover.** New SPKI ⇒ new `issuer_key` ⇒ fresh watermark. Correct by
+  construction, which is why SPKI belongs in the key.
+- **CRL Number reset** (CA restored from backup) wedges the control. Needs an
+  explicit operator reset, deliberately **not** automatic — an auto-reset
+  defeats the control entirely.
+- **First observation** is trust-on-first-use and protects nothing. Say so
+  plainly rather than implying otherwise.
+
+**What this does to the age ceiling.** It stops being the replay control and
+becomes a **liveness alarm** on the CA's publication pipeline — set from measured
+served-age (item 22), documented as an alarm, and honestly non-binding at the
+conservative default.
+
+**Live proof does not need the CA.** The RA fetches by URL, so point
+`revocation_confirm_crl_url` at a local stand-in: serve a captured older CRL
+after a newer one has been seen and assert `crl-evidence-regressed`. No CA-side
+change, no officer rights, no teardown risk.
+
+**Tests:** advance / equal / regress; CRL-Number-over-`thisUpdate` precedence;
+first observation; rollover producing a distinct key; watermark advancing in the
+confirm's transaction and not before it. Mutation-prove the regress refusal —
+it is the only branch that carries the security property.
