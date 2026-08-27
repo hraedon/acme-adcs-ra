@@ -965,3 +965,38 @@ This is the third instrument in this project whose failure mode was silence
 (stale CONNECT-PROBE target, inert firewall rule, the template-name teardown
 check that matched nothing). **Prove the instrument before the phenomenon:**
 blackhole on, probe says `dropped` on every address, and only then run Lqueue.
+
+### 18. (test, medium) — NEW 2026-08-27. **Two enrollment deadline tests race the wall clock**
+
+*Found when CI went red on a branch that could not have caused it.*
+
+`tests/test_enrollment.py` built `CertsrvEnrollmentLeg` with
+`total_timeout=0.05` in two places. The property under test is that a deadline
+expiring **during the certificate stream** still reports the ReqID the CA has
+already issued — so the 50 ms budget had to cover the `certfnsh.asp` POST and
+the ReqID parse before the blocked read even began. On a loaded runner it did
+not: the deadline fired first, `req_id` was never attached, and
+`test_one_deadline_aborts_stream_and_preserves_issued_req_id` failed on
+`assert None == '42'`.
+
+**The evidence that it is a race, not a regression:** the *same commit*
+(`37ec313`) passed the push run and failed the pull_request run — same Python
+3.12, same tree, opposite results. A suite whose green is load-bearing cannot
+have a test that disagrees with itself on identical input.
+
+Mitigated by widening both budgets to 0.5 s and scaling the elapsed assertion
+to 2.0 s — still far below the 5.0 s per-operation timeout, so the tests still
+prove the *total* deadline is what fired, and still inside the blocked read's
+1.0 s wait, so the deadline still expires mid-stream. Verified not vacuous:
+mutating `req_id=issued_req_id` to `req_id=None` still fails the first test.
+
+**This widens the race rather than removing it, and that is the open item.**
+The real fix is an injectable clock on `CertsrvEnrollmentLeg` so the deadline
+is not wall-clock at all. Deliberately not done here: `time.monotonic()` is
+read at six sites in the issuance path plus a watchdog thread, and rewriting
+that to be fake-clock-driven immediately before a live lab validation is the
+wrong order of operations. Do it in its own round, with the lab available to
+re-prove the enrollment leg afterwards.
+
+The second site (`ReqID=73`) had never failed but carried identical exposure —
+fixed at the same time rather than waiting for it to lose the race too.

@@ -420,14 +420,32 @@ class TestCertsrvEnrollmentLeg:
             host=_HOST,
             template=_TEMPLATE,
             timeout=5.0,
-            total_timeout=0.05,
+            # 0.5s, not the 0.05s this used to be. The budget has to survive
+            # the certfnsh POST *and* the ReqID parse, because the property
+            # under test is that a deadline expiring DURING THE STREAM still
+            # reports the ReqID the CA already issued. At 50ms a loaded runner
+            # spent the whole budget before the parse, the deadline fired with
+            # no ReqID attached, and the assertion below failed for a reason
+            # that had nothing to do with the behaviour: observed on CI
+            # 2026-08-27, where the same commit passed one run and failed the
+            # other. The blocked read waits up to 1.0s, so 0.5s still expires
+            # inside the stream, which is what keeps the test meaningful.
+            #
+            # This widens the race rather than removing it. The real fix is an
+            # injectable clock on CertsrvEnrollmentLeg so the deadline is not
+            # wall-clock at all; that touches the issuance path and wants its
+            # own round. See docs/UNFILED-WORK-ITEMS.md item 18.
+            total_timeout=0.5,
             session_factory=lambda: fake,
         )
 
         started = time.monotonic()
         with pytest.raises(EnrollmentTransportError, match="deadline") as caught:
             leg.submit_csr(_CSR_PEM, account_id="a", requested_sans=[])
-        assert time.monotonic() - started < 0.5
+        # Scaled with the budget above. Still far below the 5.0s per-operation
+        # timeout, so this continues to prove the TOTAL deadline is what fired
+        # rather than the per-read one.
+        assert time.monotonic() - started < 2.0
         assert caught.value.req_id == "42"
         assert caught.value.ca_issued is True
         assert blocked.closed is True
@@ -610,7 +628,22 @@ class TestCertsrvEnrollmentLeg:
             host=_HOST,
             template=_TEMPLATE,
             timeout=5.0,
-            total_timeout=0.05,
+            # 0.5s, not the 0.05s this used to be. The budget has to survive
+            # the certfnsh POST *and* the ReqID parse, because the property
+            # under test is that a deadline expiring DURING THE STREAM still
+            # reports the ReqID the CA already issued. At 50ms a loaded runner
+            # spent the whole budget before the parse, the deadline fired with
+            # no ReqID attached, and the assertion below failed for a reason
+            # that had nothing to do with the behaviour: observed on CI
+            # 2026-08-27, where the same commit passed one run and failed the
+            # other. The blocked read waits up to 1.0s, so 0.5s still expires
+            # inside the stream, which is what keeps the test meaningful.
+            #
+            # This widens the race rather than removing it. The real fix is an
+            # injectable clock on CertsrvEnrollmentLeg so the deadline is not
+            # wall-clock at all; that touches the issuance path and wants its
+            # own round. See docs/UNFILED-WORK-ITEMS.md item 18.
+            total_timeout=0.5,
             session_factory=lambda: fake,
         )
 
