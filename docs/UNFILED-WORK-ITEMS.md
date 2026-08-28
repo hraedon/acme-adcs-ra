@@ -1060,6 +1060,15 @@ re-derive and re-measure against a real CRL.
 
 > ## RESOLVED 2026-08-27 — the overlap does belong, and **≥ 649800** is the answer
 >
+> **REOPENED hours later by item 24 (below): this resolution derives the floor
+> from the published window, which is the wrong quantity — the floor that
+> governs false refusals is the maximum age an honest CDP serves, and the two
+> differ by exactly the CA's overlap. The number is deliberately left in place
+> as the interim value (it cannot false-fail on either reading) pending two
+> publication cycles of `sample_crl_age.py` data. Item 24 records why it must
+> not be re-derived on paper. The "RESOLVED" heading and body below are kept
+> as the record of the reasoning, not as a settled answer.**
+>
 > The decomposition, derived live against the CA:
 >
 > ```
@@ -1200,6 +1209,13 @@ then deleted it.
 > `docs/live-reproof-runbook.md` §E, which is committed — if the harness copy is
 > ever lost, the requirement survives. Anyone re-proving from a clean checkout
 > must re-apply it.
+>
+> **Gap closed 2026-08-28:** runbook §E now carries the reference
+> implementation of the preserve block itself (identifier-free,
+> placeholder-parameterised), so a clean checkout re-applies the change by
+> paste rather than re-deriving it from policy prose. The live copy in
+> `samples/lab-harness/restore.ps1` remains the authoritative one; the two
+> must not drift.
 >
 > Running against the lab CA every 30 minutes from the operator box since
 > 2026-08-27T19:13Z (first sample: CRL Number 127, age 55446s, window 649200s).

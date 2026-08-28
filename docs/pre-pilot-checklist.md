@@ -343,6 +343,16 @@ engineered to. Until then it has not — regardless of a green local test run.
   leaving `REQUIRE_CRL_EVIDENCE` at `false`. Both were wrong: 649800 is safe,
   it is merely non-binding, and the feature should be enabled at that value.)*
 
+  *(The supersession itself was disputed hours later — UNFILED item 24: the
+  649800 floor derives from the published *window*, but false refusals are
+  governed by the maximum age an honest CDP *serves*, and the overlap
+  separates those by 44400s on this CA — with the old 626400 sitting in the
+  gap. ≥ 649800 is held as the **interim** value, not a settled answer: it
+  cannot false-fail on either reading, and `scripts/sample_crl_age.py` is
+  measuring the served age (two publication cycles needed). Do not re-derive
+  on paper. See the §F item above and `operations.md` → *Deriving the
+  ceiling*.)*
+
   **Teardown verified, not asserted:** revert-before-revoke honoured, 26/26
   revoked by OID with 0 still Issued **cross-checked against queries known to
   return rows**, fingerprint-identical store restore, firewall rule count 0,

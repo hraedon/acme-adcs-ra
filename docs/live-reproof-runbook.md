@@ -142,6 +142,47 @@ per session costs almost nothing and is what makes the class measurable at all.
 Anything you intend to measure *across* sessions must live outside the restore
 scope entirely — see `scripts/sample_crl_age.py`, which needs no RA at all.
 
+**Reference implementation of the preserve step.** The prose above is the
+policy; this is the code, committed here so that anyone re-proving from a
+clean checkout re-applies the change by paste instead of re-deriving it. It is
+identifier-free and parameterised (`$StateRoot`, `$Python`); the live copy in
+the gitignored harness (`samples/lab-harness/restore.ps1` in this checkout) is
+the authoritative one, and the two must not drift. Load-bearing semantics:
+
+- it runs **only after the app pool is confirmed stopped** (copying a store a
+  live writer still holds is what corrupted the 2026-08-14 run);
+- it copies **all three SQLite files** — a `.db` without its `-wal` is missing
+  the newest commits, which are precisely the rows the session was run to
+  produce — plus the SIEM mirror;
+- it **throws before anything is removed**, so a failure to preserve leaves
+  the post-run store intact on disk and the teardown re-runnable.
+
+```powershell
+# PRESERVE THE POST-RUN STORE BEFORE DESTROYING IT (UNFILED item 22).
+$postrun = Join-Path $StateRoot ("postrun-store-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+New-Item -ItemType Directory -Force -Path $postrun | Out-Null
+$preserved = 0
+foreach ($suffix in @('', '-wal', '-shm')) {
+    $src = Join-Path $StateRoot ('acme_ra.db' + $suffix)
+    if (Test-Path $src) {
+        Copy-Item $src (Join-Path $postrun ('acme_ra.db' + $suffix)) -Force
+        $preserved++
+    }
+}
+if ($preserved -eq 0) { throw "no post-run store found at $StateRoot to preserve; refusing to restore over an unexamined state" }
+if (-not (Test-Path (Join-Path $postrun 'acme_ra.db'))) { throw "preserved $preserved file(s) but not acme_ra.db itself; refusing to proceed" }
+Copy-Item (Join-Path $StateRoot 'acme_ra.siem.jsonl') (Join-Path $postrun 'acme_ra.siem.jsonl') -Force -ErrorAction SilentlyContinue
+# Row counts, not file size: "the store was preserved" is the kind of claim
+# whose failure mode is silence, and a byte count would not distinguish a
+# session's worth of audit rows from an empty schema.
+& $Python -c "import sqlite3,json,sys;c=sqlite3.connect(sys.argv[1]);print('POSTRUN-PRESERVED '+json.dumps({t:c.execute('select count(*) from '+t).fetchone()[0] for t in ['audit_log','certificates','orders']}))" (Join-Path $postrun 'acme_ra.db')
+Write-Output ("POSTRUN-STORE=" + $postrun)
+```
+
+Treat `POSTRUN-PRESERVED {…}` and `POSTRUN-STORE=…` in the teardown output as
+required evidence of the preserve step; their absence means the teardown ran
+without it and the session's longitudinal evidence was destroyed.
+
 ## The lab-specific half of this procedure
 
 This document is deliberately placeholder-only: it says *what* must be proven.

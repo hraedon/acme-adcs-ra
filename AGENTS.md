@@ -100,7 +100,14 @@ The first thing the sampler found was that the merged floor derivation uses the
 published *window* where it needs the *served age* — different quantities on any
 CA with publication overlap. **Do not re-derive that number on paper; read the
 sampler** (UNFILED item 24). The watermark is deliberately independent of how
-that resolves.
+that resolves. **2026-08-28 reconciliation:** every committed surface that
+asserted ≥ 649800 as a settled floor (the `operations.md` banner and config
+example, item 20's resolution, the checklist log) now presents it as the
+**interim** value under item 24's dispute — it cannot false-fail on either
+reading, so it stays until the sampler has two publication cycles. The
+`restore.ps1` preserve block is likewise committed now, as the identifier-free
+reference implementation in `docs/live-reproof-runbook.md` §E, so a clean
+checkout re-applies it by paste instead of re-deriving from policy prose.
 
 **2026-08-25 whole-repository scan: three medium findings, fixed and LIVE
 VALIDATED on tip `5580519`.** (1) `Store.record_issuance` was unguarded — the

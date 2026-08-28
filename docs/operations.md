@@ -473,9 +473,15 @@ it verifiable, point the RA at the CA's published CRL:
 ACME_RA_REVOCATION_CONFIRM_CRL_URL=http://pki.WORK-DOMAIN.local/crl/WORK-DOMAIN-CA.crl
 # Fail closed: refuse to confirm unless the CRL proves the serial is revoked.
 ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true
-# For this CA: measured nextUpdate-thisUpdate=649200s, plus one
-# ClockSkewMinutes (600s) => floor 649800s. Anything below that can judge a
-# genuinely current CRL stale.
+# For this CA: 649800 = published window (649200s, measured off a real CRL)
+# + one ClockSkewMinutes (600s). Whether that is the FLOOR is disputed
+# (UNFILED item 24): the window bounds how long a REPLAYED document stays
+# unexpired, while false refusals are governed by the maximum age an honest
+# CDP actually SERVES — on a CA that publishes with overlap those differ by
+# exactly the overlap (44400s here; the old 626400 sits inside that gap).
+# scripts/sample_crl_age.py measures the served age. Until it has two
+# publication cycles of data, keep >= 649800 — it cannot false-fail on
+# either reading — and do not derive a fifth number on paper.
 #
 # READ THIS BEFORE COPYING IT. 649800 is ABOVE the CRL's own 649200s validity
 # window, so this ceiling NEVER FIRES BEFORE nextUpdate does: it is a backstop
@@ -508,8 +514,14 @@ These are three separate time bounds:
 
 For this CA, the committed evidence measures `CRLPeriod` as 604800 seconds (1
 week) and the `thisUpdate` → `nextUpdate` window as 649200 seconds (7d 12h
-20m). `CRLPeriod` is only the expected publication cadence; it is **not** the
-lower bound for the age ceiling.
+20m). **Which of the two is the floor for the age ceiling is disputed (UNFILED
+item 24).** The window is the attacker's replay reach — how long a replayed
+document stays unexpired. The publication cadence bounds what an honest CDP
+actually serves, and that — not the window — is the quantity that governs
+false refusals. On a CA that publishes with overlap they differ by exactly the
+overlap (44400s here, with the previously shipped 626400 sitting inside the
+gap). `scripts/sample_crl_age.py` (below) measures the served age and settles
+it; read the banner below before acting on either number.
 
 ### Deriving the ceiling (WI-052), with worked numbers
 
@@ -570,6 +582,22 @@ actually has some; on this CA it does not. See the superseded banner below.
 
 > ## ⚠ SUPERSEDED, 2026-08-27 — use **≥ 649800**, not 626400
 >
+> **Reopened the same day (UNFILED item 24): the floor derived below is the
+> wrong quantity, so treat ≥ 649800 as the interim value, not a settled
+> answer.** The derivation takes the floor from the published *window* — how
+> long a replayed document stays unexpired — but false refusals are governed
+> by the maximum age an honest CDP *serves*, which the publication cadence
+> bounds, not the window. On a CA that publishes with overlap those differ by
+> exactly the overlap (44400s here), and the originally-shipped 626400 sits
+> inside that gap — so this banner's supersession of 626400 is itself
+> unproven. ≥ 649800 cannot false-fail on either reading and stays the
+> interim recommendation; whether any smaller value also cannot is precisely
+> what `scripts/sample_crl_age.py` is measuring (two publication cycles;
+> running since 2026-08-27). Four paper derivations have been spent on this
+> floor already — item 24 declined to make it a fifth for exactly that
+> reason. The replay control is the watermark in the next section regardless,
+> so nothing security-relevant hangs on this number.
+>
 > The floor was derived live against the real CA and is **649800s**, not the
 > 605400s in the table below. The table's `A_sched_max` omits the overlap, and
 > that is the error: a CRL stays **current** for its whole published window, so
@@ -620,8 +648,9 @@ actually has some; on this CA it does not. See the superseded banner below.
 > CRL's own expiry**, not a second tighter check. That is genuinely weaker than
 > the setting was designed to be, and it is the same objection this section
 > raises below against the 691200 plumbing value. The difference is that 649800
-> is the *smallest* non-false-failing value, so it concedes nothing that was
-> actually available.
+> is the *smallest* non-false-failing value **on this derivation** — a claim
+> item 24 disputes: on the served-age reading the floor sits below the window,
+> and smaller values (626400 included) may be both safe and binding.
 >
 > Shortening the CA's **overlap** (the 43200s term) narrows the window and moves
 > the floor down with it — but the floor still exceeds the window by one skew,
@@ -640,6 +669,13 @@ actually has some; on this CA it does not. See the superseded banner below.
 > not decompose to it. Read `thisUpdate`/`nextUpdate` off a real CRL and add one
 > `ClockSkewMinutes`; do not reconstruct the window from configuration and
 > assume it matches.
+>
+> **Item 24's correction to this point:** reading the window off a real CRL is
+> right for the *upper* bound — the window is the attacker's replay reach, the
+> bound a ceiling must sit below to bind at all. It is the wrong quantity for
+> the *floor*, which is the maximum age an honest CDP serves; no document
+> carries that number, which is why the answer is a sampler rather than a
+> fifth derivation.
 
 ### The replay control is the monotonic watermark, not this ceiling
 
