@@ -1421,67 +1421,119 @@ is wide enough that the conclusion is unlikely to move.
 
 ---
 
-### 25. (design, medium) — NEW 2026-09-05. **A quarantined certificate can never be CRL-confirmed, so its revocation never drains**
+### 25. (design, medium) — NEW 2026-09-05, **CORRECTED same day**. **A transport-orphaned certificate has no issuer material, so its revocation can never be confirmed**
 
-**Found in the lab, not on paper.** The first run of the watermark proof picked
-two pending serials at random and both failed for a reason that had nothing to
-do with the watermark:
+> **Correction to this item's first draft, which was too broad and got the
+> remedy wrong.** It said quarantine means "the RA has the serial but no
+> chain", and proposed reusing `ACME_RA_ADCS_CA_BUNDLE` as issuer material.
+> Both are wrong, and the second is the more dangerous:
+>
+> * **Quarantine does not imply a missing chain.** `_quarantine_and_fail`
+>   passes `enrollment_result.chain_pem`, so a certificate quarantined for a
+>   SAN or EKU violation carries a full chain and confirms normally. Only the
+>   *transport-orphan* path can produce a chainless row.
+> * **The orphans are not identity-less either.** `_quarantine_transport_orphan`
+>   already separates two cases in so many words: leaf in hand (chain fetch or
+>   chain-binds-to-leaf failed) writes a `quarantined` row with `cert_pem`, the
+>   derived serial and the ReqID; leaf never received writes **no certificate
+>   row at all**, because the store keys on the bytes. Verified on the lab
+>   store: both blocked records carry a 2308-byte `cert_pem` and an empty
+>   `chain_pem`, and the same session produced two genuinely leafless incidents
+>   (`quarantined=false`, ReqID only) that must not be conflated with them.
+> * **`ACME_RA_ADCS_CA_BUNDLE` is TLS trust for the `/certsrv/` leg**, passed as
+>   `ca_bundle` to `CertsrvEnrollmentLeg`/`CertsrvRevocationLeg`. It is not an
+>   issuing-CA pin and must not silently acquire that second meaning — a knob
+>   that means "trust this for transport" quietly becoming "trust this to
+>   attest issuance" is exactly the kind of overload that is invisible in
+>   review.
+>
+> So the problem is **narrower and more tractable** than the draft claimed:
+> certificate identity is present, **issuer material is missing**, and the fix
+> is to recover the missing evidence and then run the existing verifier
+> unchanged.
+
+**The blocked state.** A transport-orphaned certificate whose chain fetch failed
+has `chain_pem` empty. CRL evidence verifies the CRL's signature against the
+issuing CA certificate taken from **the certificate's own stored chain**
+(deliberately: selecting the issuer by name rather than by signature picks the
+wrong generation across a CA key rollover). With no chain there is no issuer
+certificate, so every confirmation is refused:
 
 ```
 crl_detail: "could not locate the issuing CA certificate in the stored chain,
              so the CRL signature cannot be verified"
 ```
 
-Both were `QUARANTINED` certificates with `chain_pem` empty.
+With `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true` that is permanent.
+The serial sits in the pending set with no operator path out — and it is a
+certificate that is **live at the CA**, which is the worst population to lose
+track of.
 
-**Why it happens, and why neither half is a bug on its own.** Quarantine exists
-for a certificate orphaned by a post-issuance *transport* failure — the CA
-issued it, the RA never received the response, so the RA has the serial but no
-chain. CRL evidence verifies the CRL's signature against the issuing CA
-certificate **from the certificate's own stored chain** (deliberately: selecting
-the issuer by name rather than by signature picks the wrong generation across a
-CA key rollover). Put together: for a quarantined certificate there is no chain,
-so there is no verifiable evidence, so with
-`ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true` the confirmation is
-refused with `crl-evidence-required-but-absent` — permanently. The serial sits
-in the pending set with no operator path out.
+**What NOT to do.** Both shortcuts are tempting and both are wrong:
 
-`confirm_ca_revocation` explicitly accepts `CertStatus.QUARANTINED`, so the
-route intends these to be confirmable. The evidence path cannot deliver it.
-
-**What NOT to do**, stated because both shortcuts are tempting and both are
-wrong:
-
-* do **not** exempt quarantined certificates from the evidence requirement.
-  Quarantine is the state where the RA knows *least* about what the CA did; it
-  is the last place to relax verification.
+* do **not** exempt these from the evidence requirement. This is the state where
+  the RA knows *least* about what the CA did; it is the last place to relax
+  verification.
 * do **not** clear them out of the pending set to make the queue drain. The
-  pending set is the record that a revocation is owed; emptying it destroys the
-  only thing tracking the orphan.
+  pending set is the record that a revocation is owed.
 
-**The actual question to answer:** how does a quarantined record acquire
-trustworthy issuer evidence after the fact? Candidates, in rough order of how
-much they preserve the existing guarantee:
+**The design principle: recover the missing evidence, then run the existing
+verifier.** Nothing about the trust model changes — the same signature check,
+the same freshness ceiling, the same watermark. Only the input is repaired.
 
-1. **Store the chain at quarantine time from what the RA already has.** The
-   configured `ACME_RA_ADCS_CA_BUNDLE` is a pinned, operator-supplied root, and
-   the issuing CA certificate is retrievable from the CA independently of the
-   failed enrollment. Binding it to the orphan needs care — the point of
-   "issuer from the leaf's own chain" is that the leaf selects its issuer, and
-   an orphan has no leaf bytes either, only a serial.
-2. **A distinct reconciliation path for serial-only orphans** that verifies
-   against the CA database (`certutil -view` by serial, which
-   `Reconcile-Revocation.ps1` already drives) and records a *different*
-   `verification` value — never `crl-verified`, because it is not the same
-   evidence. The honesty precedent is `agent-asserted` vs `crl-verified`.
-3. **Surface them as their own operator queue** rather than leaving them
-   indistinguishable from confirmable pending revocations. Even without (1) or
-   (2) this is worth doing: today the failure is a repeating denial in the audit
-   trail with no signal that the serial can never succeed.
+**1. Recover issuer material for the stored leaf.** Obtain candidate issuer
+certificates, verify **which candidate actually signed the stored leaf**
+(`x509.Certificate.verify_directly_issued_by`, which dispatches on the signature
+algorithm — do not hand-roll a PKCS1v15 check, it fails silently on an ECDSA
+CA), persist the validated chain with an audit record, then let the ordinary
+confirm path run. The record stays `quarantined` and stays pending until
+confirmation actually succeeds; recovery repairs evidence, it does not decide
+anything. Note that a successful confirmation sets `ca_crl_updated` and does
+**not** change status today — that is correct and should stay: quarantine is a
+statement about the certificate, pending-revocation is a statement about the CA,
+and they are not the same fact.
 
-Whichever is chosen, `verification` must keep saying what was actually checked.
+> **The candidate source is already on disk, and it needs no new configuration.**
+> The RA's own store holds complete chains from the same CA for every
+> certificate it issued successfully. Measured on the lab store: 80 issuer
+> certificates across the stored chains, 2 distinct, and the correct one
+> verifies both orphans' signatures. That material arrived over the *same*
+> authenticated enrollment leg as the orphan itself, so it carries the same
+> provenance — a strictly better source than a new trust setting, and it
+> satisfies the constraint that recovery must work **after** the failure rather
+> than depend on another network request succeeding during quarantine.
+>
+> Fallback for a cold store (an orphan on the very first issuance, before any
+> chain has been stored): an explicit, separately-named issuer inventory whose
+> provenance is at least as strong as the enrollment leg's. Not
+> `ACME_RA_ADCS_CA_BUNDLE`.
 
-**Blast radius today:** two records on the lab store, both from earlier
-sessions' transport-failure injections. In a pilot the population is whatever
-the CA issued while the RA could not hear it — small, but exactly the set an
-operator most wants reconciled.
+**2. CA-database reconciliation is a separate evidence policy, not a
+substitute.** `certutil -view` by ReqID or serial — which
+`Reconcile-Revocation.ps1` already drives — is the only route for the
+**leafless** class, where there is no certificate row and the ReqID is all that
+exists: it can recover the certificate bytes and correlate a ReqID with a
+specific CA request, feeding the recovered leaf back into (1). That is recovery
+of *input*. It is **not** evidence: a database assertion does not satisfy
+`require_crl_evidence=true`, and recording it under a different `verification`
+value would not change that — honesty about the label does not move the gate.
+Anything that closes a record on a CA-DB assertion alone is a weakening of the
+requirement and has to be argued as one, explicitly, not smuggled in as a
+naming choice.
+
+**3. Expose the blocked state now, before either of the above.** This is the
+cheap part and should not wait on the design. Today the failure is an
+indistinguishable repeating denial in the audit trail with no signal that the
+serial can *never* succeed under the current configuration. The revocation
+obligation must stay visible with a reason of its own — `issuer-evidence-missing`
+— and a documented recovery action, and it must be distinguishable from the
+leafless ReqID-only incidents, which need a different action (revoke by ReqID at
+the CA by hand). Neither category may disappear merely because ordinary retries
+cannot resolve it.
+
+**Blast radius.** Narrower than the first draft implied. Not "quarantined
+certificates" — only transport orphans whose chain fetch failed, of which the
+lab store holds two, plus two leafless incidents in the other category. In a
+pilot the population is whatever the CA issued while the RA could not hear the
+response: small, live at the CA, and exactly the set an operator most needs
+reconciled.

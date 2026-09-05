@@ -349,10 +349,15 @@ engineered to. Until then it has not — regardless of a green local test run.
   ran. Fixed by quoting the elements and making a failed block fatal; the
   semantics are recorded in the runbook so a fresh checkout re-applies them.
 
-  **New finding — missing-chain quarantine (UNFILED item 25).** A quarantined
-  certificate has no stored chain, so CRL evidence can never verify for it, and
-  with `require_crl_evidence=true` it stays in the pending set permanently. Not
-  worked around: see the item.
+  **New finding — transport orphans have no issuer material (UNFILED item 25).**
+  A certificate orphaned by a failed *chain* fetch is stored with its leaf but
+  no chain, so CRL evidence has no issuing CA certificate to verify against and
+  the confirmation is refused permanently under `require_crl_evidence=true`.
+  Not worked around: see the item. *(The first draft of that item generalised
+  this to "quarantined certificates" and proposed reusing the `/certsrv/` TLS
+  bundle as issuer material; both were wrong and are corrected there.
+  Certificate identity is present — the missing thing is issuer material, and
+  the RA's own store already holds it.)*
 
   **Teardown verified, not asserted:** post-run store preserved before restore
   (904 audit rows, carrying the first `crl-verified` confirmations and
