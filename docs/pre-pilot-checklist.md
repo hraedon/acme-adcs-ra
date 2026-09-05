@@ -363,10 +363,22 @@ engineered to. Until then it has not — regardless of a green local test run.
   The manually forced CRL 129 publication is recorded in the sampler's evidence
   README so the 128→129 transition is not later read as cadence.
 
-  **Not run:** hosted CI (the branch is unpushed — identifier gate, `pip-audit`
-  and the 3.13 matrix leg are all CI-only); the §A.2 independent-client record
-  that this same change added to the runbook; the MSI no-digest/staged-copy
-  refusals, still owed.
+  **Follow-up run, same day, on the ceiling correction itself.** The default
+  change and the rewritten `CRL` phase were deployed and re-run rather than
+  reasoned about: **A 14/14, CRL 7/7**. Issuance is unaffected by the new
+  ceiling, `CRL3` now asserts that the ceiling *binds* (`626400 < 649200`,
+  margin 22800s) instead of the superseded inverse, and `CRL5`/`CRL6`/`CRL7`
+  provoke the configured age bound, expiry and monotonicity one at a time with
+  the other two satisfied — so a refusal can be attributed to the bound that
+  produced it. `Ld1` is untouched and stays a visible failure: its assertion is
+  correct and the recovery behaviour behind it has not changed.
+
+  **Not run:** hosted CI at the time of writing (identifier gate, `pip-audit`
+  and the 3.13 matrix leg are all CI-only, and the local gate skips without the
+  repo secret — it was a manual grep of the diff that caught a real CA CN in a
+  draft of this very entry); the §A.2 independent-client record that this same
+  change added to the runbook; the MSI no-digest/staged-copy refusals, still
+  owed.
 
 - **2026-08-27 — full hazard-scoped validation of `a60768d` (PRs #9/#10/#11),
   run by GLM against a brief written by the agent that authored four of the
