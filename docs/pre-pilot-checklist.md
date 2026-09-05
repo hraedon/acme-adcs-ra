@@ -236,33 +236,55 @@ honest: check a box only when the thing is actually true, not when it's planned.
       `docs/operations.md` ## Revocation runbook. **Reason 7 is rejected** by
       both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil` rejects
       it) so an accepted reason can never silently break the out-of-band loop.
-- [ ] **CRL evidence freshness is configured from the actual CA cadence.** Before
-      enabling `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, set
-      `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` to **at least
-      `A_sched_max`**, which is the CRL's **published window plus one
-      `ClockSkewMinutes`** — read `thisUpdate`/`nextUpdate` off a real CRL, do
-      **not** reconstruct the window from the `CRLOverlap*` registry values,
-      which do not decompose to it.
-      **This checklist previously required
-      `A_sched_max < max_age_seconds < (nextUpdate - thisUpdate)`. That is
-      unsatisfiable for any CA** — `A_sched_max` exceeds the window by one skew
-      by construction — and chasing it produced two wrong published numbers.
-      A ceiling at or above `A_sched_max` cannot false-fail but does **not fire
-      before `nextUpdate`**; a binding ceiling requires going below the window
-      and accepting that a genuinely current CRL can be refused. Pick one
-      knowingly. `docs/operations.md` → *Deriving the ceiling (WI-052)* carries
-      the worked numbers for a 1-week CA. **⚠ The shipped `626400` was
-      SUPERSEDED on 2026-08-27: use `≥ 649800`.** The floor is the published
-      window (`649200s`, measured) plus one `ClockSkewMinutes` (`600s`);
-      `626400` is 6h30m below it and fails CRL3 with zero margin. Note the
-      trade this forces: 649800 exceeds the window, so the independent age
-      ceiling is **non-binding** on this cadence — it sits behind the CRL's own
-      `nextUpdate` rather than in front of it. Shortening the CA's overlap is
-      what restores a binding ceiling. **Derive the floor from a real CRL, not
-      from the `CRLOverlap*` registry values, which do not decompose to the
-      observed window.** Re-derive if your CA's `CRLPeriod`,
-      `CRLOverlapPeriod` or `ClockSkewMinutes` differ. After `nextUpdate` the CRL
-      fails closed regardless of this setting.
+- [ ] **CRL evidence freshness is configured from your own CDP's observed
+      served age.** Before enabling
+      `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, run
+      `scripts/sample_crl_age.py` against your CDP across at least one complete
+      publication cycle — you must see the CRL Number turn over — and keep the
+      failed fetches, which are part of the distribution. Then set
+      `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` strictly inside the band:
+
+      > **above** the maximum age your CDP serves, with margin for a late
+      > publication, or the ceiling refuses healthy evidence;
+      > **below** the published window (`nextUpdate − thisUpdate`), or the
+      > ceiling sits behind the CRL's own expiry and never fires first.
+
+      The application default is **626400** (7d 6h), which is the value measured
+      on the lab's weekly CA on 2026-09-05: served age at most 603654s (bounded
+      above by 605454s), window 649200s, so it clears the floor by ~5h49m and
+      the roof by ~6h20m. **That number is what one observation period supports
+      for a 1-week `CRLPeriod` with ADCS's computed 12h overlap — it is not a
+      universal bound, and a CA with a different cadence or overlap has a
+      different band, possibly an empty one.** Measure before you copy it.
+
+      Do **not** derive the floor from the window: that substitution is what
+      produced four wrong derivations and two published numbers that were both
+      outside the band (`649800` above the roof, `604800` inside the
+      uncertainty on the floor). See `docs/operations.md` → *Deriving the
+      ceiling (WI-052)*. Preserve the samples outside the lab restore scope —
+      a teardown that restores to a pre-run fingerprint destroys exactly this
+      class of evidence.
+
+- [ ] **Monotonic CRL evidence is left enabled, and its baseline is understood.**
+      `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC` defaults to `true`.
+      When CRL evidence is configured, it refuses evidence older than the
+      newest CRL already acted on for that issuing CA, independently of the
+      age ceiling's calibration. It does not establish that a first-seen CRL
+      is the newest document available: the first confirmation after deployment
+      or a CA key rollover has no prior watermark to compare against.
+      Document the recovery procedure before deployment. If a CA restore
+      produces a CRL Number below the stored watermark, confirmations remain
+      deferred until an operator resolves the regression; do not automatically
+      clear the watermark when a number goes backwards. An RA database restore
+      also restores its watermark, so reconcile the evidence gap before
+      resuming confirmations. If CDP replicas serve different vintages, use
+      the sampler's regression report to assess replica lag; it is evidence
+      about observed regressions, not a prediction of the exact confirmation
+      failure rate. See `docs/operations.md` → *Monotonic CRL evidence*.
+      **Proven live 2026-09-05** against two genuine CA-signed CRLs, including
+      a negative control (the same serial and the same older CRL are accepted
+      with `REQUIRE_MONOTONIC=false`, so the refusal is attributable to the
+      watermark and nothing else) and persistence across an app-pool recycle.
 
 ---
 
@@ -272,6 +294,96 @@ engineered to. Until then it has not — regardless of a green local test run.
 ---
 
 ## Validation log
+
+- **2026-09-05 — review of `610a5a3` and full live re-proof, run by Opus 5
+  against a change authored by another agent.** Same split as 2026-08-27: the
+  reviewer did not write the change.
+
+  **Candidate installed over the deployed v1.12.0 after a baseline control run
+  (A+A1 27/27 on the released build), then every phase re-run: 72/74.** Real
+  certificates off the lab issuing CA throughout — A 14/14 (serverAuth-only EKU, SAN
+  from CSR, 3-cert chain to the existing root), A1 13/13, G 5/5, K 12/12,
+  L 9/9, Lqueue 8/8. **Two failures, both explained, both left visible:**
+
+  - `CRL3` — asserts `window <= ceiling`, which is the superseded rule: it fails
+    unless the ceiling is set to a value that can never bind. Detecting the real
+    miscalibration with an assertion that demands it be made worse. The harness
+    assertion is replaced (expiry, configured age and monotonicity are now three
+    separate checks, mirroring `tests/test_crl_max_age_calibration.py`).
+  - `Ld1` — four orders left in `processing`, all four carrying
+    `finalize-enrollment-transport-failed`: the documented operator-reconcilable
+    residue from connects that burned before the block was lifted. Ld2–Ld5 pass,
+    which is the substantive property: the stale worker abandoned on a lapsed
+    generation, exactly one certificate for the contested order, no duplicates
+    anywhere.
+
+  **The extraction in `610a5a3` does not change issuance behaviour** — verified
+  by AST comparison of every extracted body against `325eeff` before the lab
+  ran, and by A/A1 passing identically on both builds.
+
+  **The monotonic CRL watermark is proven live, 12/12 — the proof owed since
+  2026-08-27.** No archived CRL existed, so CRL 128 was captured from the CDP
+  and the CA was made to publish 129: two genuine, still-unexpired,
+  differently-numbered documents both listing the target serial. Newer CRL
+  confirms and advances the watermark; the older one is refused with audit
+  `reason_code: crl-evidence-regressed`; the refusal survives an app-pool
+  recycle; and — the check that makes the rest mean anything — **the same serial
+  with the same CRL 128 is accepted when `REQUIRE_MONOTONIC=false`**, so the
+  refusal is attributable to the watermark and not to freshness, chain or
+  parsing. Advisory mode does not walk the watermark backwards.
+
+  **WI-052 settled by measurement, and the ceiling corrected** — see the §F
+  checklist item and `operations.md`. 399 samples over 8.3 days covering one
+  complete publication cycle; default moved 604800 → **626400**.
+
+  **Harness defect found, and it bounds what earlier rounds can claim.**
+  `lease-pass-fw.sh`'s `block()` emitted the RA's IPv6 address into a PowerShell
+  array literal unquoted, so the wrapper died with a parser error, created no
+  firewall rule, and — because the function never checked ssh's exit code —
+  reported success. Only the reachability gate caught it, correctly refusing to
+  measure. `samples/` is gitignored, so **there is no record of whether the
+  2026-08-27 Lqueue/Ldrain results came from this driver or from a manual
+  invocation with correct quoting; that entry's claims are neither confirmed nor
+  retracted here.** What is claimed is narrower and demonstrated: on 2026-09-05
+  the block was verified dropping on both address families before either phase
+  ran. Fixed by quoting the elements and making a failed block fatal; the
+  semantics are recorded in the runbook so a fresh checkout re-applies them.
+
+  **New finding — transport orphans have no issuer material (UNFILED item 25).**
+  A certificate orphaned by a failed *chain* fetch is stored with its leaf but
+  no chain, so CRL evidence has no issuing CA certificate to verify against and
+  the confirmation is refused permanently under `require_crl_evidence=true`.
+  Not worked around: see the item. *(The first draft of that item generalised
+  this to "quarantined certificates" and proposed reusing the `/certsrv/` TLS
+  bundle as issuer material; both were wrong and are corrected there.
+  Certificate identity is present — the missing thing is issuer material, and
+  the RA's own store already holds it.)*
+
+  **Teardown verified, not asserted:** post-run store preserved before restore
+  (904 audit rows, carrying the first `crl-verified` confirmations and
+  `crl-evidence-regressed` refusals this project has ever kept), store restored
+  to the pre-run fingerprint exactly, all 29 session certificates revoked with
+  `STILL-ISSUED=0` cross-checked at the CA, firewall rule count 0, v1.12.0
+  reinstalled over the candidate, throwaway EAB removed, both hosts as-found.
+  The manually forced CRL 129 publication is recorded in the sampler's evidence
+  README so the 128→129 transition is not later read as cadence.
+
+  **Follow-up run, same day, on the ceiling correction itself.** The default
+  change and the rewritten `CRL` phase were deployed and re-run rather than
+  reasoned about: **A 14/14, CRL 7/7**. Issuance is unaffected by the new
+  ceiling, `CRL3` now asserts that the ceiling *binds* (`626400 < 649200`,
+  margin 22800s) instead of the superseded inverse, and `CRL5`/`CRL6`/`CRL7`
+  provoke the configured age bound, expiry and monotonicity one at a time with
+  the other two satisfied — so a refusal can be attributed to the bound that
+  produced it. `Ld1` is untouched and stays a visible failure: its assertion is
+  correct and the recovery behaviour behind it has not changed.
+
+  **Not run:** hosted CI at the time of writing (identifier gate, `pip-audit`
+  and the 3.13 matrix leg are all CI-only, and the local gate skips without the
+  repo secret — it was a manual grep of the diff that caught a real CA CN in a
+  draft of this very entry); the §A.2 independent-client record that this same
+  change added to the runbook; the MSI no-digest/staged-copy refusals, still
+  owed.
 
 - **2026-08-27 — full hazard-scoped validation of `a60768d` (PRs #9/#10/#11),
   run by GLM against a brief written by the agent that authored four of the
@@ -319,6 +431,25 @@ engineered to. Until then it has not — regardless of a green local test run.
   *(An earlier revision of this entry said "no safe value exists" and advised
   leaving `REQUIRE_CRL_EVIDENCE` at `false`. Both were wrong: 649800 is safe,
   it is merely non-binding, and the feature should be enabled at that value.)*
+
+  *(The supersession itself was disputed hours later — UNFILED item 24: the
+  649800 floor derives from the published *window*, but false refusals are
+  governed by the maximum age an honest CDP *serves*, and the overlap
+  separates those by 44400s on this CA — with the old 626400 sitting in the
+  gap. ≥ 649800 is held as the **interim** value, not a settled answer: it
+  cannot false-fail on either reading, and `scripts/sample_crl_age.py` is
+  measuring the served age (two publication cycles needed). Do not re-derive
+  on paper. See the §F item above and `operations.md` → *Deriving the
+  ceiling*.)*
+
+  *(**SETTLED 2026-09-05 by the sampler: item 24 was right and this entry's
+  supersession was wrong.** Measured served age at most 603654s against a
+  649200s window, so the band is `(605454, 649200)` and `626400` — the value
+  this entry superseded — sits inside it with ~5h49m and ~6h20m of margin.
+  `649800` is above the window and can never fire before `nextUpdate`. The
+  application default is now 626400. Nothing above is edited, because the shape
+  of the error is the useful part of the record: every wrong number here came
+  from taking the floor off a document instead of off a measurement.)*
 
   **Teardown verified, not asserted:** revert-before-revoke honoured, 26/26
   revoked by OID with 0 still Issued **cross-checked against queries known to
@@ -1507,6 +1638,13 @@ engineered to. Until then it has not — regardless of a green local test run.
   *(Record retained as written. **Superseded 2026-08-27**: `A_sched_max` was
   measured at 649800s, so that interval is empty — it is empty for any CA. See
   §F and `operations.md` → Deriving the ceiling.)*
+  *(**That supersession is itself withdrawn, 2026-09-05.** "Empty for any CA" is
+  false: it followed from measuring `A_sched_max` off the published window
+  instead of off the CDP's output. Sampled, the maximum age this CDP serves is
+  603654s, and the interval `A_sched_max < max_age_seconds < 649200` this record
+  originally specified is 43746s wide and contains the shipped default of
+  626400. **The record as first written was right; the correction was the
+  error.**)*
 
   **Teardown verified, not assumed.** CA back to 224 bytes / 4 ACEs /
   `OfficerRights: ABSENT`, `denyUrlSequences` empty (checked via the full
@@ -1717,6 +1855,10 @@ engineered to. Until then it has not — regardless of a green local test run.
         measured at 649800s, so that interval is empty — for any CA. The
         non-binding ceiling this entry warns against is now the documented,
         deliberate default. See §F.)*
+        *(**Withdrawn 2026-09-05.** `A_sched_max` is the age the CDP *serves*,
+        measured at 603654s, not the window. The interval is 43746s wide, the
+        default is 626400 and binds, and the warning this entry raised against a
+        non-binding ceiling was correct all along. See §F.)*
   - [x] **`Register-MaintenanceTasks.ps1` re-introduces the admin token on the
         revocation host.** `-AdminToken` was mandatory and always written into
         the revocation-sync task action as `$env:ACME_ADMIN_TOKEN`, even when a

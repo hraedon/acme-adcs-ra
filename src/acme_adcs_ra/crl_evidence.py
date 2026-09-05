@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import socket
 import sys
@@ -47,6 +48,7 @@ from urllib.parse import ParseResult, urljoin, urlparse
 import requests
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from requests.adapters import HTTPAdapter
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
 
@@ -59,12 +61,46 @@ _CLOCK_SKEW = timedelta(minutes=5)
 CRL_VERIFIED = "crl-verified"
 AGENT_ASSERTED = "agent-asserted"
 
+# Monotonicity verdicts (UNFILED item 23). A CRL is compared against the newest
+# document this RA has previously acted on for the same issuing CA.
+WATERMARK_FIRST = "first"          # nothing recorded yet: trust on first use
+# The default maximum age of a CRL this module will accept as evidence.
+#
+# It is defined HERE, and `RAConfig.revocation_confirm_crl_max_age_seconds`
+# imports it, so the library fallback and the deployment default cannot drift
+# apart. They did not disagree before only because every production caller
+# passes the config value explicitly -- a script or test that omitted it would
+# have silently got a different bound. The reasoning behind the number is on
+# the config field.
+DEFAULT_CRL_MAX_AGE_SECONDS = 626400
+
+WATERMARK_NEWER = "newer"          # advances the watermark
+WATERMARK_EQUAL = "equal"          # the same document, re-served; fine
+WATERMARK_OLDER = "older"          # a replay, or a lagging CDP replica
+WATERMARK_INDETERMINATE = "indeterminate"  # nothing comparable on either side
+
+# The reason code an RA records when it refuses a regressed CRL.
+CRL_EVIDENCE_REGRESSED = "crl-evidence-regressed"
+
 # How many ``Location`` hops a CRL retrieval will follow. A CDP that needs more
 # than a couple is misconfigured; the cap is here because the chain is chosen by
 # whoever answers the CDP, not by the operator.
 _MAX_CRL_REDIRECTS = 4
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+@dataclass(frozen=True)
+class CrlWatermark:
+    """The newest CRL this RA has already acted on, for one issuing CA.
+
+    Persisted by the store; passed in here so this module stays a pure
+    fetch-and-verify unit with no database dependency.
+    """
+
+    issuer_key: str
+    crl_number: str | None = None
+    this_update: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,14 +116,113 @@ class CrlEvidence:
     crl_number: str | None = None
     this_update: str | None = None
     next_update: str | None = None
+    # Identity of the CA that signed this CRL: issuer DN *and* SPKI, digested.
+    # Only ever set after the signature has verified, so it names a key that
+    # really did sign the document (see `_watermark_key`).
+    issuer_key: str | None = None
+    # How this document compared against the caller's watermark, or None when
+    # no comparison was reached (the fetch failed before it, or the caller
+    # passed no watermark and monotonicity was not being enforced).
+    watermark_verdict: str | None = None
 
     @property
     def verification(self) -> str:
         return CRL_VERIFIED if (self.checked and self.revoked) else AGENT_ASSERTED
 
+    @property
+    def regressed(self) -> bool:
+        """True when this document is older than one already acted on."""
+        return self.watermark_verdict == WATERMARK_OLDER
 
-def _issuer_public_key(cert_pem: str, chain_pem: list[str]) -> object | None:
-    """Find the public key that signed *cert_pem*, from its own stored chain.
+
+def _watermark_key(ca_cert: x509.Certificate) -> str:
+    """Identity of an issuing CA, for keying its monotonic watermark.
+
+    Both halves are load-bearing:
+
+    * the **issuer DN** alone is not enough, because a CA key rollover keeps
+      the DN and changes the key. Two generations would then share a
+      watermark, and the older generation's still-valid CRLs — legitimately
+      lower-numbered, since CRL Number sequences are per key — would read as
+      replays and be refused;
+    * the **SPKI** alone is not enough either: it identifies the key but not
+      which name it is asserting.
+
+    Not the CDP URL. That is operator configuration and changes for reasons
+    that have nothing to do with the CA's identity; keying on it would silently
+    reset the control every time a CDP moved.
+
+    Both halves are taken from the CA **certificate**, never from the CRL. A
+    CRL's issuer field and a certificate's subject field are supposed to be the
+    same name, but they are separately encoded and CAs do not always encode
+    them identically (PrintableString vs UTF8String is the usual culprit) — so
+    comparing the two, or keying off whichever happened to be at hand, risks a
+    watermark that splits in half for one CA. There is nothing to compare here:
+    the CRL is bound to this certificate by the signature check.
+    """
+    spki = ca_cert.public_key().public_bytes(
+        Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+    )
+    digest = hashlib.sha256()
+    digest.update(ca_cert.subject.public_bytes())
+    digest.update(b"\x00")
+    digest.update(spki)
+    return digest.hexdigest()
+
+
+def compare_to_watermark(
+    watermark: CrlWatermark | None,
+    *,
+    crl_number: str | None,
+    this_update: str | None,
+) -> str:
+    """Compare a freshly verified CRL against the newest one already acted on.
+
+    **CRL Number is preferred over ``thisUpdate``** whenever both documents
+    carry one. RFC 5280 §5.2.3 requires the CA to increase it monotonically
+    across every CRL it issues, which is exactly the property wanted, and
+    unlike a timestamp it is not affected by a CA clock adjustment. When either
+    side lacks the extension the comparison falls back to ``thisUpdate``; a
+    missing CRL Number is not evidence of tampering, because the extension is
+    covered by the CA's signature and cannot be stripped by whoever answers the
+    CDP.
+
+    ``WATERMARK_FIRST`` is returned when nothing has been recorded for this CA.
+    That is **trust on first use and it protects nothing**: the first document
+    seen becomes the baseline, whatever it is. Said plainly here because a
+    control that quietly does nothing on first contact is worse than no control
+    at all — an operator would reasonably assume it was working.
+    """
+    if watermark is None:
+        return WATERMARK_FIRST
+    if crl_number is not None and watermark.crl_number is not None:
+        try:
+            seen = int(watermark.crl_number)
+            served = int(crl_number)
+        except ValueError:
+            # A watermark that will not parse is corrupt bookkeeping, not
+            # evidence about the CA. Fall through to the timestamp.
+            pass
+        else:
+            if served > seen:
+                return WATERMARK_NEWER
+            return WATERMARK_EQUAL if served == seen else WATERMARK_OLDER
+    if this_update is not None and watermark.this_update is not None:
+        try:
+            seen_at = datetime.fromisoformat(watermark.this_update)
+            served_at = datetime.fromisoformat(this_update)
+        except ValueError:
+            return WATERMARK_INDETERMINATE
+        if served_at > seen_at:
+            return WATERMARK_NEWER
+        return WATERMARK_EQUAL if served_at == seen_at else WATERMARK_OLDER
+    return WATERMARK_INDETERMINATE
+
+
+def _issuing_ca_certificate(
+    cert_pem: str, chain_pem: list[str]
+) -> x509.Certificate | None:
+    """Find the CA certificate that signed *cert_pem*, from its own stored chain.
 
     The chain is what the CA returned at issuance, so it is the authoritative
     statement of which CA certificate this leaf was issued under.
@@ -124,8 +259,25 @@ def _issuer_public_key(cert_pem: str, chain_pem: list[str]) -> object | None:
                 # Right name, wrong key — keep looking for the generation that
                 # actually signed this leaf.
                 continue
-            return candidate.public_key()
+            return candidate
     return None
+
+
+def crl_watermark_key(cert_pem: str, chain_pem: list[str]) -> str | None:
+    """The watermark identity of the CA that issued *cert_pem*, or None.
+
+    Derived from the certificate's **stored chain** — what the CA returned at
+    issuance — rather than from the fetched CRL. That ordering is the point: it
+    lets the caller look up the watermark *before* going to the network, and it
+    means the identity being compared against is one the RA already trusts
+    rather than one the CDP asserted about itself. The fetched document is then
+    bound to that identity by the signature check, which verifies against this
+    same certificate's key.
+    """
+    ca_cert = _issuing_ca_certificate(cert_pem, chain_pem)
+    if ca_cert is None:
+        return None
+    return _watermark_key(ca_cert)
 
 
 def _abort_transfer(
@@ -407,9 +559,11 @@ def fetch_crl_evidence(
     chain_pem: list[str],
     timeout_seconds: float = 10.0,
     max_bytes: int = 10 * 1024 * 1024,
-    max_age_seconds: int = 7 * 24 * 3600,
+    max_age_seconds: int = DEFAULT_CRL_MAX_AGE_SECONDS,
     total_timeout_seconds: float = 30.0,
     follow_redirects: bool = False,
+    watermark: CrlWatermark | None = None,
+    enforce_monotonic: bool = True,
 ) -> CrlEvidence:
     """Check whether *serial_number* is on the CA's published CRL.
 
@@ -428,6 +582,20 @@ def fetch_crl_evidence(
     rather than policing it. Enabled, hops are held to the configured origin:
     same host, same port (bar one documented http:80 → https:443 upgrade), and
     the host must keep resolving inside the address set seen at the start.
+
+    ``watermark`` is the newest CRL this RA has already acted on for the same
+    issuing CA. Supplied, a document that goes *backwards* from it is refused
+    as ``crl-evidence-regressed`` rather than believed (UNFILED item 23). This
+    is the control that actually defends against replay, and the age ceiling
+    never was: a stale CRL that *lacks* the serial already fails closed, so the
+    only wrong-*accept* an old CRL can produce is a hold->unhold replay — a
+    certificate revoked with reason 6 and later released with reason 8
+    (``removeFromCRL``) is still listed as revoked on the older document.
+
+    ``enforce_monotonic=False`` computes and reports the verdict but does not
+    refuse on it. That is for an estate whose CDP replicas are known to lag:
+    the watermark still advances and the regression is still visible in the
+    audit trail, so the operator gets the measurement without the refusal.
     """
     parsed = urlparse(crl_url)
     # A CRL is signed, so plain HTTP is normal and safe for CDPs; anything
@@ -619,8 +787,8 @@ def fetch_crl_evidence(
             revoked=False, checked=False, detail="CRL is neither valid DER nor PEM"
         )
 
-    public_key = _issuer_public_key(cert_pem, chain_pem)
-    if public_key is None:
+    ca_cert = _issuing_ca_certificate(cert_pem, chain_pem)
+    if ca_cert is None:
         return CrlEvidence(
             revoked=False,
             checked=False,
@@ -629,12 +797,20 @@ def fetch_crl_evidence(
                 "chain, so the CRL signature cannot be verified"
             ),
         )
-    if not crl.is_signature_valid(public_key):  # type: ignore[arg-type]
+    if not crl.is_signature_valid(ca_cert.public_key()):  # type: ignore[arg-type]
         return CrlEvidence(
             revoked=False,
             checked=False,
             detail="CRL signature does not verify against the certificate's issuer",
         )
+
+    # From here on the document is bound to the CA certificate in the stored
+    # chain, so the watermark identity below names the key that demonstrably
+    # signed it. Deriving that identity from the CRL instead would let whoever
+    # answers the CDP choose which watermark it is compared against — and hand
+    # them a way to plant an unreachably high CRL Number under a name of their
+    # choosing, wedging every subsequent confirmation.
+    issuer_key = _watermark_key(ca_cert)
 
     this_update = crl.last_update_utc
     next_update = crl.next_update_utc
@@ -717,6 +893,37 @@ def fetch_crl_evidence(
             crl_number=crl_number,
             this_update=this_update.isoformat() if this_update else None,
             next_update=next_update.isoformat() if next_update else None,
+            issuer_key=issuer_key,
+        )
+
+    # Monotonicity (UNFILED item 23). Last of the document-level checks,
+    # deliberately: a CRL that already failed freshness or is a delta must not
+    # advance anything, and there is no point comparing a document we have
+    # refused for another reason.
+    verdict = compare_to_watermark(
+        watermark, crl_number=crl_number, this_update=this_update.isoformat() if this_update else None
+    )
+    if verdict == WATERMARK_OLDER and enforce_monotonic:
+        # No evidence, not counter-evidence. The RA has learned that its CDP
+        # served something older than a document it has already acted on; that
+        # says nothing trustworthy about this serial either way, so it refuses
+        # to draw a conclusion — which is fail-closed under
+        # ``require_crl_evidence`` and an honest `agent-asserted` without it.
+        return CrlEvidence(
+            revoked=False,
+            checked=False,
+            detail=(
+                f"{CRL_EVIDENCE_REGRESSED}: served CRL "
+                f"(number={crl_number}, thisUpdate={this_update.isoformat() if this_update else None}) "
+                f"is older than the newest already acted on for this CA "
+                f"(number={watermark.crl_number if watermark else None}, "
+                f"thisUpdate={watermark.this_update if watermark else None})"
+            ),
+            crl_number=crl_number,
+            this_update=this_update.isoformat() if this_update else None,
+            next_update=next_update.isoformat() if next_update else None,
+            issuer_key=issuer_key,
+            watermark_verdict=verdict,
         )
 
     entry = crl.get_revoked_certificate_by_serial_number(serial_number)
@@ -750,6 +957,8 @@ def fetch_crl_evidence(
             crl_number=crl_number,
             this_update=this_update.isoformat() if this_update else None,
             next_update=next_update.isoformat() if next_update else None,
+            issuer_key=issuer_key,
+            watermark_verdict=verdict,
         )
 
     return CrlEvidence(
@@ -763,6 +972,8 @@ def fetch_crl_evidence(
         crl_number=crl_number,
         this_update=this_update.isoformat() if this_update else None,
         next_update=next_update.isoformat() if next_update else None,
+        issuer_key=issuer_key,
+        watermark_verdict=verdict,
     )
 
 

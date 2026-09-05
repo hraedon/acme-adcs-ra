@@ -72,6 +72,64 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**2026-09-05 (later): WI-052 settled by measurement, and the watermark proven
+live.** The sampler's 399 samples over one complete publication cycle put the
+maximum served age at 603654s against a 649200s window, so a binding,
+non-false-refusing ceiling exists and the default is now **626400** (was
+604800). Both numbers this project previously published were outside the band.
+The monotonic watermark was proven against two genuine CRLs with a negative
+control. Full lab re-proof of the candidate: **72/74**, both failures explained
+and left visible (`CRL3` asserts the superseded rule; `Ld1` is the documented
+transport-failure residue). See the 2026-09-05 entry in
+`docs/pre-pilot-checklist.md`. **New: UNFILED item 25** — a quarantined
+certificate has no stored chain, so it can never be CRL-confirmed and its
+revocation never drains.
+
+**2026-09-05 maintenance candidate:** issued-certificate validation was
+extracted from `finalize.py` without changing its logic or call order; the CRL
+sampler test now uses an explicit clock. Current operator guidance distinguishes
+tagged v1.12.0 from the unreleased watermark, and documents the pruning startup
+refusal. Local Python and Linux Pester suites pass. **Full lab reproof remains
+owed on the final candidate.** See
+[`docs/reproof-handoff-2026-09-05.md`](docs/reproof-handoff-2026-09-05.md) for
+validation evidence and the operator handoff. The entries below are historical.
+
+**2026-08-27: WI-052 is closed by replacing the control, not by finding the
+number.** For the lab CA, the CRL age ceiling was introduced as an independent
+replay bound, but its safe floor is disputed because the published window and
+the age the CDP actually serves are different quantities. The replay control is now
+a **monotonic CRL watermark** (`ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC`,
+default true): the newest CRL acted on per issuing CA is recorded, and one that
+goes backwards is denied `crl-evidence-regressed`. It needs no calibration, since
+RFC 5280 already requires the CRL Number to increase. The ceiling is demoted to a
+liveness alarm on the CA's publication pipeline. **Live proof landed 2026-09-05**
+— see the entry above; the ceiling is no longer only an alarm, it is a measured
+binding bound.
+
+**The reason WI-052 survived so long is the more useful finding.** Its
+calibration data existed — `crl_this_update` on every confirmation — and the lab
+teardown restored the store that held it at the end of every session. 722 audit
+rows spanning two months, not one carrying `crl_this_update`. The item was not
+un-measured; under that procedure it was **un-measurable**, and no number of
+further validation rounds would have changed it. Generalise it: *any*
+longitudinal property is invisible to a lab process that restores to a pre-run
+fingerprint. `restore.ps1` now preserves the post-run store first (and throws
+before destroying anything if it cannot), and `scripts/sample_crl_age.py` samples
+the CDP from outside the restore scope entirely — running against the lab CA
+every 30 minutes since 2026-08-27T19:13Z.
+
+The first thing the sampler found was that the merged floor derivation uses the
+published *window* where it needs the *served age* — different quantities on any
+CA with publication overlap (UNFILED item 24). **2026-09-05: the sampler settled
+it**, and item 24 was right: max served age 603654s against a 649200s window, so
+the band is `(605454, 649200)` and the default is now **626400**. Every committed
+surface that asserted ≥ 649800 has been corrected. The standing rule stands and
+earned its keep — **do not re-derive that number on paper; read the sampler.**
+The watermark remains independent of the answer. The
+`restore.ps1` preserve block is likewise committed now, as the identifier-free
+reference implementation in `docs/live-reproof-runbook.md` §E, so a clean
+checkout re-applies it by paste instead of re-deriving from policy prose.
+
 **2026-08-25 whole-repository scan: three medium findings, fixed and LIVE
 VALIDATED on tip `5580519`.** (1) `Store.record_issuance` was unguarded — the
 first durable record of something ADCS had already done, so a full or
@@ -188,7 +246,9 @@ can be valid and servable with no record of how it was issued. Derived from
 observed issuance, not the template, since ADCS can issue shorter than asked.
 The sweep additionally requires `audit_prune_enabled`, `audit_offbox_required`
 and a delivery probe that succeeds **at sweep time**; miss any gate and it
-reports and deletes nothing. **Local-only deployments never prune** — with no
+reports and deletes nothing. The current server also refuses
+`audit_prune_enabled=true` at startup because the SIEM path has no per-row
+delivery acknowledgement. **Local-only deployments never prune** — with no
 off-box copy the local table is the only evidence there is — and instead get
 footprint reporting plus JSONL rotation. Their stated cost is availability: the
 `certificate-issued` audit row commits in the same transaction as the

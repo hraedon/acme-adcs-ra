@@ -22,6 +22,7 @@ from typing import Any, NamedTuple
 from cryptography import x509
 
 from acme_adcs_ra.audit_bounds import bound_details, bound_value
+from acme_adcs_ra.crl_evidence import CrlWatermark
 from acme_adcs_ra.jws import canonicalize_jwk, jwk_thumbprint
 
 # ---------------------------------------------------------------------------
@@ -426,6 +427,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
 -- comparisons are correct without parsing.
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
     ON audit_log(timestamp);
+
+-- The newest CRL this RA has acted on, per issuing CA (UNFILED item 23).
+--
+-- One row per CA, not per CDP URL: the URL is operator configuration and moves
+-- for reasons unconnected to the CA's identity, so keying on it would reset the
+-- control silently every time a CDP was repointed. `issuer_key` is a digest
+-- over the issuer DN *and* the signing key's SPKI, computed only after that key
+-- has verified the document — so a CA key rollover produces a fresh watermark
+-- by construction rather than by special case, and nobody who merely answers
+-- the CDP can choose which watermark they are compared against.
+--
+-- `crl_number` is TEXT because a CRL Number is an unbounded integer (RFC 5280
+-- §5.2.3 permits 20 octets); it is compared as an int, never lexicographically.
+CREATE TABLE IF NOT EXISTS crl_watermark (
+    issuer_key TEXT PRIMARY KEY,
+    crl_number TEXT,
+    this_update TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    source_url TEXT
+);
 """
 
 
@@ -2601,6 +2622,100 @@ class Store:
             )
             return cursor.rowcount == 1
 
+    # ------------------------------------------------------------------
+    # CRL monotonicity watermark (UNFILED item 23)
+    # ------------------------------------------------------------------
+
+    def read_crl_watermark(self, issuer_key: str) -> CrlWatermark | None:
+        """The newest CRL already acted on for *issuer_key*, or None.
+
+        None means first observation for this CA, which is trust-on-first-use
+        and protects nothing — the caller is expected to say so rather than
+        imply a check happened.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT issuer_key, crl_number, this_update FROM crl_watermark "
+                "WHERE issuer_key = ?",
+                (issuer_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CrlWatermark(
+            issuer_key=row["issuer_key"],
+            crl_number=row["crl_number"],
+            this_update=row["this_update"],
+        )
+
+    def reset_crl_watermark(self, issuer_key: str) -> bool:
+        """Drop the watermark for one CA. Returns True if a row was removed.
+
+        Deliberately an **explicit operator action** with no automatic caller.
+        The state that needs it is a CA restored from backup, whose CRL Number
+        sequence legitimately restarts below what this RA has already seen; the
+        control then refuses every CRL until someone intervenes. Wiring that
+        recovery to fire by itself — "the number went backwards, so clear the
+        watermark" — would hand exactly the sequence an attacker wants to the
+        attacker, and the control would defeat itself the first time it worked.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "DELETE FROM crl_watermark WHERE issuer_key = ?", (issuer_key,)
+            )
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _advance_crl_watermark_in_conn(
+        conn: sqlite3.Connection,
+        *,
+        issuer_key: str,
+        crl_number: str | None,
+        this_update: str,
+        source_url: str | None,
+    ) -> bool:
+        """Move the watermark forward, never backward. Returns True if it moved.
+
+        The compare-and-set lives **inside the caller's transaction** rather
+        than being a read followed by a write, because the confirmation route
+        reads the watermark before it fetches the CRL and writes it after: a
+        concurrent confirmation can advance the row in between, and a plain
+        UPDATE would then walk the watermark backwards to this request's older
+        document — turning the control off precisely under the concurrency an
+        attacker can generate.
+
+        Comparison prefers the CRL Number and falls back to ``this_update``,
+        matching ``compare_to_watermark``; the two must not disagree, so the
+        precedence is stated once in each and tested against the other.
+        """
+        existing = conn.execute(
+            "SELECT crl_number, this_update FROM crl_watermark WHERE issuer_key = ?",
+            (issuer_key,),
+        ).fetchone()
+        if existing is not None:
+            advances = False
+            if crl_number is not None and existing["crl_number"] is not None:
+                try:
+                    advances = int(crl_number) > int(existing["crl_number"])
+                except ValueError:
+                    advances = this_update > existing["this_update"]
+            else:
+                advances = this_update > existing["this_update"]
+            if not advances:
+                return False
+        conn.execute(
+            "INSERT INTO crl_watermark "
+            "(issuer_key, crl_number, this_update, observed_at, source_url) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(issuer_key) DO UPDATE SET "
+            "crl_number = excluded.crl_number, "
+            "this_update = excluded.this_update, "
+            "observed_at = excluded.observed_at, "
+            "source_url = excluded.source_url",
+            (issuer_key, crl_number, this_update, _now_iso(), source_url),
+        )
+        return True
+
     def confirm_ca_revocation_with_audit(
         self,
         serial_hex: str,
@@ -2611,6 +2726,8 @@ class Store:
         order_id: str | None = None,
         sans: Sequence[str] | None = None,
         details: dict[str, Any] | None = None,
+        watermark_advance: CrlWatermark | None = None,
+        watermark_source_url: str | None = None,
     ) -> tuple[bool, dict[str, Any] | None]:
         """Flip ``ca_crl_updated`` and record its audit event atomically.
 
@@ -2628,6 +2745,23 @@ class Store:
         and can be retried, or it is confirmed *and* audited. SIEM fan-out stays
         outside — it is best-effort by design and must not hold the write open.
 
+        ``watermark_advance`` carries the CRL this confirmation acted on, and
+        it moves the monotonic watermark forward in **this same transaction**
+        (UNFILED item 23). Same reasoning as the audit event: the watermark is
+        part of the record of the decision, and a watermark advanced in its own
+        transaction could survive a confirmation that then failed, or be lost
+        by a confirmation that succeeded. It advances only for a document that
+        is genuinely newer, so losing the race with a concurrent confirmation
+        leaves the higher watermark standing.
+
+        Known and deliberate gap: a CRL fetched on a check that does **not**
+        end in a confirmation — evidence required but the serial absent, say —
+        does not advance the watermark, so a later replay of that document is
+        not caught. Advancing on observation instead would be strictly
+        stronger; it is not done here because the advance would then no longer
+        be atomic with the decision it belongs to. The residue is small: the
+        unadvanced document is one the RA declined to act on.
+
         Returns ``(won_cas, event)``. ``event`` is None when no row was updated,
         which is the idempotent/unknown-serial case and carries nothing to audit.
         """
@@ -2644,6 +2778,14 @@ class Store:
             )
             if cursor.rowcount != 1:
                 return False, None
+            if watermark_advance is not None and watermark_advance.this_update:
+                self._advance_crl_watermark_in_conn(
+                    conn,
+                    issuer_key=watermark_advance.issuer_key,
+                    crl_number=watermark_advance.crl_number,
+                    this_update=watermark_advance.this_update,
+                    source_url=watermark_source_url,
+                )
             event = self._record_audit_in_conn(
                 conn,
                 event_type=event_type,

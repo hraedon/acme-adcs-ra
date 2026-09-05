@@ -22,6 +22,8 @@ from acme_adcs_ra.crl_evidence import (
     AGENT_ASSERTED,
     CrlEvidence,
     CrlEvidenceGateBusy,
+    CrlWatermark,
+    crl_watermark_key,
     fetch_crl_evidence,
 )
 from acme_adcs_ra.finalize import _refresh_order_or_500
@@ -66,6 +68,25 @@ def _crl_evidence_for(
 
     Never raises: a CRL problem must not become a 500 on the confirm path. The
     caller decides whether absent evidence is fatal.
+
+    Monotonicity (UNFILED item 23) is applied here rather than deeper down
+    because it is the layer that has both the store and the network: the
+    watermark is read before the fetch — keyed off the certificate's own stored
+    chain, so no round trip is needed to learn which CA to look up — and the
+    verdict is decided against the document that comes back.
+
+    **A regression is retried exactly once before it is believed.** Round-robin
+    CDP replicas at different vintages are the common cause and they are a
+    transient, not an attack; refusing on a single sample would make a normal
+    load-balanced PKI look compromised. A regression that survives a re-fetch is
+    reported, because a CDP that persistently serves backwards is a genuine
+    operational fault and silence about it would be the worse failure.
+
+    The retry doubles the worst-case wall time of a confirmation to two full
+    ``total_timeout_seconds``. That is bounded and it lands on the CRL gate's
+    own worker pool — separate from enrollment's since 2026-08-16 F4 — which
+    sheds with 429 rather than queueing, so a CDP that regresses under load
+    cannot spread into the issuance path.
     """
     crl_url = ctx.config.revocation_confirm_crl_url
     if not crl_url:
@@ -78,7 +99,15 @@ def _crl_evidence_for(
             checked=False,
             detail=f"stored serial is not hexadecimal: {cert.serial_number!r}",
         )
-    try:
+
+    enforce = ctx.config.revocation_confirm_crl_require_monotonic
+    # Inside the guard below, not above it. Reading the watermark touches the
+    # store, and the contract of this function is that a CRL problem never
+    # becomes a 500 on the confirm path — a read that raised here would have
+    # been the one uncaught path left.
+    watermark: CrlWatermark | None = None
+
+    def fetch() -> CrlEvidence:
         return fetch_crl_evidence(
             crl_url=crl_url,
             serial_number=serial_int,
@@ -93,7 +122,21 @@ def _crl_evidence_for(
             follow_redirects=(
                 ctx.config.revocation_confirm_crl_follow_redirects
             ),
+            watermark=watermark,
+            enforce_monotonic=enforce,
         )
+
+    try:
+        issuer_key = crl_watermark_key(cert.cert_pem, cert.chain_pem)
+        if issuer_key is not None:
+            watermark = ctx.store.read_crl_watermark(issuer_key)
+        evidence = fetch()
+        if evidence.regressed and enforce:
+            logger.warning(
+                "CRL evidence regressed against the watermark; re-fetching once"
+            )
+            evidence = fetch()
+        return evidence
     except Exception as exc:  # noqa: BLE001 - evidence gathering must never 500
         logger.warning("CRL evidence check failed", exc_info=True)
         return CrlEvidence(
@@ -653,17 +696,49 @@ async def confirm_ca_revocation(
         evidence is not None and evidence.revoked
     ):
         detail = evidence.detail if evidence is not None else "no CRL configured"
-        _audit(ctx,
-            event_type="admin-revocation-confirm-denied",
-            account_id=cert.account_id,
-            order_id=cert.order_id,
-            outcome="failed",
-            details={
-                "serial": serial_upper,
-                "reason": "crl-evidence-required-but-absent",
-                "crl_detail": detail,
-            },
-        )
+        # A regression is a materially different denial from "the CDP was
+        # unreachable" or "the serial is not listed": it says the CA's
+        # publication point served a document older than one this RA has
+        # already acted on. Recording both under one reason code would bury the
+        # only signal that distinguishes a replay from a bad afternoon.
+        #
+        # Two call sites rather than one with a computed reason, and the reason
+        # spelled as a literal rather than as `CRL_EVIDENCE_REGRESSED`, because
+        # the coalescing key must be provably server-chosen *syntactically*
+        # (tests/test_audit_coalescing_enumeration.py). Weakening that check to
+        # accept a name would be the fourth call-site patch to the same guard
+        # (UNFILED item 13). The literal is pinned to the constant by
+        # test_crl_watermark.py, so the two cannot drift apart in silence.
+        # `not checked` as well as `regressed`: in advisory mode a regression is
+        # recorded but not acted on, so the denial there is about something else
+        # (the serial is absent) and blaming the watermark would misdirect
+        # whoever reads the trail.
+        if evidence is not None and evidence.regressed and not evidence.checked:
+            _audit(ctx,
+                event_type="admin-revocation-confirm-denied",
+                account_id=cert.account_id,
+                order_id=cert.order_id,
+                outcome="failed",
+                details={
+                    "serial": serial_upper,
+                    "reason": "crl-evidence-regressed",
+                    "reason_code": "crl-evidence-regressed",
+                    "crl_detail": detail,
+                },
+            )
+        else:
+            _audit(ctx,
+                event_type="admin-revocation-confirm-denied",
+                account_id=cert.account_id,
+                order_id=cert.order_id,
+                outcome="failed",
+                details={
+                    "serial": serial_upper,
+                    "reason": "crl-evidence-required-but-absent",
+                    "reason_code": "crl-evidence-required-but-absent",
+                    "crl_detail": detail,
+                },
+            )
         raise malformed(
             "CRL evidence is required to confirm a CA-side revocation, and the "
             f"CRL does not prove this serial is revoked: {detail}"
@@ -702,6 +777,29 @@ async def confirm_ca_revocation(
             details["crl_number"] = evidence.crl_number
         if evidence.this_update:
             details["crl_this_update"] = evidence.this_update
+        if evidence.watermark_verdict:
+            # Recorded even when monotonicity is not being enforced: the point
+            # of an advisory mode is that the operator can see what a strict
+            # one would have refused before they turn it on.
+            details["crl_watermark_verdict"] = evidence.watermark_verdict
+
+    # The document this decision was taken on becomes the new floor, in the
+    # confirm's own transaction (see Store.confirm_ca_revocation_with_audit).
+    # Never backwards: the store's compare-and-set drops an advance that does
+    # not move forward, so losing a race with a concurrent confirmation leaves
+    # the higher watermark standing.
+    watermark_advance: CrlWatermark | None = None
+    if (
+        evidence is not None
+        and evidence.checked
+        and evidence.issuer_key
+        and evidence.this_update
+    ):
+        watermark_advance = CrlWatermark(
+            issuer_key=evidence.issuer_key,
+            crl_number=evidence.crl_number,
+            this_update=evidence.this_update,
+        )
 
     # The flag and its audit event commit together (2026-08-18 wave 3 F6).
     # Flipping ca_crl_updated is what removes the serial from
@@ -716,6 +814,8 @@ async def confirm_ca_revocation(
         order_id=cert.order_id,
         outcome="success",
         details=details,
+        watermark_advance=watermark_advance,
+        watermark_source_url=ctx.config.revocation_confirm_crl_url or None,
     )
     if not flipped:
         # Lost the race with a concurrent confirmation, which already audited.

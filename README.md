@@ -85,7 +85,14 @@ warning: get the template scope right (see `AGENTS.md`).
 
 ## Status
 
-> **v1.11.0 — current release.** Fixes two defects that made ACME revocation
+> **v1.12.0 — current release.** This tag carries the current security and
+> operations baseline, including the audit-growth remediations and corrected
+> audit-retention startup guard. The working branch contains additional
+> unreleased changes; use the tag for the released artifact and complete the
+> live re-proof before deployment. The unreleased CRL watermark is described in
+> the working-tree section below and is not part of v1.12.0.
+>
+> **Historical: v1.11.0.** Fixes two defects that made ACME revocation
 > unusable for real clients. `revokeCert` read the payload field `cert`; RFC 8555
 > §7.6 names it **`certificate`**, so every conformant client was refused and
 > **could not revoke at all**. And the success response carried a JSON body,
@@ -124,6 +131,11 @@ warning: get the template scope right (see `AGENTS.md`).
 > passively: security reports (see `SECURITY.md`) and bug reports are welcome,
 > but there is no response-time commitment.
 
+The working tree's **Unreleased** changes add a per-CA monotonic CRL watermark
+for confirmation replay detection and retain the CRL age setting as a
+publication-liveness alarm. They require live re-proof before being treated as
+release behavior.
+
 The full pipeline works and has been proven against a real CA: an RA running as
 the gMSA behind IIS drives `/certsrv/` and returns a **serverAuth-only**
 certificate with the **SAN from the CSR**, issued off the existing CA and
@@ -140,6 +152,7 @@ chaining to the **existing root** — no new intermediate.
 | **v1.9** | Two external security reviews. The [2026-08-13 one](docs/security-review-2026-08-13.md) — ten findings, including separated revocation-confirm authority with optional CRL proof, certificate quarantine, and atomic issuance+audit. The [2026-08-14 one](docs/security-review-2026-08-14.md) — seventeen more, including rejecting ACME reason 8 (`removeFromCRL`, which un-revokes), quarantining certificates orphaned by post-issuance *transport* failures, refusing redirects on the gMSA-authenticated enrollment leg, and a hash-pinned install closure |
 | **v1.10** | The 2026-08-15 → 2026-08-23 review series (three external rounds). Finalize revalidated at the CA boundary; `keyChange` compare-and-swap guarded; CRL retrieval pinned to a resolved socket address; the certsrv leg given one monotonic deadline and a dedicated bounded executor; CSR application purposes constrained to `serverAuth`; the installer proving its whole Python interpreter closure and binding inbox cmdlets to a trusted module export table; `audit_prune_enabled` refused rather than silently inert. **Breaking:** `Sync-Revocations.ps1` token parameters became switches, so values can no longer reach argv |
 | **v1.11** | Revocation made usable by real ACME clients: `revokeCert` reads the RFC 8555 field `certificate` (it read `cert`, so conformant clients could not revoke at all), and success returns an empty body with the out-of-band hint moved to a response header (a JSON body made a real client report successful revocations as failed). **Breaking:** the `revokeCert` response shape |
+| **v1.12** | Audit-growth remediations, issuance-orphan handling with a one-way halt, and live re-proof/teardown corrections; audit pruning remains explicitly refused until per-row off-box delivery exists |
 
 Each release's live re-proof is recorded in the validation log in
 [`docs/pre-pilot-checklist.md`](docs/pre-pilot-checklist.md).

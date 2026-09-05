@@ -40,6 +40,15 @@ from acme_adcs_ra.enrollment import (
     EnrollmentResult,
     EnrollmentTransportError,
 )
+from acme_adcs_ra.issued_certificate_validation import (
+    issued_cert_ca_capability_violations as _issued_cert_ca_capability_violations,
+)
+from acme_adcs_ra.issued_certificate_validation import (
+    issued_cert_eku_violations as _issued_cert_eku_violations,
+)
+from acme_adcs_ra.issued_certificate_validation import (
+    issued_cert_san_violations as _issued_cert_san_violations,
+)
 from acme_adcs_ra.jws import _base64url_decode, jwk_thumbprint
 from acme_adcs_ra.policy import PolicyDecision
 from acme_adcs_ra.serializers import _order_to_json
@@ -559,150 +568,6 @@ def _submit_enrollment_inner(
             details={"error": str(exc)},
         )
         raise server_internal(f"enrollment failed: {exc}") from exc
-
-
-# SAN types that carry identity but are NOT DNS. A server-auth-only template
-# driven by the CSR must never emit any of these; their presence on an issued
-# cert means the template is misconfigured (or pulling from AD). The RA's CSR
-# gate already rejects non-DNS SANs — this enforces the same on the *result*.
-_NON_DNS_SAN_TYPES: tuple[tuple[type, str], ...] = (
-    (x509.RFC822Name, "RFC822Name (email)"),
-    (x509.IPAddress, "IPAddress"),
-    (x509.UniformResourceIdentifier, "URI"),
-    (x509.OtherName, "OtherName"),
-    (x509.RegisteredID, "RegisteredID"),
-    (x509.DirectoryName, "DirectoryName"),
-)
-
-
-def _issued_cert_san_violations(
-    cert_pem: str, requested_sans: list[str]
-) -> tuple[list[str], list[str], list[str]]:
-    """MED-1: inspect the *issued* cert for SANs the order did not authorize.
-
-    The RA enforces SAN-scope policy on the *request* (the CSR), but the ADCS
-    template ultimately decides what SANs land on the cert. If the template is
-    misconfigured (e.g. it maps SANs from AD rather than the request, or appends
-    extras), the issued cert could authorize identities the RA's policy never
-    approved — and a relying party would trust them. This closes that gap by
-    inspecting the *result*:
-
-    - every DNS SAN on the issued cert must be in the authorized set (the
-      order's requested_sans), compared with the same normalization the policy
-      uses — ``rstrip('.').lower()`` — so a trailing-dot/FQDN form or a case
-      difference cannot cause a false rejection;
-    - NO non-DNS SAN (email, IP, URI, OtherName, …) may be present at all —
-      the CSR gate already rejects these, so their presence means the template
-      bypassed the request.
-
-    Returns ``(issued_dns_sans, unauthorized_dns, non_dns_san_types)``. A cert
-    with no SAN extension yields ``([], [], [])``. The caller fails closed
-    (500 + audit, no cert recorded) if either violation list is non-empty.
-    """
-    try:
-        issued = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
-    except Exception as exc:  # pragma: no cover - defensive; enrollment parsed it
-        raise server_internal(f"issued cert unparseable: {exc}") from exc
-    try:
-        san_ext = issued.extensions.get_extension_for_oid(
-            ExtensionOID.SUBJECT_ALTERNATIVE_NAME
-        )
-    except x509.ExtensionNotFound:
-        return [], [], []
-    san_value = cast(x509.SubjectAlternativeName, san_ext.value)
-    issued_dns = [str(v) for v in san_value.get_values_for_type(DNSName)]
-    authorized = {s.rstrip(".").lower() for s in requested_sans}
-    unauthorized = [
-        s for s in issued_dns if s.rstrip(".").lower() not in authorized
-    ]
-    non_dns = [
-        label
-        for san_type, label in _NON_DNS_SAN_TYPES
-        if san_value.get_values_for_type(san_type)
-    ]
-    return issued_dns, unauthorized, non_dns
-
-
-# WI-026: serverAuth is the ONLY EKU a server-authentication template may issue.
-# A cert with NO EKU extension is all-purpose; anyExtendedKeyUsage is likewise
-# unbounded; clientAuth/PKINIT would enable authenticating *as* a principal — the
-# domain-takeover escalation the threat model names as the worst case short of a
-# signing key. The "blast radius bounded to spoofing internal TLS" guarantee
-# otherwise rests entirely on ADCS template config; this enforces it on the
-# *result* so a misconfigured/swapped template cannot silently break it.
-_SERVER_AUTH_EKU_OID = "1.3.6.1.5.5.7.3.1"
-_EKU_OID_LABELS: dict[str, str] = {
-    "1.3.6.1.5.5.7.3.2": "clientAuth",
-    "2.5.29.37.0": "anyExtendedKeyUsage",
-    "1.3.6.1.5.5.7.3.3": "codeSigning",
-    "1.3.6.1.5.5.7.3.4": "emailProtection",
-    "1.3.6.1.5.5.7.3.8": "timeStamping",
-    "1.3.6.1.4.1.311.20.2.2": "smartcardLogon",
-    "1.3.6.1.5.2.3.3": "pkinitKDC",
-    "1.3.6.1.5.2.3.4": "pkinitClientAuth",
-    "1.3.6.1.5.2.3.5": "pkinitServerAuth",
-}
-
-
-def _issued_cert_eku_violations(cert_pem: str) -> list[str]:
-    """WI-026: verify the *issued* cert's Extended Key Usage is exactly serverAuth.
-
-    Returns a list of human-readable violations (empty = serverAuth-only). The
-    caller fails closed (audit + 500, no cert recorded/served) on any violation,
-    exactly as MED-1's SAN check does. Rejects: a missing EKU extension (a
-    no-EKU cert is all-purpose), anyExtendedKeyUsage, and any EKU OID other than
-    serverAuth (clientAuth, PKINIT, code-signing, …).
-    """
-    try:
-        issued = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
-    except Exception as exc:  # pragma: no cover - defensive; enrollment parsed it
-        raise server_internal(f"issued cert unparseable: {exc}") from exc
-    try:
-        eku_ext = issued.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE)
-    except x509.ExtensionNotFound:
-        return ["no Extended Key Usage extension (certificate is all-purpose)"]
-    eku_value = cast(x509.ExtendedKeyUsage, eku_ext.value)
-    oids = [oid.dotted_string for oid in eku_value]
-    violations: list[str] = []
-    non_server = [o for o in oids if o != _SERVER_AUTH_EKU_OID]
-    if non_server:
-        labelled = [
-            f"{_EKU_OID_LABELS[o]} ({o})" if o in _EKU_OID_LABELS else o for o in non_server
-        ]
-        violations.append(f"EKU beyond serverAuth: {labelled}")
-    if _SERVER_AUTH_EKU_OID not in oids:
-        violations.append("serverAuth EKU (1.3.6.1.5.5.7.3.1) absent")
-    return violations
-
-
-def _issued_cert_ca_capability_violations(cert_pem: str) -> list[str]:
-    """Reject an issued certificate that could act as a subordinate CA."""
-    try:
-        issued = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
-    except Exception as exc:  # pragma: no cover - defensive; enrollment parsed it
-        raise server_internal(f"issued cert unparseable: {exc}") from exc
-
-    violations: list[str] = []
-    try:
-        basic_constraints = issued.extensions.get_extension_for_oid(
-            ExtensionOID.BASIC_CONSTRAINTS
-        ).value
-    except x509.ExtensionNotFound:
-        pass
-    else:
-        if isinstance(basic_constraints, x509.BasicConstraints) and basic_constraints.ca:
-            violations.append("BasicConstraints CA=true")
-
-    try:
-        key_usage = issued.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
-    except x509.ExtensionNotFound:
-        return violations
-    if isinstance(key_usage, x509.KeyUsage):
-        if key_usage.key_cert_sign:
-            violations.append("KeyUsage keyCertSign=true")
-        if key_usage.crl_sign:
-            violations.append("KeyUsage cRLSign=true")
-    return violations
 
 
 def _quarantine_and_fail(

@@ -473,22 +473,27 @@ it verifiable, point the RA at the CA's published CRL:
 ACME_RA_REVOCATION_CONFIRM_CRL_URL=http://pki.WORK-DOMAIN.local/crl/WORK-DOMAIN-CA.crl
 # Fail closed: refuse to confirm unless the CRL proves the serial is revoked.
 ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true
-# For this CA: measured nextUpdate-thisUpdate=649200s, plus one
-# ClockSkewMinutes (600s) => floor 649800s. Anything below that can judge a
-# genuinely current CRL stale.
+# 626400 (7d 6h) is the application default and the measured value for the
+# lab's weekly CA -- NOT a universal constant. It has to sit inside a band:
 #
-# READ THIS BEFORE COPYING IT. 649800 is ABOVE the CRL's own 649200s validity
-# window, so this ceiling NEVER FIRES BEFORE nextUpdate does: it is a backstop
-# behind the CRL's expiry, not an independent replay-age bound. That is the
-# conservative choice -- it cannot false-fail -- and it is deliberate. If you
-# need a ceiling that actually binds, you must set it BELOW the window and
-# accept that a genuinely current CRL can be refused; see "Deriving the
-# ceiling (WI-052)" below, which explains why you cannot have both.
+#   above  the maximum age your CDP actually SERVES, or it refuses healthy
+#          evidence. Measured on the lab CA at 603654s (upper bound 605454s
+#          at a 1800s sampling interval) over one complete publication cycle.
+#   below  the CRL's published window (nextUpdate - thisUpdate), or it sits
+#          behind the CRL's own expiry and can never fire first. Measured at
+#          649200s on every sample.
 #
-# DERIVE THIS FROM A REAL CRL for your CA -- do not copy it blindly, and do not
-# reconstruct the window from the CRLOverlap* registry values, which do not
-# decompose to the observed one.
-ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=649800
+# 626400 clears the floor by ~5h49m and the roof by ~6h20m. That band exists
+# because this CA publishes with overlap; a CA with a different CRLPeriod or
+# overlap has a different band, and possibly none.
+#
+# MEASURE YOUR OWN CA before changing this. Run scripts/sample_crl_age.py
+# against your CDP across at least one full publication cycle; the served-age
+# distribution is the only source for the floor. Do NOT reconstruct the window
+# from the CRLOverlap* registry values, which do not decompose to the observed
+# one, and do not derive the floor from the window -- that substitution is the
+# error that cost this project four derivations (WI-052, UNFILED item 24).
+ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=626400
 ```
 
 The CRL is signed by the CA and readable without privilege, so this is the one
@@ -502,14 +507,22 @@ These are three separate time bounds:
 - **Publication cadence:** `CRLPeriod` is the expected interval between CRLs.
 - **Overlap / validity:** `nextUpdate - thisUpdate` is the CRL's validity window;
   `nextUpdate` is a hard expiry, not a delay budget that can be extended here.
-- **Replay-age ceiling:** `revocation_confirm_crl_max_age_seconds` independently
-  limits how old a signed CRL the RA will accept, so it must remain binding below
-  the hard expiry.
+- **Publication-liveness ceiling:** `revocation_confirm_crl_max_age_seconds`
+  bounds the age of a signed CRL the RA will accept as an alarm on a stalled
+  publication path. It is not the replay control; the monotonic watermark below
+  detects regressions in CRL sequence.
 
 For this CA, the committed evidence measures `CRLPeriod` as 604800 seconds (1
 week) and the `thisUpdate` → `nextUpdate` window as 649200 seconds (7d 12h
-20m). `CRLPeriod` is only the expected publication cadence; it is **not** the
-lower bound for the age ceiling.
+20m). **The floor for the age ceiling is neither of those — it is the maximum
+age the CDP actually serves, and it was measured on 2026-09-05 at 603654s
+(bounded above by 605454s).** The window is the attacker's replay reach: how
+long a replayed document stays unexpired, and therefore the value a ceiling
+must stay *below* to bind at all. The served age is what governs false
+refusals. On a CA that publishes with overlap the two differ by exactly the
+overlap (44400s here), which is why a usable band exists at all. Substituting
+the window for the served age is the error that produced four wrong
+derivations; `scripts/sample_crl_age.py` measures the right quantity.
 
 ### Deriving the ceiling (WI-052), with worked numbers
 
@@ -558,90 +571,162 @@ overlap, which lands on 12h).
 `max_age_seconds` must sit strictly inside `(A_sched_max, 649200)`. The headroom
 is the budget for `L + S` plus whatever replay margin you want:
 
-| value | tolerance for lateness+skew | margin below hard expiry |
+| value | margin above measured served age | margin below hard expiry |
 |---|---|---|
-| 615600 (7d 3h) | 2h50m | 9h20m |
-| 626400 (7d 6h) — ~~recommended~~ **SUPERSEDED, below the floor** | **5h50m** | **6h20m** |
-| 637200 (7d 9h) | 8h50m | 3h20m |
+| 615600 (7d 3h) | 2h49m | 9h20m |
+| **626400 (7d 6h) — the measured value, and the shipped default** | **5h49m** | **6h20m** |
+| 637200 (7d 9h) | 8h49m | 3h20m |
 
-**Every row above is below the 649800s floor and would fail CRL3.** The table is
-retained because its *method* is still how you reason about headroom once a CA
-actually has some; on this CA it does not. See the superseded banner below.
+All three rows sit inside the measured band `(605454, 649200)`. 626400 is
+shipped because it splits the band almost evenly: the two failure modes it
+trades between — refusing a healthy CRL and accepting a replayed one — have no
+common unit, so there is no argument for weighting one side, and the midpoint is
+the honest default. Move within the band deliberately if your CDP's served-age
+distribution has a longer tail than the lab's.
 
-> ## ⚠ SUPERSEDED, 2026-08-27 — use **≥ 649800**, not 626400
+> ## ✅ RESOLVED 2026-09-05 — measured, and the answer is **626400**
 >
-> The floor was derived live against the real CA and is **649800s**, not the
-> 605400s in the table below. The table's `A_sched_max` omits the overlap, and
-> that is the error: a CRL stays **current** for its whole published window, so
-> the oldest still-valid CRL the RA can be served is one full window old.
+> *This supersedes the 2026-08-27 banner that superseded 626400. Five entries in
+> this section's history argued about a number; the sixth measured it. The
+> earlier text is not reproduced because it was wrong in a way that reads
+> plausibly, which is exactly how it survived four rounds.*
 >
-> ```
-> 649800 = 604800  CRLPeriod
->        +  43200  computed overlap (CRLOverlapUnits=0 ⇒ ADCS computes it; lands on 12h)
->        +   1200  2 × ClockSkewMinutes, stamped at BOTH thisUpdate and nextUpdate
->        +    600  1 × ClockSkewMinutes, CA↔RA skew allowance
-> ```
+> **What was wrong.** Every derivation took the ceiling's floor to be the
+> published *window* — reasoning that a CRL stays current for its whole window,
+> so the oldest still-valid CRL the RA can be served is one full window old.
+> That is true of what an attacker may *replay*. It is not true of what an
+> honest CDP *serves*: the CDP replaces the document at the publication
+> interval, not at expiry. On a CA with overlap those differ by exactly the
+> overlap, so the floor sits a whole overlap below where the derivations put
+> it, and the band the derivations declared empty is 43,746 seconds wide.
 >
-> The first three terms are the published window itself (**649200s**, which
-> matched the measured `nextUpdate − thisUpdate` exactly); the fourth is the
-> allowance for the RA's clock differing from the CA's.
+> **The measurement.** `scripts/sample_crl_age.py` against the lab CDP every 30
+> minutes from 2026-08-27 to 2026-09-05: 399 samples, zero failed fetches, one
+> complete publication cycle (CRL 127 ageing from 55,446s to 603,654s, then 128
+> arriving at age 626s).
 >
-> **Set `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS ≥ 649800` on a CA with
-> this cadence.** The previously recommended 626400 is short by 23400s (6h30m)
-> and fails CRL3 with zero margin.
+> | quantity | value | how |
+> |---|---|---|
+> | maximum age served | **603654s** | last sample of CRL 127 |
+> | upper bound on that | **605454s** | + one 1800s sampling interval |
+> | published window | **649200s** | identical on all 399 samples |
+> | usable band | **(605454, 649200)** | 43746s ≈ 12h9m wide |
+> | CRL Number regressions | **0** | a strict watermark would have refused nothing |
 >
-> ### You cannot have both. Pick one, knowingly.
+> **Set `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS=626400` on a CA with
+> this cadence** — and measure your own before copying it. This is what one
+> observation period supports for a 1-week `CRLPeriod` with ADCS's computed 12h
+> overlap; it is not a property of CRLs in general.
 >
-> The constraint this section used to state —
-> `A_sched_max < max_age_seconds < (nextUpdate − thisUpdate)` — **cannot be
-> satisfied by any CA**, and that is a property of the arithmetic rather than of
-> this deployment:
->
-> ```
-> A_sched_max = window + skew          (a CRL is current for its WHOLE window)
-> binding requires max_age < window
-> ⇒ needs window + skew < max_age < window, which is empty for any skew > 0
-> ```
->
-> Chasing that constraint is what produced two wrong numbers in this item's
-> history. The real choice is between two postures:
->
-> | posture | `max_age_seconds` | fires before `nextUpdate`? | risk |
-> |---|---|---|---|
-> | **Conservative — the shipped default** | **≥ 649800** | no | none: cannot false-fail |
-> | Tightened | below 649200 | yes | refuses a genuinely current CRL whenever the RA is served one older than the value |
->
-> **The conservative posture is the default because its risk is zero and the
-> tightened posture's risk is unmeasured.** How often the RA is handed an
-> old-but-still-current CRL depends on CDP and cache behaviour — measure it
-> before tightening; do not assume the newest CRL is always served.
->
-> Choosing ≥ 649800 means the independent age ceiling is a **backstop behind the
-> CRL's own expiry**, not a second tighter check. That is genuinely weaker than
-> the setting was designed to be, and it is the same objection this section
-> raises below against the 691200 plumbing value. The difference is that 649800
-> is the *smallest* non-false-failing value, so it concedes nothing that was
-> actually available.
->
-> Shortening the CA's **overlap** (the 43200s term) narrows the window and moves
-> the floor down with it — but the floor still exceeds the window by one skew,
-> so it changes the numbers, not the choice.
->
-> **Open question worth confirming:** the original design clearly intended a
-> binding, independent replay-age ceiling. Since that is unreachable as
-> specified, either the intent was a *deliberate* tightening with accepted
-> false-fail risk, or the ceiling was always redundant with `nextUpdate`. Worth
-> settling before anyone rebuilds this reasoning a fourth time.
+> **Both previously published numbers were outside the band.** `649800` is above
+> the window, so it never fires before `nextUpdate` and bounds nothing the
+> expiry check does not already bound. `604800` — the previous application
+> default — clears the *observed* maximum by 1146s but not its upper bound, so
+> it could refuse a genuinely healthy CRL in the minutes before republication.
+> `tests/test_crl_max_age_calibration.py` pins all of this, and proves the
+> redundancy claim against the implementation rather than on paper.
 >
 > ### Methodological point, worth more than the number
 >
-> **Derive the floor from the published CRL, not from the registry.** Whatever
-> mechanism produces the observed 12h20m, the `CRLOverlap*` registry values do
-> not decompose to it. Read `thisUpdate`/`nextUpdate` off a real CRL and add one
-> `ClockSkewMinutes`; do not reconstruct the window from configuration and
-> assume it matches.
+> **Derive the roof from a published CRL and the floor from a sampler.** The
+> `CRLOverlap*` registry values do not decompose to the observed window, so read
+> `thisUpdate`/`nextUpdate` off a real CRL for the roof. No document at all
+> carries the floor — the maximum age a CDP serves is a property of its
+> behaviour over time, which is why four attempts to read it off a document
+> failed and a sampler settled it in nine days.
+>
+> **And the ceiling is not the replay control regardless.** The monotonic
+> watermark in the next section is, it needs no calibration, and it was proven
+> live on 2026-09-05. Nothing security-critical ever hung on this number; what
+> hung on it was whether operators would be told to configure something inert.
 
-**626400 was the shipped recommendation for a CA on this cadence** — see the
+
+### Monotonic CRL evidence
+
+*Added 2026-08-27 (UNFILED item 23), and proven against the real CA on
+2026-09-05 with two genuine CRLs — the older one still unexpired and still
+listing the serial, so the only thing separating them was the watermark. The
+watermark is the replay control and needs no calibration; the age ceiling is a
+separate, now-measured bound. Do not infer a universal relationship between a
+CA's served-age floor and its published validity window.*
+
+The RA records the newest CRL it has acted on for each issuing CA, and refuses
+one that goes **backwards** from it —
+`revocation-ca-confirmed` is denied with reason `crl-evidence-regressed`.
+
+Why this is the right shape and the ceiling was not:
+
+* it needs **no calibration**. RFC 5280 §5.2.3 already requires the CRL Number
+  to increase per CA, so the property is the CA's to maintain rather than the
+  operator's to derive. Four derivations of the ceiling produced two wrong
+  numbers; there is no number here to get wrong;
+* it defends the threat that is actually there. A stale CRL that *lacks* the
+  serial already fails closed, so age never protected the "was it really
+  revoked?" direction — `nextUpdate` and the signature do that. The only
+  wrong-*accept* an old CRL can produce is a **hold→unhold replay**: a
+  certificate revoked with reason 6 and later released with reason 8
+  (`removeFromCRL`) is still listed as revoked on the older document. Narrow,
+  real, and it carries the confirm token.
+
+```
+ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC=true    # default
+```
+
+**What it does not do, said plainly.** The first CRL seen for a CA becomes the
+baseline whatever it is — trust on first use, which protects nothing on the
+first confirmation after a deployment or a CA key rollover. A control that
+quietly does nothing on first contact is worse than no control, so it is stated
+here rather than left to be discovered.
+
+**Operational behaviour to expect:**
+
+| situation | what happens |
+|---|---|
+| CDP replicas at different vintages | the fetch is retried **once** before a regression is believed; a transient skew resolves itself |
+| a CDP that persistently serves backwards | denied with `crl-evidence-regressed`, and that is a real fault worth an alarm |
+| CA key rollover | new SPKI ⇒ new watermark, by construction — the watermark is keyed on the issuer DN **and** the CA certificate's SPKI |
+| CA restored from backup (CRL Number resets) | confirmations wedge until an operator resets the watermark. **Deliberately manual**: an automatic reset on "the number went backwards" would hand the attacker the exact sequence that defeats the control |
+| an estate with known-lagging replicas | set `...REQUIRE_MONOTONIC=false`. The verdict is still recorded in the audit trail (`crl_watermark_verdict`) and the watermark still advances, so you keep the measurement without the refusal |
+
+**What the age ceiling is for.** A **binding freshness bound** on the CA's
+publication pipeline, and the alarm that a CA has stopped publishing. Set it
+above the maximum age the CDP actually serves and below the published window —
+measure the first, read the second off a real CRL — and read a refusal as "the
+CA's publication has stalled", not as evidence about a certificate. It is not
+the replay control; the watermark above is, and it works whatever this number
+is set to.
+
+```bash
+# Sample the CDP on a schedule. Needs nothing but reach: no RA, no store, no
+# privilege. Run it from a cron entry or a scheduled task, anywhere.
+python scripts/sample_crl_age.py \
+    --url http://pki.example.local/crl/example-CA.crl \
+    --out /var/lib/crl-samples.jsonl
+
+# After two-plus publication cycles, what the data says:
+python scripts/sample_crl_age.py --out /var/lib/crl-samples.jsonl --summarize
+```
+
+The summary prints the observed age distribution (which is what the ceiling is
+compared against), the published window (which is the bound a ceiling has to sit
+below to do anything at all), and any **CRL Number regressions** — each one a
+document a strict watermark would have refused, which is how you find out
+whether your CDP replicas are stable enough to enforce monotonicity before you
+turn it on.
+
+The log lives **outside** anything a lab teardown or a store restore touches, on
+purpose: this project's own audit trail could not answer the age question
+because every validation session restored the store that held the answer
+(UNFILED item 22).
+
+> **Before re-tightening the ceiling, read UNFILED item 24.** The floor above is
+> derived from the published *window*, which is the age a replayed document
+> stays unexpired — not the age an honest CDP serves. Those differ by exactly
+> the CA's overlap, and a sampler has been running against the lab CA since
+> 2026-08-27 to settle which one binds. Do not produce a fifth derivation on
+> paper.
+
+**626400 is the shipped default and the measured value for a CA on this cadence** — see the
 refutation above before using it. The reasoning was that it splits the headroom
 evenly, so neither a late publication nor a wider replay window is favoured.
 Measured CA→RA clock skew on this estate is sub-second, so `S` is noise; `L` is
@@ -896,17 +981,16 @@ same denial reason update the row that is already on disk, bumping an exact
 `denial_count` and recording how many distinct `kid` values were offered. Set
 the window to 0 to go back to one row per denial.
 
-Nothing is pruned, and no attempt goes uncounted: the counter is written to a
+No rows are pruned: the counter is written to a
 committed row on every increment, so even a crash mid-window keeps the tally.
 What this bounds is *rows per unit time* (at most one per reason per window),
 not the total, so the retention guidance below still applies to normal
 operation:
 
 - **Keep hot** for the incident-review window (e.g. 90 days) for fast query.
-- **Archive cold** after the hot window: export rows older than N days to a
-  write-once / append-only sink (e.g. a compressed JSONL in cold storage)
-  and delete them from the live SQLite. Keep the archived sink on
-  tamper-evident storage.
+- **Archive cold** after the hot window only through an independently managed,
+  write-once / append-only process; the RA does not delete those rows from its
+  live SQLite store.
 - **Never delete** `certificate-issued` / `certificate-revoked` events until
   the corresponding certificates have expired AND been removed from the CRL
   (the audit is the matching half of the revocation trail; see the
@@ -914,8 +998,12 @@ operation:
 
 #### Built-in retention (`audit_retention_days`)
 
-The RA can now enforce that window itself, but only in the one deployment shape
-where deleting a local row is not destroying evidence.
+The RA records and validates this policy, but the current server refuses to
+start when `audit_prune_enabled=true`: its SIEM path has no per-row delivery
+acknowledgement, so a health probe cannot prove that each row selected for
+deletion reached off-box storage. Setting `audit_retention_days` still enforces
+the startup floor and keeps footprint reporting meaningful; it does not enable
+deletion.
 
 **The floor.** `audit_retention_days` is validated at startup against the
 longest certificate validity this RA has *actually issued* (recorded per row in
@@ -933,13 +1021,14 @@ zero, and so it does not collapse as certificate lifetimes shrink.
 | Gate | Why |
 |---|---|
 | `audit_retention_days` ≥ floor | see above |
-| `audit_prune_enabled` | declaring a policy and destroying evidence are two decisions |
+| `audit_prune_enabled` | required by the library-level deletion decision; the current server refuses `true` at startup because per-row off-box delivery is not acknowledged |
 | `audit_offbox_required` | with no off-box copy the local table is the only evidence, so nothing is deleted from it |
 | A delivery probe that succeeds **at sweep time** | a sink that worked at startup and has since died is the exact state where deleting is unrecoverable |
 
-Miss any one and the sweep reports what it would have done and deletes nothing.
-That is the expected outcome for most deployments, and for **every** local-only
-one — see the local-only note in `operator-requirements.md` for the trade.
+The current server does not wire a pruning sweep. Any library-level evaluation
+that is used by tooling remains fail-closed and deletes nothing when a gate is
+missing; local-only deployments therefore rely on footprint reporting and
+JSONL rotation.
 
 The sweep audits itself (`audit-retention-swept`, carrying the cutoff, the row
 count and the floor). A retention pass that leaves no trace is indistinguishable

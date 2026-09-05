@@ -6,6 +6,106 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### The CRL age ceiling is calibrated from measurement, not derivation (2026-09-05)
+
+**Changed default: `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` is now
+`626400` (was `604800`).** Operators who set this explicitly are unaffected;
+operators on the default get a ceiling that is both binding and clear of the
+observed served-age floor, which the previous default was not.
+
+Two different quantities constrain this setting, and five revisions of the
+documentation conflated them. The **floor** is the maximum age the CDP actually
+*serves* — below it the ceiling refuses healthy evidence. The **roof** is the
+CRL's published window — at or above it the ceiling sits behind the CRL's own
+expiry and can never fire first. Every previous derivation took the floor from
+the window, which is the attacker's replay reach rather than the CA's output, and
+on a CA that publishes with overlap those differ by exactly the overlap.
+
+`scripts/sample_crl_age.py` measured it: 399 samples over 8.3 days covering one
+complete publication cycle put the maximum served age at 603654s (upper bound
+605454s) against a 649200s window. `626400` clears the floor by ~5h49m and the
+roof by ~6h20m. **This is what one observation period supports for a 1-week
+`CRLPeriod` with ADCS's computed 12h overlap — not a universal bound.** Measure
+your own CA; `docs/pre-pilot-checklist.md` §F says how.
+
+Both previously published numbers were outside the band: the recommended
+`649800` is above the roof, and the shipped `604800` clears the observed maximum
+by only 1146s, less than one sampling interval. The number is now defined once,
+in `crl_evidence.DEFAULT_CRL_MAX_AGE_SECONDS`, which `RAConfig` imports so the
+library fallback and the deployment default cannot drift.
+`tests/test_crl_max_age_calibration.py` pins it against the measurement and
+proves — against the implementation, not on paper — that a ceiling at or above
+the window is redundant with the expiry check.
+
+**The monotonic watermark is now proven live** (2026-09-05, two genuine CA-signed
+CRLs, with a negative control isolating the refusal to the watermark and
+persistence across a service restart). It remains the replay control and remains
+independent of this calibration.
+
+### Maintenance and reproof preparation (2026-09-05)
+
+- Extracted issued-certificate SAN, EKU, and CA-capability validation into
+  `issued_certificate_validation.py`. The validation logic, finalization
+  order, error responses, and quarantine behavior are unchanged.
+- Made the CRL sampler's age test deterministic: certificate timestamps and
+  the sample clock now share an explicit instant instead of depending on how
+  long earlier tests took to run. The sampler itself is unchanged.
+- Reconciled release status, authenticated resource reads, unavailable audit
+  pruning, and CRL-age guidance with the implementation. The weekly-lab age
+  ceiling remains interim pending measured served-age evidence; no defaults
+  or deployment settings changed.
+- Added a repeatable independent-client check to the live reproof runbook.
+  Local verification and the remaining lab work are recorded in
+  `docs/reproof-handoff-2026-09-05.md`; this change has not been lab-reproven.
+
+### CRL replay is now bounded by a monotonic watermark, not by an age ceiling
+
+**New setting: `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC`, default
+`true`.** It only affects deployments that have already configured
+`revocation_confirm_crl_url`; nothing changes for anyone who has not.
+
+The RA now records the newest CRL it has acted on for each issuing CA, and
+refuses one that goes backwards — the confirmation is denied with reason
+`crl-evidence-regressed`. The threat this closes is narrow and specific: a
+**hold→unhold replay**. A certificate revoked with reason 6 and later released
+with reason 8 (`removeFromCRL`) is still listed as revoked on the older CRL, so
+replaying that document confirms a revocation for a certificate that is
+currently valid. A stale CRL that *lacks* the serial already failed closed, so
+this was the only wrong-accept an old CRL could produce.
+
+`revocation_confirm_crl_max_age_seconds` remains an enforced freshness check
+and serves as a **liveness alarm** on the CA's publication pipeline. Its
+operational margin must come from the age the CDP actually serves, which can
+differ from the published validity window. The lab's prior floor derivation
+is disputed pending measurements (UNFILED item 24). The watermark comparison
+does not depend on that calibration. No configured value changed.
+
+**What the watermark does not do, stated because a quiet no-op is worse than no
+control:** the first CRL seen for a CA is trust-on-first-use and protects
+nothing. A CA key rollover creates a fresh watermark by construction (the key is
+the issuer DN *and* the CA certificate's SPKI). A CA restored from backup
+restarts its CRL Number sequence and will wedge confirmations until an operator
+clears the watermark — deliberately manual, because an automatic reset on "the
+number went backwards" would hand an attacker the sequence that defeats the
+control. Round-robin CDP replicas at different vintages are retried once before
+a regression is believed; if yours lag persistently, set the new setting to
+`false` and the verdict is still recorded (`crl_watermark_verdict`) without the
+refusal.
+
+### New: `scripts/sample_crl_age.py`
+
+An operator tool that samples a CDP on a schedule and reports the observed CRL
+age distribution, the published window, and any CRL Number regressions. It uses
+no RA, no store and no privilege — only reach.
+
+It exists because this project could not measure its own CRL ages: the setting
+above was calibrated four times without data, since every lab validation
+restored the store that held the evidence. Use `--summarize` to set the liveness
+alarm from measurement, and to find out whether your CDP is stable enough to
+enforce monotonicity before you enable it.
+
+### Earlier in this cycle
+
 Remediation of a standard scan of `7808046`, live-validated on 2026-08-25.
 
 **Check this before upgrading if you set `audit_offbox_required`.** The sink

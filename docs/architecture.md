@@ -35,10 +35,10 @@ The minimum to serve an enterprise client:
   `Location` newOrder returns and the URL a conforming client polls), the
   account (`/acme/acct/{id}`), the account's order list, the authorization and
   the certificate. Account deactivation (§7.3.6) is a `status` change POSTed to
-  the account URL. Unauthenticated `GET` remains available for the certificate
-  and authorization for compatibility with the clients this RA was proven
-  against; conforming clients should use the POST forms, which are
-  account-scoped and therefore not an existence oracle.
+  the account URL. Certificate and authorization retrieval are
+  account-scoped `POST`-as-`GET` only; the former unauthenticated `GET` routes
+  were removed so a captured URL cannot bypass account deactivation or EAB-kid
+  eviction.
 - **URL binding is against configuration.** Every JWS — and the EAB binding —
   must name the URL derived from the configured `base_url`, never the URL the
   request happened to arrive on. `base_url` is therefore load-bearing security
@@ -205,8 +205,10 @@ things keep that from being a bare act of faith:
   Two properties make that check mean what it says. **Freshness is verified
   separately from the signature**, because a signed CRL verifies for ever:
   `nextUpdate` must be present and future, `thisUpdate` must not be future, and
-  an absolute age ceiling bounds staleness independently of `nextUpdate`, which
-  the CA chooses. And **the issuer is selected by signature, not by name** — a
+  an absolute age ceiling provides a configurable publication-liveness bound
+  independently of `nextUpdate`, which the CA chooses. Replay detection uses
+  the per-CA monotonic CRL watermark; its comparison is independent of the age
+  threshold. And **the issuer is selected by signature, not by name** — a
   CA key renewal keeps the subject DN and changes the key, so name-matching
   picks the wrong generation from a chain holding both.
 

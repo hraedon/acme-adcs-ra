@@ -1060,6 +1060,15 @@ re-derive and re-measure against a real CRL.
 
 > ## RESOLVED 2026-08-27 — the overlap does belong, and **≥ 649800** is the answer
 >
+> **REOPENED hours later by item 24 (below): this resolution derives the floor
+> from the published window, which is the wrong quantity — the floor that
+> governs false refusals is the maximum age an honest CDP serves, and the two
+> differ by exactly the CA's overlap. The number is deliberately left in place
+> as the interim value (it cannot false-fail on either reading) pending two
+> publication cycles of `sample_crl_age.py` data. Item 24 records why it must
+> not be re-derived on paper. The "RESOLVED" heading and body below are kept
+> as the record of the reasoning, not as a settled answer.**
+>
 > The decomposition, derived live against the CA:
 >
 > ```
@@ -1180,6 +1189,39 @@ then deleted it.
    or accept that only within-session properties can ever be measured. The first
    is nearly free.
 
+> **BUILT 2026-08-27.** Both halves.
+>
+> * `scripts/sample_crl_age.py` — samples a CDP, appends
+>   `thisUpdate`/`nextUpdate`/observed age/CRL Number to a JSONL file, and
+>   `--summarize` prints the age distribution, the binding upper bound, and any
+>   **CRL Number regressions** (which is also the false-positive measurement
+>   item 23's control needs). Failed fetches are recorded, not skipped: a
+>   sampler that drops failures measures only the CA's good days.
+> * `samples/lab-harness/restore.ps1` now copies the post-run store — all three
+>   SQLite files, after the pool is confirmed stopped — to
+>   `postrun-store-<ts>` **before** removing anything, and throws rather than
+>   warning if it cannot, so the restore can be re-run without loss.
+>
+> **Caveat on the second half: `samples/` is gitignored**, so the `restore.ps1`
+> change exists only in this operator box's checkout. It ships to the RA host on
+> the next teardown (the harness is scp'd per run), but it is not in the repo, not
+> on CI, and not in a fresh clone. The *policy* is therefore also written into
+> `docs/live-reproof-runbook.md` §E, which is committed — if the harness copy is
+> ever lost, the requirement survives. Anyone re-proving from a clean checkout
+> must re-apply it.
+>
+> **Gap closed 2026-08-28:** runbook §E now carries the reference
+> implementation of the preserve block itself (identifier-free,
+> placeholder-parameterised), so a clean checkout re-applies the change by
+> paste rather than re-deriving it from policy prose. The live copy in
+> `samples/lab-harness/restore.ps1` remains the authoritative one; the two
+> must not drift.
+>
+> Running against the lab CA every 30 minutes from the operator box since
+> 2026-08-27T19:13Z (first sample: CRL Number 127, age 55446s, window 649200s).
+> The first thing it found was **item 24**, which is not the question it was
+> pointed at.
+
 ### 23. (design, medium) — NEW 2026-08-27. **Replace the replay control: monotonic CRL, not an age ceiling**
 
 *Design filed rather than built; it wants its own round and a live proof.*
@@ -1242,3 +1284,293 @@ change, no officer rights, no teardown risk.
 first observation; rollover producing a distinct key; watermark advancing in the
 confirm's transaction and not before it. Mutation-prove the regress refusal —
 it is the only branch that carries the security property.
+
+> **BUILT 2026-08-27**, to the design above, with two deviations worth naming.
+>
+> * **The watermark identity is derived from the certificate's stored chain, not
+>   from the fetched CRL.** The design said "issuer DN plus the CA cert's SPKI"
+>   without saying where the DN comes from, and taking it from the CRL would
+>   have meant a network round trip before the store could be consulted — plus a
+>   DN-encoding comparison (PrintableString vs UTF8String) that CAs do not
+>   always make cleanly. Both halves now come from the CA certificate the leaf
+>   was issued under; the fetched document is bound to that identity by the
+>   signature check that already existed.
+> * **`enforce_monotonic=False`** was not in the design. It records the verdict
+>   without refusing on it, for an estate whose replicas are known to lag —
+>   because the alternative an operator reaches for is turning CRL evidence off
+>   entirely, and then nothing is measured either.
+>
+> Shipped: `crl_watermark` table (`Store.read_crl_watermark`,
+> `reset_crl_watermark`, and a compare-and-set advance inside the confirm's own
+> transaction), `compare_to_watermark` / `crl_watermark_key` in `crl_evidence`,
+> the single re-fetch before a regression is believed, the
+> `crl-evidence-regressed` denial reason, and
+> `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC` (default **true**).
+> `tests/test_crl_watermark.py`, 21 tests, mutation-proved against four
+> reverted fixes: the regress refusal, the compare-and-set, the SPKI in the key,
+> and CRL-Number precedence — each kills exactly the tests that claim it.
+>
+> **Still owed: the live proof.** It needs no CA-side change — point
+> `revocation_confirm_crl_url` at a stand-in serving a captured older CRL after
+> a newer one has been seen, and assert `crl-evidence-regressed`. Until that
+> runs, this is a control that has only ever been exercised against CRLs this
+> repository generated itself.
+
+### 24. (measurement, HIGH) — NEW 2026-08-27. **The WI-052 floor conflates the attacker's reach with the CDP's output**
+
+*Found while writing the sampler's tests for item 22: a test asserting "no
+binding ceiling can exist" failed against the summariser, and the summariser was
+right.*
+
+Item 20's resolution derives the floor as **published window + one
+`ClockSkewMinutes` = 649800s**, on the reasoning that "the oldest still-valid CRL
+the RA can be handed is one full window old". That sentence is true, and it is
+the wrong quantity for a floor.
+
+Two different ages are in play and the derivation uses one for both:
+
+| quantity | what it is | value on this CA |
+|---|---|---|
+| **publication interval `P`** | how often the CA republishes; bounds the age of what an honest CDP serves | `CRLPeriod` = 604800s |
+| **published window `W`** | `nextUpdate − thisUpdate`; bounds how long a replayed document stays unexpired | measured 649200s |
+
+The **floor** (below which healthy CRLs get refused) is set by `P` plus
+lateness and skew — the RA is only ever *served* the current document. The
+**upper bound** (above which the ceiling adds nothing to `nextUpdate`) is set by
+`W` — that is the attacker's reach. Using `W` for both closes the interval by
+construction, which is exactly the "unsatisfiable for any CA" conclusion.
+
+For a CA that publishes with **overlap** (`P < W`, which is the point of
+overlap) the interval is not empty; its width is the overlap itself. On this CA
+that is `604800 < max_age < 649200`, a 44400s (12h20m) gap — and the originally
+shipped **626400** sits inside it. So the "wrong published number" finding may
+itself be wrong, and the correction to `≥ 649800` may have made the ceiling
+non-binding for no reason.
+
+**Not changing the number on this reasoning.** Item 20 warns in its own body
+that shipping a second unverified recommendation is how it arrived, and this is
+a third derivation on paper — the fourth would be the same mistake with a
+different sign. **`P` is the measurable one**: it is the maximum age the CDP
+actually serves, and `scripts/sample_crl_age.py` (item 22) has been sampling it
+every 30 minutes since 2026-08-27T19:13Z. Two publication cycles settle it.
+
+* if measured max served age stays near 604800 → a binding ceiling exists, item
+  20's floor is wrong, and 626400 was defensible all along;
+* if it reaches toward 649200 (the CA publishes late, or a cache serves stale)
+  → item 20's floor is right for the reason it is *actually* right, which is
+  lateness rather than the window, and the ceiling genuinely cannot bind.
+
+**This does not change item 23.** The monotonic watermark is the replay control
+either way, and its value is that it does not depend on which of these answers
+is correct — no calibration, so no derivation to get wrong a fifth time. The
+ceiling stays a liveness alarm regardless; the only thing at stake here is where
+that alarm's threshold sits.
+
+**In fairness to item 20:** `operations.md` already flags this as an open
+question — *"How often the RA is handed an old-but-still-current CRL depends on
+CDP and cache behaviour — measure it before tightening"*. What is added here is
+naming **which quantity the floor actually is** (served age, not window) and
+pointing a running instrument at it, rather than leaving it as an open question
+for a fifth session to re-derive on paper.
+
+**Do not "resolve" this from the registry, the docs, or another table.** Three
+of the four derivations so far were done that way and two of them were wrong.
+Read the sampler.
+
+---
+
+### 24 (continued). RESOLVED 2026-09-05 — measured, and 626400 was defensible all along
+
+The sampler ran from 2026-08-27T19:13Z to 2026-09-05T02:00Z: **399 samples, zero
+failed fetches, one complete publication cycle** (CRL 127 ageing 55,446s →
+603,654s, then 128 arriving at 626s).
+
+| quantity | measured |
+|---|---|
+| max age served | **603654s** |
+| upper bound on that (+ one 1800s sampling interval) | **605454s** |
+| published window, all 399 samples | **649200s** |
+| usable band | **(605454, 649200)** — 43746s wide |
+| CRL Number regressions | **0** |
+
+This is the first branch of the two this item predicted: *"if measured max
+served age stays near 604800 → a binding ceiling exists, item 20's floor is
+wrong, and 626400 was defensible all along."* It does, one is, it was, and it
+was. The application default is now **626400**, pinned with its reasoning in
+`tests/test_crl_max_age_calibration.py`.
+
+**Both previously published numbers were outside the band.** `649800` is above
+the roof, so it never fires before `nextUpdate`. `604800` — the default this
+replaces — clears the *observed* maximum by 1146s but not its upper bound, so it
+could refuse a healthy CRL in the minutes before republication. That second one
+matters more than it looks: it was the shipped default while the documentation
+recommended a different, also-wrong number, so no deployment was configured the
+way any part of the record advised.
+
+**The lesson is the one this item already named, now with a cost attached.** No
+document carries the maximum age a CDP serves; it is a property of behaviour
+over time. Four attempts to read it off a document produced two published wrong
+numbers. Nine days of a 40-line sampler settled it. When a quantity's failure
+mode is "the derivation looks plausible", the instrument is cheaper than the
+argument.
+
+**Caveat kept honest:** one publication cycle, one CA, one CDP. The band's
+*existence* generalises to any CA that publishes with overlap; the *numbers* do
+not generalise anywhere. A second cycle would tighten the floor, though the band
+is wide enough that the conclusion is unlikely to move.
+
+---
+
+### 25. (design, medium) — NEW 2026-09-05, **CORRECTED same day**. **A transport-orphaned certificate has no issuer material, so its revocation can never be confirmed**
+
+> **Correction to this item's first draft, which was too broad and got the
+> remedy wrong.** It said quarantine means "the RA has the serial but no
+> chain", and proposed reusing `ACME_RA_ADCS_CA_BUNDLE` as issuer material.
+> Both are wrong, and the second is the more dangerous:
+>
+> * **Quarantine does not imply a missing chain.** `_quarantine_and_fail`
+>   passes `enrollment_result.chain_pem`, so a certificate quarantined for a
+>   SAN or EKU violation carries a full chain and confirms normally. Only the
+>   *transport-orphan* path can produce a chainless row.
+> * **The orphans are not identity-less either.** `_quarantine_transport_orphan`
+>   already separates two cases in so many words: leaf in hand (chain fetch or
+>   chain-binds-to-leaf failed) writes a `quarantined` row with `cert_pem`, the
+>   derived serial and the ReqID; leaf never received writes **no certificate
+>   row at all**, because the store keys on the bytes. Verified on the lab
+>   store: both blocked records carry a 2308-byte `cert_pem` and an empty
+>   `chain_pem`, and the same session produced two genuinely leafless incidents
+>   (`quarantined=false`, ReqID only) that must not be conflated with them.
+> * **`ACME_RA_ADCS_CA_BUNDLE` is TLS trust for the `/certsrv/` leg**, passed as
+>   `ca_bundle` to `CertsrvEnrollmentLeg`/`CertsrvRevocationLeg`. It is not an
+>   issuing-CA pin and must not silently acquire that second meaning — a knob
+>   that means "trust this for transport" quietly becoming "trust this to
+>   attest issuance" is exactly the kind of overload that is invisible in
+>   review.
+>
+> So the problem is **narrower and more tractable** than the draft claimed:
+> certificate identity is present, **issuer material is missing**, and the fix
+> is to recover the missing evidence and then run the existing verifier
+> unchanged.
+
+**The blocked state.** A transport-orphaned certificate whose chain fetch failed
+has `chain_pem` empty. CRL evidence verifies the CRL's signature against the
+issuing CA certificate taken from **the certificate's own stored chain**
+(deliberately: selecting the issuer by name rather than by signature picks the
+wrong generation across a CA key rollover). With no chain there is no issuer
+certificate, so every confirmation is refused:
+
+```
+crl_detail: "could not locate the issuing CA certificate in the stored chain,
+             so the CRL signature cannot be verified"
+```
+
+With `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true` that is permanent.
+The serial sits in the pending set with no operator path out — and it is a
+certificate that is **live at the CA**, which is the worst population to lose
+track of.
+
+**What NOT to do.** Both shortcuts are tempting and both are wrong:
+
+* do **not** exempt these from the evidence requirement. This is the state where
+  the RA knows *least* about what the CA did; it is the last place to relax
+  verification.
+* do **not** clear them out of the pending set to make the queue drain. The
+  pending set is the record that a revocation is owed.
+
+**The design principle: recover the missing evidence, then run the existing
+verifier.** Nothing about the trust model changes — the same signature check,
+the same freshness ceiling, the same watermark. Only the input is repaired.
+
+**1. Recover issuer material for the stored leaf.** Obtain candidate issuer
+certificates, verify **which candidate actually signed the stored leaf**
+(`x509.Certificate.verify_directly_issued_by`, which dispatches on the signature
+algorithm — do not hand-roll a PKCS1v15 check, it fails silently on an ECDSA
+CA), persist the validated chain with an audit record, then let the ordinary
+confirm path run. The record stays `quarantined` and stays pending until
+confirmation actually succeeds; recovery repairs evidence, it does not decide
+anything. Note that a successful confirmation sets `ca_crl_updated` and does
+**not** change status today — that is correct and should stay: quarantine is a
+statement about the certificate, pending-revocation is a statement about the CA,
+and they are not the same fact.
+
+> **The candidate source is already on disk, and it needs no new configuration.**
+> The RA's own store holds complete chains from the same CA for every
+> certificate it issued successfully. Measured on the lab store: 80 issuer
+> certificates across the stored chains, 2 distinct, and the correct one
+> verifies both orphans' signatures. That material arrived over the *same*
+> authenticated enrollment leg as the orphan itself, so it carries the same
+> provenance — a strictly better source than a new trust setting, and it
+> satisfies the constraint that recovery must work **after** the failure rather
+> than depend on another network request succeeding during quarantine.
+>
+> Fallback for a cold store (an orphan on the very first issuance, before any
+> chain has been stored): an explicit, separately-named issuer inventory whose
+> provenance is at least as strong as the enrollment leg's. Not
+> `ACME_RA_ADCS_CA_BUNDLE`.
+
+**2. CA-database reconciliation is a separate evidence policy, not a
+substitute.** `certutil -view` by ReqID or serial — which
+`Reconcile-Revocation.ps1` already drives — is the only route for the
+**leafless** class, where there is no certificate row and the ReqID is all that
+exists: it can recover the certificate bytes and correlate a ReqID with a
+specific CA request, feeding the recovered leaf back into (1). That is recovery
+of *input*. It is **not** evidence: a database assertion does not satisfy
+`require_crl_evidence=true`, and recording it under a different `verification`
+value would not change that — honesty about the label does not move the gate.
+Anything that closes a record on a CA-DB assertion alone is a weakening of the
+requirement and has to be argued as one, explicitly, not smuggled in as a
+naming choice.
+
+**3. Expose the blocked state now, before either of the above.** This is the
+cheap part and should not wait on the design. Today the failure is an
+indistinguishable repeating denial in the audit trail with no signal that the
+serial can *never* succeed under the current configuration. The revocation
+obligation must stay visible with a reason of its own — `issuer-evidence-missing`
+— and a documented recovery action, and it must be distinguishable from the
+leafless ReqID-only incidents, which need a different action (revoke by ReqID at
+the CA by hand). Neither category may disappear merely because ordinary retries
+cannot resolve it.
+
+**Blast radius.** Narrower than the first draft implied. Not "quarantined
+certificates" — only transport orphans whose chain fetch failed, of which the
+lab store holds two, plus two leafless incidents in the other category. In a
+pilot the population is whatever the CA issued while the RA could not hear the
+response: small, live at the CA, and exactly the set an operator most needs
+reconciled.
+
+**Scope and acceptance criteria, agreed 2026-09-05.** This item is ready for a
+bounded implementation. **In scope:** existing-chain recovery (1) and
+blocked-state visibility (3). **Explicitly unresolved, and deliberately not
+blocking:** the cold-start inventory fallback, which only affects an orphan
+produced before the store holds any complete chain from that CA — a case not
+demonstrated here, while the two that are demonstrated are both recoverable from
+material already on disk. CA-database reconciliation (2) stays a separate
+evidence policy and is not part of this item.
+
+Requirements the implementation must satisfy:
+
+1. **Deduplicate candidate issuer certificates, and select by
+   `verify_directly_issued_by` — never by subject name alone.** Deduplicate by
+   certificate fingerprint, *not* by subject: the store can legitimately hold
+   more than one generation of the same CA's key under an identical DN, and
+   collapsing them by name would discard the generation that actually signed the
+   orphan. Selecting by signature is what keeps older generations supported,
+   and it is the same property `_watermark_key` already relies on.
+2. **Persist the recovered issuer evidence with an audit record naming its
+   source and the certificate's fingerprint.** Where the material came from is
+   part of the evidence; a recovered chain that cannot be traced back to what
+   supplied it is not better than no chain.
+3. **Run the ordinary CRL verification and watermark checks afterwards, with no
+   exemptions.** Finding an issuer is *evidence repair*, not revocation
+   confirmation. Freshness, signature and monotonicity all still have to pass on
+   their own terms.
+4. **Preserve `QUARANTINED` status after a successful confirmation; update only
+   the existing CA-revocation bookkeeping.** This is the current behaviour
+   (`ca_crl_updated` is set, status is untouched) and it is correct: quarantine
+   is a statement about the certificate, pending-revocation is a statement about
+   the CA. An implementer reading "pending until confirmation succeeds" could
+   easily un-quarantine on success — do not.
+5. **Keep leafless ReqID-only incidents separately visible.** This recovery path
+   cannot resolve them; they need an operator revoking by ReqID at the CA. They
+   must not be folded into the recoverable class, and must not disappear from
+   view because no automated path exists.
