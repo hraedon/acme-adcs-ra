@@ -1537,3 +1537,40 @@ lab store holds two, plus two leafless incidents in the other category. In a
 pilot the population is whatever the CA issued while the RA could not hear the
 response: small, live at the CA, and exactly the set an operator most needs
 reconciled.
+
+**Scope and acceptance criteria, agreed 2026-09-05.** This item is ready for a
+bounded implementation. **In scope:** existing-chain recovery (1) and
+blocked-state visibility (3). **Explicitly unresolved, and deliberately not
+blocking:** the cold-start inventory fallback, which only affects an orphan
+produced before the store holds any complete chain from that CA — a case not
+demonstrated here, while the two that are demonstrated are both recoverable from
+material already on disk. CA-database reconciliation (2) stays a separate
+evidence policy and is not part of this item.
+
+Requirements the implementation must satisfy:
+
+1. **Deduplicate candidate issuer certificates, and select by
+   `verify_directly_issued_by` — never by subject name alone.** Deduplicate by
+   certificate fingerprint, *not* by subject: the store can legitimately hold
+   more than one generation of the same CA's key under an identical DN, and
+   collapsing them by name would discard the generation that actually signed the
+   orphan. Selecting by signature is what keeps older generations supported,
+   and it is the same property `_watermark_key` already relies on.
+2. **Persist the recovered issuer evidence with an audit record naming its
+   source and the certificate's fingerprint.** Where the material came from is
+   part of the evidence; a recovered chain that cannot be traced back to what
+   supplied it is not better than no chain.
+3. **Run the ordinary CRL verification and watermark checks afterwards, with no
+   exemptions.** Finding an issuer is *evidence repair*, not revocation
+   confirmation. Freshness, signature and monotonicity all still have to pass on
+   their own terms.
+4. **Preserve `QUARANTINED` status after a successful confirmation; update only
+   the existing CA-revocation bookkeeping.** This is the current behaviour
+   (`ca_crl_updated` is set, status is untouched) and it is correct: quarantine
+   is a statement about the certificate, pending-revocation is a statement about
+   the CA. An implementer reading "pending until confirmation succeeds" could
+   easily un-quarantine on success — do not.
+5. **Keep leafless ReqID-only incidents separately visible.** This recovery path
+   cannot resolve them; they need an operator revoking by ReqID at the CA. They
+   must not be folded into the recoverable class, and must not disappear from
+   view because no automated path exists.
