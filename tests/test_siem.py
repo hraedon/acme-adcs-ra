@@ -673,13 +673,40 @@ class TestHecRedirectDoesNotLeakTheToken:
 
     @staticmethod
     def _serve(handler_fn: Any) -> Any:
+        """A throwaway HTTP server that DRAINS the request body first.
+
+        The drain is not tidiness. Without it the handler answers and closes
+        while the client's POST body is still unread in the receive buffer, and
+        Windows answers an unread-data close with an RST rather than a FIN. The
+        client then gets ``ConnectionAbortedError [WinError 10053]`` instead of
+        the response it was about to read — intermittently, depending on how the
+        writes interleave. It reddened CI on 2026-09-05 against a docs-only
+        commit and passed on a re-run of the identical tree.
+
+        That matters here for a reason worth stating, because the obvious fix is
+        the wrong one. On an abort the request never reaches the redirect, so
+        the attacker sink is never contacted, so ``seen["authorization"] is
+        None`` passes — **for the wrong reason**. The ``"302" in
+        offbox_last_error`` assertion is the only thing that caught it, which is
+        why the flake showed up as a loud failure instead of a quiet green.
+        Anyone relaxing that assertion to "fix the flake" would convert a real
+        security test into one that cannot fail. Drain the body instead, and
+        assert the redirect was reached by direct observation.
+        """
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         class _H(BaseHTTPRequestHandler):
+            def _drain(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+
             def do_POST(self) -> None:
+                self._drain()
                 handler_fn(self)
 
             def do_GET(self) -> None:
+                self._drain()
                 handler_fn(self)
 
             def log_message(self, *a: Any) -> None:
@@ -699,8 +726,10 @@ class TestHecRedirectDoesNotLeakTheToken:
             h.wfile.write(b'{"text":"Success","code":0}')
 
         sink = self._serve(attacker)
+        front_hits: list[str] = []
 
         def collector(h: Any) -> None:
+            front_hits.append(h.path)
             h.send_response(302)
             h.send_header("Location", f"http://127.0.0.1:{sink.server_port}/x")
             h.end_headers()
@@ -719,6 +748,14 @@ class TestHecRedirectDoesNotLeakTheToken:
             finally:
                 emitter.close()
 
+            # Anti-vacuity, by direct observation rather than by parsing an
+            # error string. The sink is never contacted when the code is
+            # CORRECT, so "the token did not arrive" is only evidence if the
+            # request actually got as far as being redirected.
+            assert front_hits, (
+                "the collector was never reached, so this test proves nothing "
+                "about what a redirect would have carried"
+            )
             # The whole finding, in one assertion.
             assert seen.get("authorization") is None, (
                 "the collector token was forwarded to the redirect target"
