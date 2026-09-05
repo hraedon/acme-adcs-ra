@@ -31,7 +31,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-_NOW = datetime.datetime.now(datetime.UTC)
+_SAMPLE_TIME = datetime.datetime(2026, 8, 29, 12, 0, tzinfo=datetime.UTC)
 
 
 @pytest.fixture(scope="module")
@@ -45,10 +45,15 @@ def sampler() -> ModuleType:
     return module
 
 
-def _crl(*, number: int | None = 42, age_minutes: int = 90) -> bytes:
+def _crl(
+    *,
+    sampled_at: datetime.datetime,
+    number: int | None = 42,
+    age_minutes: int = 90,
+) -> bytes:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "CONTOSO-CA01-CA")])
-    last = _NOW - datetime.timedelta(minutes=age_minutes)
+    last = sampled_at - datetime.timedelta(minutes=age_minutes)
     builder = (
         x509.CertificateRevocationListBuilder()
         .issuer_name(name)
@@ -78,10 +83,21 @@ def _serve(body: bytes, status: int = 200) -> tuple[str, Any]:
 
 class TestSampling:
     def test_a_good_crl_yields_the_three_numbers_that_matter(
-        self, sampler: ModuleType
+        self, sampler: ModuleType, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Age, window and CRL Number: a ceiling, a bound and a watermark."""
-        url, shutdown = _serve(_crl(number=127, age_minutes=90))
+        class FixedDatetime(datetime.datetime):
+            @classmethod
+            def now(cls, tz: datetime.tzinfo | None = None) -> datetime.datetime:
+                return _SAMPLE_TIME if tz is not None else _SAMPLE_TIME.replace(tzinfo=None)
+
+        # Keep fixture construction and fetch time on an explicit clock. This
+        # remains exact even when the full suite reaches this test long after
+        # the module was imported.
+        monkeypatch.setattr(sampler, "datetime", FixedDatetime)
+        url, shutdown = _serve(
+            _crl(sampled_at=_SAMPLE_TIME, number=127, age_minutes=90)
+        )
         try:
             row = sampler.sample(url)
         finally:
@@ -89,8 +105,8 @@ class TestSampling:
         assert row["ok"] is True
         assert row["crl_number"] == "127"
         assert row["window_seconds"] == 649200
-        # 90 minutes, allowing for the fetch itself.
-        assert 5400 <= row["observed_age_seconds"] <= 5460
+        assert row["fetched_at"] == _SAMPLE_TIME.isoformat()
+        assert row["observed_age_seconds"] == 5400
 
     def test_a_failed_fetch_still_writes_a_row(self, sampler: ModuleType) -> None:
         """A gap in the series must not be ambiguous.

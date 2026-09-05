@@ -236,56 +236,39 @@ honest: check a box only when the thing is actually true, not when it's planned.
       `docs/operations.md` ## Revocation runbook. **Reason 7 is rejected** by
       both the RA and `Revoke-Cert.ps1` (RFC 5280 "unused"; `certutil` rejects
       it) so an accepted reason can never silently break the out-of-band loop.
-- [ ] **CRL evidence freshness is configured from the actual CA cadence.** Before
-      enabling `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, set
-      `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` to **at least
-      `A_sched_max`**, which is the CRL's **published window plus one
-      `ClockSkewMinutes`** — read `thisUpdate`/`nextUpdate` off a real CRL, do
-      **not** reconstruct the window from the `CRLOverlap*` registry values,
-      which do not decompose to it.
-      **This checklist previously required
-      `A_sched_max < max_age_seconds < (nextUpdate - thisUpdate)`. That is
-      unsatisfiable for any CA** — `A_sched_max` exceeds the window by one skew
-      by construction — and chasing it produced two wrong published numbers.
-      A ceiling at or above `A_sched_max` cannot false-fail but does **not fire
-      before `nextUpdate`**; a binding ceiling requires going below the window
-      and accepting that a genuinely current CRL can be refused. Pick one
-      knowingly. `docs/operations.md` → *Deriving the ceiling (WI-052)* carries
-      the worked numbers for a 1-week CA. **⚠ The shipped `626400` was
-      SUPERSEDED on 2026-08-27: use `≥ 649800`.** The floor is the published
-      window (`649200s`, measured) plus one `ClockSkewMinutes` (`600s`);
-      `626400` is 6h30m below it and fails CRL3 with zero margin. Note the
-      trade this forces: 649800 exceeds the window, so the independent age
-      ceiling is **non-binding** on this cadence — it sits behind the CRL's own
-      `nextUpdate` rather than in front of it. Shortening the CA's overlap is
-      what restores a binding ceiling. **Derive the floor from a real CRL, not
-      from the `CRLOverlap*` registry values, which do not decompose to the
-      observed window.** Re-derive if your CA's `CRLPeriod`,
-      `CRLOverlapPeriod` or `ClockSkewMinutes` differ. After `nextUpdate` the CRL
-      fails closed regardless of this setting.
-      **⚠ Do not re-derive this number on paper — a fourth attempt is running as
-      a measurement (UNFILED item 24).** The floor above is the published
-      *window*, which is how long a **replayed** document stays unexpired; the
-      floor that matters for false refusals is the maximum age an **honest CDP
-      serves**, and on a CA that publishes with overlap those differ by exactly
-      the overlap. `scripts/sample_crl_age.py` measures the second one. Leave
-      `≥ 649800` in place until it has two publication cycles of data.
+- [ ] **CRL evidence freshness is configured from observed served age.** Before
+      enabling `ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE`, measure the
+      CDP with `scripts/sample_crl_age.py` across at least two publication
+      cycles, including failed fetches. Set
+      `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` above the maximum
+      observed served age with an operational margin. This remains an enforced
+      freshness check: exceeding it defers confirmation; an expired
+      `nextUpdate` also fails closed regardless of this setting.
+      The published window (`nextUpdate - thisUpdate`) and the maximum age
+      served by a healthy CDP are different quantities when publication
+      overlaps. **The prior window-plus-skew floor is disputed (UNFILED item
+      24), not a universal configuration rule.** The documented weekly-lab
+      value of `649800` seconds is interim pending two publication cycles of
+      sampler evidence; it is neither a new application default nor a value
+      to copy to every CA. See `docs/operations.md` → *Deriving the ceiling
+      (WI-052)*. Preserve the samples outside the lab restore scope.
 
-- [ ] **Monotonic CRL evidence is left enabled, and its first-use gap is
-      understood.** `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC` defaults
-      to `true` and is the control that actually bounds CRL replay — the age
-      ceiling above cannot be, whatever number it carries. It needs no
-      calibration. Two things to know before pilot:
-      **(1)** the first CRL seen for a CA is trust-on-first-use and protects
-      nothing, so the first confirmation after deployment or a CA key rollover
-      is unprotected by it;
-      **(2)** if the CA is ever restored from backup its CRL Number sequence
-      restarts, and confirmations then wedge until an operator clears the
-      watermark. That reset is deliberately manual — record who can do it, and
-      where, **before** you need it at 2am. If your CDP round-robins replicas at
-      different vintages, run `scripts/sample_crl_age.py --summarize` first: it
-      reports CRL Number regressions, which is exactly the false-refusal rate
-      you would be signing up for.
+- [ ] **Monotonic CRL evidence is left enabled, and its baseline is understood.**
+      `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC` defaults to `true`.
+      When CRL evidence is configured, it refuses evidence older than the
+      newest CRL already acted on for that issuing CA, independently of the
+      age ceiling's calibration. It does not establish that a first-seen CRL
+      is the newest document available: the first confirmation after deployment
+      or a CA key rollover has no prior watermark to compare against.
+      Document the recovery procedure before deployment. If a CA restore
+      produces a CRL Number below the stored watermark, confirmations remain
+      deferred until an operator resolves the regression; do not automatically
+      clear the watermark when a number goes backwards. An RA database restore
+      also restores its watermark, so reconcile the evidence gap before
+      resuming confirmations. If CDP replicas serve different vintages, use
+      the sampler's regression report to assess replica lag; it is evidence
+      about observed regressions, not a prediction of the exact confirmation
+      failure rate. See `docs/operations.md` → *Monotonic CRL evidence*.
 
 ---
 

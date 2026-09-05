@@ -72,11 +72,19 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**2026-09-05 maintenance candidate:** issued-certificate validation was
+extracted from `finalize.py` without changing its logic or call order; the CRL
+sampler test now uses an explicit clock. Current operator guidance distinguishes
+tagged v1.12.0 from the unreleased watermark, and documents the pruning startup
+refusal. Local Python and Linux Pester suites pass. **Full lab reproof remains
+owed on the final candidate.** See
+[`docs/reproof-handoff-2026-09-05.md`](docs/reproof-handoff-2026-09-05.md) for
+validation evidence and the operator handoff. The entries below are historical.
+
 **2026-08-27: WI-052 is closed by replacing the control, not by finding the
-number.** The CRL age ceiling was introduced as an independent replay bound and
-cannot be one — to bind it must sit below the CA's published window, to avoid
-refusing healthy CRLs it must sit above the age the CDP actually serves. Four
-derivations were spent looking for a value in between. The replay control is now
+number.** For the lab CA, the CRL age ceiling was introduced as an independent
+replay bound, but its safe floor is disputed because the published window and
+the age the CDP actually serves are different quantities. The replay control is now
 a **monotonic CRL watermark** (`ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC`,
 default true): the newest CRL acted on per issuing CA is recorded, and one that
 goes backwards is denied `crl-evidence-regressed`. It needs no calibration, since
@@ -225,7 +233,9 @@ can be valid and servable with no record of how it was issued. Derived from
 observed issuance, not the template, since ADCS can issue shorter than asked.
 The sweep additionally requires `audit_prune_enabled`, `audit_offbox_required`
 and a delivery probe that succeeds **at sweep time**; miss any gate and it
-reports and deletes nothing. **Local-only deployments never prune** — with no
+reports and deletes nothing. The current server also refuses
+`audit_prune_enabled=true` at startup because the SIEM path has no per-row
+delivery acknowledgement. **Local-only deployments never prune** — with no
 off-box copy the local table is the only evidence there is — and instead get
 footprint reporting plus JSONL rotation. Their stated cost is availability: the
 `certificate-issued` audit row commits in the same transaction as the

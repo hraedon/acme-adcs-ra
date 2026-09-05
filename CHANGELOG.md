@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Maintenance and reproof preparation (2026-09-05)
+
+- Extracted issued-certificate SAN, EKU, and CA-capability validation into
+  `issued_certificate_validation.py`. The validation logic, finalization
+  order, error responses, and quarantine behavior are unchanged.
+- Made the CRL sampler's age test deterministic: certificate timestamps and
+  the sample clock now share an explicit instant instead of depending on how
+  long earlier tests took to run. The sampler itself is unchanged.
+- Reconciled release status, authenticated resource reads, unavailable audit
+  pruning, and CRL-age guidance with the implementation. The weekly-lab age
+  ceiling remains interim pending measured served-age evidence; no defaults
+  or deployment settings changed.
+- Added a repeatable independent-client check to the live reproof runbook.
+  Local verification and the remaining lab work are recorded in
+  `docs/reproof-handoff-2026-09-05.md`; this change has not been lab-reproven.
+
 ### CRL replay is now bounded by a monotonic watermark, not by an age ceiling
 
 **New setting: `ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC`, default
@@ -21,12 +37,12 @@ replaying that document confirms a revocation for a certificate that is
 currently valid. A stale CRL that *lacks* the serial already failed closed, so
 this was the only wrong-accept an old CRL could produce.
 
-`revocation_confirm_crl_max_age_seconds` is **demoted to a liveness alarm** on
-the CA's publication pipeline. It was introduced as an independent replay bound
-and could never be one — to bind it must sit below the CA's publication window,
-to avoid refusing healthy CRLs it must sit above the age the CDP actually
-serves, and on a CA without publication overlap those constraints do not
-overlap. Its value did not change; what it claims to do did.
+`revocation_confirm_crl_max_age_seconds` remains an enforced freshness check
+and serves as a **liveness alarm** on the CA's publication pipeline. Its
+operational margin must come from the age the CDP actually serves, which can
+differ from the published validity window. The lab's prior floor derivation
+is disputed pending measurements (UNFILED item 24). The watermark comparison
+does not depend on that calibration. No configured value changed.
 
 **What the watermark does not do, stated because a quiet no-op is worse than no
 control:** the first CRL seen for a CA is trust-on-first-use and protects

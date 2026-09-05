@@ -508,9 +508,10 @@ These are three separate time bounds:
 - **Publication cadence:** `CRLPeriod` is the expected interval between CRLs.
 - **Overlap / validity:** `nextUpdate - thisUpdate` is the CRL's validity window;
   `nextUpdate` is a hard expiry, not a delay budget that can be extended here.
-- **Replay-age ceiling:** `revocation_confirm_crl_max_age_seconds` independently
-  limits how old a signed CRL the RA will accept, so it must remain binding below
-  the hard expiry.
+- **Publication-liveness ceiling:** `revocation_confirm_crl_max_age_seconds`
+  bounds the age of a signed CRL the RA will accept as an alarm on a stalled
+  publication path. It is not the replay control; the monotonic watermark below
+  detects regressions in CRL sequence.
 
 For this CA, the committed evidence measures `CRLPeriod` as 604800 seconds (1
 week) and the `thisUpdate` → `nextUpdate` window as 649200 seconds (7d 12h
@@ -677,11 +678,12 @@ actually has some; on this CA it does not. See the superseded banner below.
 > carries that number, which is why the answer is a sampler rather than a
 > fifth derivation.
 
-### The replay control is the monotonic watermark, not this ceiling
+### Monotonic CRL evidence
 
-*Added 2026-08-27 (UNFILED item 23). This is the answer to the "open question"
-immediately above: the ceiling was never able to be the control it was designed
-to be, so the control moved rather than the number.*
+*Added 2026-08-27 (UNFILED item 23). The watermark is the current working-tree
+replay control. The age ceiling remains a liveness alarm while sampler data
+settles the safe served-age floor for the lab CA; do not infer a universal
+relationship between that floor and a CRL's published validity window.*
 
 The RA records the newest CRL it has acted on for each issuing CA, and refuses
 one that goes **backwards** from it —
@@ -1011,17 +1013,16 @@ same denial reason update the row that is already on disk, bumping an exact
 `denial_count` and recording how many distinct `kid` values were offered. Set
 the window to 0 to go back to one row per denial.
 
-Nothing is pruned, and no attempt goes uncounted: the counter is written to a
+No rows are pruned: the counter is written to a
 committed row on every increment, so even a crash mid-window keeps the tally.
 What this bounds is *rows per unit time* (at most one per reason per window),
 not the total, so the retention guidance below still applies to normal
 operation:
 
 - **Keep hot** for the incident-review window (e.g. 90 days) for fast query.
-- **Archive cold** after the hot window: export rows older than N days to a
-  write-once / append-only sink (e.g. a compressed JSONL in cold storage)
-  and delete them from the live SQLite. Keep the archived sink on
-  tamper-evident storage.
+- **Archive cold** after the hot window only through an independently managed,
+  write-once / append-only process; the RA does not delete those rows from its
+  live SQLite store.
 - **Never delete** `certificate-issued` / `certificate-revoked` events until
   the corresponding certificates have expired AND been removed from the CRL
   (the audit is the matching half of the revocation trail; see the
@@ -1029,8 +1030,12 @@ operation:
 
 #### Built-in retention (`audit_retention_days`)
 
-The RA can now enforce that window itself, but only in the one deployment shape
-where deleting a local row is not destroying evidence.
+The RA records and validates this policy, but the current server refuses to
+start when `audit_prune_enabled=true`: its SIEM path has no per-row delivery
+acknowledgement, so a health probe cannot prove that each row selected for
+deletion reached off-box storage. Setting `audit_retention_days` still enforces
+the startup floor and keeps footprint reporting meaningful; it does not enable
+deletion.
 
 **The floor.** `audit_retention_days` is validated at startup against the
 longest certificate validity this RA has *actually issued* (recorded per row in
@@ -1048,13 +1053,14 @@ zero, and so it does not collapse as certificate lifetimes shrink.
 | Gate | Why |
 |---|---|
 | `audit_retention_days` ≥ floor | see above |
-| `audit_prune_enabled` | declaring a policy and destroying evidence are two decisions |
+| `audit_prune_enabled` | required by the library-level deletion decision; the current server refuses `true` at startup because per-row off-box delivery is not acknowledged |
 | `audit_offbox_required` | with no off-box copy the local table is the only evidence, so nothing is deleted from it |
 | A delivery probe that succeeds **at sweep time** | a sink that worked at startup and has since died is the exact state where deleting is unrecoverable |
 
-Miss any one and the sweep reports what it would have done and deletes nothing.
-That is the expected outcome for most deployments, and for **every** local-only
-one — see the local-only note in `operator-requirements.md` for the trade.
+The current server does not wire a pruning sweep. Any library-level evaluation
+that is used by tooling remains fail-closed and deletes nothing when a gate is
+missing; local-only deployments therefore rely on footprint reporting and
+JSONL rotation.
 
 The sweep audits itself (`audit-retention-swept`, carrying the cutoff, the row
 count and the floor). A retention pass that leaves no trace is indistinguishable

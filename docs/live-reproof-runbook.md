@@ -38,7 +38,9 @@ Record each run in the validation log in
 ### A. Issuance + EKU (shared leg)
 
 1. Start the RA app pool; confirm `GET /directory` → 200.
-2. Drive a full ACME round-trip (new-account EAB → order → challenge → finalize →
+2. Use an independently maintained ACME client, such as the deployed Certify
+   the Web installation, to drive a full ACME round-trip
+   (new-account EAB → order → challenge → finalize →
    cert). Confirm: serverAuth-only EKU (WI-026 passes on a real cert),
    `clientAuth` absent, chain off the existing CA (no new intermediate), SAN from
    the CSR, requester = the enrollment gMSA in the CA DB.
@@ -81,6 +83,26 @@ controls a *deployment* mistake silently disables, which unit tests cannot see.
 5. **Nothing extra is published:** `/docs`, `/redoc`, `/openapi.json` → **404**.
 6. **Nonce ceiling:** ~220 rapid `HEAD /acme/new-nonce` → a mix of 204 and
    **429** with `Retry-After`.
+
+### A.2 Independent-client compatibility record
+
+Repeat this on each candidate artifact as part of the full run. The in-repo
+client is useful for controlled checks, but cannot establish compatibility
+with an independent implementation.
+
+1. Record the RA commit, client version, and ACME library version when exposed
+   by the client. Use a fresh, scoped test account and record the effective
+   configuration without credentials.
+2. Complete issuance and a subsequent renewal/order through that client's
+   normal workflow. Confirm it can poll the order and retrieve the certificate
+   through authenticated POST-as-GET. Verify the resulting certificate and
+   chain as in §A.
+3. Request revocation through the same client. Record both the client's success
+   result and the RA's empty HTTP 200 response. Separately verify CA-side
+   revocation, queue confirmation, and CRL publication under §B or §C; the
+   client's success is not evidence that publication has completed.
+4. Preserve redacted client logs and the associated RA/CA evidence before
+   teardown. Record any skipped client operation as unproven, with its reason.
 
 ### B. Automated revocation — two-identity (recommended topology)
 
