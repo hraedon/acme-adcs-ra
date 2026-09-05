@@ -64,6 +64,16 @@ AGENT_ASSERTED = "agent-asserted"
 # Monotonicity verdicts (UNFILED item 23). A CRL is compared against the newest
 # document this RA has previously acted on for the same issuing CA.
 WATERMARK_FIRST = "first"          # nothing recorded yet: trust on first use
+# The default maximum age of a CRL this module will accept as evidence.
+#
+# It is defined HERE, and `RAConfig.revocation_confirm_crl_max_age_seconds`
+# imports it, so the library fallback and the deployment default cannot drift
+# apart. They did not disagree before only because every production caller
+# passes the config value explicitly -- a script or test that omitted it would
+# have silently got a different bound. The reasoning behind the number is on
+# the config field.
+DEFAULT_CRL_MAX_AGE_SECONDS = 626400
+
 WATERMARK_NEWER = "newer"          # advances the watermark
 WATERMARK_EQUAL = "equal"          # the same document, re-served; fine
 WATERMARK_OLDER = "older"          # a replay, or a lagging CDP replica
@@ -549,7 +559,7 @@ def fetch_crl_evidence(
     chain_pem: list[str],
     timeout_seconds: float = 10.0,
     max_bytes: int = 10 * 1024 * 1024,
-    max_age_seconds: int = 7 * 24 * 3600,
+    max_age_seconds: int = DEFAULT_CRL_MAX_AGE_SECONDS,
     total_timeout_seconds: float = 30.0,
     follow_redirects: bool = False,
     watermark: CrlWatermark | None = None,

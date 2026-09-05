@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from acme_adcs_ra.crl_evidence import DEFAULT_CRL_MAX_AGE_SECONDS
 from acme_adcs_ra.jws import _base64url_decode
 from acme_adcs_ra.policy import validate_dns_name
 
@@ -358,15 +359,35 @@ class RAConfig(BaseSettings):
     # sheds with 429 + Retry-After rather than queueing — the serial stays
     # pending, so the next sync sweep picks it up.
     revocation_confirm_crl_max_pending: int = 32
-    # An enforced freshness check on the CA's publication pipeline. Treat a
-    # refusal as a liveness alarm; the monotonic watermark below independently
-    # rejects evidence older than a CRL already acted on for the issuing CA.
-    # Set this ceiling above the observed maximum served age with margin,
-    # measured by scripts/sample_crl_age.py across publication cycles.
-    # The published validity window and maximum healthy served age differ
-    # when publication overlaps. Earlier claims that no CA could have a useful
-    # age ceiling conflated those quantities (WI-052, UNFILED item 24).
-    revocation_confirm_crl_max_age_seconds: int = 7 * 24 * 3600
+    # An enforced freshness check on the CA's publication pipeline, and a
+    # binding one. Two bounds constrain it, and they are NOT the same quantity:
+    #
+    #   floor  the maximum age an honest CDP actually SERVES. Below this the
+    #          ceiling refuses healthy evidence. No document carries the number
+    #          -- it has to be measured (scripts/sample_crl_age.py).
+    #   roof   the CRL's published validity window (nextUpdate - thisUpdate).
+    #          At or above this the ceiling sits behind the CRL's own expiry and
+    #          can never fire first, so it bounds nothing the expiry check does
+    #          not already bound.
+    #
+    # On a CA that publishes with overlap those differ by exactly the overlap,
+    # so a band exists and a ceiling can be both safe and binding. Four paper
+    # derivations argued otherwise by taking the floor from the window; that was
+    # the error (WI-052, UNFILED item 24, resolved 2026-09-05 by measurement).
+    #
+    # 626400 (7d 6h) is the value measured for the lab's weekly CA: 399 samples
+    # over 8.3 days covering one complete publication cycle put the maximum
+    # served age at 603654s (upper bound 605454s at a 1800s sampling interval)
+    # against a 649200s window. 626400 clears the floor by ~5h50m and the roof by
+    # ~6h20m. It is NOT a universal constant -- it is what THIS observation
+    # period supports for a 1-week CRLPeriod with ADCS's computed 12h overlap.
+    # A CA with a different cadence or overlap has a different band; measure it.
+    # See docs/operations.md -> "Deriving the ceiling (WI-052)".
+    #
+    # The monotonic watermark below is the replay control and does not depend on
+    # this calibration at all; a refusal here is an alarm about the CA's
+    # publication pipeline, not evidence about a certificate.
+    revocation_confirm_crl_max_age_seconds: int = DEFAULT_CRL_MAX_AGE_SECONDS
 
     # Refuse a CRL older than the newest one already acted on for the same
     # issuing CA (UNFILED item 23). This comparison does not depend on the

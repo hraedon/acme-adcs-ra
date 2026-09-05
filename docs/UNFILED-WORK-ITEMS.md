@@ -1376,3 +1376,112 @@ for a fifth session to re-derive on paper.
 **Do not "resolve" this from the registry, the docs, or another table.** Three
 of the four derivations so far were done that way and two of them were wrong.
 Read the sampler.
+
+---
+
+### 24 (continued). RESOLVED 2026-09-05 — measured, and 626400 was defensible all along
+
+The sampler ran from 2026-08-27T19:13Z to 2026-09-05T02:00Z: **399 samples, zero
+failed fetches, one complete publication cycle** (CRL 127 ageing 55,446s →
+603,654s, then 128 arriving at 626s).
+
+| quantity | measured |
+|---|---|
+| max age served | **603654s** |
+| upper bound on that (+ one 1800s sampling interval) | **605454s** |
+| published window, all 399 samples | **649200s** |
+| usable band | **(605454, 649200)** — 43746s wide |
+| CRL Number regressions | **0** |
+
+This is the first branch of the two this item predicted: *"if measured max
+served age stays near 604800 → a binding ceiling exists, item 20's floor is
+wrong, and 626400 was defensible all along."* It does, one is, it was, and it
+was. The application default is now **626400**, pinned with its reasoning in
+`tests/test_crl_max_age_calibration.py`.
+
+**Both previously published numbers were outside the band.** `649800` is above
+the roof, so it never fires before `nextUpdate`. `604800` — the default this
+replaces — clears the *observed* maximum by 1146s but not its upper bound, so it
+could refuse a healthy CRL in the minutes before republication. That second one
+matters more than it looks: it was the shipped default while the documentation
+recommended a different, also-wrong number, so no deployment was configured the
+way any part of the record advised.
+
+**The lesson is the one this item already named, now with a cost attached.** No
+document carries the maximum age a CDP serves; it is a property of behaviour
+over time. Four attempts to read it off a document produced two published wrong
+numbers. Nine days of a 40-line sampler settled it. When a quantity's failure
+mode is "the derivation looks plausible", the instrument is cheaper than the
+argument.
+
+**Caveat kept honest:** one publication cycle, one CA, one CDP. The band's
+*existence* generalises to any CA that publishes with overlap; the *numbers* do
+not generalise anywhere. A second cycle would tighten the floor, though the band
+is wide enough that the conclusion is unlikely to move.
+
+---
+
+### 25. (design, medium) — NEW 2026-09-05. **A quarantined certificate can never be CRL-confirmed, so its revocation never drains**
+
+**Found in the lab, not on paper.** The first run of the watermark proof picked
+two pending serials at random and both failed for a reason that had nothing to
+do with the watermark:
+
+```
+crl_detail: "could not locate the issuing CA certificate in the stored chain,
+             so the CRL signature cannot be verified"
+```
+
+Both were `QUARANTINED` certificates with `chain_pem` empty.
+
+**Why it happens, and why neither half is a bug on its own.** Quarantine exists
+for a certificate orphaned by a post-issuance *transport* failure — the CA
+issued it, the RA never received the response, so the RA has the serial but no
+chain. CRL evidence verifies the CRL's signature against the issuing CA
+certificate **from the certificate's own stored chain** (deliberately: selecting
+the issuer by name rather than by signature picks the wrong generation across a
+CA key rollover). Put together: for a quarantined certificate there is no chain,
+so there is no verifiable evidence, so with
+`ACME_RA_REVOCATION_CONFIRM_REQUIRE_CRL_EVIDENCE=true` the confirmation is
+refused with `crl-evidence-required-but-absent` — permanently. The serial sits
+in the pending set with no operator path out.
+
+`confirm_ca_revocation` explicitly accepts `CertStatus.QUARANTINED`, so the
+route intends these to be confirmable. The evidence path cannot deliver it.
+
+**What NOT to do**, stated because both shortcuts are tempting and both are
+wrong:
+
+* do **not** exempt quarantined certificates from the evidence requirement.
+  Quarantine is the state where the RA knows *least* about what the CA did; it
+  is the last place to relax verification.
+* do **not** clear them out of the pending set to make the queue drain. The
+  pending set is the record that a revocation is owed; emptying it destroys the
+  only thing tracking the orphan.
+
+**The actual question to answer:** how does a quarantined record acquire
+trustworthy issuer evidence after the fact? Candidates, in rough order of how
+much they preserve the existing guarantee:
+
+1. **Store the chain at quarantine time from what the RA already has.** The
+   configured `ACME_RA_ADCS_CA_BUNDLE` is a pinned, operator-supplied root, and
+   the issuing CA certificate is retrievable from the CA independently of the
+   failed enrollment. Binding it to the orphan needs care — the point of
+   "issuer from the leaf's own chain" is that the leaf selects its issuer, and
+   an orphan has no leaf bytes either, only a serial.
+2. **A distinct reconciliation path for serial-only orphans** that verifies
+   against the CA database (`certutil -view` by serial, which
+   `Reconcile-Revocation.ps1` already drives) and records a *different*
+   `verification` value — never `crl-verified`, because it is not the same
+   evidence. The honesty precedent is `agent-asserted` vs `crl-verified`.
+3. **Surface them as their own operator queue** rather than leaving them
+   indistinguishable from confirmable pending revocations. Even without (1) or
+   (2) this is worth doing: today the failure is a repeating denial in the audit
+   trail with no signal that the serial can never succeed.
+
+Whichever is chosen, `verification` must keep saying what was actually checked.
+
+**Blast radius today:** two records on the lab store, both from earlier
+sessions' transport-failure injections. In a pilot the population is whatever
+the CA issued while the RA could not hear it — small, but exactly the set an
+operator most wants reconciled.

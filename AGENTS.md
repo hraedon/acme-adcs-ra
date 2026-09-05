@@ -72,6 +72,19 @@ ESC surface adcs-lens would flag — scope it tightly.
 
 ## Status
 
+**2026-09-05 (later): WI-052 settled by measurement, and the watermark proven
+live.** The sampler's 399 samples over one complete publication cycle put the
+maximum served age at 603654s against a 649200s window, so a binding,
+non-false-refusing ceiling exists and the default is now **626400** (was
+604800). Both numbers this project previously published were outside the band.
+The monotonic watermark was proven against two genuine CRLs with a negative
+control. Full lab re-proof of the candidate: **72/74**, both failures explained
+and left visible (`CRL3` asserts the superseded rule; `Ld1` is the documented
+transport-failure residue). See the 2026-09-05 entry in
+`docs/pre-pilot-checklist.md`. **New: UNFILED item 25** — a quarantined
+certificate has no stored chain, so it can never be CRL-confirmed and its
+revocation never drains.
+
 **2026-09-05 maintenance candidate:** issued-certificate validation was
 extracted from `finalize.py` without changing its logic or call order; the CRL
 sampler test now uses an explicit clock. Current operator guidance distinguishes
@@ -89,8 +102,9 @@ a **monotonic CRL watermark** (`ACME_RA_REVOCATION_CONFIRM_CRL_REQUIRE_MONOTONIC
 default true): the newest CRL acted on per issuing CA is recorded, and one that
 goes backwards is denied `crl-evidence-regressed`. It needs no calibration, since
 RFC 5280 already requires the CRL Number to increase. The ceiling is demoted to a
-liveness alarm on the CA's publication pipeline. **Live proof still owed** — a
-stand-in serving a captured older CRL; no CA-side change needed.
+liveness alarm on the CA's publication pipeline. **Live proof landed 2026-09-05**
+— see the entry above; the ceiling is no longer only an alarm, it is a measured
+binding bound.
 
 **The reason WI-052 survived so long is the more useful finding.** Its
 calibration data existed — `crl_this_update` on every confirmation — and the lab
@@ -106,13 +120,12 @@ every 30 minutes since 2026-08-27T19:13Z.
 
 The first thing the sampler found was that the merged floor derivation uses the
 published *window* where it needs the *served age* — different quantities on any
-CA with publication overlap. **Do not re-derive that number on paper; read the
-sampler** (UNFILED item 24). The watermark is deliberately independent of how
-that resolves. **2026-08-28 reconciliation:** every committed surface that
-asserted ≥ 649800 as a settled floor (the `operations.md` banner and config
-example, item 20's resolution, the checklist log) now presents it as the
-**interim** value under item 24's dispute — it cannot false-fail on either
-reading, so it stays until the sampler has two publication cycles. The
+CA with publication overlap (UNFILED item 24). **2026-09-05: the sampler settled
+it**, and item 24 was right: max served age 603654s against a 649200s window, so
+the band is `(605454, 649200)` and the default is now **626400**. Every committed
+surface that asserted ≥ 649800 has been corrected. The standing rule stands and
+earned its keep — **do not re-derive that number on paper; read the sampler.**
+The watermark remains independent of the answer. The
 `restore.ps1` preserve block is likewise committed now, as the identifier-free
 reference implementation in `docs/live-reproof-runbook.md` §E, so a clean
 checkout re-applies it by paste instead of re-deriving from policy prose.

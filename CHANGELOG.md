@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### The CRL age ceiling is calibrated from measurement, not derivation (2026-09-05)
+
+**Changed default: `ACME_RA_REVOCATION_CONFIRM_CRL_MAX_AGE_SECONDS` is now
+`626400` (was `604800`).** Operators who set this explicitly are unaffected;
+operators on the default get a ceiling that is both binding and clear of the
+observed served-age floor, which the previous default was not.
+
+Two different quantities constrain this setting, and five revisions of the
+documentation conflated them. The **floor** is the maximum age the CDP actually
+*serves* — below it the ceiling refuses healthy evidence. The **roof** is the
+CRL's published window — at or above it the ceiling sits behind the CRL's own
+expiry and can never fire first. Every previous derivation took the floor from
+the window, which is the attacker's replay reach rather than the CA's output, and
+on a CA that publishes with overlap those differ by exactly the overlap.
+
+`scripts/sample_crl_age.py` measured it: 399 samples over 8.3 days covering one
+complete publication cycle put the maximum served age at 603654s (upper bound
+605454s) against a 649200s window. `626400` clears the floor by ~5h49m and the
+roof by ~6h20m. **This is what one observation period supports for a 1-week
+`CRLPeriod` with ADCS's computed 12h overlap — not a universal bound.** Measure
+your own CA; `docs/pre-pilot-checklist.md` §F says how.
+
+Both previously published numbers were outside the band: the recommended
+`649800` is above the roof, and the shipped `604800` clears the observed maximum
+by only 1146s, less than one sampling interval. The number is now defined once,
+in `crl_evidence.DEFAULT_CRL_MAX_AGE_SECONDS`, which `RAConfig` imports so the
+library fallback and the deployment default cannot drift.
+`tests/test_crl_max_age_calibration.py` pins it against the measurement and
+proves — against the implementation, not on paper — that a ceiling at or above
+the window is redundant with the expiry check.
+
+**The monotonic watermark is now proven live** (2026-09-05, two genuine CA-signed
+CRLs, with a negative control isolating the refusal to the watermark and
+persistence across a service restart). It remains the replay control and remains
+independent of this calibration.
+
 ### Maintenance and reproof preparation (2026-09-05)
 
 - Extracted issued-certificate SAN, EKU, and CA-capability validation into

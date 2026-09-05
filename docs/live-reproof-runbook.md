@@ -104,6 +104,40 @@ with an independent implementation.
 4. Preserve redacted client logs and the associated RA/CA evidence before
    teardown. Record any skipped client operation as unproven, with its reason.
 
+### A.3 The phase-L blackhole, and proving the instrument first
+
+The queue/drain phases need the CA's inbound TCP/443 blocked from the RA so
+enrollments hang on connect. Two things about that mechanism are load-bearing
+and have each silently voided a round:
+
+1. **Scope the rule to every address the RA can source from, in both families.**
+   A v4-only scope lets enrollments ride IPv6 straight through it.
+2. **Quote the addresses when you build the PowerShell array literal, and check
+   the exit code.** Unquoted, an IPv6 literal is not a valid PowerShell
+   expression: the wrapper dies with `Missing expression after ','`, creates no
+   rule, and — if the caller does not check the exit code — reports success. The
+   harness driver did exactly this until 2026-09-05.
+
+```bash
+# The array elements MUST be quoted, and a failed block MUST be fatal.
+printf '& C:\\Temp\\ca-inbound-block.ps1 -Mode %s -RaAddress @("%s","%s")\n' \
+    "$mode" "$RA_V4" "$RA_V6" > "$D/blk.ps1"
+scp -q "$D/blk.ps1" "$CA:C:/Temp/blk.ps1"
+ssh "$CA" 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\Temp\blk.ps1' || {
+    echo "BLOCK $mode FAILED on the CA - refusing to continue"; exit 1; }
+```
+
+**Then prove the drop from the RA before measuring anything.** `reachprobe.ps1`
+must report `dropped` — not `refused`, which means something is answering with
+RST and nothing will queue — for **every** address, and the driver must exit
+rather than proceed on any other result. That gate is the only reason the
+2026-09-05 run did not take a measurement on top of a blackhole that was never
+installed.
+
+The harness lives under gitignored `samples/`, so this section is the copy that
+survives a fresh clone. Same convention as §E's preserve block: the prose is the
+policy, the snippet is the code, and the two must not drift.
+
 ### B. Automated revocation — two-identity (recommended topology)
 
 1. Provision a dedicated revoker gMSA on a utility host: grant it
